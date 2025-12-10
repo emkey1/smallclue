@@ -52,15 +52,65 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/third-party/nextvi
+    ${CMAKE_CURRENT_SOURCE_DIR}/third-party/ios_system/ssh_keygen
+    ${CMAKE_CURRENT_SOURCE_DIR}/third-party/ios_system/ssh_keygen/openbsd-compat
 )
 
 # Source files
+set(NEXTVI_SOURCES third-party/nextvi/vi.c)
+
+file(GLOB_RECURSE OPENSSH_SOURCES CONFIGURE_DEPENDS
+    third-party/ios_system/ssh_keygen/*.c
+)
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "openbsd-compat/regress/")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/ssh-agent\\.c$")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/ssh-add\\.c$")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/auth2-gss\\.c$")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/gss-genr\\.c$")
+# Drop server/auth-only sources; keep client pieces like authfd/authfile.
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/auth2-.*\\.c$")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/auth-(passwd|rhosts).*\\.c$")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/monitor.*\\.c$")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/sshd.*\\.c$")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/servconf\\.c$")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/session\\.c$")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/sandbox-.*\\.c$")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/ssh-keysign\\.c$")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/ssh-pkcs11-helper\\.c$")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/sftp-server\\.c$")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/sshsig\\.c$")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/platform-pledge\\.c$")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/platform-tracing\\.c$")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/getrrsetbyname.*\\.c$")
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/ssh-sk-client\\.c$")
+
+# Re-add client helpers that were filtered out by broad patterns.
+list(APPEND OPENSSH_SOURCES
+    third-party/ios_system/ssh_keygen/monitor_fdpass.c
+    third-party/ios_system/ssh_keygen/sshsig.c
+    third-party/ios_system/ssh_keygen/platform-pledge.c
+)
+
 set(SOURCES
     src/main.c
     src/core.c
     src/nextvi_app.c
     src/openssh_app.c
+    src/runtime_support.c
+    src/openssh_stubs.c
+    src/openssh_shim.c
+    ${NEXTVI_SOURCES}
+    ${OPENSSH_SOURCES}
 )
+
+set_source_files_properties(${NEXTVI_SOURCES} PROPERTIES COMPILE_DEFINITIONS "main=nextvi_main_entry")
+set_source_files_properties(third-party/ios_system/ssh_keygen/ssh.c PROPERTIES COMPILE_DEFINITIONS "ssh_main=pscal_openssh_ssh_main")
+set_source_files_properties(third-party/ios_system/ssh_keygen/scp.c PROPERTIES COMPILE_DEFINITIONS "scp_main=pscal_openssh_scp_main")
+set_source_files_properties(third-party/ios_system/ssh_keygen/sftp.c PROPERTIES COMPILE_DEFINITIONS "sftp_main=pscal_openssh_sftp_main")
+set_source_files_properties(third-party/ios_system/ssh_keygen/ssh-keygen.c PROPERTIES COMPILE_DEFINITIONS "sshkeygen_main=pscal_openssh_ssh_keygen_main")
+
+add_compile_definitions(HAVE_CONFIG_H)
 
 # Optional Integration source
 # src/integration.c depends on vm/vm.h and backend_ast/builtin.h
@@ -89,6 +139,16 @@ target_link_libraries(smallclue PRIVATE Threads::Threads)
 if(ENABLE_CURL)
     target_link_libraries(smallclue PRIVATE ${CURL_LIBRARIES})
 endif()
+
+if(APPLE)
+    target_link_libraries(smallclue PRIVATE resolv)
+endif()
+
+# Link OpenSSH dependencies
+find_package(ZLIB REQUIRED)
+target_link_libraries(smallclue PRIVATE ZLIB::ZLIB)
+find_package(OpenSSL REQUIRED)
+target_link_libraries(smallclue PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
 if(APPLE)
     # Link against CoreFoundation or specific frameworks if iOS target functions require them
