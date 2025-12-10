@@ -12,7 +12,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include "third-party/openssh/pscal_runtime_hooks.h"
+#include "../../third-party/openssh-10.2p1/pscal_runtime_hooks.h"
 
 int pscal_openssh_ssh_main(int argc, char **argv);
 int pscal_openssh_scp_main(int argc, char **argv);
