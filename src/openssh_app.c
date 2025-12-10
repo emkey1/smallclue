@@ -105,9 +105,23 @@ static char *smallclueRuntimeLogPath(void) {
     return strdup(file_path);
 }
 
+static void smallclueLogTeePumpCleanup(void *ctx) {
+    SmallclueLogTee *t = (SmallclueLogTee *)ctx;
+    if (!t) return;
+    if (t->pipe_read >= 0) {
+        close(t->pipe_read);
+        t->pipe_read = -1;
+    }
+    if (t->log_fd >= 0) {
+        close(t->log_fd);
+        t->log_fd = -1;
+    }
+}
+
 static void *smallclueLogTeePump(void *arg) {
     SmallclueLogTee *tee = (SmallclueLogTee *)arg;
     if (!tee) return NULL;
+    pthread_cleanup_push(smallclueLogTeePumpCleanup, tee);
     char buffer[4096];
     while (1) {
         ssize_t n = read(tee->pipe_read, buffer, sizeof(buffer));
@@ -124,6 +138,7 @@ static void *smallclueLogTeePump(void *arg) {
             (void)write(tee->log_fd, buffer, (size_t)n);
         }
     }
+    pthread_cleanup_pop(1);
     return NULL;
 }
 
