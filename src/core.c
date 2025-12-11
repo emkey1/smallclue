@@ -56,6 +56,11 @@ __attribute__((weak)) void PSCALRuntimeUpdateWindowSize(int columns, int rows) {
 void PSCALRuntimeBeginScriptCapture(const char *path, int append) __attribute__((weak));
 void PSCALRuntimeEndScriptCapture(void) __attribute__((weak));
 int PSCALRuntimeScriptCaptureActive(void) __attribute__((weak));
+#ifndef PSCAL_RUNTIME_CAPTURE_IMPL
+__attribute__((weak)) void PSCALRuntimeBeginScriptCapture(const char *path, int append) { (void)path; (void)append; }
+__attribute__((weak)) void PSCALRuntimeEndScriptCapture(void) {}
+__attribute__((weak)) int PSCALRuntimeScriptCaptureActive(void) { return 0; }
+#endif
 #endif
 #include <termios.h>
 #include <time.h>
