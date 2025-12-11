@@ -19,6 +19,9 @@ int pscal_openssh_sftp_main(int argc, char **argv);
 int pscal_openssh_ssh_keygen_main(int argc, char **argv);
 void PSCALRuntimeSetDebugLogMirroring(int enable);
 __attribute__((weak)) void PSCALRuntimeSetDebugLogMirroring(int enable) { (void)enable; }
+void PSCALRuntimeBeginScriptCapture(const char *path, int append) __attribute__((weak));
+void PSCALRuntimeEndScriptCapture(void) __attribute__((weak));
+int PSCALRuntimeScriptCaptureActive(void) __attribute__((weak));
 
 volatile sig_atomic_t g_smallclue_openssh_exit_requested = 0;
 
@@ -115,6 +118,8 @@ int smallclueRunSsh(int argc, char **argv) {
     /* Detect whether the user already supplied a port via -p or -o Port=... or host:port. */
     bool user_set_port = false;
     bool user_set_config = false;
+    bool user_set_identity = false;
+    bool interactive_stdin = isatty(STDIN_FILENO) != 0;
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
         if (!arg) continue;
@@ -129,6 +134,9 @@ int smallclueRunSsh(int argc, char **argv) {
         if (strncmp(arg, "-o", 2) == 0 && strstr(arg, "Port=") != NULL) {
             user_set_port = true;
             break;
+        }
+        if ((strncmp(arg, "-i", 2) == 0) || (strncmp(arg, "-o", 2) == 0 && strstr(arg, "IdentityFile=") != NULL)) {
+            user_set_identity = true;
         }
         const char *colon = strrchr(arg, ':');
         if (colon && colon != arg && colon[1] != '\0' && strspn(colon + 1, "0123456789") == strlen(colon + 1)) {
@@ -145,12 +153,35 @@ int smallclueRunSsh(int argc, char **argv) {
     }
     snprintf(known_hosts_opt, opt_len, "UserKnownHostsFile=%s", known_hosts_path);
     const char *strict_opt = "StrictHostKeyChecking=accept-new";
-    int extra = 4;
+    int extra = 6; /* -F /dev/null, -o known_hosts, -o strict, -o IdentityAgent=none */
     if (!user_set_port) {
         extra += 2;
     }
     if (!user_set_config) {
         extra += 2;
+    }
+    if (!interactive_stdin) {
+        extra += 2; /* BatchMode=yes */
+    }
+    char identity_paths[3][PATH_MAX];
+    int identity_count = 0;
+    if (!user_set_identity) {
+        const char *home = getenv("HOME");
+        if (!home || !*home) {
+            home = ".";
+        }
+        const char *candidates[] = { "id_ed25519", "id_rsa", "id_ecdsa" };
+        for (int i = 0; i < 3; ++i) {
+            char path[PATH_MAX];
+            int w = snprintf(path, sizeof(path), "%s/.ssh/%s", home, candidates[i]);
+            if (w > 0 && w < (int)sizeof(path)) {
+                if (access(path, R_OK) == 0) {
+                    snprintf(identity_paths[identity_count], sizeof(identity_paths[identity_count]), "%s", path);
+                    identity_count++;
+                }
+            }
+        }
+        extra += identity_count * 2;
     }
     int new_argc = argc + extra;
     char **augmented = (char **)calloc((size_t)new_argc + 1, sizeof(char *));
@@ -161,6 +192,8 @@ int smallclueRunSsh(int argc, char **argv) {
     }
     int count = 0;
     augmented[count++] = strdup((argc > 0 && argv && argv[0]) ? argv[0] : "ssh");
+    augmented[count++] = strdup("-o");
+    augmented[count++] = strdup("IdentityAgent=none");
     if (!user_set_config) {
         augmented[count++] = strdup("-F");
         augmented[count++] = strdup("/dev/null");
@@ -170,9 +203,17 @@ int smallclueRunSsh(int argc, char **argv) {
     known_hosts_opt = NULL;
     augmented[count++] = strdup("-o");
     augmented[count++] = strdup(strict_opt);
+    if (!interactive_stdin) {
+        augmented[count++] = strdup("-o");
+        augmented[count++] = strdup("BatchMode=yes");
+    }
     if (!user_set_port) {
         augmented[count++] = strdup("-p");
         augmented[count++] = strdup("22");
+    }
+    for (int i = 0; i < identity_count; ++i) {
+        augmented[count++] = strdup("-i");
+        augmented[count++] = strdup(identity_paths[i]);
     }
     for (int i = 1; i < argc; ++i) {
         augmented[count++] = argv[i] ? strdup(argv[i]) : strdup("");
