@@ -22,6 +22,9 @@ __attribute__((weak)) void PSCALRuntimeSetDebugLogMirroring(int enable) { (void)
 void PSCALRuntimeBeginScriptCapture(const char *path, int append) __attribute__((weak));
 void PSCALRuntimeEndScriptCapture(void) __attribute__((weak));
 int PSCALRuntimeScriptCaptureActive(void) __attribute__((weak));
+void PSCALRuntimeBeginScriptCapture(const char *path, int append) __attribute__((weak));
+void PSCALRuntimeEndScriptCapture(void) __attribute__((weak));
+int PSCALRuntimeScriptCaptureActive(void) __attribute__((weak));
 
 volatile sig_atomic_t g_smallclue_openssh_exit_requested = 0;
 
