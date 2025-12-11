@@ -18,6 +18,7 @@ int pscal_openssh_scp_main(int argc, char **argv);
 int pscal_openssh_sftp_main(int argc, char **argv);
 int pscal_openssh_ssh_keygen_main(int argc, char **argv);
 void PSCALRuntimeSetDebugLogMirroring(int enable);
+__attribute__((weak)) void PSCALRuntimeSetDebugLogMirroring(int enable) { (void)enable; }
 
 volatile sig_atomic_t g_smallclue_openssh_exit_requested = 0;
 
