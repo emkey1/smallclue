@@ -2,7 +2,7 @@
 #include <signal.h>
 #include <stdio.h>
 
-#include "../../third-party/openssh-10.2p1/pscal_runtime_hooks.h"
+#include "pscal_openssh_hooks.h"
 
 /* Stub OpenSSH entry points so the standalone build links. */
 __attribute__((weak)) int pscal_openssh_ssh_main(int argc, char **argv) {
