@@ -152,6 +152,7 @@ DEFINE_SMALLCLUE_WRAPPER("uptime", uptime)
 DEFINE_SMALLCLUE_WRAPPER("file", file)
 DEFINE_SMALLCLUE_WRAPPER("scp", scp)
 DEFINE_SMALLCLUE_WRAPPER("sftp", sftp)
+DEFINE_SMALLCLUE_WRAPPER("script", script)
 DEFINE_SMALLCLUE_WRAPPER("ssh", ssh)
 DEFINE_SMALLCLUE_WRAPPER("ssh-keygen", sshkeygen)
 #if defined(PSCAL_TARGET_IOS)
@@ -264,6 +265,7 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("traceroute", vmBuiltinSmallclue_traceroute, "traceroute");
     registerSmallclueBuiltin("nslookup", vmBuiltinSmallclue_nslookup, "nslookup");
     registerSmallclueBuiltin("host", vmBuiltinSmallclue_host, "host");
+    registerSmallclueBuiltin("script", vmBuiltinSmallclue_script, "script");
     registerSmallclueBuiltin("nextvi", vmBuiltinSmallclue_nextvi, "nextvi");
     registerSmallclueBuiltin("vi", vmBuiltinSmallclue_nextvi, "vi");
     registerSmallclueBuiltin("dmesg", vmBuiltinSmallclue_dmesg, "dmesg");

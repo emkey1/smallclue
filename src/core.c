@@ -536,11 +536,11 @@ static const SmallclueApplet kSmallclueApplets[] = {
 #endif
     {"scp", smallclueScpCommand, "Securely copy files over SSH"},
     {"sftp", smallclueSftpCommand, "Interactive SFTP client"},
+    {"script", smallclueScriptCommand, "Record terminal output to a file"},
     {"ssh", smallclueSshCommand, "OpenSSH client"},
     {"ssh-keygen", smallclueSshKeygenCommand, "Generate SSH key pairs"},
     {"tail", smallclueTailCommand, "Print the last lines of files"},
     {"tee", smallclueTeeCommand, "Copy stdin to files and stdout"},
-    {"script", smallclueScriptCommand, "Record terminal output to a file"},
     {"telnet", smallclueTelnetCommand, "Simple TCP telnet client"},
     {"test", smallclueTestCommand, "Evaluate expressions"},
     {"touch", smallclueTouchCommand, "Update file timestamps"},
@@ -683,14 +683,14 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  Uses OpenSSH scp"},
     {"sftp", "sftp [-P PORT] [USER@]HOST\n"
              "  Interactive SFTP client"},
-    {"ssh", "ssh [-p PORT] [USER@]HOST [command]\n"
-            "  OpenSSH client"},
-    {"ssh-keygen", "ssh-keygen [-t TYPE] [-f FILE] [-C COMMENT]\n"
-                   "  Generate SSH key pairs"},
     {"script", "script [-a] [-e] [FILE]\n"
                "  Record terminal output to FILE (default: typescript)\n"
                "  -a append to FILE\n"
                "  -e stop active capture"},
+    {"ssh", "ssh [-p PORT] [USER@]HOST [command]\n"
+            "  OpenSSH client"},
+    {"ssh-keygen", "ssh-keygen [-t TYPE] [-f FILE] [-C COMMENT]\n"
+                   "  Generate SSH key pairs"},
     {"tail", "tail [-n N] [FILE...]\n"
              "  Default N=10"},
     {"tee", "tee [-a] FILE...\n"
