@@ -53,6 +53,9 @@ void pscalRuntimeDebugLog(const char *message) __attribute__((weak));
 #if defined(PSCAL_TARGET_IOS)
 __attribute__((weak_import)) void PSCALRuntimeUpdateWindowSize(int columns, int rows);
 __attribute__((weak)) void PSCALRuntimeUpdateWindowSize(int columns, int rows) { (void)columns; (void)rows; }
+void PSCALRuntimeBeginScriptCapture(const char *path, int append) __attribute__((weak));
+void PSCALRuntimeEndScriptCapture(void) __attribute__((weak));
+int PSCALRuntimeScriptCaptureActive(void) __attribute__((weak));
 #endif
 #include <termios.h>
 #include <time.h>
@@ -68,6 +71,12 @@ __attribute__((weak)) void PSCALRuntimeUpdateWindowSize(int columns, int rows) {
 #if SMALLCLUE_HAS_IFADDRS
 #include <ifaddrs.h>
 #include <net/if.h>
+#endif
+
+#if !defined(PSCAL_TARGET_IOS)
+void PSCALRuntimeBeginScriptCapture(const char *path, int append) { (void)path; (void)append; }
+void PSCALRuntimeEndScriptCapture(void) {}
+int PSCALRuntimeScriptCaptureActive(void) { return 0; }
 #endif
 
 static const char *smallclueResolvePath(const char *path, char *buffer, size_t buflen) {
@@ -291,6 +300,7 @@ static int smallclueWatchCommand(int argc, char **argv);
 static int smallclueBasenameCommand(int argc, char **argv);
 static int smallclueDirnameCommand(int argc, char **argv);
 static int smallclueTeeCommand(int argc, char **argv);
+static int smallclueScriptCommand(int argc, char **argv);
 static int smallclueTestCommand(int argc, char **argv);
 static int smallclueBracketCommand(int argc, char **argv);
 static int smallclueXargsCommand(int argc, char **argv);
@@ -525,6 +535,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"ssh-keygen", smallclueSshKeygenCommand, "Generate SSH key pairs"},
     {"tail", smallclueTailCommand, "Print the last lines of files"},
     {"tee", smallclueTeeCommand, "Copy stdin to files and stdout"},
+    {"script", smallclueScriptCommand, "Record terminal output to a file"},
     {"telnet", smallclueTelnetCommand, "Simple TCP telnet client"},
     {"test", smallclueTestCommand, "Evaluate expressions"},
     {"touch", smallclueTouchCommand, "Update file timestamps"},
@@ -671,6 +682,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  OpenSSH client"},
     {"ssh-keygen", "ssh-keygen [-t TYPE] [-f FILE] [-C COMMENT]\n"
                    "  Generate SSH key pairs"},
+    {"script", "script [-a] [-e] [FILE]\n"
+               "  Record terminal output to FILE (default: typescript)\n"
+               "  -a append to FILE\n"
+               "  -e stop active capture"},
     {"tail", "tail [-n N] [FILE...]\n"
              "  Default N=10"},
     {"tee", "tee [-a] FILE...\n"
@@ -3705,6 +3720,48 @@ static int smallclueTeeCommand(int argc, char **argv) {
         free(files);
     }
     return status;
+}
+
+static int smallclueScriptCommand(int argc, char **argv) {
+    smallclueResetGetopt();
+    int append = 0;
+    int stop = 0;
+    int opt;
+    while ((opt = getopt(argc, argv, "ae")) != -1) {
+        if (opt == 'a') {
+            append = 1;
+        } else if (opt == 'e') {
+            stop = 1;
+        } else {
+            fprintf(stderr, "usage: script [-a] [-e] [file]\n");
+            return 1;
+        }
+    }
+
+    const char *path = (optind < argc) ? argv[optind] : "typescript";
+
+    if (stop) {
+        if (&PSCALRuntimeEndScriptCapture) {
+            PSCALRuntimeEndScriptCapture();
+            printf("Script capture stopped\n");
+            return 0;
+        }
+        fprintf(stderr, "script: capture not available on this platform\n");
+        return 1;
+    }
+
+    if (!&PSCALRuntimeBeginScriptCapture) {
+        fprintf(stderr, "script: capture not available on this platform\n");
+        return 1;
+    }
+
+    PSCALRuntimeBeginScriptCapture(path, append);
+    if (&PSCALRuntimeScriptCaptureActive && !PSCALRuntimeScriptCaptureActive()) {
+        fprintf(stderr, "script: failed to start capture for %s\n", path);
+        return 1;
+    }
+    printf("Script started, file is %s%s\n", path, append ? " (append)" : "");
+    return 0;
 }
 
 static int smallclueElvisCommand(int argc, char **argv) {
