@@ -277,9 +277,14 @@ int smallclueRunSsh(int argc, char **argv) {
 
     /* Detect whether the user already supplied a port via -p or -o Port=... or host:port. */
     bool user_set_port = false;
+    bool user_set_config = false;
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
         if (!arg) continue;
+        if (strcmp(arg, "-F") == 0) {
+            user_set_config = true;
+            continue;
+        }
         if (strcmp(arg, "-p") == 0) {
             user_set_port = true;
             break;
@@ -307,6 +312,9 @@ int smallclueRunSsh(int argc, char **argv) {
     if (!user_set_port) {
         extra += 2;
     }
+    if (!user_set_config) {
+        extra += 2;
+    }
     int new_argc = argc + extra;
     char **augmented = (char **)calloc((size_t)new_argc + 1, sizeof(char *));
     if (!augmented) {
@@ -316,6 +324,10 @@ int smallclueRunSsh(int argc, char **argv) {
     }
     int count = 0;
     augmented[count++] = strdup((argc > 0 && argv && argv[0]) ? argv[0] : "ssh");
+    if (!user_set_config) {
+        augmented[count++] = strdup("-F");
+        augmented[count++] = strdup("/dev/null");
+    }
     augmented[count++] = strdup("-o");
     augmented[count++] = known_hosts_opt;
     known_hosts_opt = NULL;
