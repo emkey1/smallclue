@@ -155,7 +155,7 @@ int smallclueRunSsh(int argc, char **argv) {
     }
     snprintf(known_hosts_opt, opt_len, "UserKnownHostsFile=%s", known_hosts_path);
     const char *strict_opt = "StrictHostKeyChecking=accept-new";
-    int extra = 8; /* -F /dev/null, -o known_hosts, -o strict, -o IdentityAgent=none, -o IdentitiesOnly=yes */
+    int extra = 10; /* -F /dev/null, -o known_hosts, -o strict, -o IdentityAgent=none, -o IdentitiesOnly=yes, -o BatchMode=no */
     if (!user_set_port) {
         extra += 2;
     }
@@ -198,6 +198,8 @@ int smallclueRunSsh(int argc, char **argv) {
     augmented[count++] = strdup("IdentityAgent=none");
     augmented[count++] = strdup("-o");
     augmented[count++] = strdup("IdentitiesOnly=yes");
+    augmented[count++] = strdup("-o");
+    augmented[count++] = strdup("BatchMode=no");
     if (!user_set_config) {
         augmented[count++] = strdup("-F");
         augmented[count++] = strdup("/dev/null");
