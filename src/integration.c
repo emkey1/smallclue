@@ -259,6 +259,7 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("rm", vmBuiltinSmallclue_rm, "rm");
     registerSmallclueBuiltin("rmdir", vmBuiltinSmallclue_rmdir, "rmdir");
     registerSmallclueBuiltin("ln", vmBuiltinSmallclue_ln, "ln");
+    registerSmallclueBuiltin("ls", vmBuiltinSmallclue_ls, "ls"); /* critical: keep smallclue ls available on iOS */
     registerSmallclueBuiltin("ping", vmBuiltinSmallclue_ping, "ping");
     registerSmallclueBuiltin("env", vmBuiltinSmallclue_env, "env");
     registerSmallclueBuiltin("telnet", vmBuiltinSmallclue_telnet, "telnet");
