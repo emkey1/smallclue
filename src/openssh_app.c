@@ -17,6 +17,7 @@ int pscal_openssh_ssh_main(int argc, char **argv);
 int pscal_openssh_scp_main(int argc, char **argv);
 int pscal_openssh_sftp_main(int argc, char **argv);
 int pscal_openssh_ssh_keygen_main(int argc, char **argv);
+void PSCALRuntimeSetDebugLogMirroring(int enable);
 
 volatile sig_atomic_t g_smallclue_openssh_exit_requested = 0;
 
@@ -75,12 +76,14 @@ static int smallclueInvokeOpensshEntry(const char *label, int (*entry)(int, char
     pscal_openssh_exit_context exitContext;
     pscal_openssh_reset_progress_state();
     pscal_openssh_push_exit_context(&exitContext);
+    PSCALRuntimeSetDebugLogMirroring(1);
     int status;
     if (sigsetjmp(exitContext.env, 0) == 0) {
         status = entry(argc, argv);
     } else {
         status = exitContext.exit_code;
     }
+    PSCALRuntimeSetDebugLogMirroring(0);
     pscal_openssh_pop_exit_context(&exitContext);
     return status;
 }
