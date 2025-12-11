@@ -274,6 +274,27 @@ int smallclueRunSsh(int argc, char **argv) {
     if (!known_hosts_path) {
         return smallclueRunOpensshEntry("ssh", pscal_openssh_ssh_main, argc, argv);
     }
+
+    /* Detect whether the user already supplied a port via -p or -o Port=... or host:port. */
+    bool user_set_port = false;
+    for (int i = 1; i < argc; ++i) {
+        const char *arg = argv[i];
+        if (!arg) continue;
+        if (strcmp(arg, "-p") == 0) {
+            user_set_port = true;
+            break;
+        }
+        if (strncmp(arg, "-o", 2) == 0 && strstr(arg, "Port=") != NULL) {
+            user_set_port = true;
+            break;
+        }
+        const char *colon = strrchr(arg, ':');
+        if (colon && colon != arg && colon[1] != '\0' && strspn(colon + 1, "0123456789") == strlen(colon + 1)) {
+            user_set_port = true;
+            break;
+        }
+    }
+
     size_t opt_len = strlen("UserKnownHostsFile=") + strlen(known_hosts_path) + 1;
     char *known_hosts_opt = (char *)malloc(opt_len);
     if (!known_hosts_opt) {
@@ -283,6 +304,9 @@ int smallclueRunSsh(int argc, char **argv) {
     snprintf(known_hosts_opt, opt_len, "UserKnownHostsFile=%s", known_hosts_path);
     const char *strict_opt = "StrictHostKeyChecking=accept-new";
     int extra = 4;
+    if (!user_set_port) {
+        extra += 2;
+    }
     int new_argc = argc + extra;
     char **augmented = (char **)calloc((size_t)new_argc + 1, sizeof(char *));
     if (!augmented) {
@@ -297,6 +321,10 @@ int smallclueRunSsh(int argc, char **argv) {
     known_hosts_opt = NULL;
     augmented[count++] = strdup("-o");
     augmented[count++] = strdup(strict_opt);
+    if (!user_set_port) {
+        augmented[count++] = strdup("-p");
+        augmented[count++] = strdup("22");
+    }
     for (int i = 1; i < argc; ++i) {
         augmented[count++] = argv[i] ? strdup(argv[i]) : strdup("");
     }
