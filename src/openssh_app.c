@@ -5,13 +5,65 @@
 #include <stdbool.h>
 #include <string.h>
 #include <limits.h>
-#include <sys/stat.h>
 #include <errno.h>
+#include <stdint.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <sys/stat.h>
 #include "pscal_openssh_hooks.h"
+#if defined(PSCAL_TARGET_IOS)
+#if defined(__has_include)
+#  if __has_include("PSCALRuntime.h")
+#    include "PSCALRuntime.h"
+#  else
+extern jmp_buf *PSCALRuntimeSwapExitJumpBuffer(jmp_buf *buffer) __attribute__((weak_import));
+extern int PSCALRuntimePushExitOverride(jmp_buf *buffer) __attribute__((weak_import));
+extern void PSCALRuntimePopExitOverride(void) __attribute__((weak_import));
+extern int PSCALRuntimePushExitOverrideWithStatus(jmp_buf *buffer, volatile int *status_out) __attribute__((weak_import));
+extern void PSCALRuntimePopExitOverrideWithStatus(void) __attribute__((weak_import));
+#  endif
+#elif defined(__APPLE__)
+extern jmp_buf *PSCALRuntimeSwapExitJumpBuffer(jmp_buf *buffer) __attribute__((weak_import));
+extern int PSCALRuntimePushExitOverride(jmp_buf *buffer) __attribute__((weak_import));
+extern void PSCALRuntimePopExitOverride(void) __attribute__((weak_import));
+extern int PSCALRuntimePushExitOverrideWithStatus(jmp_buf *buffer, volatile int *status_out) __attribute__((weak_import));
+extern void PSCALRuntimePopExitOverrideWithStatus(void) __attribute__((weak_import));
+#else
+extern jmp_buf *PSCALRuntimeSwapExitJumpBuffer(jmp_buf *buffer) __attribute__((weak));
+extern int PSCALRuntimePushExitOverride(jmp_buf *buffer) __attribute__((weak));
+extern void PSCALRuntimePopExitOverride(void) __attribute__((weak));
+extern int PSCALRuntimePushExitOverrideWithStatus(jmp_buf *buffer, volatile int *status_out) __attribute__((weak));
+extern void PSCALRuntimePopExitOverrideWithStatus(void) __attribute__((weak));
+#endif
+/* Provide a weak fallback so standalone smallclue builds without the runtime
+ * bridge still link cleanly on iOS. The real runtime implementation overrides
+ * this when available. */
+__attribute__((weak))
+jmp_buf *PSCALRuntimeSwapExitJumpBuffer(jmp_buf *buffer) {
+    (void)buffer;
+    return NULL;
+}
+__attribute__((weak))
+int PSCALRuntimePushExitOverride(jmp_buf *buffer) {
+    (void)buffer;
+    return -1;
+}
+__attribute__((weak))
+void PSCALRuntimePopExitOverride(void) {
+}
+__attribute__((weak))
+int PSCALRuntimePushExitOverrideWithStatus(jmp_buf *buffer, volatile int *status_out) {
+    (void)buffer;
+    (void)status_out;
+    return -1;
+}
+__attribute__((weak))
+void PSCALRuntimePopExitOverrideWithStatus(void) {
+}
+#endif
 
 int pscal_openssh_ssh_main(int argc, char **argv);
 int pscal_openssh_scp_main(int argc, char **argv);
@@ -22,11 +74,20 @@ __attribute__((weak)) void PSCALRuntimeSetDebugLogMirroring(int enable) { (void)
 void PSCALRuntimeBeginScriptCapture(const char *path, int append) __attribute__((weak));
 void PSCALRuntimeEndScriptCapture(void) __attribute__((weak));
 int PSCALRuntimeScriptCaptureActive(void) __attribute__((weak));
-void PSCALRuntimeBeginScriptCapture(const char *path, int append) __attribute__((weak));
-void PSCALRuntimeEndScriptCapture(void) __attribute__((weak));
-int PSCALRuntimeScriptCaptureActive(void) __attribute__((weak));
 
 volatile sig_atomic_t g_smallclue_openssh_exit_requested = 0;
+static sigjmp_buf g_smallclue_openssh_fallback_env;
+static volatile sig_atomic_t g_smallclue_openssh_fallback_active = 0;
+static volatile sig_atomic_t g_smallclue_openssh_fallback_code = 0;
+
+int pscal_openssh_fallback_exit(int code) {
+    if (!g_smallclue_openssh_fallback_active) {
+        return 0;
+    }
+    g_smallclue_openssh_fallback_code = code;
+    siglongjmp(g_smallclue_openssh_fallback_env, 1);
+    return 1; /* unreachable, but keeps the compiler happy */
+}
 
 static void smallclueFreeArgv(char **argv, int count) {
     if (!argv) {
@@ -38,39 +99,28 @@ static void smallclueFreeArgv(char **argv, int count) {
     free(argv);
 }
 
-static int smallclueEnsureDirectory(const char *path, mode_t mode) {
-    struct stat st;
-    if (stat(path, &st) == 0) {
-        return S_ISDIR(st.st_mode) ? 0 : -1;
+static void smallclueEnsureWritableHomeSsh(void) {
+    const char *home = getenv("PSCALI_WORKDIR");
+    if (!home || !*home) {
+        home = getenv("PSCALI_CONTAINER_ROOT");
     }
-    if (errno != ENOENT) {
-        return -1;
+    if (!home || !*home) {
+        home = getenv("HOME");
     }
-    if (mkdir(path, mode) == 0) {
-        return 0;
-    }
-    return (errno == EEXIST) ? 0 : -1;
-}
-
-static char *smallclueKnownHostsPath(void) {
-    const char *home = getenv("HOME");
     if (!home || !*home) {
         home = ".";
     }
+
     char ssh_dir[PATH_MAX];
     int written = snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home);
-    if (written < 0 || written >= (int)sizeof(ssh_dir)) {
-        return NULL;
+    if (written > 0 && written < (int)sizeof(ssh_dir)) {
+        struct stat st;
+        if (stat(ssh_dir, &st) != 0) {
+            mkdir(ssh_dir, 0700);
+        }
     }
-    if (smallclueEnsureDirectory(ssh_dir, 0700) != 0) {
-        return NULL;
-    }
-    char file_path[PATH_MAX];
-    written = snprintf(file_path, sizeof(file_path), "%s/known_hosts", ssh_dir);
-    if (written < 0 || written >= (int)sizeof(file_path)) {
-        return NULL;
-    }
-    return strdup(file_path);
+
+    setenv("HOME", home, 1);
 }
 
 static int smallclueInvokeOpensshEntry(const char *label, int (*entry)(int, char **),
@@ -95,8 +145,8 @@ static int smallclueInvokeOpensshEntry(const char *label, int (*entry)(int, char
     return status;
 }
 
-static int smallclueRunOpensshEntry(const char *label, int (*entry)(int, char **),
-                                    int argc, char **argv) {
+static int smallclueRunOpensshEntryOnce(const char *label, int (*entry)(int, char **),
+                                        int argc, char **argv) {
     if (!entry) {
         fprintf(stderr, "%s: command unavailable\n", label ? label : "ssh");
         return 127;
@@ -107,146 +157,143 @@ static int smallclueRunOpensshEntry(const char *label, int (*entry)(int, char **
     ignore_action.sa_handler = SIG_IGN;
     sigemptyset(&ignore_action.sa_mask);
     sigaction(SIGPIPE, &ignore_action, &old_pipe);
-    int status = smallclueInvokeOpensshEntry(label, entry, argc, argv);
+    int status = 255;
+#if defined(PSCAL_TARGET_IOS)
+    jmp_buf exit_env;
+    volatile int exit_status_sink = 0;
+    bool override_active = false;
+    if (PSCALRuntimePushExitOverrideWithStatus &&
+        PSCALRuntimePushExitOverrideWithStatus(&exit_env, &exit_status_sink) == 0) {
+        override_active = true;
+        int jump_code = setjmp(exit_env);
+        if (jump_code != 0) {
+            status = (jump_code == 1) ? exit_status_sink : jump_code;
+            goto smallclue_openssh_done;
+        }
+    } else if (PSCALRuntimePushExitOverride && PSCALRuntimePushExitOverride(&exit_env) == 0) {
+        override_active = true;
+        int jump_code = setjmp(exit_env);
+        if (jump_code != 0) {
+            status = (jump_code == 1) ? 0 : jump_code;
+            goto smallclue_openssh_done;
+        }
+    }
+    int jump_code_outer = sigsetjmp(g_smallclue_openssh_fallback_env, 0);
+    if (jump_code_outer != 0) {
+        status = g_smallclue_openssh_fallback_code;
+        goto smallclue_openssh_done;
+    }
+    g_smallclue_openssh_fallback_active = 1;
+    pscal_openssh_set_global_exit_handler(&g_smallclue_openssh_fallback_env,
+                                          &g_smallclue_openssh_fallback_code);
+    status = smallclueInvokeOpensshEntry(label, entry, argc, argv);
+smallclue_openssh_done:
+    g_smallclue_openssh_fallback_active = 0;
+    if (override_active) {
+        if (PSCALRuntimePopExitOverrideWithStatus) {
+            PSCALRuntimePopExitOverrideWithStatus();
+        } else if (PSCALRuntimePopExitOverride) {
+            PSCALRuntimePopExitOverride();
+        }
+    }
+#if defined(PSCAL_TARGET_IOS)
+    pscal_openssh_set_global_exit_handler(NULL, NULL);
+#endif
+#else
+    status = smallclueInvokeOpensshEntry(label, entry, argc, argv);
+#endif
     sigaction(SIGPIPE, &old_pipe, NULL);
     return status;
 }
 
-int smallclueRunSsh(int argc, char **argv) {
-    char *known_hosts_path = smallclueKnownHostsPath();
-    if (!known_hosts_path) {
-        return smallclueRunOpensshEntry("ssh", pscal_openssh_ssh_main, argc, argv);
-    }
+#if defined(PSCAL_TARGET_IOS)
+typedef struct {
+    const char *label;
+    int (*entry)(int, char **);
+    int argc;
+    char **argv;
+} smallclueOpensshThreadContext;
 
-    /* Detect whether the user already supplied a port via -p or -o Port=... or host:port. */
-    bool user_set_port = false;
-    bool user_set_config = false;
-    bool user_set_identity = false;
+static void *smallclueRunOpensshEntryThread(void *arg) {
+    smallclueOpensshThreadContext *ctx = (smallclueOpensshThreadContext *)arg;
+    int status = smallclueRunOpensshEntryOnce(ctx->label, ctx->entry, ctx->argc, ctx->argv);
+    return (void *)(intptr_t)status;
+}
+
+static int smallclueRunOpensshEntry(const char *label, int (*entry)(int, char **),
+                                    int argc, char **argv) {
+    smallclueOpensshThreadContext ctx = {
+        .label = label,
+        .entry = entry,
+        .argc = argc,
+        .argv = argv
+    };
+    pthread_t thread;
+    int err = pthread_create(&thread, NULL, smallclueRunOpensshEntryThread, &ctx);
+    if (err != 0) {
+        return smallclueRunOpensshEntryOnce(label, entry, argc, argv);
+    }
+    void *thread_ret = NULL;
+    pthread_join(thread, &thread_ret);
+    return (int)(intptr_t)thread_ret;
+}
+#else
+static int smallclueRunOpensshEntry(const char *label, int (*entry)(int, char **),
+                                    int argc, char **argv) {
+    return smallclueRunOpensshEntryOnce(label, entry, argc, argv);
+}
+#endif
+
+int smallclueRunSsh(int argc, char **argv) {
+    smallclueEnsureWritableHomeSsh();
+    if (argc < 2) {
+        fprintf(stderr, "usage: ssh [options] host [command]\n");
+        return 255;
+    }
+    /* Preserve user args; only ensure -tt for interactive sessions. */
+    bool has_tty_flag = false;
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
-        if (!arg) continue;
-        if (strcmp(arg, "-F") == 0) {
-            user_set_config = true;
+        if (!arg) {
             continue;
         }
-        if (strcmp(arg, "-p") == 0) {
-            user_set_port = true;
-            break;
-        }
-        if (strncmp(arg, "-o", 2) == 0 && strstr(arg, "Port=") != NULL) {
-            user_set_port = true;
-            break;
-        }
-        if ((strncmp(arg, "-i", 2) == 0) || (strncmp(arg, "-o", 2) == 0 && strstr(arg, "IdentityFile=") != NULL)) {
-            user_set_identity = true;
-        }
-        const char *colon = strrchr(arg, ':');
-        if (colon && colon != arg && colon[1] != '\0' && strspn(colon + 1, "0123456789") == strlen(colon + 1)) {
-            user_set_port = true;
+        if (strcmp(arg, "-t") == 0 || strcmp(arg, "-tt") == 0) {
+            has_tty_flag = true;
             break;
         }
     }
 
-    size_t opt_len = strlen("UserKnownHostsFile=") + strlen(known_hosts_path) + 1;
-    char *known_hosts_opt = (char *)malloc(opt_len);
-    if (!known_hosts_opt) {
-        free(known_hosts_path);
-        return smallclueRunOpensshEntry("ssh", pscal_openssh_ssh_main, argc, argv);
-    }
-    snprintf(known_hosts_opt, opt_len, "UserKnownHostsFile=%s", known_hosts_path);
-    const char *strict_opt = "StrictHostKeyChecking=accept-new";
-    int extra = 10; /* -F /dev/null, -o known_hosts, -o strict, -o IdentityAgent=none, -o IdentitiesOnly=yes, -o BatchMode=no */
-    if (!user_set_port) {
-        extra += 2;
-    }
-    if (!user_set_config) {
-        extra += 2;
-    }
-    /* Prefer container identities alongside known_hosts. */
-    char identity_paths[3][PATH_MAX];
-    int identity_count = 0;
-    if (!user_set_identity) {
-        char *kh_dir = strdup(known_hosts_path);
-        if (kh_dir) {
-            char *slash = strrchr(kh_dir, '/');
-            if (slash) {
-                *slash = '\0';
-                const char *candidates[] = { "id_ed25519", "id_rsa", "id_ecdsa" };
-                for (int i = 0; i < 3; ++i) {
-                    char path[PATH_MAX];
-                    int w = snprintf(path, sizeof(path), "%s/%s", kh_dir, candidates[i]);
-                    if (w > 0 && w < (int)sizeof(path) && access(path, R_OK) == 0) {
-                        snprintf(identity_paths[identity_count], sizeof(identity_paths[identity_count]), "%s", path);
-                        identity_count++;
-                    }
-                }
-            }
-            free(kh_dir);
-        }
-        extra += identity_count * 2;
-    }
+    int extra = has_tty_flag ? 0 : 1;
     int new_argc = argc + extra;
-    char **augmented = (char **)calloc((size_t)new_argc + 1, sizeof(char *));
+    char **augmented = (char **)calloc((size_t)new_argc, sizeof(char *));
     if (!augmented) {
-        free(known_hosts_opt);
-        free(known_hosts_path);
         return smallclueRunOpensshEntry("ssh", pscal_openssh_ssh_main, argc, argv);
     }
     int count = 0;
-    augmented[count++] = strdup((argc > 0 && argv && argv[0]) ? argv[0] : "ssh");
-    augmented[count++] = strdup("-o");
-    augmented[count++] = strdup("IdentityAgent=none");
-    augmented[count++] = strdup("-o");
-    augmented[count++] = strdup("IdentitiesOnly=yes");
-    augmented[count++] = strdup("-o");
-    augmented[count++] = strdup("BatchMode=no");
-    if (!user_set_config) {
-        augmented[count++] = strdup("-F");
-        augmented[count++] = strdup("/dev/null");
+    if (argc > 0 && argv && argv[0]) {
+        augmented[count++] = strdup(argv[0]);
+    } else {
+        augmented[count++] = strdup("ssh");
     }
-    augmented[count++] = strdup("-o");
-    augmented[count++] = known_hosts_opt;
-    known_hosts_opt = NULL;
-    augmented[count++] = strdup("-o");
-    augmented[count++] = strdup(strict_opt);
-    if (!user_set_port) {
-        augmented[count++] = strdup("-p");
-        augmented[count++] = strdup("22");
-    }
-    for (int i = 0; i < identity_count; ++i) {
-        augmented[count++] = strdup("-i");
-        augmented[count++] = strdup(identity_paths[i]);
+    if (!has_tty_flag) {
+        augmented[count++] = strdup("-tt");
     }
     for (int i = 1; i < argc; ++i) {
         augmented[count++] = argv[i] ? strdup(argv[i]) : strdup("");
     }
-    bool alloc_failed = false;
-    for (int i = 0; i < count; ++i) {
-        if (!augmented[i]) {
-            alloc_failed = true;
-            break;
-        }
-    }
-    int status;
-    if (!alloc_failed) {
-        fprintf(stderr,
-                "ssh: automatically accepting new host keys; cache=%s\n",
-                known_hosts_path);
-        status = smallclueRunOpensshEntry("ssh", pscal_openssh_ssh_main, count, augmented);
-    } else {
-        status = smallclueRunOpensshEntry("ssh", pscal_openssh_ssh_main, argc, argv);
-    }
+
+    int status = smallclueRunOpensshEntry("ssh", pscal_openssh_ssh_main, count, augmented);
     smallclueFreeArgv(augmented, count);
-    free(known_hosts_opt);
-    free(known_hosts_path);
     return status;
 }
 
 int smallclueRunScp(int argc, char **argv) {
+    smallclueEnsureWritableHomeSsh();
     return smallclueRunOpensshEntry("scp", pscal_openssh_scp_main, argc, argv);
 }
 
 int smallclueRunSftp(int argc, char **argv) {
+    smallclueEnsureWritableHomeSsh();
     return smallclueRunOpensshEntry("sftp", pscal_openssh_sftp_main, argc, argv);
 }
 

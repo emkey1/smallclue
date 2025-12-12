@@ -9,6 +9,48 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <setjmp.h>
+
+#if defined(PSCAL_TARGET_IOS)
+#if defined(__APPLE__)
+extern jmp_buf *PSCALRuntimeSwapExitJumpBuffer(jmp_buf *buffer) __attribute__((weak_import));
+extern int PSCALRuntimePushExitOverride(jmp_buf *buffer) __attribute__((weak_import));
+extern void PSCALRuntimePopExitOverride(void) __attribute__((weak_import));
+extern int PSCALRuntimePushExitOverrideWithStatus(jmp_buf *buffer, volatile int *status_out) __attribute__((weak_import));
+extern void PSCALRuntimePopExitOverrideWithStatus(void) __attribute__((weak_import));
+#else
+extern jmp_buf *PSCALRuntimeSwapExitJumpBuffer(jmp_buf *buffer) __attribute__((weak));
+extern int PSCALRuntimePushExitOverride(jmp_buf *buffer) __attribute__((weak));
+extern void PSCALRuntimePopExitOverride(void) __attribute__((weak));
+extern int PSCALRuntimePushExitOverrideWithStatus(jmp_buf *buffer, volatile int *status_out) __attribute__((weak));
+extern void PSCALRuntimePopExitOverrideWithStatus(void) __attribute__((weak));
+#endif
+/* Provide weak fallbacks so standalone smallclue builds without the runtime
+ * bridge still link cleanly on iOS. The real runtime implementation overrides
+ * these when available. */
+__attribute__((weak))
+jmp_buf *PSCALRuntimeSwapExitJumpBuffer(jmp_buf *buffer) {
+    (void)buffer;
+    return NULL;
+}
+__attribute__((weak))
+int PSCALRuntimePushExitOverride(jmp_buf *buffer) {
+    (void)buffer;
+    return -1;
+}
+__attribute__((weak))
+void PSCALRuntimePopExitOverride(void) {
+}
+__attribute__((weak))
+int PSCALRuntimePushExitOverrideWithStatus(jmp_buf *buffer, volatile int *status_out) {
+    (void)buffer;
+    (void)status_out;
+    return -1;
+}
+__attribute__((weak))
+void PSCALRuntimePopExitOverrideWithStatus(void) {
+}
+#endif
 
 #if defined(__APPLE__)
 extern void shellRuntimeSetLastStatus(int status) __attribute__((weak_import));
@@ -86,7 +128,41 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
         }
     }
 
-    int status = ok ? smallclueDispatchApplet(applet, argc, argv) : 1;
+    int status = 1;
+    if (ok) {
+#if defined(PSCAL_TARGET_IOS)
+        jmp_buf exit_env;
+        volatile int exit_status_sink = 0;
+        bool override_active = false;
+        if (PSCALRuntimePushExitOverrideWithStatus &&
+            PSCALRuntimePushExitOverrideWithStatus(&exit_env, &exit_status_sink) == 0) {
+            override_active = true;
+            int jump_code = setjmp(exit_env);
+            if (jump_code != 0) {
+                status = (jump_code == 1) ? exit_status_sink : jump_code;
+                goto smallclue_dispatch_done;
+            }
+        } else if (PSCALRuntimePushExitOverride && PSCALRuntimePushExitOverride(&exit_env) == 0) {
+            override_active = true;
+            int jump_code = setjmp(exit_env);
+            if (jump_code != 0) {
+                status = (jump_code == 1) ? 0 : jump_code;
+                goto smallclue_dispatch_done;
+            }
+        }
+#endif
+        status = smallclueDispatchApplet(applet, argc, argv);
+#if defined(PSCAL_TARGET_IOS)
+smallclue_dispatch_done:
+        if (override_active) {
+            if (PSCALRuntimePopExitOverrideWithStatus) {
+                PSCALRuntimePopExitOverrideWithStatus();
+            } else if (PSCALRuntimePopExitOverride) {
+                PSCALRuntimePopExitOverride();
+            }
+        }
+#endif
+    }
     if (shellRuntimeSetLastStatus) {
         shellRuntimeSetLastStatus(status);
     }
