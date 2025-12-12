@@ -39,6 +39,12 @@ void pscal_openssh_reset_progress_state(void) {
     /* No-op for the stub build. */
 }
 
+void pscal_openssh_set_global_exit_handler(sigjmp_buf *env,
+                                           volatile sig_atomic_t *code_out) {
+    (void)env;
+    (void)code_out;
+}
+
 void pscal_openssh_push_exit_context(pscal_openssh_exit_context *ctx) {
     if (ctx) {
         ctx->exit_code = 0;
