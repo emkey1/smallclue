@@ -14,7 +14,9 @@
 #endif
 #if defined(PSCAL_TARGET_IOS)
 #include "common/path_virtualization.h"
+#include "ios/vproc.h"
 #endif
+#include "core/build_info.h"
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -61,6 +63,7 @@ __attribute__((weak)) void PSCALRuntimeBeginScriptCapture(const char *path, int 
 __attribute__((weak)) void PSCALRuntimeEndScriptCapture(void) {}
 __attribute__((weak)) int PSCALRuntimeScriptCaptureActive(void) { return 0; }
 #endif
+__attribute__((weak)) char *pscalRuntimeCopyMarketingVersion(void) { return NULL; }
 #endif
 #include <termios.h>
 #include <time.h>
@@ -258,9 +261,11 @@ enum {
 };
 
 typedef struct {
-    char **lines;
-    size_t count;
-    size_t capacity;
+    FILE *file;
+    size_t *offsets;
+    size_t offset_count;
+    size_t line_count;
+    size_t length;
 } PagerBuffer;
 
 typedef struct {
@@ -300,6 +305,9 @@ static int smallclueIdCommand(int argc, char **argv);
 static void smallclueDfFormatSize(char *buf, size_t bufsize, unsigned long long bytes, bool human);
 static int smallclueTrueCommand(int argc, char **argv);
 static int smallclueFalseCommand(int argc, char **argv);
+static int smallclueYesCommand(int argc, char **argv);
+static int smallclueNoCommand(int argc, char **argv);
+static int smallclueVersionCommand(int argc, char **argv);
 static int smallclueSleepCommand(int argc, char **argv);
 static int smallclueWatchCommand(int argc, char **argv);
 static int smallclueBasenameCommand(int argc, char **argv);
@@ -519,6 +527,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"more", smallcluePagerCommand, "Paginate file contents"},
     {"mv", smallclueMvCommand, "Move or rename files"},
     {"nslookup", smallclueNslookupCommand, "DNS lookup utility"},
+    {"no", smallclueNoCommand, "Repeatedly print strings (exit 1)"},
     {"pbcopy", smallcluePbcopyCommand, "Copy stdin to the system clipboard"},
     {"pbpaste", smallcluePbpasteCommand, "Paste the system clipboard to stdout"},
     {"ping", smallcluePingCommand, "TCP ping utility"},
@@ -550,10 +559,12 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"type", smallclueTypeCommand, "Describe command names"},
     {"uniq", smallclueUniqCommand, "Report or omit repeated lines"},
     {"uptime", smallclueUptimeCommand, "Show system uptime"},
+    {"version", smallclueVersionCommand, "Show app version"},
     {"watch", smallclueWatchCommand, "Periodically run a command"},
     {"vi", smallclueElvisCommand, "Alias for Nextvi text editor"},
     {"wc", smallclueWcCommand, "Count lines/words/bytes"},
     {"wget", smallclueWgetCommand, "Download files via HTTP(S)"},
+    {"yes", smallclueYesCommand, "Repeatedly print strings"},
     {"xargs", smallclueXargsCommand, "Build command lines from stdin"},
     {"df", smallclueDfCommand, "Report filesystem usage"},
 #if defined(PSCAL_TARGET_IOS)
@@ -715,6 +726,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -u unique only"},
     {"uptime", "uptime\n"
                "  Show system uptime"},
+    {"version", "version\n"
+                "  Show PSCAL app marketing version"},
     {"vi", "vi [FILE]\n"
            "  Alias for nextvi"},
     {"watch", "watch [-n SECONDS] command...\n"
@@ -727,6 +740,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  --post-data\n"
              "  -q\n"
              "  -nv"},
+    {"yes", "yes [STRING...]\n"
+            "  Repeatedly print STRING (default: y)"},
+    {"no", "no [STRING...]\n"
+           "  Repeatedly print STRING (default: n) and exit 1 on stop"},
     {"xargs", "xargs [-n N] [-0]\n"
               "  Build command lines from stdin"},
     {"df", "df [-h]\n"
@@ -764,20 +781,25 @@ static void pagerBell(void) {
     fflush(stdout);
 }
 
-static bool pagerBufferAppendLine(PagerBuffer *buffer, char *line) {
-    if (!buffer) {
+static bool pagerBufferEnsureOffsetCapacity(size_t **offsets,
+                                            size_t *capacity,
+                                            size_t required) {
+    if (!offsets || !capacity) {
         return false;
     }
-    if (buffer->count == buffer->capacity) {
-        size_t new_capacity = buffer->capacity ? buffer->capacity * 2 : 64;
-        char **new_lines = (char **)realloc(buffer->lines, new_capacity * sizeof(char *));
-        if (!new_lines) {
-            return false;
-        }
-        buffer->lines = new_lines;
-        buffer->capacity = new_capacity;
+    if (required <= *capacity) {
+        return true;
     }
-    buffer->lines[buffer->count++] = line;
+    size_t new_capacity = (*capacity == 0) ? 1024 : *capacity;
+    while (new_capacity < required) {
+        new_capacity *= 2;
+    }
+    size_t *resized = (size_t *)realloc(*offsets, new_capacity * sizeof(size_t));
+    if (!resized) {
+        return false;
+    }
+    *offsets = resized;
+    *capacity = new_capacity;
     return true;
 }
 
@@ -785,13 +807,15 @@ static void pagerBufferFree(PagerBuffer *buffer) {
     if (!buffer) {
         return;
     }
-    for (size_t i = 0; i < buffer->count; ++i) {
-        free(buffer->lines[i]);
+    if (buffer->file) {
+        fclose(buffer->file);
     }
-    free(buffer->lines);
-    buffer->lines = NULL;
-    buffer->count = 0;
-    buffer->capacity = 0;
+    free(buffer->offsets);
+    buffer->file = NULL;
+    buffer->offsets = NULL;
+    buffer->offset_count = 0;
+    buffer->line_count = 0;
+    buffer->length = 0;
 }
 
 static bool smallclueLineVectorAppend(SmallclueLineVector *vec, const char *data, size_t len) {
@@ -980,16 +1004,90 @@ static int smallclueKillCommandOriginal(int argc, char **argv) {
     for (; idx < argc; ++idx) {
         char *end = NULL;
         errno = 0;
-        long pid_val = strtol(argv[idx], &end, 10);
+        const char *arg = argv[idx];
+        long pid_val = -1;
+
+#if defined(PSCAL_TARGET_IOS)
+        if (arg && arg[0] == '%') {
+            const char *p = arg + 1;
+            while (isspace((unsigned char)*p)) {
+                ++p;
+            }
+            errno = 0;
+            long vis = strtol(p, &end, 10);
+            while (end && *end && isspace((unsigned char)*end)) {
+                ++end;
+            }
+            bool ok = (errno == 0 && end && *end == '\0' && vis > 0);
+            if (ok) {
+                size_t cap = vprocSnapshot(NULL, 0);
+                VProcSnapshot *snaps = (cap > 0) ? (VProcSnapshot *)calloc(cap, sizeof(VProcSnapshot)) : NULL;
+                size_t count = snaps ? vprocSnapshot(snaps, cap) : 0;
+                /* Prefer matching by synthetic job id to keep numbering stable. */
+                for (size_t i = 0; i < count; ++i) {
+                    const VProcSnapshot *s = &snaps[i];
+                    if (!s || s->pid <= 0) {
+                        continue;
+                    }
+                    int jid = vprocGetJobId(s->pid);
+                    if (jid > 0 && jid == vis) {
+                        pid_val = s->pid;
+                        break;
+                    }
+                }
+                size_t visible = 0;
+                for (size_t i = 0; i < count; ++i) {
+                    const VProcSnapshot *s = &snaps[i];
+                    if (!s || s->pid <= 0) {
+                        continue;
+                    }
+                    if (s->pid == vprocGetShellSelfPid() || pthread_equal(s->tid, pthread_self())) {
+                        continue;
+                    }
+                    if (pid_val > 0) {
+                        break;
+                    }
+                    ++visible;
+                    if (visible == (size_t)vis) {
+                        pid_val = s->pid;
+                        break;
+                    }
+                }
+                free(snaps);
+                if (pid_val < 0) {
+                    fprintf(stderr, "kill: invalid job '%s'\n", arg);
+                    status = 1;
+                    continue;
+                }
+            } else {
+                fprintf(stderr, "kill: invalid pid '%s'\n", arg);
+                status = 1;
+                continue;
+            }
+        }
+#endif
+
+        if (pid_val < 0) {
+            pid_val = strtol(arg, &end, 10);
+        }
+
         if (errno != 0 || !end || *end != '\0' || pid_val <= 0) {
-            fprintf(stderr, "kill: invalid pid '%s'\n", argv[idx]);
+            fprintf(stderr, "kill: invalid pid '%s'\n", arg ? arg : "");
             status = 1;
             continue;
         }
-        if (kill((pid_t)pid_val, signo) != 0) {
-            fprintf(stderr, "kill: %s: %s\n", argv[idx], strerror(errno));
+
+#if defined(PSCAL_TARGET_IOS)
+        if (vprocKillShim((pid_t)pid_val, signo) != 0) {
+            fprintf(stderr, "kill: %s: %s\n", arg, strerror(errno));
             status = 1;
         }
+#else
+        if (kill((pid_t)pid_val, signo) != 0) {
+            fprintf(stderr, "kill: %s: %s\n", arg, strerror(errno));
+            status = 1;
+        }
+#endif
     }
     return status;
 }
@@ -1088,43 +1186,107 @@ static int smallclueStringCompare(const void *a, const void *b) {
 }
 
 static int pagerCollectLines(const char *cmd_name, const char *path, FILE *stream, PagerBuffer *buffer) {
-    char *line = NULL;
-    size_t line_cap = 0;
-    ssize_t len;
-    int status = 0;
-
-    while ((len = getline(&line, &line_cap, stream)) != -1) {
-        char *copy = (char *)malloc((size_t)len + 1);
-        if (!copy) {
-            fprintf(stderr, "%s: out of memory\n", pager_command_name(cmd_name));
-            status = 1;
-            break;
-        }
-        memcpy(copy, line, (size_t)len);
-        copy[len] = '\0';
-        if (!pagerBufferAppendLine(buffer, copy)) {
-            free(copy);
-            fprintf(stderr, "%s: out of memory\n", pager_command_name(cmd_name));
-            status = 1;
-            break;
-        }
+    if (!stream || !buffer) {
+        return 1;
     }
 
-    if (line) {
-        free(line);
+    memset(buffer, 0, sizeof(*buffer));
+    const char *tmp_root = getenv("TMPDIR");
+    if (!tmp_root || !*tmp_root) {
+        tmp_root = "/tmp";
     }
-    if (status == 0 && ferror(stream)) {
-        fprintf(stderr, "%s: %s: %s\n", pager_command_name(cmd_name), path ? path : "(stdin)", strerror(errno));
-        status = 1;
+    char tmpl[PATH_MAX];
+    snprintf(tmpl, sizeof(tmpl), "%s/smallclue-pager-XXXXXX", tmp_root);
+    int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        fprintf(stderr, "%s: failed to allocate pager storage: %s\n",
+                pager_command_name(cmd_name), strerror(errno));
+        return 1;
     }
-    if (status != 0) {
+    FILE *fp = fdopen(fd, "w+b");
+    if (!fp) {
+        close(fd);
+        unlink(tmpl);
+        fprintf(stderr, "%s: failed to open pager storage: %s\n",
+                pager_command_name(cmd_name), strerror(errno));
+        return 1;
+    }
+    unlink(tmpl);
+
+    size_t *offsets = NULL;
+    size_t offset_cap = 0;
+    size_t offset_count = 0;
+    if (!pagerBufferEnsureOffsetCapacity(&offsets, &offset_cap, 1)) {
+        fprintf(stderr, "%s: out of memory\n", pager_command_name(cmd_name));
+        fclose(fp);
+        return 1;
+    }
+    offsets[offset_count++] = 0;
+
+    char buf[8192];
+    size_t total = 0;
+    while (true) {
+        size_t read_bytes = fread(buf, 1, sizeof(buf), stream);
+        if (read_bytes > 0) {
+            size_t written = fwrite(buf, 1, read_bytes, fp);
+            if (written != read_bytes) {
+                fprintf(stderr, "%s: failed to buffer pager input\n",
+                        pager_command_name(cmd_name));
+                free(offsets);
+                fclose(fp);
+                return 1;
+            }
+            for (size_t i = 0; i < read_bytes; ++i) {
+                if (buf[i] == '\n') {
+                    if (!pagerBufferEnsureOffsetCapacity(&offsets, &offset_cap, offset_count + 1)) {
+                        fprintf(stderr, "%s: out of memory\n", pager_command_name(cmd_name));
+                        free(offsets);
+                        fclose(fp);
+                        return 1;
+                    }
+                    offsets[offset_count++] = total + i + 1;
+                }
+            }
+            total += read_bytes;
+        }
+        if (read_bytes < sizeof(buf)) {
+            if (ferror(stream)) {
+                fprintf(stderr, "%s: %s: %s\n",
+                        pager_command_name(cmd_name),
+                        path ? path : "(stdin)",
+                        strerror(errno));
+                free(offsets);
+                fclose(fp);
+                return 1;
+            }
+            break;
+        }
+    }
+
+    if (offset_count == 0 || offsets[offset_count - 1] != total) {
+        if (!pagerBufferEnsureOffsetCapacity(&offsets, &offset_cap, offset_count + 1)) {
+            fprintf(stderr, "%s: out of memory\n", pager_command_name(cmd_name));
+            free(offsets);
+            fclose(fp);
+            return 1;
+        }
+        offsets[offset_count++] = total;
+    }
+
+    buffer->file = fp;
+    buffer->offsets = offsets;
+    buffer->offset_count = offset_count;
+    buffer->line_count = (offset_count > 0) ? (offset_count - 1) : 0;
+    buffer->length = total;
+    if (fseeko(fp, 0, SEEK_SET) != 0) {
         pagerBufferFree(buffer);
+        return 1;
     }
-    return status;
+    return 0;
 }
 
 static void pagerRenderPage(const PagerBuffer *buffer, size_t start, int page_rows) {
-    if (!buffer) {
+    if (!buffer || !buffer->file || !buffer->offsets) {
         return;
     }
     if (page_rows < 1) {
@@ -1132,29 +1294,56 @@ static void pagerRenderPage(const PagerBuffer *buffer, size_t start, int page_ro
     }
     fputs("\x1b[2J\x1b[H", stdout);
     size_t end = start + (size_t)page_rows;
-    if (end > buffer->count) {
-        end = buffer->count;
+    if (end > buffer->line_count) {
+        end = buffer->line_count;
     }
+    char chunk[4096];
     for (size_t i = start; i < end; ++i) {
-        const char *line = buffer->lines[i];
-        fputs(line, stdout);
-        size_t len = strlen(line);
-        if (len == 0 || line[len - 1] != '\n') {
+        size_t begin = buffer->offsets[i];
+        size_t finish = buffer->offsets[i + 1];
+        if (finish > buffer->length) {
+            finish = buffer->length;
+        }
+        if (fseeko(buffer->file, (off_t)begin, SEEK_SET) != 0) {
+            break;
+        }
+        size_t remaining = (finish > begin) ? (finish - begin) : 0;
+        while (remaining > 0) {
+            size_t to_read = remaining;
+            if (to_read > sizeof(chunk)) {
+                to_read = sizeof(chunk);
+            }
+            size_t read_bytes = fread(chunk, 1, to_read, buffer->file);
+            if (read_bytes == 0) {
+                break;
+            }
+            fwrite(chunk, 1, read_bytes, stdout);
+            remaining -= read_bytes;
+            if (read_bytes < to_read) {
+                break;
+            }
+        }
+        if (finish == begin) {
             fputc('\n', stdout);
+        } else if (fseeko(buffer->file, (off_t)(finish - 1), SEEK_SET) == 0) {
+            int last = fgetc(buffer->file);
+            if (last != '\n') {
+                fputc('\n', stdout);
+            }
         }
     }
     fflush(stdout);
 }
 
 static size_t pagerMaxTop(const PagerBuffer *buffer, int page_rows) {
-    if (!buffer || buffer->count == 0) {
+    if (!buffer || buffer->line_count == 0) {
         return 0;
     }
     size_t page = (size_t)(page_rows > 0 ? page_rows : 1);
-    if (buffer->count <= page) {
+    if (buffer->line_count <= page) {
         return 0;
     }
-    return buffer->count - page;
+    return buffer->line_count - page;
 }
 
 static int pagerPromptAndRead(const char *cmd_name) {
@@ -1168,7 +1357,7 @@ static int pagerPromptAndRead(const char *cmd_name) {
 }
 
 static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, int page_rows) {
-    if (!buffer || buffer->count == 0) {
+    if (!buffer || buffer->line_count == 0) {
         return 0;
     }
     if (page_rows < 1) {
@@ -1224,7 +1413,7 @@ static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, in
             case '\r':
             case PAGER_KEY_ARROW_DOWN: {
                 size_t page = (size_t)page_rows;
-                if (top + page < buffer->count) {
+                if (top + page < buffer->line_count) {
                     top++;
                     redraw = true;
                 } else {
@@ -1270,6 +1459,37 @@ static int print_file(const char *path, FILE *stream) {
 
 static const char *pager_command_name(const char *name) {
     return (name && *name) ? name : "pager";
+}
+
+static bool pager_test_input_initialized = false;
+static const char *pager_test_input_cursor = NULL;
+static size_t pager_test_input_remaining = 0;
+
+static void pagerInitTestInput(void) {
+    if (pager_test_input_initialized) {
+        return;
+    }
+    pager_test_input_initialized = true;
+    const char *env = getenv("PSCALI_PAGER_TEST_INPUT");
+    if (env && *env) {
+        pager_test_input_cursor = env;
+        pager_test_input_remaining = strlen(env);
+    }
+}
+
+static bool pagerTestInputHasData(void) {
+    pagerInitTestInput();
+    return pager_test_input_cursor && pager_test_input_remaining > 0;
+}
+
+static int pagerTestInputNext(void) {
+    if (!pagerTestInputHasData()) {
+        return EOF;
+    }
+    int ch = (unsigned char)*pager_test_input_cursor;
+    pager_test_input_cursor++;
+    pager_test_input_remaining--;
+    return ch;
 }
 
 static int pager_control_fd_value = -2;
@@ -1320,6 +1540,14 @@ static int pager_control_fd(void) {
 }
 
 static int pager_read_key(void) {
+    pagerInitTestInput();
+    int scripted = pagerTestInputNext();
+    if (scripted != EOF) {
+        return scripted;
+    }
+    if (pager_test_input_cursor) {
+        return 'q';
+    }
     int fd = pager_control_fd();
     if (fd < 0) {
         return 'q';
@@ -1410,13 +1638,39 @@ static int pager_terminal_rows(void) {
         }
     }
     const char *lines = getenv("LINES");
+    int parsed = 0;
     if (lines && *lines) {
-        int parsed = atoi(lines);
+        parsed = atoi(lines);
         if (parsed > 0) {
             return parsed;
         }
     }
-    return 24;
+    int fallback = 24;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d", parsed > 0 ? parsed : fallback);
+    setenv("LINES", buf, 1);
+    return (parsed > 0) ? parsed : fallback;
+}
+
+static int pagerParseEnvBool(const char *value) {
+    if (!value) {
+        return -1;
+    }
+    while (*value && isspace((unsigned char)*value)) {
+        value++;
+    }
+    if (*value == '\0') {
+        return -1;
+    }
+    if (strcasecmp(value, "1") == 0 || strcasecmp(value, "true") == 0 ||
+        strcasecmp(value, "yes") == 0 || strcasecmp(value, "on") == 0) {
+        return 1;
+    }
+    if (strcasecmp(value, "0") == 0 || strcasecmp(value, "false") == 0 ||
+        strcasecmp(value, "no") == 0 || strcasecmp(value, "off") == 0) {
+        return 0;
+    }
+    return -1;
 }
 
 static int pager_file(const char *cmd_name, const char *path, FILE *stream) {
@@ -1427,13 +1681,44 @@ static int pager_file(const char *cmd_name, const char *path, FILE *stream) {
 
     int ctrl_fd = pager_control_fd();
     bool have_ctrl = (ctrl_fd >= 0) && pscalRuntimeFdIsInteractive(ctrl_fd);
-    if (!have_ctrl) {
+    int force_env = pagerParseEnvBool(getenv("PSCALI_PAGER_FORCE"));
+    bool force_interactive = false;
+    bool disable_interactive = false;
+#if defined(PSCAL_TARGET_IOS)
+    force_interactive = true;
+#endif
+    if (force_env > 0) {
+        force_interactive = true;
+    } else if (force_env == 0) {
+        disable_interactive = true;
+    }
+    if (pagerTestInputHasData()) {
+        force_interactive = true;
+    }
+    if (disable_interactive) {
+        force_interactive = false;
+    }
+
+    bool interactive = have_ctrl || force_interactive;
+    if (!interactive) {
         /* No interactive input available; dump what we collected. */
-        for (size_t i = 0; i < buffer.count; ++i) {
-            fputs(buffer.lines[i], stdout);
-            size_t len = strlen(buffer.lines[i]);
-            if (len == 0 || buffer.lines[i][len - 1] != '\n') {
-                fputc('\n', stdout);
+        if (buffer.file) {
+            if (fseeko(buffer.file, 0, SEEK_SET) == 0) {
+                char chunk[8192];
+                while (true) {
+                    size_t n = fread(chunk, 1, sizeof(chunk), buffer.file);
+                    if (n == 0) {
+                        break;
+                    }
+                    if (fwrite(chunk, 1, n, stdout) != n) {
+                        perror("pager: write error");
+                        pagerBufferFree(&buffer);
+                        return 1;
+                    }
+                    if (n < sizeof(chunk)) {
+                        break;
+                    }
+                }
             }
         }
         pagerBufferFree(&buffer);
@@ -2565,7 +2850,12 @@ static int cat_file(const char *path) {
     if (!path || strcmp(path, "-") == 0) {
         return print_file("(stdin)", stdin);
     }
-    FILE *fp = fopen(path, "rb");
+    char resolved[PATH_MAX];
+    const char *open_path = smallclueResolvePath(path, resolved, sizeof(resolved));
+    if (!open_path || *open_path == '\0') {
+        open_path = path;
+    }
+    FILE *fp = fopen(open_path, "rb");
     if (!fp) {
         fprintf(stderr, "cat: %s: %s\n", path, strerror(errno));
         return 1;
@@ -3302,6 +3592,162 @@ static int smallclueFalseCommand(int argc, char **argv) {
     (void)argc;
     (void)argv;
     return 1;
+}
+
+static char *smallclueYesNoPayload(int argc, char **argv, const char *fallback) {
+    if (!fallback) {
+        fallback = "";
+    }
+    if (argc <= 1) {
+        return strdup(fallback);
+    }
+    size_t total = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i]) {
+            total += strlen(argv[i]);
+        }
+        if (i + 1 < argc) {
+            total += 1; /* space */
+        }
+    }
+    char *buf = (char *)malloc(total + 1);
+    if (!buf) {
+        return NULL;
+    }
+    size_t pos = 0;
+    for (int i = 1; i < argc; ++i) {
+        const char *part = argv[i] ? argv[i] : "";
+        size_t len = strlen(part);
+        if (len > 0) {
+            memcpy(buf + pos, part, len);
+            pos += len;
+        }
+        if (i + 1 < argc) {
+            buf[pos++] = ' ';
+        }
+    }
+    buf[pos] = '\0';
+    return buf;
+}
+
+static int smallclueYesNoLoop(const char *text, int initial_status) {
+    if (!text) {
+        return initial_status;
+    }
+    size_t len = strlen(text);
+    char *line = (char *)malloc(len + 2);
+    if (!line) {
+        return 1;
+    }
+    memcpy(line, text, len);
+    line[len] = '\n';
+    line[len + 1] = '\0';
+    size_t line_len = len + 1;
+    int status = initial_status;
+    while (true) {
+        if (smallclueShouldAbort(&status)) {
+            break;
+        }
+        size_t written = fwrite(line, 1, line_len, stdout);
+        if (written != line_len) {
+            status = errno ? errno : status;
+            break;
+        }
+        if (fflush(stdout) != 0) {
+            status = errno ? errno : status;
+            break;
+        }
+    }
+    free(line);
+    return status;
+}
+
+static int smallclueYesCommand(int argc, char **argv) {
+    smallclueClearPendingSignals();
+    char *payload = smallclueYesNoPayload(argc, argv, "y");
+    if (!payload) {
+        return 1;
+    }
+    int status = smallclueYesNoLoop(payload, 0);
+    free(payload);
+    return status;
+}
+
+static int smallclueNoCommand(int argc, char **argv) {
+    smallclueClearPendingSignals();
+    char *payload = smallclueYesNoPayload(argc, argv, "n");
+    if (!payload) {
+        return 1;
+    }
+    int status = smallclueYesNoLoop(payload, 1);
+    free(payload);
+    return status;
+}
+
+static bool smallclueFormatBuildTimestamp(const char *programVersion, char *out, size_t out_len) {
+    if (!out || out_len == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    const char *p = programVersion;
+    if (!p) {
+        return false;
+    }
+    /* Expect YYYYMMDD.HHMM... */
+    for (int i = 0; i < 8; ++i) {
+        if (!isdigit((unsigned char)p[i])) {
+            return false;
+        }
+    }
+    if (p[8] != '.') {
+        return false;
+    }
+    for (int i = 9; i < 13; ++i) {
+        if (!isdigit((unsigned char)p[i])) {
+            return false;
+        }
+    }
+    int written = snprintf(out, out_len, "%c%c%c%c%c%c%c%c-%c%c:%c%c",
+                           p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+                           p[9], p[10], p[11], p[12]);
+    if (written < 0 || (size_t)written >= out_len) {
+        out[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+static int smallclueVersionCommand(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    char *version = NULL;
+#if defined(PSCAL_TARGET_IOS)
+    extern char *pscalRuntimeCopyMarketingVersion(void) __attribute__((weak));
+    if (pscalRuntimeCopyMarketingVersion) {
+        version = pscalRuntimeCopyMarketingVersion();
+    }
+#endif
+#ifdef PROGRAM_VERSION
+    const char *fallback = PROGRAM_VERSION;
+#else
+    const char *fallback = NULL;
+#endif
+    if (!version && fallback) {
+        version = strdup(fallback);
+    }
+    if (!version) {
+        printf("version: unknown\n");
+        return 1;
+    }
+    const char *programVersion = pscal_program_version_string();
+    char buildStamp[32];
+    if (smallclueFormatBuildTimestamp(programVersion, buildStamp, sizeof(buildStamp))) {
+        printf("version: %s (%s)\n", version, buildStamp);
+    } else {
+        printf("version: %s\n", version);
+    }
+    free(version);
+    return 0;
 }
 
 #if defined(PSCAL_TARGET_IOS)
@@ -4981,32 +5427,93 @@ static int smallclueTailFollow(FILE *fp, const char *label, long lines) {
     if (status != 0) {
         return status;
     }
+    int fd = fileno(fp);
+    if (fd < 0) {
+        fprintf(stderr, "tail: %s: bad file descriptor\n", label ? label : "(stdin)");
+        return 1;
+    }
+
+    /* Start following from the current end-of-file position. */
+    off_t lastPos;
+#if defined(__APPLE__)
+    lastPos = ftello(fp);
+#else
+    lastPos = ftell(fp);
+#endif
+    if (lastPos < 0) {
+        lastPos = 0;
+    }
+
     char *line = NULL;
     size_t cap = 0;
     while (1) {
         if (smallclueShouldAbort(&status)) {
             break;
         }
-        ssize_t len = getline(&line, &cap, fp);
-        if (len < 0) {
+
+        struct stat st;
+        if (fstat(fd, &st) != 0) {
             if (errno == EINTR) {
                 continue;
             }
-            if (feof(fp)) {
-                clearerr(fp);
-                usleep(200000); /* 200ms */
-                continue;
-            }
             fprintf(stderr, "tail: %s: %s\n", label ? label : "(stdin)", strerror(errno));
-            free(line);
-            return 1;
+            status = 1;
+            break;
         }
-        fwrite(line, 1, (size_t)len, stdout);
-        fflush(stdout);
+
+        /* Handle truncation/rotation. */
+        if (st.st_size < lastPos) {
+            fseeko(fp, st.st_size, SEEK_SET);
+            lastPos = st.st_size;
+            usleep(200000);
+            continue;
+        }
+
+        if (st.st_size > lastPos) {
+            /* New content available. */
+            if (fseeko(fp, lastPos, SEEK_SET) != 0) {
+                fprintf(stderr, "tail: %s: %s\n", label ? label : "(stdin)", strerror(errno));
+                status = 1;
+                break;
+            }
+            while (lastPos < st.st_size) {
+                ssize_t len = getline(&line, &cap, fp);
+                if (len < 0) {
+                    if (errno == EINTR) {
+                        clearerr(fp);
+                        continue;
+                    }
+                    if (feof(fp)) {
+                        clearerr(fp);
+                        break;
+                    }
+                    fprintf(stderr, "tail: %s: %s\n", label ? label : "(stdin)", strerror(errno));
+                    status = 1;
+                    break;
+                }
+                fwrite(line, 1, (size_t)len, stdout);
+                fflush(stdout);
+#if defined(__APPLE__)
+                lastPos = ftello(fp);
+#else
+                lastPos = ftell(fp);
+#endif
+                if (lastPos < 0) {
+                    lastPos = st.st_size;
+                    break;
+                }
+            }
+            if (status != 0) {
+                break;
+            }
+        } else {
+            /* No new data; sleep before polling again. */
+            usleep(200000); /* 200ms */
+        }
     }
-    /* unreachable */
+
     free(line);
-    return 0;
+    return status;
 }
 
 #if defined(PSCAL_TARGET_IOS)
@@ -5025,6 +5532,21 @@ static void smallclueLogPathExpansion(const char *label, const char *path) {
              path ? path : "(null)",
              resolved ? resolved : "(null)");
     pscalRuntimeDebugLog(logbuf);
+}
+
+static FILE *smallclueTailOpenFile(const char *path, char *resolved, size_t resolved_len) {
+    const char *open_path = smallclueResolvePath(path, resolved, resolved_len);
+    const char *target = (open_path && *open_path) ? open_path : path;
+    smallclueLogPathExpansion("tail-open", path);
+    return pscalPathVirtualized_fopen(target, "r");
+}
+#else
+static FILE *smallclueTailOpenFile(const char *path, char *resolved, size_t resolved_len) {
+    const char *open_path = smallclueResolvePath(path, resolved, resolved_len);
+    const char *target = (open_path && *open_path) ? open_path : path;
+    (void)resolved;
+    (void)resolved_len;
+    return fopen(target, "r");
 }
 #endif
 
@@ -5081,7 +5603,8 @@ static int smallclueTailCommand(int argc, char **argv) {
     } else {
         for (int i = index; i < argc; ++i) {
             const char *path = argv[i];
-            FILE *fp = fopen(path, "r");
+            char resolved[PATH_MAX];
+            FILE *fp = smallclueTailOpenFile(path, resolved, sizeof(resolved));
             if (!fp) {
                 fprintf(stderr, "tail: %s: %s\n", path, strerror(errno));
                 status = 1;
@@ -7130,7 +7653,32 @@ int smallclueDispatchApplet(const SmallclueApplet *applet, int argc, char **argv
     return applet->entry(argc, argv);
 }
 
+static void smallclueRedirectFromEnv(void) {
+    const char *stdout_path = getenv("PSCALI_BG_STDOUT");
+    const char *stdout_append = getenv("PSCALI_BG_STDOUT_APPEND");
+    const char *stderr_path = getenv("PSCALI_BG_STDERR");
+    const char *stderr_append = getenv("PSCALI_BG_STDERR_APPEND");
+
+    if (stdout_path && *stdout_path) {
+        int flags = O_CREAT | O_WRONLY | ((stdout_append && strcmp(stdout_append, "1") == 0) ? O_APPEND : O_TRUNC);
+        int fd = open(stdout_path, flags, 0666);
+        if (fd >= 0) {
+            dup2(fd, STDOUT_FILENO);
+            close(fd);
+        }
+    }
+    if (stderr_path && *stderr_path) {
+        int flags = O_CREAT | O_WRONLY | ((stderr_append && strcmp(stderr_append, "1") == 0) ? O_APPEND : O_TRUNC);
+        int fd = open(stderr_path, flags, 0666);
+        if (fd >= 0) {
+            dup2(fd, STDERR_FILENO);
+            close(fd);
+        }
+    }
+}
+
 int smallclueMain(int argc, char **argv) {
+    smallclueRedirectFromEnv();
     const SmallclueApplet *applet = NULL;
     char *call_name = basename(argv[0]);
 

@@ -212,6 +212,9 @@ DEFINE_SMALLCLUE_WRAPPER("pwd", pwd)
 DEFINE_SMALLCLUE_WRAPPER("chmod", chmod)
 DEFINE_SMALLCLUE_WRAPPER("true", truecmd)
 DEFINE_SMALLCLUE_WRAPPER("false", falsecmd)
+DEFINE_SMALLCLUE_WRAPPER("yes", yes)
+DEFINE_SMALLCLUE_WRAPPER("no", no)
+DEFINE_SMALLCLUE_WRAPPER("version", version)
 DEFINE_SMALLCLUE_WRAPPER("sleep", sleepcmd)
 DEFINE_SMALLCLUE_WRAPPER("basename", basename)
 DEFINE_SMALLCLUE_WRAPPER("dirname", dirname)
@@ -311,6 +314,8 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("chmod", vmBuiltinSmallclue_chmod, "chmod");
     registerSmallclueBuiltin("true", vmBuiltinSmallclue_truecmd, "true");
     registerSmallclueBuiltin("false", vmBuiltinSmallclue_falsecmd, "false");
+    registerSmallclueBuiltin("yes", vmBuiltinSmallclue_yes, "yes");
+    registerSmallclueBuiltin("no", vmBuiltinSmallclue_no, "no");
     registerSmallclueBuiltin("sleep", vmBuiltinSmallclue_sleepcmd, "sleep");
     registerSmallclueBuiltin("basename", vmBuiltinSmallclue_basename, "basename");
     registerSmallclueBuiltin("dirname", vmBuiltinSmallclue_dirname, "dirname");
@@ -350,6 +355,7 @@ static void smallclueRegisterBuiltinsOnce(void) {
 #endif
     registerSmallclueBuiltin("wget", vmBuiltinSmallclue_wget, "wget");
     registerSmallclueBuiltin("watch", vmBuiltinSmallclue_watch, "watch");
+    registerSmallclueBuiltin("version", vmBuiltinSmallclue_version, "version");
 #if defined(PSCAL_TARGET_IOS)
     registerSmallclueBuiltin("smallclue-help", vmBuiltinSmallclue_smallclue_help, "smallclue-help");
 #endif

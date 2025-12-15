@@ -69,6 +69,8 @@ int pscal_openssh_ssh_main(int argc, char **argv);
 int pscal_openssh_scp_main(int argc, char **argv);
 int pscal_openssh_sftp_main(int argc, char **argv);
 int pscal_openssh_ssh_keygen_main(int argc, char **argv);
+void pscal_openssh_set_global_exit_handler(sigjmp_buf *env,
+                                           volatile sig_atomic_t *code_out);
 void PSCALRuntimeSetDebugLogMirroring(int enable);
 __attribute__((weak)) void PSCALRuntimeSetDebugLogMirroring(int enable) { (void)enable; }
 void PSCALRuntimeBeginScriptCapture(const char *path, int append) __attribute__((weak));

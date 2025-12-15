@@ -134,3 +134,11 @@ __attribute__((weak)) const char *pscalHostsGetContainerPath(void) {
     const char *root = getenv("PSCALI_CONTAINER_ROOT");
     return (root && *root) ? root : "/";
 }
+
+__attribute__((weak)) char *pscalRuntimeCopyMarketingVersion(void) {
+    const char *ver = getenv("CFBundleShortVersionString");
+    if (ver && *ver) {
+        return strdup(ver);
+    }
+    return NULL;
+}
