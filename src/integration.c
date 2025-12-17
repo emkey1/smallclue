@@ -352,6 +352,7 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("vi", vmBuiltinSmallclue_nextvi, "vi");
     registerSmallclueBuiltin("dmesg", vmBuiltinSmallclue_dmesg, "dmesg");
     registerSmallclueBuiltin("licenses", vmBuiltinSmallclue_licenses, "licenses");
+    registerSmallclueBuiltin("top", vmBuiltinShellTop, "top");
 #endif
     registerSmallclueBuiltin("wget", vmBuiltinSmallclue_wget, "wget");
     registerSmallclueBuiltin("watch", vmBuiltinSmallclue_watch, "watch");

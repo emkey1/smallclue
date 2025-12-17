@@ -358,6 +358,7 @@ static int smallclueIpAddrCommand(int argc, char **argv);
 #endif
 static int smallclueDfCommand(int argc, char **argv);
 #if defined(PSCAL_TARGET_IOS)
+static int smallclueTopCommand(int argc, char **argv);
 static int smallclueDmesgCommand(int argc, char **argv);
 static int smallclueHelpCommand(int argc, char **argv);
 #endif
@@ -571,6 +572,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"smallclue-help", smallclueHelpCommand, "List available smallclue applets"},
     {"licenses", smallclueLicensesCommand, "View third-party licenses"},
     {"dmesg", smallclueDmesgCommand, "Show PSCAL runtime log for this session"},
+    {"top", smallclueTopCommand, "Show PSCAL virtual processes"},
 #endif
 };
 
@@ -758,6 +760,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                  "  Browse PSCAL and third-party licenses; use arrows/enter to view"},
     {"dmesg", "dmesg\n"
               "  Show PSCAL runtime log for this session"},
+    {"top", "top\n"
+            "  Show PSCAL virtual processes and CPU ticks"},
 #endif
     {NULL, NULL}
 };
@@ -902,6 +906,61 @@ static int smallcluePsCommand(int argc, char **argv) {
     printf("%4d %6d %5d %s\n", (int)pid, (int)ppid, (int)uid, cmd);
     return 0;
 }
+
+#if defined(PSCAL_TARGET_IOS)
+static const char *smallclueTopState(const VProcSnapshot *snap) {
+    if (!snap) {
+        return "unknown";
+    }
+    if (snap->zombie) {
+        return "zombie";
+    }
+    if (snap->stopped) {
+        return "stopped";
+    }
+    if (snap->continued) {
+        return "continued";
+    }
+    if (snap->exited) {
+        return "exited";
+    }
+    if (snap->sigchld_pending) {
+        return "sigchld";
+    }
+    return "running";
+}
+
+static int smallclueTopCommand(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+
+    size_t snapshot_cap = vprocSnapshot(NULL, 0);
+    VProcSnapshot *snapshots = NULL;
+    if (snapshot_cap > 0) {
+        snapshots = (VProcSnapshot *)calloc(snapshot_cap, sizeof(VProcSnapshot));
+    }
+    size_t snapshot_count = snapshots ? vprocSnapshot(snapshots, snapshot_cap) : 0;
+
+    printf("%-6s %-6s %-3s %-10s %-6s %-6s %s\n",
+           "PID", "PGID", "FG", "STATE", "UTIME", "STIME", "CMD");
+    for (size_t i = 0; i < snapshot_count; ++i) {
+        VProcSnapshot *snap = &snapshots[i];
+        if (!snap) {
+            continue;
+        }
+        const char *state = smallclueTopState(snap);
+        bool fg = (snap->fg_pgid > 0 && snap->pgid == snap->fg_pgid);
+        const char *cmd = snap->command[0] ? snap->command
+                        : (snap->comm[0] ? snap->comm : "task");
+        printf("%-6d %-6d %-3s %-10s %-6d %-6d %s\n",
+               snap->pid, snap->pgid, fg ? "fg" : "",
+               state, snap->rusage_utime, snap->rusage_stime, cmd);
+    }
+
+    free(snapshots);
+    return 0;
+}
+#endif
 
 typedef struct {
     const char *name;
