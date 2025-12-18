@@ -12,6 +12,10 @@
 #include <setjmp.h>
 
 #if defined(PSCAL_TARGET_IOS)
+#include "ios/vproc.h"
+#endif
+
+#if defined(PSCAL_TARGET_IOS)
 #if defined(__APPLE__)
 extern jmp_buf *PSCALRuntimeSwapExitJumpBuffer(jmp_buf *buffer) __attribute__((weak_import));
 extern int PSCALRuntimePushExitOverride(jmp_buf *buffer) __attribute__((weak_import));
@@ -81,6 +85,30 @@ static char *smallclueDuplicateArg(const Value *value) {
     return strdup("");
 }
 
+static void smallclueFormatLabel(int argc, char **argv, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!argv || argc <= 0) {
+        return;
+    }
+    size_t used = 0;
+    for (int i = 0; i < argc && used + 1 < out_sz; ++i) {
+        const char *part = argv[i] ? argv[i] : "";
+        size_t len = strlen(part);
+        if (used + len + 1 >= out_sz) {
+            len = out_sz - used - 1;
+        }
+        memcpy(out + used, part, len);
+        used += len;
+        if (used + 1 < out_sz && i + 1 < argc) {
+            out[used++] = ' ';
+        }
+    }
+    out[used] = '\0';
+}
+
 static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const char *name) {
     const SmallclueApplet *applet = smallclueFindApplet(name);
     if (!applet) {
@@ -131,6 +159,16 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
     int status = 1;
     if (ok) {
 #if defined(PSCAL_TARGET_IOS)
+        VProcCommandScope vproc_scope;
+        bool vproc_scope_active = false;
+        char label[96];
+        smallclueFormatLabel(argc, argv, label, sizeof(label));
+        if (label[0]) {
+            vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, label, false, false);
+        } else {
+            vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, applet->name, false, false);
+        }
+
         jmp_buf exit_env;
         volatile int exit_status_sink = 0;
         bool override_active = false;
@@ -154,6 +192,10 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
         status = smallclueDispatchApplet(applet, argc, argv);
 #if defined(PSCAL_TARGET_IOS)
 smallclue_dispatch_done:
+        if (vproc_scope_active) {
+            vprocCommandScopeEnd(&vproc_scope, status);
+            vproc_scope_active = false;
+        }
         if (override_active) {
             if (PSCALRuntimePopExitOverrideWithStatus) {
                 PSCALRuntimePopExitOverrideWithStatus();
@@ -271,7 +313,8 @@ static void registerSmallclueBuiltin(const char *name,
                                      VmBuiltinFn handler,
                                      const char *display_name) {
     VmBuiltinFn existing = getVmBuiltinHandler(name);
-    if (existing == handler) {
+    if (existing != NULL) {
+        /* Preserve any existing handler (e.g., shell builtins); only register when missing. */
         return;
     }
     registerVmBuiltin(name, handler, BUILTIN_TYPE_PROCEDURE, display_name);
@@ -352,7 +395,6 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("vi", vmBuiltinSmallclue_nextvi, "vi");
     registerSmallclueBuiltin("dmesg", vmBuiltinSmallclue_dmesg, "dmesg");
     registerSmallclueBuiltin("licenses", vmBuiltinSmallclue_licenses, "licenses");
-    registerSmallclueBuiltin("top", vmBuiltinShellTop, "top");
 #endif
     registerSmallclueBuiltin("wget", vmBuiltinSmallclue_wget, "wget");
     registerSmallclueBuiltin("watch", vmBuiltinSmallclue_watch, "watch");

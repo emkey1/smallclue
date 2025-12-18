@@ -908,6 +908,7 @@ static int smallcluePsCommand(int argc, char **argv) {
 }
 
 #if defined(PSCAL_TARGET_IOS)
+#include "ios/vproc_tree.h"
 static const char *smallclueTopState(const VProcSnapshot *snap) {
     if (!snap) {
         return "unknown";
@@ -930,9 +931,51 @@ static const char *smallclueTopState(const VProcSnapshot *snap) {
     return "running";
 }
 
+static bool smallclueWriteAll(int fd, const char *data, size_t len) {
+    if (!data || len == 0) {
+        return true;
+    }
+    size_t off = 0;
+    while (off < len) {
+        ssize_t wrote = write(fd, data + off, len - off);
+        if (wrote < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        off += (size_t)wrote;
+    }
+    return true;
+}
+
 static int smallclueTopCommand(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
+    bool tree = true;
+    for (int i = 1; i < argc; ++i) {
+        const char *arg = argv[i];
+        if (!arg) {
+            continue;
+        }
+        if (strcmp(arg, "--flat") == 0) {
+            tree = false;
+        } else if (strcmp(arg, "--tree") == 0) {
+            tree = true;
+        } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+            const char *help =
+                "top [--tree|--flat]\n"
+                "  Show PSCAL virtual processes.\n"
+                "  --tree (default) render parent/child tree.\n"
+                "  --flat show a flat list.\n";
+            (void)smallclueWriteAll(STDOUT_FILENO, help, strlen(help));
+            return 0;
+        } else {
+            fprintf(stderr, "top: unsupported option '%s'\n", arg);
+            return 1;
+        }
+    }
+
+    VProc *self_vp = vprocCurrent();
+    int self_pid = self_vp ? vprocPid(self_vp) : (int)vprocGetPidShim();
 
     size_t snapshot_cap = vprocSnapshot(NULL, 0);
     VProcSnapshot *snapshots = NULL;
@@ -941,20 +984,91 @@ static int smallclueTopCommand(int argc, char **argv) {
     }
     size_t snapshot_count = snapshots ? vprocSnapshot(snapshots, snapshot_cap) : 0;
 
-    printf("%-6s %-6s %-3s %-10s %-6s %-6s %s\n",
-           "PID", "PGID", "FG", "STATE", "UTIME", "STIME", "CMD");
-    for (size_t i = 0; i < snapshot_count; ++i) {
-        VProcSnapshot *snap = &snapshots[i];
-        if (!snap) {
-            continue;
+    char header[160];
+    int hn = snprintf(header, sizeof(header),
+                      "%-6s %-6s %-6s %-6s %-3s %-10s %-6s %-6s %s\n",
+                      "PID", "PPID", "PGID", "SID", "FG", "STATE", "UTIME", "STIME", "CMD");
+    if (hn > 0) {
+        (void)smallclueWriteAll(STDOUT_FILENO, header, (size_t)hn);
+    }
+
+    if (tree) {
+        size_t row_cap = snapshot_count ? snapshot_count : 1;
+        VProcTreeRow *rows = (VProcTreeRow *)calloc(row_cap, sizeof(VProcTreeRow));
+        size_t row_count = rows ? vprocBuildTreeRows(snapshots, snapshot_count, rows, row_cap) : 0;
+        if (rows && row_count > row_cap) {
+            VProcTreeRow *grown = (VProcTreeRow *)realloc(rows, row_count * sizeof(VProcTreeRow));
+            if (grown) {
+                rows = grown;
+                row_cap = row_count;
+            }
+            row_count = rows ? vprocBuildTreeRows(snapshots, snapshot_count, rows, row_cap) : 0;
         }
-        const char *state = smallclueTopState(snap);
-        bool fg = (snap->fg_pgid > 0 && snap->pgid == snap->fg_pgid);
-        const char *cmd = snap->command[0] ? snap->command
-                        : (snap->comm[0] ? snap->comm : "task");
-        printf("%-6d %-6d %-3s %-10s %-6d %-6d %s\n",
-               snap->pid, snap->pgid, fg ? "fg" : "",
-               state, snap->rusage_utime, snap->rusage_stime, cmd);
+        if (rows) {
+            for (size_t r = 0; r < row_count && r < row_cap; ++r) {
+                const VProcTreeRow *row = &rows[r];
+                if (!row || row->snapshot_index >= snapshot_count) {
+                    continue;
+                }
+                VProcSnapshot *snap = &snapshots[row->snapshot_index];
+                if (!snap || snap->pid <= 0) {
+                    continue;
+                }
+                const char *state = smallclueTopState(snap);
+                bool fg = (snap->fg_pgid > 0 && snap->pgid == snap->fg_pgid);
+                const char *cmd = snap->command[0] ? snap->command
+                                : (snap->comm[0] ? snap->comm
+                                : ((snap->pid == vprocGetShellSelfPid()) ? "shell" : "task"));
+                if (snap->pid == self_pid) {
+                    cmd = "top";
+                }
+
+                char indent[96];
+                size_t used = 0;
+                for (int d = 0; d < row->depth && used + 2 < sizeof(indent); ++d) {
+                    indent[used++] = ' ';
+                    indent[used++] = ' ';
+                }
+                indent[used] = '\0';
+
+                double ut_s = 0.0, st_s = 0.0;
+                vprocFormatCpuTimes(snap->rusage_utime, snap->rusage_stime, &ut_s, &st_s);
+                char line[320];
+                int n = snprintf(line, sizeof(line),
+                                 "%-6d %-6d %-6d %-6d %-3s %-10s %-6.1f %-6.1f %s%s\n",
+                                 snap->pid, snap->parent_pid, snap->pgid, snap->sid,
+                                 fg ? "fg" : "", state, ut_s, st_s, indent, cmd);
+                if (n > 0) {
+                    (void)smallclueWriteAll(STDOUT_FILENO, line, (size_t)n);
+                }
+            }
+            free(rows);
+        }
+    } else {
+        for (size_t i = 0; i < snapshot_count; ++i) {
+            VProcSnapshot *snap = &snapshots[i];
+            if (!snap || snap->pid <= 0) {
+                continue;
+            }
+            const char *state = smallclueTopState(snap);
+            bool fg = (snap->fg_pgid > 0 && snap->pgid == snap->fg_pgid);
+            const char *cmd = snap->command[0] ? snap->command
+                            : (snap->comm[0] ? snap->comm
+                            : ((snap->pid == vprocGetShellSelfPid()) ? "shell" : "task"));
+            if (snap->pid == self_pid) {
+                cmd = "top";
+            }
+            double ut_s = 0.0, st_s = 0.0;
+            vprocFormatCpuTimes(snap->rusage_utime, snap->rusage_stime, &ut_s, &st_s);
+            char line[320];
+            int n = snprintf(line, sizeof(line),
+                             "%-6d %-6d %-6d %-6d %-3s %-10s %-6.1f %-6.1f %s\n",
+                             snap->pid, snap->parent_pid, snap->pgid, snap->sid,
+                             fg ? "fg" : "", state, ut_s, st_s, cmd);
+            if (n > 0) {
+                (void)smallclueWriteAll(STDOUT_FILENO, line, (size_t)n);
+            }
+        }
     }
 
     free(snapshots);
@@ -1499,6 +1613,7 @@ static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, in
 
 static int print_file(const char *path, FILE *stream) {
     char buffer[4096];
+    bool dbg = getenv("PSCALI_PIPE_DEBUG") != NULL;
     while (!feof(stream)) {
         size_t n = fread(buffer, 1, sizeof(buffer), stream);
         if (n == 0) {
@@ -1507,6 +1622,9 @@ static int print_file(const char *path, FILE *stream) {
         if (fwrite(buffer, 1, n, stdout) != n) {
             perror("cat: write error");
             return 1;
+        }
+        if (dbg) {
+            fprintf(stderr, "[cat] wrote chunk=%zu bytes\n", n);
         }
     }
     if (ferror(stream)) {
@@ -1759,6 +1877,14 @@ static int pager_file(const char *cmd_name, const char *path, FILE *stream) {
     }
 
     bool interactive = have_ctrl || force_interactive;
+    /* If we have no viable control fd and no interactive stdio, force a
+     * non-interactive dump so pipelines still produce output when no TTY. */
+    if (!have_ctrl &&
+        !pscalRuntimeStdinIsInteractive() &&
+        !pscalRuntimeStdoutIsInteractive() &&
+        !pscalRuntimeStderrIsInteractive()) {
+        interactive = false;
+    }
     if (!interactive) {
         /* No interactive input available; dump what we collected. */
         if (buffer.file) {
@@ -2906,7 +3032,9 @@ static int smallclueHttpFetch(const char *cmd_name, const char *url, const char 
 
 static int cat_file(const char *path) {
     int status = 0;
+    bool dbg = getenv("PSCALI_PIPE_DEBUG") != NULL;
     if (!path || strcmp(path, "-") == 0) {
+        if (dbg) fprintf(stderr, "[cat] reading stdin\n");
         return print_file("(stdin)", stdin);
     }
     char resolved[PATH_MAX];
@@ -2918,6 +3046,14 @@ static int cat_file(const char *path) {
     if (!fp) {
         fprintf(stderr, "cat: %s: %s\n", path, strerror(errno));
         return 1;
+    }
+    if (dbg) {
+        struct stat st;
+        if (fstat(fileno(fp), &st) == 0) {
+            fprintf(stderr, "[cat] opened %s size=%lld\n", open_path, (long long)st.st_size);
+        } else {
+            fprintf(stderr, "[cat] opened %s (size unknown)\n", open_path);
+        }
     }
     status = print_file(path, fp);
     fclose(fp);
@@ -4017,7 +4153,36 @@ static int smallclueWatchRunApplet(const SmallclueApplet *applet, int argc, char
         fprintf(stderr, "watch: %s: command not found\n", argv[0]);
         return 127;
     }
+#if !defined(PSCAL_TARGET_IOS)
     return smallclueDispatchApplet(applet, argc, argv);
+#else
+    char label[96] = {0};
+    size_t used = 0;
+    for (int i = 0; i < argc && used + 1 < sizeof(label); ++i) {
+        const char *part = argv[i] ? argv[i] : "";
+        size_t len = strlen(part);
+        if (used + len + 1 >= sizeof(label)) {
+            len = sizeof(label) - used - 1;
+        }
+        memcpy(label + used, part, len);
+        used += len;
+        if (used + 1 < sizeof(label) && i + 1 < argc) {
+            label[used++] = ' ';
+        }
+    }
+    label[used] = '\0';
+
+    VProcCommandScope scope;
+    bool scoped = vprocCommandScopeBegin(&scope,
+                                         label[0] ? label : (argv && argv[0] ? argv[0] : applet->name),
+                                         true,
+                                         true);
+    int status = smallclueDispatchApplet(applet, argc, argv);
+    if (scoped) {
+        vprocCommandScopeEnd(&scope, status);
+    }
+    return status;
+#endif
 }
 
 static int smallclueWatchCommand(int argc, char **argv) {
@@ -4057,9 +4222,6 @@ static int smallclueWatchCommand(int argc, char **argv) {
         fprintf(stderr, "watch: command required\n");
         return 1;
     }
-
-    const SmallclueApplet *applet = smallclueFindApplet(argv[idx]);
-
     char *cmdline = NULL;
     size_t cmdlen = 0;
     for (int i = idx; i < argc; ++i) {
@@ -4075,6 +4237,14 @@ static int smallclueWatchCommand(int argc, char **argv) {
         cmdlen += part;
         cmdline[cmdlen++] = (i + 1 < argc) ? ' ' : '\0';
     }
+#if defined(PSCAL_TARGET_IOS)
+    /* Do not overwrite this process label with the watched command. The header
+     * already displays the command line, and keeping the label stable ensures
+     * vproc listings show both `watch` and the command it runs as distinct
+     * synthetic tasks. */
+#endif
+
+    const SmallclueApplet *applet = smallclueFindApplet(argv[idx]);
 
     int status = 0;
     while (1) {
@@ -4105,6 +4275,9 @@ static int smallclueWatchCommand(int argc, char **argv) {
 
 watch_done:
     free(cmdline);
+#if defined(PSCAL_TARGET_IOS)
+    /* label unchanged */
+#endif
     return status;
 }
 
