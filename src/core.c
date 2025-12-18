@@ -732,7 +732,7 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                 "  Show PSCAL app marketing version"},
     {"vi", "vi [FILE]\n"
            "  Alias for nextvi"},
-    {"watch", "watch [-n SECONDS] command...\n"
+    {"watch", "watch [-n SECONDS] [-c COUNT|--count COUNT] command...\n"
               "  Periodically run a command"},
     {"wc", "wc [-l] [-w] [-c] [FILE...]\n"
            "  Count lines/words/bytes"},
@@ -4189,6 +4189,7 @@ static int smallclueWatchCommand(int argc, char **argv) {
     smallclueResetGetopt();
     smallclueClearPendingSignals();
     double interval = 2.0;
+    int max_iterations = -1;
     int idx = 1;
     while (idx < argc) {
         const char *arg = argv[idx];
@@ -4210,6 +4211,21 @@ static int smallclueWatchCommand(int argc, char **argv) {
                 fprintf(stderr, "watch: invalid interval '%s'\n", argv[idx + 1]);
                 return 1;
             }
+            idx += 2;
+            continue;
+        }
+        if (strcmp(arg, "-c") == 0 || strcmp(arg, "--count") == 0) {
+            if (idx + 1 >= argc) {
+                fprintf(stderr, "watch: option requires an argument -- count\n");
+                return 1;
+            }
+            char *endptr = NULL;
+            long count = strtol(argv[idx + 1], &endptr, 10);
+            if (!endptr || *endptr != '\0' || count <= 0 || count > INT_MAX) {
+                fprintf(stderr, "watch: invalid count '%s'\n", argv[idx + 1]);
+                return 1;
+            }
+            max_iterations = (int)count;
             idx += 2;
             continue;
         }
@@ -4247,6 +4263,7 @@ static int smallclueWatchCommand(int argc, char **argv) {
     const SmallclueApplet *applet = smallclueFindApplet(argv[idx]);
 
     int status = 0;
+    int iterations = 0;
     while (1) {
         int abort_status = 0;
         if (smallclueShouldAbort(&abort_status)) {
@@ -4258,6 +4275,12 @@ static int smallclueWatchCommand(int argc, char **argv) {
         fflush(stdout);
         status = smallclueWatchRunApplet(applet, cmd_argc, &argv[idx]);
         fflush(stdout);
+        if (max_iterations > 0) {
+            iterations++;
+            if (iterations >= max_iterations) {
+                break;
+            }
+        }
         struct timespec ts;
         ts.tv_sec = (time_t)interval;
         ts.tv_nsec = (long)((interval - (double)ts.tv_sec) * 1e9);
