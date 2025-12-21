@@ -636,8 +636,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Pager; navigation: j/k, /, n, g/G, q"},
     {"ln", "ln [-s] TARGET LINK\n"
            "  -s symbolic link"},
-    {"ls", "ls [-a] [-l] [-t] [-h] [-d] [--color[=auto|always|never]] [path ...]\n"
-           "  -a show entries starting with '.'\n"
+    {"ls", "ls [-a] [-A] [-l] [-t] [-h] [-d] [--color[=auto|always|never]] [path ...]\n"
+           "  -a show entries starting with '.' (including . and ..)\n"
+           "  -A show entries starting with '.' (excluding . and ..)\n"
            "  -l long format with permissions, ownership, size, time\n"
            "  -t sort by modification time\n"
            "  -h human-readable sizes (with -l)\n"
@@ -1614,6 +1615,7 @@ static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, in
 static int print_file(const char *path, FILE *stream) {
     char buffer[4096];
     bool dbg = getenv("PSCALI_PIPE_DEBUG") != NULL;
+    clearerr(stream);
     while (!feof(stream)) {
         size_t n = fread(buffer, 1, sizeof(buffer), stream);
         if (n == 0) {
@@ -3285,6 +3287,7 @@ static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int 
 
 static int list_directory(const char *path,
                           bool show_all,
+                          bool show_almost_all,
                           bool long_format,
                           bool sort_by_time,
                           bool human,
@@ -3304,8 +3307,15 @@ static int list_directory(const char *path,
     struct dirent *dir;
     while ((dir = readdir(d)) != NULL) {
         const char *filename = dir->d_name;
-        if (!show_all && filename[0] == '.') {
-            continue;
+        if (filename[0] == '.') {
+            if (!show_all) {
+                if (!show_almost_all) {
+                    continue;
+                }
+                if (strcmp(filename, ".") == 0 || strcmp(filename, "..") == 0) {
+                    continue;
+                }
+            }
         }
 
         char *full_path = join_path(path, filename);
@@ -3418,6 +3428,7 @@ static int smallclueEchoCommand(int argc, char **argv) {
 
 static bool smallclueLsValidateShortOptions(const char *arg,
                                             int *show_all,
+                                            int *show_almost_all,
                                             int *long_format,
                                             int *sort_by_time,
                                             int *list_dirs_only,
@@ -3430,6 +3441,12 @@ static bool smallclueLsValidateShortOptions(const char *arg,
         switch (*cursor) {
             case 'a':
                 *show_all = 1;
+                *show_almost_all = 0;
+                break;
+            case 'A':
+                if (!*show_all) {
+                    *show_almost_all = 1;
+                }
                 break;
             case 'l':
                 *long_format = 1;
@@ -3494,6 +3511,7 @@ static bool smallclueLsHandleLongOption(const char *arg) {
 
 static int smallclueLsCommand(int argc, char **argv) {
     int show_all = 0;
+    int show_almost_all = 0;
     int long_format = 0;
     int sort_by_time = 0;
     int list_dirs_only = 0;
@@ -3534,6 +3552,7 @@ static int smallclueLsCommand(int argc, char **argv) {
         }
         if (!smallclueLsValidateShortOptions(arg + 1,
                                              &show_all,
+                                             &show_almost_all,
                                              &long_format,
                                              &sort_by_time,
                                              &list_dirs_only,
@@ -3554,7 +3573,8 @@ static int smallclueLsCommand(int argc, char **argv) {
         if (list_dirs_only) {
             return print_path_entry(".", ".", long_format, human_sizes, color_mode, classify) ? 1 : 0;
         }
-        return list_directory(".", show_all, long_format, sort_by_time, human_sizes, color_mode, classify);
+        return list_directory(".", show_all, show_almost_all, long_format,
+                              sort_by_time, human_sizes, color_mode, classify);
     }
 
     int remaining = argc - paths_start;
@@ -3574,7 +3594,8 @@ static int smallclueLsCommand(int argc, char **argv) {
                 }
                 printf("%s:\n", path);
             }
-            status |= list_directory(path, show_all, long_format, sort_by_time, human_sizes, color_mode, classify);
+            status |= list_directory(path, show_all, show_almost_all, long_format,
+                                     sort_by_time, human_sizes, color_mode, classify);
         } else {
             status |= print_path_entry_with_stat(path, path, long_format, human_sizes, &stat_buf, color_mode, classify);
         }
