@@ -167,6 +167,15 @@ static void smallclueClearPendingSignals(void) {
 }
 
 static bool smallclueShouldAbort(int *out_status) {
+#if defined(PSCAL_TARGET_IOS)
+    VProc *vp = vprocCurrent();
+    if (vp) {
+        int shell_pid = vprocGetShellSelfPid();
+        if (shell_pid <= 0 || vprocPid(vp) != shell_pid) {
+            (void)vprocWaitIfStopped(vp);
+        }
+    }
+#endif
     if (pscalRuntimeConsumeSigint()) {
         if (out_status) {
             *out_status = 130;
@@ -4343,8 +4352,49 @@ static int smallclueSleepCommand(int argc, char **argv) {
     if (req.tv_nsec < 0) {
         req.tv_nsec = 0;
     }
-    while (nanosleep(&req, &req) == -1 && errno == EINTR) {
-        continue;
+    struct timespec start;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        while (nanosleep(&req, &req) == -1 && errno == EINTR) {
+            int abort_status = 0;
+            if (smallclueShouldAbort(&abort_status)) {
+                return abort_status;
+            }
+        }
+        return 0;
+    }
+    struct timespec deadline = start;
+    deadline.tv_sec += req.tv_sec;
+    deadline.tv_nsec += req.tv_nsec;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    while (true) {
+        int abort_status = 0;
+        if (smallclueShouldAbort(&abort_status)) {
+            return abort_status;
+        }
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+            break;
+        }
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+            break;
+        }
+        double remaining = (double)(deadline.tv_sec - now.tv_sec) +
+                           ((double)(deadline.tv_nsec - now.tv_nsec) / 1e9);
+        if (remaining < 0.0) {
+            break;
+        }
+        double slice = remaining > 0.1 ? 0.1 : remaining;
+        struct timespec chunk;
+        chunk.tv_sec = (time_t)slice;
+        chunk.tv_nsec = (long)((slice - (double)chunk.tv_sec) * 1e9);
+        if (chunk.tv_nsec < 0) {
+            chunk.tv_nsec = 0;
+        }
+        (void)nanosleep(&chunk, NULL);
     }
     return 0;
 }
