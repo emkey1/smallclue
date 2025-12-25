@@ -97,6 +97,7 @@ set(SOURCES
     src/core.c
     src/nextvi_app.c
     src/openssh_app.c
+    src/vproc_test_app.c
     src/runtime_support.c
     src/openssh_stubs.c
     src/openssh_shim.c

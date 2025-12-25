@@ -87,6 +87,8 @@ void PSCALRuntimeEndScriptCapture(void) {}
 int PSCALRuntimeScriptCaptureActive(void) { return 0; }
 #endif
 
+int smallclueVprocTestCommand(int argc, char **argv);
+
 static const char *smallclueResolvePath(const char *path, char *buffer, size_t buflen) {
     if (!path) {
         return NULL;
@@ -570,6 +572,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"uniq", smallclueUniqCommand, "Report or omit repeated lines"},
     {"uptime", smallclueUptimeCommand, "Show system uptime"},
     {"version", smallclueVersionCommand, "Show app version"},
+    {"vproc-test", smallclueVprocTestCommand, "Run vproc/terminal diagnostics"},
     {"watch", smallclueWatchCommand, "Periodically run a command"},
     {"vi", smallclueElvisCommand, "Alias for Nextvi text editor"},
     {"wc", smallclueWcCommand, "Count lines/words/bytes"},
@@ -740,6 +743,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                "  Show system uptime"},
     {"version", "version\n"
                 "  Show PSCAL app marketing version"},
+    {"vproc-test", "vproc-test [--help]\n"
+                   "  Run vproc/session/spawn diagnostics\n"
+                   "  --session  Only run session input checks\n"
+                   "  --vproc    Only run vproc stdin checks\n"
+                   "  --spawn    Only run vproc spawn checks\n"
+                   "  --readpass Run an SSH-style passphrase read test"},
     {"vi", "vi [FILE]\n"
            "  Alias for nextvi"},
     {"watch", "watch [-n SECONDS] [-c COUNT|--count COUNT] command...\n"

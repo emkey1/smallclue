@@ -257,6 +257,7 @@ DEFINE_SMALLCLUE_WRAPPER("false", falsecmd)
 DEFINE_SMALLCLUE_WRAPPER("yes", yes)
 DEFINE_SMALLCLUE_WRAPPER("no", no)
 DEFINE_SMALLCLUE_WRAPPER("version", version)
+DEFINE_SMALLCLUE_WRAPPER("vproc-test", vproc_test)
 DEFINE_SMALLCLUE_WRAPPER("sleep", sleepcmd)
 DEFINE_SMALLCLUE_WRAPPER("basename", basename)
 DEFINE_SMALLCLUE_WRAPPER("dirname", dirname)
@@ -395,6 +396,7 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("vi", vmBuiltinSmallclue_nextvi, "vi");
     registerSmallclueBuiltin("dmesg", vmBuiltinSmallclue_dmesg, "dmesg");
     registerSmallclueBuiltin("licenses", vmBuiltinSmallclue_licenses, "licenses");
+    registerSmallclueBuiltin("vproc-test", vmBuiltinSmallclue_vproc_test, "vproc-test");
 #endif
     registerSmallclueBuiltin("wget", vmBuiltinSmallclue_wget, "wget");
     registerSmallclueBuiltin("watch", vmBuiltinSmallclue_watch, "watch");
