@@ -508,6 +508,9 @@ static VprocTestResult vprocTestSpawnExec(const char *payload, const char **deta
     }
 
     VProcOptions opts = vprocDefaultOptions();
+    if (session->stdin_host_fd >= 0) {
+        opts.stdin_fd = session->stdin_host_fd;
+    }
     VProc *vp = vprocCreate(&opts);
     if (!vp) {
         vprocTestDrainSessionInput(len);
