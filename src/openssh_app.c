@@ -13,8 +13,10 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include "common/path_truncate.h"
 #include "pscal_openssh_hooks.h"
 #if defined(PSCAL_TARGET_IOS)
+#include "ios/vproc.h"
 #if defined(__has_include)
 #  if __has_include("PSCALRuntime.h")
 #    include "PSCALRuntime.h"
@@ -101,6 +103,279 @@ static void smallclueFreeArgv(char **argv, int count) {
     free(argv);
 }
 
+static char *smallclueDupString(const char *value) {
+    const char *src = value ? value : "";
+    return strdup(src);
+}
+
+static char *smallclueDupEnv(const char *name) {
+    if (!name) {
+        return NULL;
+    }
+    const char *value = getenv(name);
+    return value ? strdup(value) : NULL;
+}
+
+static void smallclueRestoreEnv(const char *name, const char *value) {
+    if (!name) {
+        return;
+    }
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+}
+
+static bool smallclueOptionKeyLooksPath(const char *key, size_t len) {
+    if (!key || len < 4) {
+        return false;
+    }
+    if (len >= 4 && strncasecmp(key + len - 4, "file", 4) == 0) {
+        return true;
+    }
+    if (len >= 4 && strncasecmp(key + len - 4, "path", 4) == 0) {
+        return true;
+    }
+    return false;
+}
+
+static char *smallclueExpandAbsolutePath(const char *path) {
+    if (!path) {
+        return smallclueDupString(path);
+    }
+    if (path[0] != '/') {
+        return smallclueDupString(path);
+    }
+    char expanded[PATH_MAX];
+    if (pathTruncateExpand(path, expanded, sizeof(expanded))) {
+        return smallclueDupString(expanded);
+    }
+    return smallclueDupString(path);
+}
+
+static char *smallclueExpandOptionAssignment(const char *option) {
+    if (!option) {
+        return smallclueDupString(option);
+    }
+    const char *eq = strchr(option, '=');
+    if (!eq) {
+        return smallclueDupString(option);
+    }
+    size_t key_len = (size_t)(eq - option);
+    if (!smallclueOptionKeyLooksPath(option, key_len)) {
+        return smallclueDupString(option);
+    }
+    const char *value = eq + 1;
+    if (value[0] != '/') {
+        return smallclueDupString(option);
+    }
+    char expanded[PATH_MAX];
+    if (!pathTruncateExpand(value, expanded, sizeof(expanded))) {
+        return smallclueDupString(option);
+    }
+    size_t total = key_len + 1 + strlen(expanded) + 1;
+    char *out = (char *)malloc(total);
+    if (!out) {
+        return smallclueDupString(option);
+    }
+    memcpy(out, option, key_len);
+    out[key_len] = '=';
+    memcpy(out + key_len + 1, expanded, strlen(expanded) + 1);
+    return out;
+}
+
+static char *smallclueConcatOptionValue(const char *prefix, const char *value) {
+    if (!prefix) {
+        return smallclueDupString(value);
+    }
+    const char *val = value ? value : "";
+    size_t total = strlen(prefix) + strlen(val) + 1;
+    char *out = (char *)malloc(total);
+    if (!out) {
+        return smallclueDupString(prefix);
+    }
+    memcpy(out, prefix, strlen(prefix));
+    memcpy(out + strlen(prefix), val, strlen(val) + 1);
+    return out;
+}
+
+static char **smallclueExpandSshArgs(int argc, char **argv, int *out_count) {
+    if (!argv || argc <= 0 || !out_count) {
+        return NULL;
+    }
+    char **expanded = (char **)calloc((size_t)argc, sizeof(char *));
+    if (!expanded) {
+        return NULL;
+    }
+    int count = 0;
+    bool stop = false;
+    for (int i = 0; i < argc; ++i) {
+        const char *arg = argv[i] ? argv[i] : "";
+        if (i == 0) {
+            expanded[count++] = smallclueDupString(arg);
+            continue;
+        }
+        if (stop) {
+            expanded[count++] = smallclueDupString(arg);
+            continue;
+        }
+        if (strcmp(arg, "--") == 0) {
+            expanded[count++] = smallclueDupString(arg);
+            stop = true;
+            continue;
+        }
+        if (arg[0] == '-' && arg[1] != '\0') {
+            if (strcmp(arg, "-i") == 0 || strcmp(arg, "-F") == 0 ||
+                strcmp(arg, "-E") == 0 || strcmp(arg, "-S") == 0 ||
+                strcmp(arg, "-I") == 0) {
+                expanded[count++] = smallclueDupString(arg);
+                if (i + 1 < argc) {
+                    expanded[count++] = smallclueExpandAbsolutePath(argv[++i]);
+                }
+                continue;
+            }
+            if (strcmp(arg, "-o") == 0) {
+                expanded[count++] = smallclueDupString(arg);
+                if (i + 1 < argc) {
+                    expanded[count++] = smallclueExpandOptionAssignment(argv[++i]);
+                }
+                continue;
+            }
+            if ((arg[1] == 'i' || arg[1] == 'F' || arg[1] == 'E' ||
+                 arg[1] == 'S' || arg[1] == 'I') && arg[2] != '\0') {
+                char prefix[3] = { arg[0], arg[1], '\0' };
+                char *value = smallclueExpandAbsolutePath(arg + 2);
+                expanded[count++] = smallclueConcatOptionValue(prefix, value);
+                free(value);
+                continue;
+            }
+            if (arg[1] == 'o' && arg[2] != '\0') {
+                char *value = smallclueExpandOptionAssignment(arg + 2);
+                expanded[count++] = smallclueConcatOptionValue("-o", value);
+                free(value);
+                continue;
+            }
+            expanded[count++] = smallclueDupString(arg);
+            continue;
+        }
+        stop = true;
+        expanded[count++] = smallclueDupString(arg);
+    }
+    *out_count = count;
+    return expanded;
+}
+
+static char **smallclueExpandScpArgs(int argc, char **argv, int *out_count) {
+    if (!argv || argc <= 0 || !out_count) {
+        return NULL;
+    }
+    char **expanded = (char **)calloc((size_t)argc, sizeof(char *));
+    if (!expanded) {
+        return NULL;
+    }
+    int count = 0;
+    for (int i = 0; i < argc; ++i) {
+        const char *arg = argv[i] ? argv[i] : "";
+        if (i == 0) {
+            expanded[count++] = smallclueDupString(arg);
+            continue;
+        }
+        if (strcmp(arg, "-i") == 0 || strcmp(arg, "-F") == 0 || strcmp(arg, "-S") == 0) {
+            expanded[count++] = smallclueDupString(arg);
+            if (i + 1 < argc) {
+                expanded[count++] = smallclueExpandAbsolutePath(argv[++i]);
+            }
+            continue;
+        }
+        if (strcmp(arg, "-o") == 0) {
+            expanded[count++] = smallclueDupString(arg);
+            if (i + 1 < argc) {
+                expanded[count++] = smallclueExpandOptionAssignment(argv[++i]);
+            }
+            continue;
+        }
+        if ((arg[1] == 'i' || arg[1] == 'F' || arg[1] == 'S') && arg[2] != '\0') {
+            char prefix[3] = { arg[0], arg[1], '\0' };
+            char *value = smallclueExpandAbsolutePath(arg + 2);
+            expanded[count++] = smallclueConcatOptionValue(prefix, value);
+            free(value);
+            continue;
+        }
+        if (arg[0] == '-' && arg[1] == 'o' && arg[2] != '\0') {
+            char *value = smallclueExpandOptionAssignment(arg + 2);
+            expanded[count++] = smallclueConcatOptionValue("-o", value);
+            free(value);
+            continue;
+        }
+        if (arg[0] == '/' && strchr(arg, ':') == NULL) {
+            expanded[count++] = smallclueExpandAbsolutePath(arg);
+            continue;
+        }
+        expanded[count++] = smallclueDupString(arg);
+    }
+    *out_count = count;
+    return expanded;
+}
+
+static char **smallclueExpandSftpArgs(int argc, char **argv, int *out_count) {
+    if (!argv || argc <= 0 || !out_count) {
+        return NULL;
+    }
+    char **expanded = (char **)calloc((size_t)argc, sizeof(char *));
+    if (!expanded) {
+        return NULL;
+    }
+    int count = 0;
+    bool stop = false;
+    for (int i = 0; i < argc; ++i) {
+        const char *arg = argv[i] ? argv[i] : "";
+        if (i == 0) {
+            expanded[count++] = smallclueDupString(arg);
+            continue;
+        }
+        if (stop) {
+            expanded[count++] = smallclueDupString(arg);
+            continue;
+        }
+        if (strcmp(arg, "--") == 0) {
+            expanded[count++] = smallclueDupString(arg);
+            stop = true;
+            continue;
+        }
+        if (arg[0] == '-' && arg[1] != '\0') {
+            if (strcmp(arg, "-b") == 0 || strcmp(arg, "-F") == 0 ||
+                strcmp(arg, "-i") == 0 || strcmp(arg, "-S") == 0 ||
+                strcmp(arg, "-D") == 0 || strcmp(arg, "-s") == 0) {
+                expanded[count++] = smallclueDupString(arg);
+                if (i + 1 < argc) {
+                    expanded[count++] = smallclueExpandAbsolutePath(argv[++i]);
+                }
+                continue;
+            }
+            if (strcmp(arg, "-o") == 0) {
+                expanded[count++] = smallclueDupString(arg);
+                if (i + 1 < argc) {
+                    expanded[count++] = smallclueExpandOptionAssignment(argv[++i]);
+                }
+                continue;
+            }
+            if (arg[1] == 'o' && arg[2] != '\0') {
+                char *value = smallclueExpandOptionAssignment(arg + 2);
+                expanded[count++] = smallclueConcatOptionValue("-o", value);
+                free(value);
+                continue;
+            }
+            expanded[count++] = smallclueDupString(arg);
+            continue;
+        }
+        stop = true;
+        expanded[count++] = smallclueDupString(arg);
+    }
+    *out_count = count;
+    return expanded;
+}
+
 static void smallclueEnsureWritableHomeSsh(void) {
     const char *home = getenv("PSCALI_WORKDIR");
     if (!home || !*home) {
@@ -123,6 +398,87 @@ static void smallclueEnsureWritableHomeSsh(void) {
     }
 
     setenv("HOME", home, 1);
+}
+
+static bool smallclueApplyVirtualHome(char **saved_home, char **saved_pscali_home) {
+    if (saved_home) {
+        *saved_home = NULL;
+    }
+    if (saved_pscali_home) {
+        *saved_pscali_home = NULL;
+    }
+    if (!pathTruncateEnabled()) {
+        return false;
+    }
+    const char *home = getenv("HOME");
+    if (!home || home[0] != '/') {
+        return false;
+    }
+    char stripped[PATH_MAX];
+    if (!pathTruncateStrip(home, stripped, sizeof(stripped))) {
+        return false;
+    }
+    if (strcmp(stripped, home) == 0) {
+        return false;
+    }
+    if (saved_home) {
+        *saved_home = smallclueDupString(home);
+    }
+    if (saved_pscali_home) {
+        *saved_pscali_home = smallclueDupEnv("PSCALI_HOME");
+    }
+    setenv("HOME", stripped, 1);
+    setenv("PSCALI_HOME", stripped, 1);
+    return true;
+}
+
+typedef struct {
+    char *askpass;
+    char *askpass_require;
+    char *display;
+    char *wayland_display;
+} smallclueSshAskpassEnv;
+
+static bool smallclueApplySshPromptEnv(smallclueSshAskpassEnv *env) {
+#if defined(PSCAL_TARGET_IOS)
+    if (!env) {
+        return false;
+    }
+    env->askpass = smallclueDupEnv("SSH_ASKPASS");
+    env->askpass_require = smallclueDupEnv("SSH_ASKPASS_REQUIRE");
+    env->display = smallclueDupEnv("DISPLAY");
+    env->wayland_display = smallclueDupEnv("WAYLAND_DISPLAY");
+    setenv("SSH_ASKPASS_REQUIRE", "never", 1);
+    unsetenv("SSH_ASKPASS");
+    setenv("DISPLAY", "", 1);
+    setenv("WAYLAND_DISPLAY", "", 1);
+    return true;
+#else
+    (void)env;
+    return false;
+#endif
+}
+
+static void smallclueRestoreSshPromptEnv(smallclueSshAskpassEnv *env) {
+#if defined(PSCAL_TARGET_IOS)
+    if (!env) {
+        return;
+    }
+    smallclueRestoreEnv("SSH_ASKPASS", env->askpass);
+    smallclueRestoreEnv("SSH_ASKPASS_REQUIRE", env->askpass_require);
+    smallclueRestoreEnv("DISPLAY", env->display);
+    smallclueRestoreEnv("WAYLAND_DISPLAY", env->wayland_display);
+    free(env->askpass);
+    free(env->askpass_require);
+    free(env->display);
+    free(env->wayland_display);
+    env->askpass = NULL;
+    env->askpass_require = NULL;
+    env->display = NULL;
+    env->wayland_display = NULL;
+#else
+    (void)env;
+#endif
 }
 
 static int smallclueInvokeOpensshEntry(const char *label, int (*entry)(int, char **),
@@ -214,11 +570,22 @@ typedef struct {
     int (*entry)(int, char **);
     int argc;
     char **argv;
+    VProc *vp;
 } smallclueOpensshThreadContext;
 
 static void *smallclueRunOpensshEntryThread(void *arg) {
     smallclueOpensshThreadContext *ctx = (smallclueOpensshThreadContext *)arg;
+    bool activated = false;
+    if (ctx && ctx->vp) {
+        vprocActivate(ctx->vp);
+        vprocRegisterThread(ctx->vp, pthread_self());
+        activated = true;
+    }
     int status = smallclueRunOpensshEntryOnce(ctx->label, ctx->entry, ctx->argc, ctx->argv);
+    if (activated) {
+        vprocUnregisterThread(ctx->vp, pthread_self());
+        vprocDeactivate();
+    }
     return (void *)(intptr_t)status;
 }
 
@@ -228,7 +595,8 @@ static int smallclueRunOpensshEntry(const char *label, int (*entry)(int, char **
         .label = label,
         .entry = entry,
         .argc = argc,
-        .argv = argv
+        .argv = argv,
+        .vp = vprocCurrent()
     };
     pthread_t thread;
     int err = pthread_create(&thread, NULL, smallclueRunOpensshEntryThread, &ctx);
@@ -248,8 +616,19 @@ static int smallclueRunOpensshEntry(const char *label, int (*entry)(int, char **
 
 int smallclueRunSsh(int argc, char **argv) {
     smallclueEnsureWritableHomeSsh();
+    char *saved_home = NULL;
+    char *saved_pscali_home = NULL;
+    bool restore_home = smallclueApplyVirtualHome(&saved_home, &saved_pscali_home);
+    smallclueSshAskpassEnv askpass_env = {0};
+    bool restore_askpass = smallclueApplySshPromptEnv(&askpass_env);
     if (argc < 2) {
         fprintf(stderr, "usage: ssh [options] host [command]\n");
+        if (restore_home) {
+            smallclueRestoreEnv("HOME", saved_home);
+            smallclueRestoreEnv("PSCALI_HOME", saved_pscali_home);
+        }
+        free(saved_home);
+        free(saved_pscali_home);
         return 255;
     }
     /* Preserve user args; only ensure -tt for interactive sessions. */
@@ -269,7 +648,14 @@ int smallclueRunSsh(int argc, char **argv) {
     int new_argc = argc + extra;
     char **augmented = (char **)calloc((size_t)new_argc, sizeof(char *));
     if (!augmented) {
-        return smallclueRunOpensshEntry("ssh", pscal_openssh_ssh_main, argc, argv);
+        int status = smallclueRunOpensshEntry("ssh", pscal_openssh_ssh_main, argc, argv);
+        if (restore_home) {
+            smallclueRestoreEnv("HOME", saved_home);
+            smallclueRestoreEnv("PSCALI_HOME", saved_pscali_home);
+        }
+        free(saved_home);
+        free(saved_pscali_home);
+        return status;
     }
     int count = 0;
     if (argc > 0 && argv && argv[0]) {
@@ -284,19 +670,79 @@ int smallclueRunSsh(int argc, char **argv) {
         augmented[count++] = argv[i] ? strdup(argv[i]) : strdup("");
     }
 
-    int status = smallclueRunOpensshEntry("ssh", pscal_openssh_ssh_main, count, augmented);
+    int expanded_count = 0;
+    char **expanded = smallclueExpandSshArgs(count, augmented, &expanded_count);
+    int status = smallclueRunOpensshEntry("ssh", pscal_openssh_ssh_main,
+                                          expanded ? expanded_count : count,
+                                          expanded ? expanded : augmented);
+    if (expanded) {
+        smallclueFreeArgv(expanded, expanded_count);
+    }
     smallclueFreeArgv(augmented, count);
+    if (restore_askpass) {
+        smallclueRestoreSshPromptEnv(&askpass_env);
+    }
+    if (restore_home) {
+        smallclueRestoreEnv("HOME", saved_home);
+        smallclueRestoreEnv("PSCALI_HOME", saved_pscali_home);
+    }
+    free(saved_home);
+    free(saved_pscali_home);
     return status;
 }
 
 int smallclueRunScp(int argc, char **argv) {
     smallclueEnsureWritableHomeSsh();
-    return smallclueRunOpensshEntry("scp", pscal_openssh_scp_main, argc, argv);
+    char *saved_home = NULL;
+    char *saved_pscali_home = NULL;
+    bool restore_home = smallclueApplyVirtualHome(&saved_home, &saved_pscali_home);
+    smallclueSshAskpassEnv askpass_env = {0};
+    bool restore_askpass = smallclueApplySshPromptEnv(&askpass_env);
+    int expanded_count = 0;
+    char **expanded = smallclueExpandScpArgs(argc, argv, &expanded_count);
+    int status = smallclueRunOpensshEntry("scp", pscal_openssh_scp_main,
+                                          expanded ? expanded_count : argc,
+                                          expanded ? expanded : argv);
+    if (expanded) {
+        smallclueFreeArgv(expanded, expanded_count);
+    }
+    if (restore_askpass) {
+        smallclueRestoreSshPromptEnv(&askpass_env);
+    }
+    if (restore_home) {
+        smallclueRestoreEnv("HOME", saved_home);
+        smallclueRestoreEnv("PSCALI_HOME", saved_pscali_home);
+    }
+    free(saved_home);
+    free(saved_pscali_home);
+    return status;
 }
 
 int smallclueRunSftp(int argc, char **argv) {
     smallclueEnsureWritableHomeSsh();
-    return smallclueRunOpensshEntry("sftp", pscal_openssh_sftp_main, argc, argv);
+    char *saved_home = NULL;
+    char *saved_pscali_home = NULL;
+    bool restore_home = smallclueApplyVirtualHome(&saved_home, &saved_pscali_home);
+    smallclueSshAskpassEnv askpass_env = {0};
+    bool restore_askpass = smallclueApplySshPromptEnv(&askpass_env);
+    int expanded_count = 0;
+    char **expanded = smallclueExpandSftpArgs(argc, argv, &expanded_count);
+    int status = smallclueRunOpensshEntry("sftp", pscal_openssh_sftp_main,
+                                          expanded ? expanded_count : argc,
+                                          expanded ? expanded : argv);
+    if (expanded) {
+        smallclueFreeArgv(expanded, expanded_count);
+    }
+    if (restore_askpass) {
+        smallclueRestoreSshPromptEnv(&askpass_env);
+    }
+    if (restore_home) {
+        smallclueRestoreEnv("HOME", saved_home);
+        smallclueRestoreEnv("PSCALI_HOME", saved_pscali_home);
+    }
+    free(saved_home);
+    free(saved_pscali_home);
+    return status;
 }
 
 int smallclueRunSshKeygen(int argc, char **argv) {
