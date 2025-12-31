@@ -58,10 +58,12 @@ __attribute__((weak)) void PSCALRuntimeUpdateWindowSize(int columns, int rows) {
 void PSCALRuntimeBeginScriptCapture(const char *path, int append) __attribute__((weak));
 void PSCALRuntimeEndScriptCapture(void) __attribute__((weak));
 int PSCALRuntimeScriptCaptureActive(void) __attribute__((weak));
+int pscalRuntimeOpenShellTab(void) __attribute__((weak));
 #ifndef PSCAL_RUNTIME_CAPTURE_IMPL
 __attribute__((weak)) void PSCALRuntimeBeginScriptCapture(const char *path, int append) { (void)path; (void)append; }
 __attribute__((weak)) void PSCALRuntimeEndScriptCapture(void) {}
 __attribute__((weak)) int PSCALRuntimeScriptCaptureActive(void) { return 0; }
+__attribute__((weak)) int pscalRuntimeOpenShellTab(void) { errno = ENOSYS; return -1; }
 #endif
 __attribute__((weak)) char *pscalRuntimeCopyMarketingVersion(void) { return NULL; }
 #endif
@@ -372,6 +374,7 @@ static int smallclueDfCommand(int argc, char **argv);
 static int smallclueTopCommand(int argc, char **argv);
 static int smallclueDmesgCommand(int argc, char **argv);
 static int smallclueHelpCommand(int argc, char **argv);
+static int smallclueAddTabCommand(int argc, char **argv);
 #endif
 
 static int smallclueNslookupCommand(int argc, char **argv) {
@@ -581,6 +584,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"xargs", smallclueXargsCommand, "Build command lines from stdin"},
     {"df", smallclueDfCommand, "Report filesystem usage"},
 #if defined(PSCAL_TARGET_IOS)
+    {"addt", smallclueAddTabCommand, "Open an additional shell tab"},
     {"smallclue-help", smallclueHelpCommand, "List available smallclue applets"},
     {"licenses", smallclueLicensesCommand, "View third-party licenses"},
     {"dmesg", smallclueDmesgCommand, "Show PSCAL runtime log for this session"},
@@ -772,6 +776,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"nslookup", "nslookup [-v] host [port]\n"
                  "  DNS lookup utility (UDP port defaults to 53). -v prints hosts lookup debugging."},
 #if defined(PSCAL_TARGET_IOS)
+    {"addt", "addt\n"
+             "  Open an additional shell tab"},
     {"smallclue-help", "smallclue-help [command]\n"
                        "  Without arguments: list all applets\n"
                        "  With a command: show usage if available"},
@@ -4565,6 +4571,27 @@ static int smallclueSftpCommand(int argc, char **argv) {
 static int smallclueSshKeygenCommand(int argc, char **argv) {
     return smallclueRunSshKeygen(argc, argv);
 }
+#if defined(PSCAL_TARGET_IOS)
+static int smallclueAddTabCommand(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    if (!pscalRuntimeOpenShellTab) {
+        fprintf(stderr, "addt: command unavailable\n");
+        return 1;
+    }
+    int rc = pscalRuntimeOpenShellTab();
+    if (rc != 0) {
+        if (rc < 0) {
+            errno = -rc;
+        } else if (errno == 0) {
+            errno = EIO;
+        }
+        fprintf(stderr, "addt: unable to open shell tab: %s\n", strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+#endif
 #if SMALLCLUE_HAS_IFADDRS
 static void smallclueIpAddrUsage(void) {
     fputs("usage: ipaddr [-4|-6] [-a]\n", stderr);

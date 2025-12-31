@@ -21,6 +21,12 @@ typedef struct {
     int failures;
 } VprocTestState;
 
+static bool gVprocTestDebug = false;
+
+static bool vprocTestDebugEnabled(void) {
+    return gVprocTestDebug;
+}
+
 typedef enum {
     VPROC_TEST_FAIL = 0,
     VPROC_TEST_OK,
@@ -372,7 +378,7 @@ static void *vprocTestWritePipe(void *arg) {
             ctx->ok = false;
             ctx->err = errno;
         }
-        if (getenv("PSCALI_TOOL_DEBUG")) {
+        if (vprocTestDebugEnabled()) {
             fprintf(stderr,
                     "[vproc-test] write payload fd=%d rc=%zd errno=%d\n",
                     ctx->fd,
@@ -384,7 +390,7 @@ static void *vprocTestWritePipe(void *arg) {
             ctx->ok = false;
             ctx->err = errno;
         }
-        if (getenv("PSCALI_TOOL_DEBUG")) {
+        if (vprocTestDebugEnabled()) {
             fprintf(stderr,
                     "[vproc-test] write newline fd=%d rc=%zd errno=%d\n",
                     ctx->fd,
@@ -412,7 +418,7 @@ static void *vprocTestInjectInput(void *arg) {
 }
 
 static void vprocTestDumpEntry(int pid, int waiter_pid) {
-    if (!getenv("PSCALI_TOOL_DEBUG")) {
+    if (!vprocTestDebugEnabled()) {
         return;
     }
     VProcSnapshot snap[64];
@@ -507,8 +513,9 @@ static VprocTestResult vprocTestSpawnExec(const char *payload, const char **deta
         return VPROC_TEST_FAIL;
     }
 
+    VProcSessionStdio *session = vprocSessionStdioCurrent();
     VProcOptions opts = vprocDefaultOptions();
-    if (session->stdin_host_fd >= 0) {
+    if (session && session->stdin_host_fd >= 0) {
         opts.stdin_fd = session->stdin_host_fd;
     }
     VProc *vp = vprocCreate(&opts);
@@ -521,7 +528,7 @@ static VprocTestResult vprocTestSpawnExec(const char *payload, const char **deta
     }
 
     int parent_pid = vprocGetPidShim();
-    if (getenv("PSCALI_TOOL_DEBUG")) {
+    if (vprocTestDebugEnabled()) {
         fprintf(stderr,
                 "[vproc-test] spawn parent_pid=%d shell=%d kernel=%d child=%d\n",
                 parent_pid,
@@ -593,7 +600,7 @@ static VprocTestResult vprocTestSpawnExec(const char *payload, const char **deta
                 *detail = msg;
             }
         }
-        if (getenv("PSCALI_TOOL_DEBUG")) {
+        if (vprocTestDebugEnabled()) {
             fprintf(stderr,
                     "[vproc-test] spawn wait status=%d waited=%d errno=%d\n",
                     status,
@@ -670,7 +677,7 @@ static VprocTestResult vprocTestReadPassPipe(const char *payload, const char **d
         return VPROC_TEST_FAIL;
     }
     int hold_fd = vprocTestDupFd(pipefd[1]);
-    if (getenv("PSCALI_TOOL_DEBUG")) {
+    if (vprocTestDebugEnabled()) {
         fprintf(stderr, "[vproc-test] pipe hold=%d\n", hold_fd);
     }
 
@@ -697,7 +704,7 @@ static VprocTestResult vprocTestReadPassPipe(const char *payload, const char **d
     vprocRegisterThread(vp, pthread_self());
     vprocActivate(vp);
     vprocHostClose(pipefd[0]);
-    if (getenv("PSCALI_TOOL_DEBUG")) {
+    if (vprocTestDebugEnabled()) {
         int vproc_stdin = vprocTranslateFd(vp, STDIN_FILENO);
         fprintf(stderr,
                 "[vproc-test] pipe read=%d write=%d session_stdin=%d vproc_stdin=%d\n",
@@ -718,7 +725,7 @@ static VprocTestResult vprocTestReadPassPipe(const char *payload, const char **d
         ctx->delay_ms = 50;
         if (vprocHostPthreadCreate(&writer, NULL, vprocTestWritePipe, ctx) == 0) {
             writer_started = true;
-        } else if (getenv("PSCALI_TOOL_DEBUG")) {
+        } else if (vprocTestDebugEnabled()) {
             fprintf(stderr, "[vproc-test] writer spawn failed\n");
         } else {
             vprocTestWritePipe(ctx);
@@ -769,7 +776,7 @@ static VprocTestResult vprocTestReadPassInject(const char *payload, const char *
         }
         return VPROC_TEST_FAIL;
     }
-    if (getenv("PSCALI_TOOL_DEBUG")) {
+    if (vprocTestDebugEnabled()) {
         pthread_mutex_lock(&input->mu);
         fprintf(stderr,
                 "[vproc-test] inject input len=%zu eof=%d reader=%d fd=%d\n",
@@ -826,6 +833,8 @@ typedef struct {
 typedef struct {
     VProc *vp;
     VprocTestReadPassChildCtx *child;
+    int shell_pid;
+    int kernel_pid;
 } VprocTestReadPassThreadCtx;
 
 static void *vprocTestReadPassChild(void *arg) {
@@ -841,6 +850,7 @@ static void *vprocTestReadPassChild(void *arg) {
     if (!pass || pass[0] == '\0') {
         ctx->err = EIO;
         ctx->ok = false;
+        fprintf(stderr, "[vproc-test] readpass empty\n");
         free(pass);
         return NULL;
     }
@@ -859,12 +869,10 @@ static void *vprocTestReadPassChild(void *arg) {
         }
         ctx->seen[copy_len] = '\0';
         ctx->seen_len = strlen(pass);
-        if (getenv("PSCALI_TOOL_DEBUG")) {
-            fprintf(stderr,
-                    "[vproc-test] child read len=%zu buf=\"%s\"\n",
-                    ctx->seen_len,
-                    ctx->seen);
-        }
+        fprintf(stderr,
+                "[vproc-test] readpass mismatch len=%zu buf=\"%s\"\n",
+                ctx->seen_len,
+                ctx->seen);
     }
     free(pass);
     return NULL;
@@ -873,7 +881,20 @@ static void *vprocTestReadPassChild(void *arg) {
 static void *vprocTestReadPassThreadMain(void *arg) {
     VprocTestReadPassThreadCtx *ctx = (VprocTestReadPassThreadCtx *)arg;
     bool activated = false;
+    if (vprocTestDebugEnabled()) {
+        fprintf(stderr,
+                "[vproc-test] readpass thread start vp=%p shell=%d kernel=%d\n",
+                ctx ? (void *)ctx->vp : NULL,
+                ctx ? ctx->shell_pid : -1,
+                ctx ? ctx->kernel_pid : -1);
+    }
     if (ctx && ctx->vp) {
+        if (ctx->shell_pid > 0) {
+            vprocSetShellSelfPid(ctx->shell_pid);
+        }
+        if (ctx->kernel_pid > 0) {
+            vprocSetKernelPid(ctx->kernel_pid);
+        }
         vprocActivate(ctx->vp);
         vprocRegisterThread(ctx->vp, pthread_self());
         activated = true;
@@ -884,6 +905,9 @@ static void *vprocTestReadPassThreadMain(void *arg) {
     if (activated) {
         vprocUnregisterThread(ctx->vp, pthread_self());
         vprocDeactivate();
+    }
+    if (vprocTestDebugEnabled()) {
+        fprintf(stderr, "[vproc-test] readpass thread done\n");
     }
     return NULL;
 }
@@ -930,7 +954,9 @@ static VprocTestResult vprocTestReadPassSpawn(const char *payload, const char **
     pthread_t thread = 0;
     VprocTestReadPassThreadCtx thread_ctx = {
         .vp = vp,
-        .child = &ctx
+        .child = &ctx,
+        .shell_pid = vprocGetShellSelfPid(),
+        .kernel_pid = vprocGetKernelPid()
     };
     bool thread_started = (pthread_create(&thread, NULL, vprocTestReadPassThreadMain,
                                           &thread_ctx) == 0);
@@ -992,8 +1018,17 @@ static VprocTestResult vprocTestReadPassVproc(const char *payload, const char **
         return VPROC_TEST_FAIL;
     }
 
+    fprintf(stderr,
+            "[vproc-test] readpass_vproc start dbg=%d\n",
+            vprocTestDebugEnabled() ? 1 : 0);
     VprocTestResult ready = vprocTestSessionReady(detail);
     if (ready != VPROC_TEST_OK) {
+        if (vprocTestDebugEnabled()) {
+            fprintf(stderr,
+                    "[vproc-test] readpass_vproc not ready result=%d detail=%s\n",
+                    (int)ready,
+                    (detail && *detail) ? *detail : "none");
+        }
         return ready;
     }
 
@@ -1004,10 +1039,34 @@ static VprocTestResult vprocTestReadPassVproc(const char *payload, const char **
         }
         return VPROC_TEST_FAIL;
     }
+    if (vprocTestDebugEnabled()) {
+        fprintf(stderr,
+                "[vproc-test] readpass_vproc session stdin=%d stdout=%d stderr=%d input=%p\n",
+                session->stdin_host_fd,
+                session->stdout_host_fd,
+                session->stderr_host_fd,
+                (void *)session->input);
+    }
+    if (vprocTestDebugEnabled()) {
+        fprintf(stderr,
+                "[vproc-test] readpass_vproc enter stdin=%d stdout=%d stderr=%d\n",
+                session->stdin_host_fd,
+                session->stdout_host_fd,
+                session->stderr_host_fd);
+    }
     vprocTestSessionClearInput(session);
     (void)vprocSessionInputEnsureShim();
 
     VProcOptions opts = vprocDefaultOptions();
+    if (session->stdin_host_fd >= 0) {
+        opts.stdin_fd = session->stdin_host_fd;
+    }
+    if (session->stdout_host_fd >= 0) {
+        opts.stdout_fd = session->stdout_host_fd;
+    }
+    if (session->stderr_host_fd >= 0) {
+        opts.stderr_fd = session->stderr_host_fd;
+    }
     VProc *vp = vprocCreate(&opts);
     if (!vp) {
         if (detail) {
@@ -1015,10 +1074,46 @@ static VprocTestResult vprocTestReadPassVproc(const char *payload, const char **
         }
         return VPROC_TEST_FAIL;
     }
+    if (vprocTestDebugEnabled()) {
+        fprintf(stderr,
+                "[vproc-test] readpass_vproc vproc pid=%d stdin=%d\n",
+                vprocPid(vp),
+                vprocTranslateFd(vp, STDIN_FILENO));
+    }
 
     int parent_pid = vprocGetPidShim();
     if (parent_pid > 0 && parent_pid != vprocPid(vp)) {
         vprocSetParent(vprocPid(vp), parent_pid);
+    }
+    int fg_sid = -1;
+    int fg_prev = -1;
+    if (parent_pid > 0) {
+        fg_sid = vprocGetSid(parent_pid);
+        if (fg_sid > 0) {
+            fg_prev = vprocGetForegroundPgid(fg_sid);
+            if (fg_prev > 0) {
+                (void)vprocSetpgidShim(vprocPid(vp), vprocPid(vp));
+                if (vprocSetForegroundPgid(fg_sid, vprocPid(vp)) != 0 &&
+                    vprocTestDebugEnabled()) {
+                    fprintf(stderr,
+                            "[vproc-test] readpass_vproc fg set failed sid=%d pgid=%d errno=%d\n",
+                            fg_sid,
+                            vprocPid(vp),
+                            errno);
+                } else if (vprocTestDebugEnabled()) {
+                    fprintf(stderr,
+                            "[vproc-test] readpass_vproc fg sid=%d prev=%d now=%d\n",
+                            fg_sid,
+                            fg_prev,
+                            vprocPid(vp));
+                }
+            } else if (vprocTestDebugEnabled()) {
+                fprintf(stderr,
+                        "[vproc-test] readpass_vproc fg skip sid=%d prev=%d\n",
+                        fg_sid,
+                        fg_prev);
+            }
+        }
     }
 
     VprocTestReadPassChildCtx ctx = {
@@ -1030,50 +1125,69 @@ static VprocTestResult vprocTestReadPassVproc(const char *payload, const char **
         .seen_len = 0
     };
     pthread_t thread = 0;
-    bool thread_started = (vprocSpawnThread(vp, vprocTestReadPassChild, &ctx, &thread) == 0);
+    VprocTestReadPassThreadCtx thread_ctx = {
+        .vp = vp,
+        .child = &ctx,
+        .shell_pid = vprocGetShellSelfPid(),
+        .kernel_pid = vprocGetKernelPid()
+    };
+    int thread_rc = vprocHostPthreadCreate(&thread, NULL, vprocTestReadPassThreadMain, &thread_ctx);
+    bool thread_started = (thread_rc == 0);
+    if (vprocTestDebugEnabled()) {
+        fprintf(stderr,
+                "[vproc-test] readpass_vproc thread rc=%d started=%d\n",
+                thread_rc,
+                (int)thread_started);
+    }
 
-    VprocTestInjectCtx *write_ctx = (VprocTestInjectCtx *)calloc(1, sizeof(VprocTestInjectCtx));
-    pthread_t writer = 0;
-    bool writer_started = false;
-    if (write_ctx) {
-        write_ctx->payload = payload;
-        write_ctx->len = ctx.payload_len;
-        write_ctx->delay_ms = 50;
-        if (vprocHostPthreadCreate(&writer, NULL, vprocTestInjectInput, write_ctx) == 0) {
-            writer_started = true;
-        } else {
-            vprocTestInjectInput(write_ctx);
-        }
-    } else {
-        VprocTestInjectCtx fallback = {
-            .payload = payload,
-            .len = ctx.payload_len,
-            .delay_ms = 0
-        };
-        vprocTestInjectInput(&fallback);
+    VprocTestInjectCtx inject_ctx = {
+        .payload = payload,
+        .len = ctx.payload_len,
+        .delay_ms = 50,
+        .ok = false
+    };
+    vprocTestInjectInput(&inject_ctx);
+    if (vprocTestDebugEnabled()) {
+        fprintf(stderr,
+                "[vproc-test] readpass_vproc injected ok=%d\n",
+                (int)inject_ctx.ok);
     }
 
     if (!thread_started) {
+        vprocActivate(vp);
+        vprocRegisterThread(vp, pthread_self());
         vprocTestReadPassChild(&ctx);
+        vprocUnregisterThread(vp, pthread_self());
+        vprocDeactivate();
     }
-    if (writer_started) {
-        pthread_join(writer, NULL);
-    }
-    if (write_ctx) {
-        if (!write_ctx->ok && ctx.ok) {
-            ctx.ok = false;
-            ctx.err = EIO;
-        }
-        free(write_ctx);
+    if (!inject_ctx.ok && ctx.ok) {
+        ctx.ok = false;
+        ctx.err = EIO;
     }
 
     if (thread_started) {
         pthread_join(thread, NULL);
     }
+    if (fg_sid > 0 && fg_prev > 0) {
+        (void)vprocSetForegroundPgid(fg_sid, fg_prev);
+        if (vprocTestDebugEnabled()) {
+            fprintf(stderr,
+                    "[vproc-test] readpass_vproc fg restore sid=%d pgid=%d\n",
+                    fg_sid,
+                    fg_prev);
+        }
+    }
     vprocDestroy(vp);
     vprocTestSessionClearInput(session);
 
     if (!ctx.ok) {
+        if (vprocTestDebugEnabled()) {
+            fprintf(stderr,
+                    "[vproc-test] readpass_vproc err=%d seen_len=%zu seen=\"%s\"\n",
+                    ctx.err,
+                    ctx.seen_len,
+                    ctx.seen);
+        }
         if (detail) {
             *detail = (ctx.err == EINVAL) ? "mismatch" : "read failed";
         }
@@ -1094,6 +1208,15 @@ int smallclueVprocTestCommand(int argc, char **argv) {
     fprintf(stderr, "vproc-test: only available on iOS/iPadOS builds.\n");
     return 1;
 #else
+    gVprocTestDebug = (getenv("PSCALI_TOOL_DEBUG") != NULL);
+    if (vprocTestDebugEnabled()) {
+#ifdef PROGRAM_VERSION
+        fprintf(stderr, "[vproc-test] build=%s\n", PROGRAM_VERSION);
+#else
+        fprintf(stderr, "[vproc-test] build=unknown\n");
+#endif
+        fprintf(stderr, "[vproc-test] marker=%s %s\n", __DATE__, __TIME__);
+    }
     if (argc > 1 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
         fprintf(stderr,
                 "vproc-test [--help]\n"

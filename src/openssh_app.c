@@ -17,6 +17,7 @@
 #include "pscal_openssh_hooks.h"
 #if defined(PSCAL_TARGET_IOS)
 #include "ios/vproc.h"
+#include "ios/tty/pscal_pty.h"
 #if defined(__has_include)
 #  if __has_include("PSCALRuntime.h")
 #    include "PSCALRuntime.h"
@@ -26,6 +27,7 @@ extern int PSCALRuntimePushExitOverride(jmp_buf *buffer) __attribute__((weak_imp
 extern void PSCALRuntimePopExitOverride(void) __attribute__((weak_import));
 extern int PSCALRuntimePushExitOverrideWithStatus(jmp_buf *buffer, volatile int *status_out) __attribute__((weak_import));
 extern void PSCALRuntimePopExitOverrideWithStatus(void) __attribute__((weak_import));
+extern void PSCALRuntimeInterposeBootstrap(void) __attribute__((weak_import));
 #  endif
 #elif defined(__APPLE__)
 extern jmp_buf *PSCALRuntimeSwapExitJumpBuffer(jmp_buf *buffer) __attribute__((weak_import));
@@ -33,12 +35,14 @@ extern int PSCALRuntimePushExitOverride(jmp_buf *buffer) __attribute__((weak_imp
 extern void PSCALRuntimePopExitOverride(void) __attribute__((weak_import));
 extern int PSCALRuntimePushExitOverrideWithStatus(jmp_buf *buffer, volatile int *status_out) __attribute__((weak_import));
 extern void PSCALRuntimePopExitOverrideWithStatus(void) __attribute__((weak_import));
+extern void PSCALRuntimeInterposeBootstrap(void) __attribute__((weak_import));
 #else
 extern jmp_buf *PSCALRuntimeSwapExitJumpBuffer(jmp_buf *buffer) __attribute__((weak));
 extern int PSCALRuntimePushExitOverride(jmp_buf *buffer) __attribute__((weak));
 extern void PSCALRuntimePopExitOverride(void) __attribute__((weak));
 extern int PSCALRuntimePushExitOverrideWithStatus(jmp_buf *buffer, volatile int *status_out) __attribute__((weak));
 extern void PSCALRuntimePopExitOverrideWithStatus(void) __attribute__((weak));
+extern void PSCALRuntimeInterposeBootstrap(void) __attribute__((weak));
 #endif
 /* Provide a weak fallback so standalone smallclue builds without the runtime
  * bridge still link cleanly on iOS. The real runtime implementation overrides
@@ -65,6 +69,26 @@ int PSCALRuntimePushExitOverrideWithStatus(jmp_buf *buffer, volatile int *status
 __attribute__((weak))
 void PSCALRuntimePopExitOverrideWithStatus(void) {
 }
+
+__attribute__((weak))
+void PSCALRuntimeInterposeBootstrap(void) {
+}
+#endif
+
+#if defined(PSCAL_TARGET_IOS)
+__attribute__((weak))
+int pscalRuntimeOpenSshSession(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    errno = ENOSYS;
+    return -1;
+}
+
+__attribute__((weak))
+void pscalRuntimeSshSessionExited(uint64_t session_id, int status) {
+    (void)session_id;
+    (void)status;
+}
 #endif
 
 int pscal_openssh_ssh_main(int argc, char **argv);
@@ -78,6 +102,9 @@ __attribute__((weak)) void PSCALRuntimeSetDebugLogMirroring(int enable) { (void)
 void PSCALRuntimeBeginScriptCapture(const char *path, int append) __attribute__((weak));
 void PSCALRuntimeEndScriptCapture(void) __attribute__((weak));
 int PSCALRuntimeScriptCaptureActive(void) __attribute__((weak));
+#if defined(PSCAL_TARGET_IOS)
+int pscalRuntimeOpenSshSession(int argc, char **argv) __attribute__((weak));
+#endif
 
 volatile sig_atomic_t g_smallclue_openssh_exit_requested = 0;
 static sigjmp_buf g_smallclue_openssh_fallback_env;
@@ -488,17 +515,34 @@ static int smallclueInvokeOpensshEntry(const char *label, int (*entry)(int, char
         fprintf(stderr, "%s: command unavailable\n", label ? label : "ssh");
         return 127;
     }
+#if defined(PSCAL_TARGET_IOS)
+    bool mirror_debug = false;
+    const char *tool_debug = getenv("PSCALI_TOOL_DEBUG");
+    const char *ssh_debug = getenv("PSCALI_SSH_DEBUG");
+    if ((tool_debug && *tool_debug && strcmp(tool_debug, "0") != 0) ||
+        (ssh_debug && *ssh_debug && strcmp(ssh_debug, "0") != 0)) {
+        mirror_debug = true;
+    }
+#endif
     pscal_openssh_exit_context exitContext;
     pscal_openssh_reset_progress_state();
     pscal_openssh_push_exit_context(&exitContext);
-    PSCALRuntimeSetDebugLogMirroring(1);
+#if defined(PSCAL_TARGET_IOS)
+    if (mirror_debug) {
+        PSCALRuntimeSetDebugLogMirroring(1);
+    }
+#endif
     int status;
     if (sigsetjmp(exitContext.env, 0) == 0) {
         status = entry(argc, argv);
     } else {
         status = exitContext.exit_code;
     }
-    PSCALRuntimeSetDebugLogMirroring(0);
+#if defined(PSCAL_TARGET_IOS)
+    if (mirror_debug) {
+        PSCALRuntimeSetDebugLogMirroring(0);
+    }
+#endif
     pscal_openssh_pop_exit_context(&exitContext);
     return status;
 }
@@ -607,6 +651,258 @@ static int smallclueRunOpensshEntry(const char *label, int (*entry)(int, char **
     pthread_join(thread, &thread_ret);
     return (int)(intptr_t)thread_ret;
 }
+
+extern void pscalRuntimeSshSessionExited(uint64_t session_id, int status) __attribute__((weak));
+
+typedef struct {
+    int argc;
+    char **argv;
+    int bridge_in_fd;
+    int bridge_out_fd;
+    struct pscal_fd *pty_master;
+    struct pscal_fd *pty_slave;
+    uint64_t session_id;
+} smallclueSshSessionContext;
+
+static void smallclueSshSessionNotifyExit(uint64_t session_id, int status) {
+    if (pscalRuntimeSshSessionExited) {
+        pscalRuntimeSshSessionExited(session_id, status);
+    }
+}
+
+static void smallclueCloseSessionFds(smallclueSshSessionContext *ctx) {
+    if (!ctx) {
+        return;
+    }
+    int bridge_in = ctx->bridge_in_fd;
+    int bridge_out = ctx->bridge_out_fd;
+    ctx->bridge_in_fd = -1;
+    ctx->bridge_out_fd = -1;
+    if (bridge_in >= 0) {
+        close(bridge_in);
+    }
+    if (bridge_out >= 0 && bridge_out != bridge_in) {
+        close(bridge_out);
+    }
+    if (ctx->pty_master) {
+        pscal_fd_close(ctx->pty_master);
+        ctx->pty_master = NULL;
+    }
+    if (ctx->pty_slave) {
+        pscal_fd_close(ctx->pty_slave);
+        ctx->pty_slave = NULL;
+    }
+}
+
+static bool smallclueDirectPtyOutputEnabled(void) {
+    const char *env = getenv("PSCALI_PTY_OUTPUT_DIRECT");
+    if (!env || env[0] == '\0') {
+        return true;
+    }
+    return strcmp(env, "0") != 0;
+}
+
+static void *smallclueRunSshSessionThread(void *arg) {
+    smallclueSshSessionContext *ctx = (smallclueSshSessionContext *)arg;
+    if (!ctx) {
+        return NULL;
+    }
+    int status = 255;
+    int kernel_pid = vprocEnsureKernelPid();
+    VProcSessionStdio *session_stdio = vprocSessionStdioCreate();
+    if (!session_stdio) {
+        smallclueCloseSessionFds(ctx);
+        smallclueSshSessionNotifyExit(ctx->session_id, status);
+        smallclueFreeArgv(ctx->argv, ctx->argc);
+        free(ctx);
+        return NULL;
+    }
+    if (vprocSessionStdioInitWithPty(session_stdio,
+                                     ctx->pty_slave,
+                                     ctx->pty_master,
+                                     ctx->bridge_in_fd,
+                                     ctx->bridge_out_fd,
+                                     ctx->session_id,
+                                     kernel_pid) != 0) {
+        vprocSessionStdioDestroy(session_stdio);
+        smallclueCloseSessionFds(ctx);
+        smallclueSshSessionNotifyExit(ctx->session_id, status);
+        smallclueFreeArgv(ctx->argv, ctx->argc);
+        free(ctx);
+        return NULL;
+    }
+    vprocSessionStdioActivate(session_stdio);
+    ctx->pty_slave = NULL;
+    ctx->pty_master = NULL;
+    ctx->bridge_in_fd = -1;
+    ctx->bridge_out_fd = -1;
+
+    VProcOptions opts = vprocDefaultOptions();
+    bool use_pscal_stdio = session_stdio && session_stdio->stdin_pscal_fd;
+    opts.stdin_fd = use_pscal_stdio ? -2 : session_stdio->stdin_host_fd;
+    opts.stdout_fd = use_pscal_stdio ? -2 : session_stdio->stdout_host_fd;
+    opts.stderr_fd = use_pscal_stdio ? -2 : session_stdio->stderr_host_fd;
+    opts.pid_hint = vprocReservePid();
+    VProc *vp = vprocCreate(&opts);
+    if (vp) {
+        if (!session_stdio) {
+            smallclueCloseSessionFds(ctx);
+        }
+        vprocActivate(vp);
+        if (use_pscal_stdio) {
+            (void)vprocAdoptPscalStdio(vp,
+                                       session_stdio->stdin_pscal_fd,
+                                       session_stdio->stdout_pscal_fd,
+                                       session_stdio->stderr_pscal_fd);
+        }
+        vprocRegisterThread(vp, pthread_self());
+        int pid = vprocPid(vp);
+        if (kernel_pid > 0 && kernel_pid != pid) {
+            vprocSetParent(pid, kernel_pid);
+        }
+        (void)vprocSetSid(pid, pid);
+        (void)vprocSetPgid(pid, pid);
+        (void)vprocSetForegroundPgid(pid, pid);
+        vprocSetCommandLabel(pid, (ctx->argv && ctx->argv[0]) ? ctx->argv[0] : "ssh");
+    } else {
+        status = 255;
+        if (getenv("PSCALI_TOOL_DEBUG")) {
+            fprintf(stderr, "[ssh-session] vproc create failed\n");
+        }
+    }
+
+    if (vp) {
+        status = smallclueRunOpensshEntryOnce("ssh", pscal_openssh_ssh_main, ctx->argc, ctx->argv);
+    }
+
+    if (vp) {
+        vprocUnregisterThread(vp, pthread_self());
+        vprocDeactivate();
+        vprocMarkExit(vp, status);
+        vprocDestroy(vp);
+    }
+
+    if (session_stdio) {
+        vprocSessionStdioActivate(NULL);
+        vprocSessionStdioDestroy(session_stdio);
+    }
+
+    smallclueSshSessionNotifyExit(ctx->session_id, status);
+    smallclueFreeArgv(ctx->argv, ctx->argc);
+    free(ctx);
+    return NULL;
+}
+
+int PSCALRuntimeCreateSshSession(int argc,
+                                 char **argv,
+                                 uint64_t session_id,
+                                 int *out_read_fd,
+                                 int *out_write_fd) {
+    if (argc <= 0 || !argv) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!out_read_fd || !out_write_fd) {
+        errno = EINVAL;
+        return -1;
+    }
+    *out_read_fd = -1;
+    *out_write_fd = -1;
+
+    PSCALRuntimeInterposeBootstrap();
+    (void)vprocEnsureKernelPid();
+
+    int session_stdin = -1;
+    int session_stdout = -1;
+    int ui_read = -1;
+    int ui_write = -1;
+    const bool direct_output = smallclueDirectPtyOutputEnabled();
+    if (!direct_output) {
+        if (vprocCreateSessionPipes(&session_stdin, &session_stdout, &ui_read, &ui_write) != 0) {
+            return -1;
+        }
+    }
+    struct pscal_fd *pty_master = NULL;
+    struct pscal_fd *pty_slave = NULL;
+    int pty_num = -1;
+    int pty_err = pscalPtyOpenMaster(O_RDWR, &pty_master, &pty_num);
+    if (pty_err < 0) {
+        if (session_stdin >= 0) close(session_stdin);
+        if (session_stdout >= 0) close(session_stdout);
+        if (ui_read >= 0) close(ui_read);
+        if (ui_write >= 0) close(ui_write);
+        errno = pscalCompatErrno(pty_err);
+        return -1;
+    }
+    pty_err = pscalPtyUnlock(pty_master);
+    if (pty_err < 0) {
+        if (session_stdin >= 0) close(session_stdin);
+        if (session_stdout >= 0) close(session_stdout);
+        if (ui_read >= 0) close(ui_read);
+        if (ui_write >= 0) close(ui_write);
+        if (pty_master) pscal_fd_close(pty_master);
+        errno = pscalCompatErrno(pty_err);
+        return -1;
+    }
+    pty_err = pscalPtyOpenSlave(pty_num, O_RDWR, &pty_slave);
+    if (pty_err < 0) {
+        if (session_stdin >= 0) close(session_stdin);
+        if (session_stdout >= 0) close(session_stdout);
+        if (ui_read >= 0) close(ui_read);
+        if (ui_write >= 0) close(ui_write);
+        if (pty_master) pscal_fd_close(pty_master);
+        errno = pscalCompatErrno(pty_err);
+        return -1;
+    }
+
+    smallclueSshSessionContext *ctx = (smallclueSshSessionContext *)calloc(1, sizeof(smallclueSshSessionContext));
+    if (!ctx) {
+        errno = ENOMEM;
+        if (session_stdin >= 0) close(session_stdin);
+        if (session_stdout >= 0) close(session_stdout);
+        if (ui_read >= 0) close(ui_read);
+        if (ui_write >= 0) close(ui_write);
+        if (pty_master) pscal_fd_close(pty_master);
+        if (pty_slave) pscal_fd_close(pty_slave);
+        return -1;
+    }
+    ctx->argc = argc;
+    ctx->bridge_in_fd = session_stdin;
+    ctx->bridge_out_fd = session_stdout;
+    ctx->pty_master = pty_master;
+    ctx->pty_slave = pty_slave;
+    ctx->session_id = session_id;
+    ctx->argv = (char **)calloc((size_t)argc, sizeof(char *));
+    if (!ctx->argv) {
+        smallclueCloseSessionFds(ctx);
+        free(ctx);
+        errno = ENOMEM;
+        return -1;
+    }
+    for (int i = 0; i < argc; ++i) {
+        ctx->argv[i] = smallclueDupString(argv[i]);
+        if (!ctx->argv[i]) {
+            smallclueFreeArgv(ctx->argv, i);
+            free(ctx);
+            errno = ENOMEM;
+            return -1;
+        }
+    }
+
+    pthread_t thread;
+    int err = vprocHostPthreadCreate(&thread, NULL, smallclueRunSshSessionThread, ctx);
+    if (err != 0) {
+        smallclueFreeArgv(ctx->argv, ctx->argc);
+        smallclueCloseSessionFds(ctx);
+        free(ctx);
+        errno = err;
+        return -1;
+    }
+    pthread_detach(thread);
+    *out_read_fd = ui_read;
+    *out_write_fd = ui_write;
+    return 0;
+}
 #else
 static int smallclueRunOpensshEntry(const char *label, int (*entry)(int, char **),
                                     int argc, char **argv) {
@@ -672,9 +968,24 @@ int smallclueRunSsh(int argc, char **argv) {
 
     int expanded_count = 0;
     char **expanded = smallclueExpandSshArgs(count, augmented, &expanded_count);
-    int status = smallclueRunOpensshEntry("ssh", pscal_openssh_ssh_main,
-                                          expanded ? expanded_count : count,
-                                          expanded ? expanded : augmented);
+    int status = 255;
+#if defined(PSCAL_TARGET_IOS)
+    if (pscalRuntimeOpenSshSession) {
+        int rc = pscalRuntimeOpenSshSession(expanded ? expanded_count : count,
+                                            expanded ? expanded : augmented);
+        if (rc == 0) {
+            status = 0;
+            goto smallclue_ssh_done;
+        }
+        fprintf(stderr, "ssh: unable to open SSH tab\n");
+        status = 1;
+        goto smallclue_ssh_done;
+    }
+#endif
+    status = smallclueRunOpensshEntry("ssh", pscal_openssh_ssh_main,
+                                      expanded ? expanded_count : count,
+                                      expanded ? expanded : augmented);
+smallclue_ssh_done:
     if (expanded) {
         smallclueFreeArgv(expanded, expanded_count);
     }
@@ -746,5 +1057,16 @@ int smallclueRunSftp(int argc, char **argv) {
 }
 
 int smallclueRunSshKeygen(int argc, char **argv) {
-    return smallclueRunOpensshEntry("ssh-keygen", pscal_openssh_ssh_keygen_main, argc, argv);
+    smallclueEnsureWritableHomeSsh();
+    char *saved_home = NULL;
+    char *saved_pscali_home = NULL;
+    bool restore_home = smallclueApplyVirtualHome(&saved_home, &saved_pscali_home);
+    int status = smallclueRunOpensshEntry("ssh-keygen", pscal_openssh_ssh_keygen_main, argc, argv);
+    if (restore_home) {
+        smallclueRestoreEnv("HOME", saved_home);
+        smallclueRestoreEnv("PSCALI_HOME", saved_pscali_home);
+    }
+    free(saved_home);
+    free(saved_pscali_home);
+    return status;
 }

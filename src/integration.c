@@ -164,9 +164,9 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
         char label[96];
         smallclueFormatLabel(argc, argv, label, sizeof(label));
         if (label[0]) {
-            vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, label, false, false);
+            vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, label, false, true);
         } else {
-            vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, applet->name, false, false);
+            vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, applet->name, false, true);
         }
 
         jmp_buf exit_env;
@@ -290,6 +290,7 @@ DEFINE_SMALLCLUE_WRAPPER("telnet", telnet)
 DEFINE_SMALLCLUE_WRAPPER("traceroute", traceroute)
 DEFINE_SMALLCLUE_WRAPPER("nslookup", nslookup)
 DEFINE_SMALLCLUE_WRAPPER("host", host)
+DEFINE_SMALLCLUE_WRAPPER("addt", addt)
 DEFINE_SMALLCLUE_WRAPPER("dmesg", dmesg)
 DEFINE_SMALLCLUE_WRAPPER("licenses", licenses)
 #endif
@@ -394,6 +395,7 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("script", vmBuiltinSmallclue_script, "script");
     registerSmallclueBuiltin("nextvi", vmBuiltinSmallclue_nextvi, "nextvi");
     registerSmallclueBuiltin("vi", vmBuiltinSmallclue_nextvi, "vi");
+    registerSmallclueBuiltin("addt", vmBuiltinSmallclue_addt, "addt");
     registerSmallclueBuiltin("dmesg", vmBuiltinSmallclue_dmesg, "dmesg");
     registerSmallclueBuiltin("licenses", vmBuiltinSmallclue_licenses, "licenses");
     registerSmallclueBuiltin("vproc-test", vmBuiltinSmallclue_vproc_test, "vproc-test");
