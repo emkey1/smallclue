@@ -28,6 +28,8 @@ extern void PSCALRuntimePopExitOverride(void) __attribute__((weak_import));
 extern int PSCALRuntimePushExitOverrideWithStatus(jmp_buf *buffer, volatile int *status_out) __attribute__((weak_import));
 extern void PSCALRuntimePopExitOverrideWithStatus(void) __attribute__((weak_import));
 extern void PSCALRuntimeInterposeBootstrap(void) __attribute__((weak_import));
+extern void PSCALRuntimeRegisterSessionContext(uint64_t session_id) __attribute__((weak_import));
+extern void PSCALRuntimeUnregisterSessionContext(uint64_t session_id) __attribute__((weak_import));
 #  endif
 #elif defined(__APPLE__)
 extern jmp_buf *PSCALRuntimeSwapExitJumpBuffer(jmp_buf *buffer) __attribute__((weak_import));
@@ -36,6 +38,8 @@ extern void PSCALRuntimePopExitOverride(void) __attribute__((weak_import));
 extern int PSCALRuntimePushExitOverrideWithStatus(jmp_buf *buffer, volatile int *status_out) __attribute__((weak_import));
 extern void PSCALRuntimePopExitOverrideWithStatus(void) __attribute__((weak_import));
 extern void PSCALRuntimeInterposeBootstrap(void) __attribute__((weak_import));
+extern void PSCALRuntimeRegisterSessionContext(uint64_t session_id) __attribute__((weak_import));
+extern void PSCALRuntimeUnregisterSessionContext(uint64_t session_id) __attribute__((weak_import));
 #else
 extern jmp_buf *PSCALRuntimeSwapExitJumpBuffer(jmp_buf *buffer) __attribute__((weak));
 extern int PSCALRuntimePushExitOverride(jmp_buf *buffer) __attribute__((weak));
@@ -43,6 +47,8 @@ extern void PSCALRuntimePopExitOverride(void) __attribute__((weak));
 extern int PSCALRuntimePushExitOverrideWithStatus(jmp_buf *buffer, volatile int *status_out) __attribute__((weak));
 extern void PSCALRuntimePopExitOverrideWithStatus(void) __attribute__((weak));
 extern void PSCALRuntimeInterposeBootstrap(void) __attribute__((weak));
+extern void PSCALRuntimeRegisterSessionContext(uint64_t session_id) __attribute__((weak));
+extern void PSCALRuntimeUnregisterSessionContext(uint64_t session_id) __attribute__((weak));
 #endif
 /* Provide a weak fallback so standalone smallclue builds without the runtime
  * bridge still link cleanly on iOS. The real runtime implementation overrides
@@ -72,6 +78,16 @@ void PSCALRuntimePopExitOverrideWithStatus(void) {
 
 __attribute__((weak))
 void PSCALRuntimeInterposeBootstrap(void) {
+}
+
+__attribute__((weak))
+void PSCALRuntimeRegisterSessionContext(uint64_t session_id) {
+    (void)session_id;
+}
+
+__attribute__((weak))
+void PSCALRuntimeUnregisterSessionContext(uint64_t session_id) {
+    (void)session_id;
 }
 #endif
 
@@ -889,9 +905,16 @@ int PSCALRuntimeCreateSshSession(int argc,
         }
     }
 
+    if (PSCALRuntimeRegisterSessionContext) {
+        PSCALRuntimeRegisterSessionContext(session_id);
+    }
+
     pthread_t thread;
     int err = vprocHostPthreadCreate(&thread, NULL, smallclueRunSshSessionThread, ctx);
     if (err != 0) {
+        if (PSCALRuntimeUnregisterSessionContext) {
+            PSCALRuntimeUnregisterSessionContext(session_id);
+        }
         smallclueFreeArgv(ctx->argv, ctx->argc);
         smallclueCloseSessionFds(ctx);
         free(ctx);
