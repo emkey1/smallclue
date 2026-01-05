@@ -673,8 +673,6 @@ extern void pscalRuntimeSshSessionExited(uint64_t session_id, int status) __attr
 typedef struct {
     int argc;
     char **argv;
-    int bridge_in_fd;
-    int bridge_out_fd;
     struct pscal_fd *pty_master;
     struct pscal_fd *pty_slave;
     uint64_t session_id;
@@ -690,16 +688,6 @@ static void smallclueCloseSessionFds(smallclueSshSessionContext *ctx) {
     if (!ctx) {
         return;
     }
-    int bridge_in = ctx->bridge_in_fd;
-    int bridge_out = ctx->bridge_out_fd;
-    ctx->bridge_in_fd = -1;
-    ctx->bridge_out_fd = -1;
-    if (bridge_in >= 0) {
-        close(bridge_in);
-    }
-    if (bridge_out >= 0 && bridge_out != bridge_in) {
-        close(bridge_out);
-    }
     if (ctx->pty_master) {
         pscal_fd_close(ctx->pty_master);
         ctx->pty_master = NULL;
@@ -708,14 +696,6 @@ static void smallclueCloseSessionFds(smallclueSshSessionContext *ctx) {
         pscal_fd_close(ctx->pty_slave);
         ctx->pty_slave = NULL;
     }
-}
-
-static bool smallclueDirectPtyOutputEnabled(void) {
-    const char *env = getenv("PSCALI_PTY_OUTPUT_DIRECT");
-    if (!env || env[0] == '\0') {
-        return true;
-    }
-    return strcmp(env, "0") != 0;
 }
 
 static void *smallclueRunSshSessionThread(void *arg) {
@@ -736,8 +716,6 @@ static void *smallclueRunSshSessionThread(void *arg) {
     if (vprocSessionStdioInitWithPty(session_stdio,
                                      ctx->pty_slave,
                                      ctx->pty_master,
-                                     ctx->bridge_in_fd,
-                                     ctx->bridge_out_fd,
                                      ctx->session_id,
                                      kernel_pid) != 0) {
         vprocSessionStdioDestroy(session_stdio);
@@ -750,8 +728,6 @@ static void *smallclueRunSshSessionThread(void *arg) {
     vprocSessionStdioActivate(session_stdio);
     ctx->pty_slave = NULL;
     ctx->pty_master = NULL;
-    ctx->bridge_in_fd = -1;
-    ctx->bridge_out_fd = -1;
 
     VProcOptions opts = vprocDefaultOptions();
     bool use_pscal_stdio = session_stdio && session_stdio->stdin_pscal_fd;
@@ -828,44 +804,22 @@ int PSCALRuntimeCreateSshSession(int argc,
     PSCALRuntimeInterposeBootstrap();
     (void)vprocEnsureKernelPid();
 
-    int session_stdin = -1;
-    int session_stdout = -1;
-    int ui_read = -1;
-    int ui_write = -1;
-    const bool direct_output = smallclueDirectPtyOutputEnabled();
-    if (!direct_output) {
-        if (vprocCreateSessionPipes(&session_stdin, &session_stdout, &ui_read, &ui_write) != 0) {
-            return -1;
-        }
-    }
     struct pscal_fd *pty_master = NULL;
     struct pscal_fd *pty_slave = NULL;
     int pty_num = -1;
     int pty_err = pscalPtyOpenMaster(O_RDWR, &pty_master, &pty_num);
     if (pty_err < 0) {
-        if (session_stdin >= 0) close(session_stdin);
-        if (session_stdout >= 0) close(session_stdout);
-        if (ui_read >= 0) close(ui_read);
-        if (ui_write >= 0) close(ui_write);
         errno = pscalCompatErrno(pty_err);
         return -1;
     }
     pty_err = pscalPtyUnlock(pty_master);
     if (pty_err < 0) {
-        if (session_stdin >= 0) close(session_stdin);
-        if (session_stdout >= 0) close(session_stdout);
-        if (ui_read >= 0) close(ui_read);
-        if (ui_write >= 0) close(ui_write);
         if (pty_master) pscal_fd_close(pty_master);
         errno = pscalCompatErrno(pty_err);
         return -1;
     }
     pty_err = pscalPtyOpenSlave(pty_num, O_RDWR, &pty_slave);
     if (pty_err < 0) {
-        if (session_stdin >= 0) close(session_stdin);
-        if (session_stdout >= 0) close(session_stdout);
-        if (ui_read >= 0) close(ui_read);
-        if (ui_write >= 0) close(ui_write);
         if (pty_master) pscal_fd_close(pty_master);
         errno = pscalCompatErrno(pty_err);
         return -1;
@@ -874,17 +828,11 @@ int PSCALRuntimeCreateSshSession(int argc,
     smallclueSshSessionContext *ctx = (smallclueSshSessionContext *)calloc(1, sizeof(smallclueSshSessionContext));
     if (!ctx) {
         errno = ENOMEM;
-        if (session_stdin >= 0) close(session_stdin);
-        if (session_stdout >= 0) close(session_stdout);
-        if (ui_read >= 0) close(ui_read);
-        if (ui_write >= 0) close(ui_write);
         if (pty_master) pscal_fd_close(pty_master);
         if (pty_slave) pscal_fd_close(pty_slave);
         return -1;
     }
     ctx->argc = argc;
-    ctx->bridge_in_fd = session_stdin;
-    ctx->bridge_out_fd = session_stdout;
     ctx->pty_master = pty_master;
     ctx->pty_slave = pty_slave;
     ctx->session_id = session_id;
@@ -922,8 +870,6 @@ int PSCALRuntimeCreateSshSession(int argc,
         return -1;
     }
     pthread_detach(thread);
-    *out_read_fd = ui_read;
-    *out_write_fd = ui_write;
     return 0;
 }
 #else
