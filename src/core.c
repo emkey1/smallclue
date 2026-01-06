@@ -338,6 +338,10 @@ static int smallclueXargsCommand(int argc, char **argv);
 static int smallcluePsCommand(int argc, char **argv);
 static int smallclueKillCommand(int argc, char **argv);
 static int smallclueMkdirCommand(int argc, char **argv);
+static void smallclueEmitTerminalSane(void);
+#if defined(PSCAL_TARGET_IOS)
+static bool smallclueSessionPtyName(char *buf, size_t buf_len);
+#endif
 static int smallclueRmdirCommand(int argc, char **argv);
 static int smallclueLnCommand(int argc, char **argv);
 static int smallclueTypeCommand(int argc, char **argv);
@@ -1913,7 +1917,7 @@ static int pagerTestInputNext(void) {
     return ch;
 }
 
-static int pager_control_fd_value = -2;
+static _Thread_local int pager_control_fd_value = -2;
 
 // Duplicate an FD for pager control input only if it can be read from.
 static int pagerDupForRead(int fd) {
@@ -1947,7 +1951,40 @@ static int pager_control_fd(void) {
         pagerDebugLogf("[pager] open /dev/tty fd=%d err=%d (%s)",
                        fd, err, (fd < 0) ? strerror(err) : "ok");
     }
-    if (fd < 0 && pscalRuntimeStdoutIsInteractive()) {
+#if defined(PSCAL_TARGET_IOS)
+    if (fd >= 0 && !pscalRuntimeFdIsInteractive(fd)) {
+        if (pagerDebugEnabled()) {
+            pagerDebugLogf("[pager] /dev/tty not interactive, closing fd=%d", fd);
+        }
+        close(fd);
+        fd = -1;
+    }
+    if (fd < 0) {
+        char session_tty[64];
+        if (smallclueSessionPtyName(session_tty, sizeof(session_tty))) {
+            fd = open(session_tty, O_RDONLY | O_CLOEXEC);
+            if (pagerDebugEnabled()) {
+                int err = (fd < 0) ? errno : 0;
+                pagerDebugLogf("[pager] open session tty %s fd=%d err=%d (%s)",
+                               session_tty,
+                               fd,
+                               err,
+                               (fd < 0) ? strerror(err) : "ok");
+            }
+            if (fd >= 0 && !pscalRuntimeFdIsInteractive(fd)) {
+                if (pagerDebugEnabled()) {
+                    pagerDebugLogf("[pager] session tty not interactive, closing fd=%d", fd);
+                }
+                close(fd);
+                fd = -1;
+            }
+        }
+    }
+    bool try_stdout = true;
+#else
+    bool try_stdout = pscalRuntimeStdoutIsInteractive();
+#endif
+    if (fd < 0 && try_stdout) {
         const char *tty = ttyname(STDOUT_FILENO);
         if (pagerDebugEnabled()) {
             pagerDebugLogf("[pager] ttyname(stdout)=%s", tty ? tty : "(null)");
@@ -1969,7 +2006,19 @@ static int pager_control_fd(void) {
             }
         }
     }
-    if (fd < 0 && pscalRuntimeStdinIsInteractive()) {
+#if defined(PSCAL_TARGET_IOS)
+    if (fd >= 0 && !pscalRuntimeFdIsInteractive(fd)) {
+        if (pagerDebugEnabled()) {
+            pagerDebugLogf("[pager] stdout fallback not interactive, closing fd=%d", fd);
+        }
+        close(fd);
+        fd = -1;
+    }
+    bool try_stdin = true;
+#else
+    bool try_stdin = pscalRuntimeStdinIsInteractive();
+#endif
+    if (fd < 0 && try_stdin) {
         const char *tty = ttyname(STDIN_FILENO);
         if (pagerDebugEnabled()) {
             pagerDebugLogf("[pager] ttyname(stdin)=%s", tty ? tty : "(null)");
@@ -1991,6 +2040,15 @@ static int pager_control_fd(void) {
             }
         }
     }
+#if defined(PSCAL_TARGET_IOS)
+    if (fd >= 0 && !pscalRuntimeFdIsInteractive(fd)) {
+        if (pagerDebugEnabled()) {
+            pagerDebugLogf("[pager] stdin fallback not interactive, closing fd=%d", fd);
+        }
+        close(fd);
+        fd = -1;
+    }
+#endif
     pager_control_fd_value = fd;
     if (pagerDebugEnabled()) {
         pagerDebugLogf("[pager] control fd resolved=%d", pager_control_fd_value);
@@ -4317,13 +4375,14 @@ typedef struct {
 } SmallclueLicense;
 
 static const SmallclueLicense kSmallclueLicenses[] = {
-    {"PSCAL", "/home/Docs/Licenses/pscal.txt"},
-    {"OpenSSH", "/home/Docs/Licenses/openssh.txt"},
-    {"curl", "/home/Docs/Licenses/curl.txt"},
-    {"OpenSSL", "/home/Docs/Licenses/openssl.txt"},
-    {"SDL2", "/home/Docs/Licenses/sdl2.txt"},
-    {"Nextvi", "/home/Docs/Licenses/nextvi.txt"},
-    {"yyjson", "/home/Docs/Licenses/yyjson.txt"},
+    {"PSCAL", "/home/Docs/Licenses/pscal_LICENSE.txt"},
+    {"OpenSSH", "/home/Docs/Licenses/openssh_LICENSE.txt"},
+    {"curl", "/home/Docs/Licenses/curl_LICENSE.txt"},
+    {"OpenSSL", "/home/Docs/Licenses/openssl_LICENSE.txt"},
+    {"SDL2", "/home/Docs/Licenses/sdl_LICENSE.txt"},
+    {"Nextvi", "/home/Docs/Licenses/nextvi_LICENSE.txt"},
+    {"yyjson", "/home/Docs/Licenses/yyjson_LICENSE.txt"},
+    {"hterm", "/home/Docs/Licenses/hterm_LICENSE.txt"},
 };
 
 static size_t smallclueLicensesCount(void) {
@@ -4345,6 +4404,7 @@ static void smallclueLicensesRenderMenu(size_t selected) {
 static int smallclueLicensesCommand(int argc, char **argv) {
     (void)argc;
     (void)argv;
+    pager_control_fd_reset();
     size_t total = smallclueLicensesCount();
     if (total == 0) {
         fprintf(stderr, "licenses: no entries available\n");
@@ -4390,6 +4450,8 @@ static int smallclueLicensesCommand(int argc, char **argv) {
     }
     printf("\033[2J\033[H");
     fflush(stdout);
+    pager_control_fd_reset();
+    smallclueEmitTerminalSane();
     return 0;
 }
 
