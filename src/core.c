@@ -310,6 +310,7 @@ static int smallclueFindCommand(int argc, char **argv);
 static int smallclueTailCommand(int argc, char **argv);
 static int smallclueTouchCommand(int argc, char **argv);
 static int smallclueSttyCommand(int argc, char **argv);
+static int smallclueTsetCommand(int argc, char **argv);
 static int smallclueResizeCommand(int argc, char **argv);
 static int smallclueSortCommand(int argc, char **argv);
 static int smallclueUniqCommand(int argc, char **argv);
@@ -569,6 +570,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"tee", smallclueTeeCommand, "Copy stdin to files and stdout"},
     {"telnet", smallclueTelnetCommand, "Simple TCP telnet client"},
     {"test", smallclueTestCommand, "Evaluate expressions"},
+    {"tset", smallclueTsetCommand, "Initialize terminal settings"},
     {"touch", smallclueTouchCommand, "Update file timestamps"},
     {"traceroute", smallclueTracerouteCommand, "Trace network path to a host"},
     {"tr", smallclueTrCommand, "Translate or delete characters"},
@@ -733,6 +735,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                    "  Trace network path using the system traceroute command"},
     {"test", "test EXPRESSION\n"
              "  File: -f -d -e; String: = != -z; Int: -eq -ne -lt -le -gt -ge"},
+    {"tset", "tset [-IQqs] [-e CH] [-i CH] [-k CH] [-r] [TERM]\n"
+             "  Set TERM and initialize terminal\n"
+             "  -s emit shell commands\n"
+             "  -r report terminal type\n"
+             "  -Q quiet, -I skip init\n"
+             "  -e/-i/-k set erase/intr/kill chars"},
     {"touch", "touch FILE...\n"
               "  Update timestamps or create empty file"},
     {"tr", "tr SET1 SET2\n"
@@ -6378,6 +6386,266 @@ static void smallclueEmitTerminalReset(void) {
 static void smallclueEmitTerminalSane(void) {
     fputs("\x1b[0m\x1b[?7h\x1b[?25h", stdout); // reset attributes, enable wrap & cursor
     fflush(stdout);
+}
+
+static void smallcluePrintTsetUsage(FILE *out) {
+    if (!out) {
+        out = stderr;
+    }
+    fprintf(out,
+            "Usage: tset [-IQqs] [-e CH] [-i CH] [-k CH] [-r] [TERM]\n"
+            "  -s emit shell commands\n"
+            "  -r report terminal type\n"
+            "  -Q quiet, -I skip init\n"
+            "  -e/-i/-k set erase/intr/kill chars\n");
+}
+
+static bool smallclueParseControlValue(const char *text, cc_t *out) {
+    if (!text || !*text || !out) {
+        return false;
+    }
+    if (strcasecmp(text, "undef") == 0 || strcasecmp(text, "disable") == 0) {
+#ifdef _POSIX_VDISABLE
+        *out = _POSIX_VDISABLE;
+        return true;
+#else
+        return false;
+#endif
+    }
+    if (text[0] == '^' && text[1] != '\0') {
+        char c = text[1];
+        if (c == '?') {
+            *out = 127;
+            return true;
+        }
+        if (c >= 'a' && c <= 'z') {
+            c = (char)(c - 'a' + 'A');
+        }
+        *out = (cc_t)(c & 0x1f);
+        return true;
+    }
+    if (text[0] == '\\' && text[1] != '\0' && text[2] == '\0') {
+        switch (text[1]) {
+            case 'n':
+                *out = '\n';
+                return true;
+            case 'r':
+                *out = '\r';
+                return true;
+            case 't':
+                *out = '\t';
+                return true;
+            case 'b':
+                *out = '\b';
+                return true;
+            case 'e':
+                *out = 27;
+                return true;
+            case '0':
+                *out = '\0';
+                return true;
+            default:
+                break;
+        }
+    }
+    if (text[1] == '\0') {
+        *out = (unsigned char)text[0];
+        return true;
+    }
+    char *endptr = NULL;
+    long value = strtol(text, &endptr, 0);
+    if (endptr && *endptr == '\0' && value >= 0 && value <= 255) {
+        *out = (cc_t)value;
+        return true;
+    }
+    return false;
+}
+
+static int smallclueApplyTsetControlChars(bool quiet,
+                                          bool has_erase,
+                                          cc_t erase_char,
+                                          bool has_intr,
+                                          cc_t intr_char,
+                                          bool has_kill,
+                                          cc_t kill_char) {
+    if (!has_erase && !has_intr && !has_kill) {
+        return 0;
+    }
+    if (!pscalRuntimeStdinHasRealTTY()) {
+        if (!quiet) {
+            fprintf(stderr, "tset: stdin is not a tty (cannot set control chars)\n");
+        }
+        return 0;
+    }
+    struct termios tio;
+    if (smallclueTcgetattr(STDIN_FILENO, &tio) != 0) {
+        if (!quiet) {
+            perror("tset");
+        }
+        return 1;
+    }
+#ifdef VERASE
+    if (has_erase) {
+        tio.c_cc[VERASE] = erase_char;
+    }
+#else
+    if (has_erase && !quiet) {
+        fprintf(stderr, "tset: erase control not supported\n");
+    }
+#endif
+#ifdef VINTR
+    if (has_intr) {
+        tio.c_cc[VINTR] = intr_char;
+    }
+#else
+    if (has_intr && !quiet) {
+        fprintf(stderr, "tset: intr control not supported\n");
+    }
+#endif
+#ifdef VKILL
+    if (has_kill) {
+        tio.c_cc[VKILL] = kill_char;
+    }
+#else
+    if (has_kill && !quiet) {
+        fprintf(stderr, "tset: kill control not supported\n");
+    }
+#endif
+    if (smallclueTcsetattr(STDIN_FILENO, TCSANOW, &tio) != 0) {
+        if (!quiet) {
+            perror("tset");
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static int smallclueTsetCommand(int argc, char **argv) {
+    bool quiet = false;
+    bool emit_shell = false;
+    bool report = false;
+    bool do_init = true;
+    bool has_erase = false;
+    bool has_intr = false;
+    bool has_kill = false;
+    cc_t erase_char = 0;
+    cc_t intr_char = 0;
+    cc_t kill_char = 0;
+    const char *term_override = NULL;
+
+    for (int i = 1; i < argc; ++i) {
+        const char *arg = argv[i];
+        if (!arg || *arg == '\0') {
+            continue;
+        }
+        if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
+            smallcluePrintTsetUsage(stdout);
+            return 0;
+        }
+        if (strcmp(arg, "--") == 0) {
+            if (i + 1 < argc) {
+                term_override = argv[++i];
+                if (i + 1 < argc) {
+                    fprintf(stderr, "tset: unexpected argument '%s'\n", argv[i + 1]);
+                    return 1;
+                }
+            }
+            break;
+        }
+        if (arg[0] != '-' || arg[1] == '\0') {
+            if (!term_override) {
+                term_override = arg;
+                continue;
+            }
+            fprintf(stderr, "tset: unexpected argument '%s'\n", arg);
+            return 1;
+        }
+
+        size_t len = strlen(arg);
+        for (size_t pos = 1; pos < len; ++pos) {
+            char opt = arg[pos];
+            const char *value = NULL;
+            switch (opt) {
+                case 'Q':
+                case 'q':
+                    quiet = true;
+                    break;
+                case 's':
+                    emit_shell = true;
+                    break;
+                case 'r':
+                    report = true;
+                    break;
+                case 'I':
+                    do_init = false;
+                    break;
+                case 'V':
+                    printf("tset (smallclue)\n");
+                    return 0;
+                case 'e':
+                case 'i':
+                case 'k':
+                case 'm':
+                    if (pos + 1 < len) {
+                        value = arg + pos + 1;
+                        pos = len;
+                    } else if (i + 1 < argc) {
+                        value = argv[++i];
+                    } else {
+                        fprintf(stderr, "tset: option -%c requires an argument\n", opt);
+                        return 1;
+                    }
+                    if (opt == 'm') {
+                        break;
+                    }
+                    {
+                        cc_t parsed = 0;
+                        if (!smallclueParseControlValue(value, &parsed)) {
+                            fprintf(stderr, "tset: invalid control char '%s'\n", value);
+                            return 1;
+                        }
+                        if (opt == 'e') {
+                            has_erase = true;
+                            erase_char = parsed;
+                        } else if (opt == 'i') {
+                            has_intr = true;
+                            intr_char = parsed;
+                        } else if (opt == 'k') {
+                            has_kill = true;
+                            kill_char = parsed;
+                        }
+                    }
+                    break;
+                default:
+                    fprintf(stderr, "tset: unsupported option '-%c'\n", opt);
+                    return 1;
+            }
+        }
+    }
+
+    const char *term = term_override;
+    if (!term || !*term) {
+        term = getenv("TERM");
+    }
+    if (!term || !*term) {
+        term = "xterm-256color";
+    }
+    setenv("TERM", term, 1);
+
+    if (do_init && !emit_shell && isatty(STDOUT_FILENO)) {
+        smallclueEmitTerminalSane();
+    }
+
+    if (emit_shell && !quiet) {
+        printf("TERM=%s; export TERM;\n", term);
+    }
+    if (!quiet && (report || !emit_shell)) {
+        FILE *out = emit_shell ? stderr : stdout;
+        fprintf(out, "%s\n", term);
+    }
+
+    return smallclueApplyTsetControlChars(quiet, has_erase, erase_char, has_intr, intr_char,
+                                          has_kill, kill_char);
 }
 
 static void smallclueGetTerminalSize(int *rows, int *cols) {
