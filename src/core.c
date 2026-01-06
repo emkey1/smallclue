@@ -311,6 +311,7 @@ static int smallclueTailCommand(int argc, char **argv);
 static int smallclueTouchCommand(int argc, char **argv);
 static int smallclueSttyCommand(int argc, char **argv);
 static int smallclueTsetCommand(int argc, char **argv);
+static int smallclueTtyCommand(int argc, char **argv);
 static int smallclueResizeCommand(int argc, char **argv);
 static int smallclueSortCommand(int argc, char **argv);
 static int smallclueUniqCommand(int argc, char **argv);
@@ -572,6 +573,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"test", smallclueTestCommand, "Evaluate expressions"},
     {"tset", smallclueTsetCommand, "Initialize terminal settings"},
     {"touch", smallclueTouchCommand, "Update file timestamps"},
+    {"tty", smallclueTtyCommand, "Print terminal name"},
     {"traceroute", smallclueTracerouteCommand, "Trace network path to a host"},
     {"tr", smallclueTrCommand, "Translate or delete characters"},
     {"true", smallclueTrueCommand, "Do nothing, successfully"},
@@ -743,6 +745,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -e/-i/-k set erase/intr/kill chars"},
     {"touch", "touch FILE...\n"
               "  Update timestamps or create empty file"},
+    {"tty", "tty [-s]\n"
+            "  Print terminal name"},
     {"tr", "tr SET1 SET2\n"
            "  Translate/delete characters"},
     {"true", "true\n"
@@ -6646,6 +6650,44 @@ static int smallclueTsetCommand(int argc, char **argv) {
 
     return smallclueApplyTsetControlChars(quiet, has_erase, erase_char, has_intr, intr_char,
                                           has_kill, kill_char);
+}
+
+static int smallclueTtyCommand(int argc, char **argv) {
+    bool silent = false;
+    if (argc > 2) {
+        fprintf(stderr, "tty: too many arguments\n");
+        return 1;
+    }
+    if (argc == 2) {
+        if (strcmp(argv[1], "-s") == 0 || strcmp(argv[1], "--silent") == 0) {
+            silent = true;
+        } else if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+            printf("Usage: tty [-s]\n");
+            return 0;
+        } else {
+            fprintf(stderr, "tty: unsupported option '%s'\n", argv[1]);
+            return 1;
+        }
+    }
+
+    if (!pscalRuntimeStdinHasRealTTY()) {
+        if (!silent) {
+            printf("not a tty\n");
+        }
+        return 1;
+    }
+
+    const char *name = ttyname(STDIN_FILENO);
+    if (!name || !*name) {
+        name = ttyname(STDOUT_FILENO);
+    }
+    if (!name || !*name) {
+        name = "/dev/tty";
+    }
+    if (!silent) {
+        printf("%s\n", name);
+    }
+    return 0;
 }
 
 static void smallclueGetTerminalSize(int *rows, int *cols) {

@@ -237,6 +237,7 @@ DEFINE_SMALLCLUE_WRAPPER("du", du)
 DEFINE_SMALLCLUE_WRAPPER("find", find)
 DEFINE_SMALLCLUE_WRAPPER("stty", stty)
 DEFINE_SMALLCLUE_WRAPPER("tset", tset)
+DEFINE_SMALLCLUE_WRAPPER("tty", tty)
 DEFINE_SMALLCLUE_WRAPPER("resize", resize)
 DEFINE_SMALLCLUE_WRAPPER("sort", sort)
 DEFINE_SMALLCLUE_WRAPPER("uniq", uniq)
@@ -366,6 +367,7 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("find", vmBuiltinSmallclue_find, "find");
     registerSmallclueBuiltin("stty", vmBuiltinSmallclue_stty, "stty");
     registerSmallclueBuiltin("tset", vmBuiltinSmallclue_tset, "tset");
+    registerSmallclueBuiltin("tty", vmBuiltinSmallclue_tty, "tty");
     registerSmallclueBuiltin("resize", vmBuiltinSmallclue_resize, "resize");
     registerSmallclueBuiltin("sort", vmBuiltinSmallclue_sort, "sort");
     registerSmallclueBuiltin("uniq", vmBuiltinSmallclue_uniq, "uniq");
