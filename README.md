@@ -69,6 +69,8 @@ Functionally similar to BusyBox, `smallclue` combines many common tools (like `l
 * **cal**: Display a calendar.
 * **clear** / **cls**: Clear the terminal screen.
 * **sleep**: Delay for a specified amount of time.
+* **tset**: Modify terminal settings.
+* **tty**: Report tty.
 * **watch**: Execute a program periodically, showing output fullscreen.
 * **xargs**: Build and execute command lines from standard input.
 * **test** / **[**: Evaluate conditional expressions.
