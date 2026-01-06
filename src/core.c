@@ -346,6 +346,7 @@ static int smallclueRmdirCommand(int argc, char **argv);
 static int smallclueLnCommand(int argc, char **argv);
 static int smallclueTypeCommand(int argc, char **argv);
 static int smallclueFileCommand(int argc, char **argv);
+static int smallclueStatCommand(int argc, char **argv);
 static int __attribute__((unused)) smallclueLicensesCommand(int argc, char **argv);
 static const char *smallclueLeafName(const char *path);
 static int smallclueBuildPath(char *buf, size_t buf_size, const char *dir, const char *leaf);
@@ -563,6 +564,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"sed", smallclueSedCommand, "Stream editor for simple substitutions"},
     {"sleep", smallclueSleepCommand, "Delay for a number of seconds"},
     {"sort", smallclueSortCommand, "Sort lines of text"},
+    {"stat", smallclueStatCommand, "Display file status"},
     {"stty", smallclueSttyCommand, "Adjust terminal rows/columns"},
 #if defined(SMALLCLUE_WITH_EXSH)
     {"sh", smallclueShCommand, "Run the PSCAL shell front end"},
@@ -714,6 +716,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"sort", "sort [-r] [-n]\n"
              "  -r reverse\n"
              "  -n numeric"},
+    {"stat", "stat [-L] FILE...\n"
+             "  -L follow symlinks"},
     {"stty", "stty [-a] [rows N] [cols N]\n"
              "  Adjust/report terminal size"},
 #if defined(SMALLCLUE_WITH_EXSH)
@@ -8540,6 +8544,124 @@ static int smallclueFileCommand(int argc, char **argv) {
             printf(is_text ? "ASCII text\n" : "binary data\n");
         } else {
             printf("unknown file type\n");
+        }
+    }
+    return status;
+}
+
+static const char *smallclueStatTypeLabel(const struct stat *st) {
+    if (S_ISREG(st->st_mode)) return "regular file";
+    if (S_ISDIR(st->st_mode)) return "directory";
+    if (S_ISLNK(st->st_mode)) return "symbolic link";
+    if (S_ISCHR(st->st_mode)) return "character special file";
+    if (S_ISBLK(st->st_mode)) return "block special file";
+    if (S_ISFIFO(st->st_mode)) return "fifo";
+    if (S_ISSOCK(st->st_mode)) return "socket";
+    return "unknown";
+}
+
+static void smallclueStatFormatPerms(char *buf, size_t buflen, mode_t mode) {
+    if (!buf || buflen < 11) {
+        return;
+    }
+    buf[0] = S_ISDIR(mode) ? 'd' : S_ISLNK(mode) ? 'l' : '-';
+    buf[1] = (mode & S_IRUSR) ? 'r' : '-';
+    buf[2] = (mode & S_IWUSR) ? 'w' : '-';
+    buf[3] = (mode & S_IXUSR) ? 'x' : '-';
+    buf[4] = (mode & S_IRGRP) ? 'r' : '-';
+    buf[5] = (mode & S_IWGRP) ? 'w' : '-';
+    buf[6] = (mode & S_IXGRP) ? 'x' : '-';
+    buf[7] = (mode & S_IROTH) ? 'r' : '-';
+    buf[8] = (mode & S_IWOTH) ? 'w' : '-';
+    buf[9] = (mode & S_IXOTH) ? 'x' : '-';
+    buf[10] = '\0';
+}
+
+static void smallclueStatPrintTime(const char *label, time_t value) {
+    char buf[64];
+    struct tm tm_val;
+    if (localtime_r(&value, &tm_val)) {
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_val);
+    } else {
+        snprintf(buf, sizeof(buf), "%lld", (long long)value);
+    }
+    printf("%s: %s\n", label, buf);
+}
+
+static int smallclueStatPath(const char *path, bool follow) {
+    char resolved[PATH_MAX];
+    const char *target = smallclueResolvePath(path, resolved, sizeof(resolved));
+    if (!target || *target == '\0') {
+        target = path;
+    }
+    struct stat st;
+    if ((follow ? stat(target, &st) : lstat(target, &st)) != 0) {
+        fprintf(stderr, "stat: %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    const char *type = smallclueStatTypeLabel(&st);
+    char display_buf[PATH_MAX * 2];
+    const char *display = path;
+    if (!follow && S_ISLNK(st.st_mode)) {
+        char link_target[PATH_MAX];
+        ssize_t len = readlink(target, link_target, sizeof(link_target) - 1);
+        if (len >= 0) {
+            link_target[len] = '\0';
+            snprintf(display_buf, sizeof(display_buf), "%s -> %s", path, link_target);
+            display = display_buf;
+        }
+    }
+    printf("  File: %s\n", display);
+    printf("  Size: %lld\tBlocks: %lld\tIO Block: %ld\t%s\n",
+           (long long)st.st_size,
+           (long long)st.st_blocks,
+           (long)st.st_blksize,
+           type);
+    printf("Device: %llu\tInode: %llu\tLinks: %llu\n",
+           (unsigned long long)st.st_dev,
+           (unsigned long long)st.st_ino,
+           (unsigned long long)st.st_nlink);
+    char perms[11];
+    smallclueStatFormatPerms(perms, sizeof(perms), st.st_mode);
+    struct passwd *pw = getpwuid(st.st_uid);
+    struct group *gr = getgrgid(st.st_gid);
+    printf("Access: (%04o/%s)  Uid: (%u/%s)   Gid: (%u/%s)\n",
+           (unsigned)(st.st_mode & 07777),
+           perms,
+           (unsigned)st.st_uid,
+           pw ? pw->pw_name : "?",
+           (unsigned)st.st_gid,
+           gr ? gr->gr_name : "?");
+    smallclueStatPrintTime("Access", st.st_atime);
+    smallclueStatPrintTime("Modify", st.st_mtime);
+    smallclueStatPrintTime("Change", st.st_ctime);
+    return 0;
+}
+
+static int smallclueStatCommand(int argc, char **argv) {
+    smallclueResetGetopt();
+    int follow = 0;
+    int opt;
+    while ((opt = getopt(argc, argv, "L")) != -1) {
+        switch (opt) {
+            case 'L':
+                follow = 1;
+                break;
+            default:
+                fprintf(stderr, "stat: usage: stat [-L] FILE...\n");
+                return 1;
+        }
+    }
+    if (optind >= argc) {
+        fprintf(stderr, "stat: missing operand\n");
+        return 1;
+    }
+    int status = 0;
+    for (int i = optind; i < argc; ++i) {
+        if (smallclueStatPath(argv[i], follow) != 0) {
+            status = 1;
+        } else if (i + 1 < argc) {
+            putchar('\n');
         }
     }
     return status;

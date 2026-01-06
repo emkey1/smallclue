@@ -28,6 +28,7 @@ Functionally similar to BusyBox, `smallclue` combines many common tools (like `l
 * **du**: Estimate file space usage.
 * **df**: Report file system disk space usage.
 * **file**: Determine file type.
+* **stat**: Display file status.
 * **basename** / **dirname**: Parse path components.
 
 ### Text Processing & Filtering
