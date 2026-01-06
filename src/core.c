@@ -15,6 +15,7 @@
 #if defined(PSCAL_TARGET_IOS)
 #include "common/path_virtualization.h"
 #include "ios/vproc.h"
+#include "ios/tty/pscal_tty.h"
 #endif
 #include "core/build_info.h"
 #include <ctype.h>
@@ -6652,6 +6653,24 @@ static int smallclueTsetCommand(int argc, char **argv) {
                                           has_kill, kill_char);
 }
 
+#if defined(PSCAL_TARGET_IOS)
+static bool smallclueSessionPtyName(char *buf, size_t buf_len) {
+    if (!buf || buf_len == 0) {
+        return false;
+    }
+    VProcSessionStdio *session = vprocSessionStdioCurrent();
+    if (!session || !session->pty_active || !session->pty_slave || !session->pty_slave->tty) {
+        return false;
+    }
+    int num = session->pty_slave->tty->num;
+    if (num < 0) {
+        return false;
+    }
+    int written = snprintf(buf, buf_len, "/dev/pts/%d", num);
+    return written > 0 && (size_t)written < buf_len;
+}
+#endif
+
 static int smallclueTtyCommand(int argc, char **argv) {
     bool silent = false;
     if (argc > 2) {
@@ -6677,7 +6696,16 @@ static int smallclueTtyCommand(int argc, char **argv) {
         return 1;
     }
 
-    const char *name = ttyname(STDIN_FILENO);
+    const char *name = NULL;
+#if defined(PSCAL_TARGET_IOS)
+    char session_name[64];
+    if (smallclueSessionPtyName(session_name, sizeof(session_name))) {
+        name = session_name;
+    }
+#endif
+    if (!name || !*name) {
+        name = ttyname(STDIN_FILENO);
+    }
     if (!name || !*name) {
         name = ttyname(STDOUT_FILENO);
     }
