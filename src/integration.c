@@ -311,6 +311,29 @@ DEFINE_SMALLCLUE_WRAPPER("smallclue-help", smallclue_help)
 
 static pthread_once_t g_smallclue_builtin_once = PTHREAD_ONCE_INIT;
 
+static const char **g_smallclue_registered_names = NULL;
+static size_t g_smallclue_registered_count = 0;
+
+static void smallclueRecordRegisteredName(const char *name) {
+    if (!name || !*name) {
+        return;
+    }
+    for (size_t i = 0; i < g_smallclue_registered_count; ++i) {
+        if (strcmp(g_smallclue_registered_names[i], name) == 0) {
+            return;
+        }
+    }
+    const char **resized =
+        (const char **)realloc(g_smallclue_registered_names,
+                               (g_smallclue_registered_count + 1) * sizeof(*g_smallclue_registered_names));
+    if (!resized) {
+        return;
+    }
+    g_smallclue_registered_names = resized;
+    g_smallclue_registered_names[g_smallclue_registered_count] = name;
+    g_smallclue_registered_count++;
+}
+
 static void registerSmallclueBuiltin(const char *name,
                                      VmBuiltinFn handler,
                                      const char *display_name) {
@@ -320,6 +343,7 @@ static void registerSmallclueBuiltin(const char *name,
         return;
     }
     registerVmBuiltin(name, handler, BUILTIN_TYPE_PROCEDURE, display_name);
+    smallclueRecordRegisteredName(name);
 }
 
 static void smallclueRegisterBuiltinsOnce(void) {
@@ -410,4 +434,17 @@ static void smallclueRegisterBuiltinsOnce(void) {
 
 void smallclueRegisterBuiltins(void) {
     pthread_once(&g_smallclue_builtin_once, smallclueRegisterBuiltinsOnce);
+}
+
+bool smallclueIsRegisteredBuiltinName(const char *name) {
+    if (!name || !*name) {
+        return false;
+    }
+    smallclueRegisterBuiltins();
+    for (size_t i = 0; i < g_smallclue_registered_count; ++i) {
+        if (strcmp(g_smallclue_registered_names[i], name) == 0) {
+            return true;
+        }
+    }
+    return false;
 }

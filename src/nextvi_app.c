@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <termios.h>
+#include "termios_shim.h"
 #if defined(PSCAL_TARGET_IOS)
 #include "common/path_virtualization.h"
 #endif
@@ -109,9 +110,9 @@ int smallclueRunElvis(int argc, char **argv) {
     struct termios saved_ios;
     int tty_fd = STDIN_FILENO;
     bool have_tty = false;
-    if (tcgetattr(tty_fd, &saved_ios) != 0) {
+    if (smallclueTcgetattr(tty_fd, &saved_ios) != 0) {
         tty_fd = dup_fd >= 0 ? dup_fd : open("/dev/tty", O_RDWR);
-        if (tty_fd >= 0 && tcgetattr(tty_fd, &saved_ios) == 0) {
+        if (tty_fd >= 0 && smallclueTcgetattr(tty_fd, &saved_ios) == 0) {
             have_tty = true;
         }
     } else {
@@ -124,7 +125,7 @@ int smallclueRunElvis(int argc, char **argv) {
         raw.c_oflag &= ~(OPOST);
         raw.c_cc[VMIN] = 1;
         raw.c_cc[VTIME] = 0;
-        tcsetattr(tty_fd, TCSAFLUSH, &raw);
+        smallclueTcsetattr(tty_fd, TCSAFLUSH, &raw);
         tcflush(tty_fd, TCIFLUSH);
     } else {
         have_tty = false;
@@ -138,7 +139,7 @@ int smallclueRunElvis(int argc, char **argv) {
     pscalRuntimeDebugLog(resultBuf);
 
     if (have_tty) {
-        tcsetattr(tty_fd, TCSAFLUSH, &saved_ios);
+        smallclueTcsetattr(tty_fd, TCSAFLUSH, &saved_ios);
         if (tty_fd != STDIN_FILENO) {
             close(tty_fd);
         }

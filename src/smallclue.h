@@ -2,8 +2,11 @@
 #define SMALLCLUE_SMALLCLUE_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #if defined(PSCAL_TARGET_IOS)
 #include "common/path_virtualization.h"
+/* Ensure vproc syscall shims apply in app builds that skip global -include. */
+#include "ios/vproc_shim.h"
 #endif
 
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
@@ -31,6 +34,7 @@ const SmallclueApplet *smallclueFindApplet(const char *name);
 int smallclueDispatchApplet(const SmallclueApplet *applet, int argc, char **argv);
 
 void smallclueRegisterBuiltins(void);
+bool smallclueIsRegisteredBuiltinName(const char *name);
 
 #ifdef __cplusplus
 }

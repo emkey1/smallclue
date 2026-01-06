@@ -31,6 +31,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <strings.h>
 #include <netdb.h>
@@ -68,6 +69,7 @@ __attribute__((weak)) int pscalRuntimeOpenShellTab(void) { errno = ENOSYS; retur
 __attribute__((weak)) char *pscalRuntimeCopyMarketingVersion(void) { return NULL; }
 #endif
 #include <termios.h>
+#include "termios_shim.h"
 #include <time.h>
 #include <unistd.h>
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
@@ -883,12 +885,166 @@ static void smallclueLineVectorFree(SmallclueLineVector *vec) {
     vec->capacity = 0;
 }
 
+static ssize_t smallclueReadStdin(void *buf, size_t count, int *out_errno) {
+    if (out_errno) {
+        *out_errno = 0;
+    }
+    if (!buf || count == 0) {
+        return 0;
+    }
+    while (true) {
+        ssize_t res = 0;
+#if defined(PSCAL_TARGET_IOS)
+        res = vprocReadShim(STDIN_FILENO, buf, count);
+#else
+        res = read(STDIN_FILENO, buf, count);
+#endif
+        if (res < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (out_errno) {
+                *out_errno = errno ? errno : EIO;
+            }
+            return -1;
+        }
+        return res;
+    }
+}
+
+static ssize_t smallclueReadStream(FILE *stream, void *buf, size_t count, int *out_errno) {
+    if (out_errno) {
+        *out_errno = 0;
+    }
+    if (!stream || !buf || count == 0) {
+        return 0;
+    }
+    if (stream == stdin) {
+        return smallclueReadStdin(buf, count, out_errno);
+    }
+    size_t read_bytes = fread(buf, 1, count, stream);
+    if (read_bytes < count && ferror(stream)) {
+        if (out_errno) {
+            *out_errno = errno ? errno : EIO;
+        }
+    }
+    return (ssize_t)read_bytes;
+}
+
+static int smallclueGetcStream(FILE *stream, int *out_errno) {
+    if (out_errno) {
+        *out_errno = 0;
+    }
+    if (!stream) {
+        if (out_errno) {
+            *out_errno = EBADF;
+        }
+        errno = EBADF;
+        return EOF;
+    }
+    if (stream != stdin) {
+        int ch = fgetc(stream);
+        if (ch == EOF && ferror(stream)) {
+            if (out_errno) {
+                *out_errno = errno ? errno : EIO;
+            }
+        }
+        return ch;
+    }
+    unsigned char ch = 0;
+    int read_err = 0;
+    ssize_t res = smallclueReadStdin(&ch, 1, &read_err);
+    if (res <= 0) {
+        if (read_err && out_errno) {
+            *out_errno = read_err;
+        }
+        return EOF;
+    }
+    return (int)ch;
+}
+
+static ssize_t smallclueGetlineStream(char **line, size_t *cap, FILE *stream, int *out_errno) {
+    if (out_errno) {
+        *out_errno = 0;
+    }
+    if (!line || !cap || !stream) {
+        if (out_errno) {
+            *out_errno = EINVAL;
+        }
+        errno = EINVAL;
+        return -1;
+    }
+    if (stream != stdin) {
+        ssize_t len = getline(line, cap, stream);
+        if (len < 0 && ferror(stream)) {
+            if (out_errno) {
+                *out_errno = errno ? errno : EIO;
+            }
+        }
+        return len;
+    }
+    if (!*line || *cap == 0) {
+        size_t newcap = 128;
+        char *buf = (char *)malloc(newcap);
+        if (!buf) {
+            if (out_errno) {
+                *out_errno = ENOMEM;
+            }
+            errno = ENOMEM;
+            return -1;
+        }
+        *line = buf;
+        *cap = newcap;
+    }
+    size_t len = 0;
+    while (true) {
+        unsigned char ch = 0;
+        int read_err = 0;
+        ssize_t res = smallclueReadStdin(&ch, 1, &read_err);
+        if (res < 0) {
+            if (out_errno) {
+                *out_errno = read_err ? read_err : (errno ? errno : EIO);
+            }
+            return -1;
+        }
+        if (res == 0) {
+            if (len == 0) {
+                return -1;
+            }
+            break;
+        }
+        if (len + 1 >= *cap) {
+            size_t newcap = (*cap) * 2;
+            if (newcap < *cap + 2) {
+                newcap = *cap + 2;
+            }
+            char *resized = (char *)realloc(*line, newcap);
+            if (!resized) {
+                if (out_errno) {
+                    *out_errno = ENOMEM;
+                }
+                errno = ENOMEM;
+                return -1;
+            }
+            *line = resized;
+            *cap = newcap;
+        }
+        (*line)[len++] = (char)ch;
+        if (ch == '\n') {
+            break;
+        }
+    }
+    (*line)[len] = '\0';
+    return (ssize_t)len;
+}
+
 static bool smallclueReadTokensFromStdin(SmallclueLineVector *vec) {
     char *token = NULL;
     size_t tokcap = 0;
     size_t toklen = 0;
     int ch;
-    while ((ch = fgetc(stdin)) != EOF) {
+    int read_err = 0;
+    while ((ch = smallclueGetcStream(stdin, &read_err)) != EOF) {
         if (isspace((unsigned char)ch)) {
             if (toklen > 0) {
                 if (!smallclueLineVectorAppend(vec, token, toklen)) {
@@ -910,6 +1066,10 @@ static bool smallclueReadTokensFromStdin(SmallclueLineVector *vec) {
             tokcap = newcap;
         }
         token[toklen++] = (char)ch;
+    }
+    if (read_err) {
+        free(token);
+        return false;
     }
     if (toklen > 0) {
         bool ok = smallclueLineVectorAppend(vec, token, toklen);
@@ -1358,13 +1518,13 @@ static int smallclueLineVectorLoadStream(FILE *fp, const char *path, const char 
     size_t cap = 0;
     int status = 0;
     while (true) {
-        ssize_t len = getline(&line, &cap, fp);
+        int read_err = 0;
+        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
         if (len < 0) {
-            if (feof(fp)) {
-                break;
+            if (read_err) {
+                fprintf(stderr, "%s: %s: %s\n", cmd_name, path ? path : "(stdin)", strerror(read_err));
+                status = 1;
             }
-            fprintf(stderr, "%s: %s: %s\n", cmd_name, path ? path : "(stdin)", strerror(errno));
-            status = 1;
             break;
         }
         if (!smallclueLineVectorAppend(vec, line, (size_t)len)) {
@@ -1424,17 +1584,27 @@ static int pagerCollectLines(const char *cmd_name, const char *path, FILE *strea
     char buf[8192];
     size_t total = 0;
     while (true) {
-        size_t read_bytes = fread(buf, 1, sizeof(buf), stream);
+        int read_err = 0;
+        ssize_t read_bytes = smallclueReadStream(stream, buf, sizeof(buf), &read_err);
+        if (read_bytes < 0) {
+            fprintf(stderr, "%s: %s: %s\n",
+                    pager_command_name(cmd_name),
+                    path ? path : "(stdin)",
+                    strerror(read_err ? read_err : errno));
+            free(offsets);
+            fclose(fp);
+            return 1;
+        }
         if (read_bytes > 0) {
-            size_t written = fwrite(buf, 1, read_bytes, fp);
-            if (written != read_bytes) {
+            size_t written = fwrite(buf, 1, (size_t)read_bytes, fp);
+            if (written != (size_t)read_bytes) {
                 fprintf(stderr, "%s: failed to buffer pager input\n",
                         pager_command_name(cmd_name));
                 free(offsets);
                 fclose(fp);
                 return 1;
             }
-            for (size_t i = 0; i < read_bytes; ++i) {
+            for (size_t i = 0; i < (size_t)read_bytes; ++i) {
                 if (buf[i] == '\n') {
                     if (!pagerBufferEnsureOffsetCapacity(&offsets, &offset_cap, offset_count + 1)) {
                         fprintf(stderr, "%s: out of memory\n", pager_command_name(cmd_name));
@@ -1445,18 +1615,18 @@ static int pagerCollectLines(const char *cmd_name, const char *path, FILE *strea
                     offsets[offset_count++] = total + i + 1;
                 }
             }
-            total += read_bytes;
+            total += (size_t)read_bytes;
         }
-        if (read_bytes < sizeof(buf)) {
-            if (ferror(stream)) {
-                fprintf(stderr, "%s: %s: %s\n",
-                        pager_command_name(cmd_name),
-                        path ? path : "(stdin)",
-                        strerror(errno));
-                free(offsets);
-                fclose(fp);
-                return 1;
-            }
+        if (read_err) {
+            fprintf(stderr, "%s: %s: %s\n",
+                    pager_command_name(cmd_name),
+                    path ? path : "(stdin)",
+                    strerror(read_err));
+            free(offsets);
+            fclose(fp);
+            return 1;
+        }
+        if (read_bytes == 0) {
             break;
         }
     }
@@ -1639,29 +1809,64 @@ static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, in
 static int print_file(const char *path, FILE *stream) {
     char buffer[4096];
     bool dbg = getenv("PSCALI_PIPE_DEBUG") != NULL;
-    clearerr(stream);
-    while (!feof(stream)) {
-        size_t n = fread(buffer, 1, sizeof(buffer), stream);
+    while (true) {
+        int read_err = 0;
+        ssize_t n = smallclueReadStream(stream, buffer, sizeof(buffer), &read_err);
+        if (n < 0) {
+            fprintf(stderr, "cat: %s: %s\n",
+                    path ? path : "(stdin)",
+                    strerror(read_err ? read_err : errno));
+            return 1;
+        }
         if (n == 0) {
             break;
         }
-        if (fwrite(buffer, 1, n, stdout) != n) {
+        if (fwrite(buffer, 1, (size_t)n, stdout) != (size_t)n) {
             perror("cat: write error");
             return 1;
         }
         if (dbg) {
-            fprintf(stderr, "[cat] wrote chunk=%zu bytes\n", n);
+            fprintf(stderr, "[cat] wrote chunk=%zu bytes\n", (size_t)n);
         }
-    }
-    if (ferror(stream)) {
-        fprintf(stderr, "cat: %s: read error\n", path ? path : "(stdin)");
-        return 1;
+        if (read_err) {
+            fprintf(stderr, "cat: %s: %s\n",
+                    path ? path : "(stdin)",
+                    strerror(read_err));
+            return 1;
+        }
     }
     return 0;
 }
 
 static const char *pager_command_name(const char *name) {
     return (name && *name) ? name : "pager";
+}
+
+static bool pagerDebugEnabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("PSCALI_PAGER_DEBUG");
+        enabled = (env && *env && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static void pagerDebugLogf(const char *format, ...) {
+    if (!pagerDebugEnabled() || !format) {
+        return;
+    }
+    char buf[512];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buf, sizeof(buf), format, args);
+    va_end(args);
+#if defined(PSCAL_TARGET_IOS)
+    if (pscalRuntimeDebugLog) {
+        pscalRuntimeDebugLog(buf);
+        return;
+    }
+#endif
+    fprintf(stderr, "%s\n", buf);
 }
 
 static bool pager_test_input_initialized = false;
@@ -1718,28 +1923,76 @@ static int pager_control_fd(void) {
 #ifdef _WIN32
     pager_control_fd_value = -1;
 #else
+    if (pagerDebugEnabled()) {
+        pagerDebugLogf("[pager] control fd init stdin_tty=%d stdout_tty=%d",
+                       pscalRuntimeStdinIsInteractive() ? 1 : 0,
+                       pscalRuntimeStdoutIsInteractive() ? 1 : 0);
+    }
     int fd = open("/dev/tty", O_RDONLY | O_CLOEXEC);
+    if (pagerDebugEnabled()) {
+        int err = (fd < 0) ? errno : 0;
+        pagerDebugLogf("[pager] open /dev/tty fd=%d err=%d (%s)",
+                       fd, err, (fd < 0) ? strerror(err) : "ok");
+    }
     if (fd < 0 && pscalRuntimeStdoutIsInteractive()) {
         const char *tty = ttyname(STDOUT_FILENO);
+        if (pagerDebugEnabled()) {
+            pagerDebugLogf("[pager] ttyname(stdout)=%s", tty ? tty : "(null)");
+        }
         if (tty && *tty) {
             fd = open(tty, O_RDONLY | O_CLOEXEC);
+            if (pagerDebugEnabled()) {
+                int err = (fd < 0) ? errno : 0;
+                pagerDebugLogf("[pager] open stdout tty fd=%d err=%d (%s)",
+                               fd, err, (fd < 0) ? strerror(err) : "ok");
+            }
         }
         if (fd < 0) {
             fd = pagerDupForRead(STDOUT_FILENO);
+            if (pagerDebugEnabled()) {
+                int err = (fd < 0) ? errno : 0;
+                pagerDebugLogf("[pager] dup stdout fd=%d err=%d (%s)",
+                               fd, err, (fd < 0) ? strerror(err) : "ok");
+            }
         }
     }
     if (fd < 0 && pscalRuntimeStdinIsInteractive()) {
         const char *tty = ttyname(STDIN_FILENO);
+        if (pagerDebugEnabled()) {
+            pagerDebugLogf("[pager] ttyname(stdin)=%s", tty ? tty : "(null)");
+        }
         if (tty && *tty) {
             fd = open(tty, O_RDONLY | O_CLOEXEC);
+            if (pagerDebugEnabled()) {
+                int err = (fd < 0) ? errno : 0;
+                pagerDebugLogf("[pager] open stdin tty fd=%d err=%d (%s)",
+                               fd, err, (fd < 0) ? strerror(err) : "ok");
+            }
         }
         if (fd < 0) {
             fd = pagerDupForRead(STDIN_FILENO);
+            if (pagerDebugEnabled()) {
+                int err = (fd < 0) ? errno : 0;
+                pagerDebugLogf("[pager] dup stdin fd=%d err=%d (%s)",
+                               fd, err, (fd < 0) ? strerror(err) : "ok");
+            }
         }
     }
     pager_control_fd_value = fd;
+    if (pagerDebugEnabled()) {
+        pagerDebugLogf("[pager] control fd resolved=%d", pager_control_fd_value);
+    }
 #endif
     return pager_control_fd_value;
+}
+
+static void pager_control_fd_reset(void) {
+    if (pager_control_fd_value >= 0) {
+        if (pager_control_fd_value > STDERR_FILENO) {
+            close(pager_control_fd_value);
+        }
+        pager_control_fd_value = -2;
+    }
 }
 
 static int pager_read_key(void) {
@@ -1755,11 +2008,27 @@ static int pager_read_key(void) {
     if (fd < 0) {
         return 'q';
     }
-    if (!pscalRuntimeFdIsInteractive(fd)) {
+    int fd_is_tty = pscalRuntimeFdIsInteractive(fd) ? 1 : 0;
+    if (pagerDebugEnabled()) {
+        pagerDebugLogf("[pager] read key fd=%d isatty=%d", fd, fd_is_tty);
+    }
+    if (!fd_is_tty) {
         return 'q';
     }
     struct termios orig;
-    bool have_termios = (tcgetattr(fd, &orig) == 0);
+    int tcget_rc = smallclueTcgetattr(fd, &orig);
+    bool have_termios = (tcget_rc == 0);
+    if (pagerDebugEnabled()) {
+        int err = (tcget_rc != 0) ? errno : 0;
+        pagerDebugLogf("[pager] tcgetattr rc=%d err=%d (%s)",
+                       tcget_rc, err, (tcget_rc != 0) ? strerror(err) : "ok");
+        if (have_termios) {
+            pagerDebugLogf("[pager] termios orig iflag=0x%lx oflag=0x%lx lflag=0x%lx",
+                           (unsigned long)orig.c_iflag,
+                           (unsigned long)orig.c_oflag,
+                           (unsigned long)orig.c_lflag);
+        }
+    }
     struct termios raw;
     if (have_termios) {
         raw = orig;
@@ -1767,7 +2036,12 @@ static int pager_read_key(void) {
         raw.c_iflag &= ~(IXON | ICRNL);
         raw.c_cc[VMIN] = 1;
         raw.c_cc[VTIME] = 0;
-        tcsetattr(fd, TCSAFLUSH, &raw);
+        int tcset_rc = smallclueTcsetattr(fd, TCSAFLUSH, &raw);
+        if (pagerDebugEnabled()) {
+            int err = (tcset_rc != 0) ? errno : 0;
+            pagerDebugLogf("[pager] tcsetattr raw rc=%d err=%d (%s)",
+                           tcset_rc, err, (tcset_rc != 0) ? strerror(err) : "ok");
+        }
     }
     int result = 'q';
     for (;;) {
@@ -1784,6 +2058,15 @@ static int pager_read_key(void) {
         }
         unsigned char ch = 0;
         ssize_t n = read(fd, &ch, 1);
+        if (pagerDebugEnabled()) {
+            if (n <= 0) {
+                int err = errno;
+                pagerDebugLogf("[pager] read rc=%zd err=%d (%s)",
+                               n, err, strerror(err));
+            } else {
+                pagerDebugLogf("[pager] read ch=0x%02x", (unsigned int)ch);
+            }
+        }
         if (n <= 0) {
             break;
         }
@@ -1822,12 +2105,27 @@ static int pager_read_key(void) {
         break;
     }
     if (have_termios) {
-        tcsetattr(fd, TCSAFLUSH, &orig);
+        int tcset_rc = smallclueTcsetattr(fd, TCSAFLUSH, &orig);
+        if (pagerDebugEnabled()) {
+            int err = (tcset_rc != 0) ? errno : 0;
+            pagerDebugLogf("[pager] tcsetattr restore rc=%d err=%d (%s)",
+                           tcset_rc, err, (tcset_rc != 0) ? strerror(err) : "ok");
+        }
     }
     return result;
 }
 
 static int pager_terminal_rows(void) {
+    int parsed = 0;
+    const char *lines = getenv("LINES");
+    if (lines && *lines) {
+        parsed = atoi(lines);
+#if defined(PSCAL_TARGET_IOS)
+        if (parsed > 0) {
+            return parsed;
+        }
+#endif
+    }
     struct winsize ws;
     if (isatty(STDOUT_FILENO) && ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
         if (ws.ws_row > 0) {
@@ -1840,13 +2138,8 @@ static int pager_terminal_rows(void) {
             return ws.ws_row;
         }
     }
-    const char *lines = getenv("LINES");
-    int parsed = 0;
-    if (lines && *lines) {
-        parsed = atoi(lines);
-        if (parsed > 0) {
-            return parsed;
-        }
+    if (parsed > 0) {
+        return parsed;
     }
     int fallback = 24;
     char buf[16];
@@ -1877,6 +2170,7 @@ static int pagerParseEnvBool(const char *value) {
 }
 
 static int pager_file(const char *cmd_name, const char *path, FILE *stream) {
+    pager_control_fd_reset();
     PagerBuffer buffer = {0};
     if (pagerCollectLines(cmd_name, path, stream, &buffer) != 0) {
         return 1;
@@ -1933,6 +2227,7 @@ static int pager_file(const char *cmd_name, const char *path, FILE *stream) {
             }
         }
         pagerBufferFree(&buffer);
+        pager_control_fd_reset();
         return 0;
     }
 
@@ -1944,6 +2239,7 @@ static int pager_file(const char *cmd_name, const char *path, FILE *stream) {
 
     int status = pagerInteractiveSession(cmd_name, &buffer, page_rows);
     pagerBufferFree(&buffer);
+    pager_control_fd_reset();
     return status;
 }
 
@@ -2523,7 +2819,12 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
         fputc('\n', output);
     }
 
-    while ((line_len = getline(&line, &line_cap, input)) != -1) {
+    while (true) {
+        int read_err = 0;
+        line_len = smallclueGetlineStream(&line, &line_cap, input, &read_err);
+        if (line_len < 0) {
+            break;
+        }
         while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) {
             line[--line_len] = '\0';
         }
@@ -2760,7 +3061,12 @@ static char *markdownExtractTitle(const char *path) {
     size_t cap = 0;
     ssize_t len;
     char *title = NULL;
-    while ((len = getline(&line, &cap, fp)) != -1) {
+    while (true) {
+        int read_err = 0;
+        len = smallclueGetlineStream(&line, &cap, fp, &read_err);
+        if (len < 0) {
+            break;
+        }
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
             line[--len] = '\0';
         }
@@ -4480,9 +4786,18 @@ static int smallclueTeeCommand(int argc, char **argv) {
     }
     int status = 0;
     char buffer[4096];
-    size_t nread;
-    while ((nread = fread(buffer, 1, sizeof(buffer), stdin)) > 0) {
-        if (fwrite(buffer, 1, nread, stdout) != nread) {
+    while (true) {
+        int read_err = 0;
+        ssize_t nread = smallclueReadStream(stdin, buffer, sizeof(buffer), &read_err);
+        if (nread < 0) {
+            perror("tee");
+            status = 1;
+            break;
+        }
+        if (nread == 0) {
+            break;
+        }
+        if (fwrite(buffer, 1, (size_t)nread, stdout) != (size_t)nread) {
             perror("tee");
             status = 1;
             break;
@@ -4491,17 +4806,18 @@ static int smallclueTeeCommand(int argc, char **argv) {
             if (!files[i]) {
                 continue;
             }
-            if (fwrite(buffer, 1, nread, files[i]) != nread) {
+            if (fwrite(buffer, 1, (size_t)nread, files[i]) != (size_t)nread) {
                 fprintf(stderr, "tee: %s: %s\n", argv[optind + i], strerror(errno));
                 fclose(files[i]);
                 files[i] = NULL;
                 status = 1;
             }
         }
-    }
-    if (ferror(stdin)) {
-        perror("tee");
-        status = 1;
+        if (read_err) {
+            perror("tee");
+            status = 1;
+            break;
+        }
     }
     if (files) {
         for (int i = 0; i < file_count; ++i) {
@@ -5258,6 +5574,7 @@ static int smallclueDmesgCommand(int argc, char **argv) {
             if (len > 0 && snapshot[len - 1] != '\n') {
                 fputc('\n', stdout);
             }
+            fflush(stdout);
             free(snapshot);
             return 0;
         }
@@ -5662,10 +5979,13 @@ static int smallclueHeadStream(FILE *fp, const char *label, long lines) {
     long remaining = lines;
     int status = 0;
     while (remaining > 0) {
-        ssize_t len = getline(&line, &cap, fp);
+        int read_err = 0;
+        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
         if (len < 0) {
-            if (ferror(fp)) {
-                fprintf(stderr, "head: %s: %s\n", label ? label : "(stdin)", strerror(errno));
+            if (read_err) {
+                fprintf(stderr, "head: %s: %s\n",
+                        label ? label : "(stdin)",
+                        strerror(read_err));
                 status = 1;
             }
             break;
@@ -5746,10 +6066,13 @@ static int smallclueTailStream(FILE *fp, const char *label, long lines) {
     long count = 0;
     int status = 0;
     while (1) {
-        ssize_t len = getline(&line, &cap, fp);
+        int read_err = 0;
+        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
         if (len < 0) {
-            if (ferror(fp)) {
-                fprintf(stderr, "tail: %s: %s\n", label ? label : "(stdin)", strerror(errno));
+            if (read_err) {
+                fprintf(stderr, "tail: %s: %s\n",
+                        label ? label : "(stdin)",
+                        strerror(read_err));
                 status = 1;
             }
             break;
@@ -5839,17 +6162,20 @@ static int smallclueTailFollow(FILE *fp, const char *label, long lines) {
                 break;
             }
             while (lastPos < st.st_size) {
-                ssize_t len = getline(&line, &cap, fp);
+                int read_err = 0;
+                ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
                 if (len < 0) {
-                    if (errno == EINTR) {
+                    if (read_err == EINTR) {
                         clearerr(fp);
                         continue;
                     }
-                    if (feof(fp)) {
+                    if (read_err == 0) {
                         clearerr(fp);
                         break;
                     }
-                    fprintf(stderr, "tail: %s: %s\n", label ? label : "(stdin)", strerror(errno));
+                    fprintf(stderr, "tail: %s: %s\n",
+                            label ? label : "(stdin)",
+                            strerror(read_err));
                     status = 1;
                     break;
                 }
@@ -6200,7 +6526,7 @@ static int smallclueSttyReport(void) {
         return 0;
     }
     struct termios tio;
-    if (tcgetattr(STDIN_FILENO, &tio) != 0) {
+    if (smallclueTcgetattr(STDIN_FILENO, &tio) != 0) {
         perror("stty");
         return 1;
     }
@@ -6220,8 +6546,22 @@ static int smallclueSttyReport(void) {
     }
     if (rows <= 0) rows = 24;
     if (cols <= 0) cols = 80;
-    printf("speed %s baud; rows %d; columns %d;\n",
-        smallclueBaudLabel(ospeed), rows, cols);
+    const char *baud_label = smallclueBaudLabel(ospeed);
+    bool emit_speed = true;
+#ifdef B0
+    if (ospeed == B0) {
+#ifdef B115200
+        baud_label = "B115200";
+#else
+        emit_speed = false;
+#endif
+    }
+#endif
+    if (emit_speed && baud_label) {
+        printf("speed %s baud; rows %d; columns %d;\n", baud_label, rows, cols);
+    } else {
+        printf("rows %d; columns %d;\n", rows, cols);
+    }
 
 #ifdef VINTR
     smallclueDescribeControlChar("intr", tio.c_cc[VINTR]);
@@ -6431,10 +6771,13 @@ static int smallclueUniqStream(FILE *fp, const char *path, int print_counts) {
     long count = 0;
     int status = 0;
     while (true) {
-        ssize_t len = getline(&line, &cap, fp);
+        int read_err = 0;
+        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
         if (len < 0) {
-            if (!feof(fp)) {
-                fprintf(stderr, "uniq: %s: %s\n", path ? path : "(stdin)", strerror(errno));
+            if (read_err) {
+                fprintf(stderr, "uniq: %s: %s\n",
+                        path ? path : "(stdin)",
+                        strerror(read_err));
                 status = 1;
             }
             break;
@@ -6611,10 +6954,11 @@ static int smallclueSedCommand(int argc, char **argv) {
     int index = 2;
     if (index >= argc) {
         while (!status) {
-            ssize_t len = getline(&line, &cap, stdin);
+            int read_err = 0;
+            ssize_t len = smallclueGetlineStream(&line, &cap, stdin, &read_err);
             if (len < 0) {
-                if (!feof(stdin)) {
-                    perror("sed");
+                if (read_err) {
+                    fprintf(stderr, "sed: %s\n", strerror(read_err));
                     status = 1;
                 }
                 break;
@@ -6637,10 +6981,11 @@ static int smallclueSedCommand(int argc, char **argv) {
                 break;
             }
             while (true) {
-                ssize_t len = getline(&line, &cap, fp);
+                int read_err = 0;
+                ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
                 if (len < 0) {
-                    if (!feof(fp)) {
-                        fprintf(stderr, "sed: %s: %s\n", argv[i], strerror(errno));
+                    if (read_err) {
+                        fprintf(stderr, "sed: %s: %s\n", argv[i], strerror(read_err));
                         status = 1;
                     }
                     break;
@@ -6741,10 +7086,11 @@ static int smallclueCutCommand(int argc, char **argv) {
     int status = 0;
     if (index >= argc) {
         while (true) {
-            ssize_t len = getline(&line, &cap, stdin);
+            int read_err = 0;
+            ssize_t len = smallclueGetlineStream(&line, &cap, stdin, &read_err);
             if (len < 0) {
-                if (!feof(stdin)) {
-                    perror("cut");
+                if (read_err) {
+                    fprintf(stderr, "cut: %s\n", strerror(read_err));
                     status = 1;
                 }
                 break;
@@ -6760,10 +7106,11 @@ static int smallclueCutCommand(int argc, char **argv) {
                 continue;
             }
             while (true) {
-                ssize_t len = getline(&line, &cap, fp);
+                int read_err = 0;
+                ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
                 if (len < 0) {
-                    if (!feof(fp)) {
-                        fprintf(stderr, "cut: %s: %s\n", argv[i], strerror(errno));
+                    if (read_err) {
+                        fprintf(stderr, "cut: %s: %s\n", argv[i], strerror(read_err));
                         status = 1;
                     }
                     break;
@@ -6983,7 +7330,15 @@ static int smallclueGrepCommand(int argc, char **argv) {
     if (paths <= 0) {
         ssize_t len;
         long line_no = 0;
-        while ((len = getline(&line, &cap, stdin)) != -1) {
+        while (true) {
+            int read_err = 0;
+            len = smallclueGetlineStream(&line, &cap, stdin, &read_err);
+            if (len < 0) {
+                if (read_err) {
+                    fprintf(stderr, "grep: %s\n", strerror(read_err));
+                }
+                break;
+            }
             line_no++;
             int found = smallclueStrCaseStr(line, pattern, ignore_case) != NULL;
             if (invert_match ? !found : found) {
@@ -7004,7 +7359,15 @@ static int smallclueGrepCommand(int argc, char **argv) {
             }
             ssize_t len;
             long line_no = 0;
-            while ((len = getline(&line, &cap, fp)) != -1) {
+            while (true) {
+                int read_err = 0;
+                len = smallclueGetlineStream(&line, &cap, fp, &read_err);
+                if (len < 0) {
+                    if (read_err) {
+                        fprintf(stderr, "grep: %s: %s\n", path, strerror(read_err));
+                    }
+                    break;
+                }
                 line_no++;
                 int found = smallclueStrCaseStr(line, pattern, ignore_case) != NULL;
                 if (invert_match ? !found : found) {
@@ -7045,7 +7408,8 @@ static int smallclueWcProcessFile(const char *path, SmallclueWcCounts *counts) {
     int c;
     int in_word = 0;
     counts->lines = counts->words = counts->bytes = 0;
-    while ((c = fgetc(fp)) != EOF) {
+    int read_err = 0;
+    while ((c = smallclueGetcStream(fp, &read_err)) != EOF) {
         counts->bytes++;
         if (c == '\n') {
             counts->lines++;
@@ -7060,7 +7424,7 @@ static int smallclueWcProcessFile(const char *path, SmallclueWcCounts *counts) {
     if (fp != stdin) {
         fclose(fp);
     }
-    if (ferror(fp)) {
+    if (read_err) {
         fprintf(stderr, "wc: %s: read error\n", path ? path : "(stdin)");
         return 1;
     }
