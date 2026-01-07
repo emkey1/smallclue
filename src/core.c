@@ -356,7 +356,7 @@ static int smallclueRemovePathWithLabel(const char *label, const char *path, boo
 static int smallclueCopyFile(const char *label, const char *src, const char *dst);
 static int smallclueMkdirParents(const char *path, mode_t mode);
 static void smallclueGetTerminalSize(int *rows, int *cols);
-static int smallclueElvisCommand(int argc, char **argv);
+static int smallclueEditorCommand(int argc, char **argv);
 static int smallclueSshCommand(int argc, char **argv);
 static int smallclueScpCommand(int argc, char **argv);
 static int smallclueSftpCommand(int argc, char **argv);
@@ -531,7 +531,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"dirname", smallclueDirnameCommand, "Strip last path component"},
     {"du", smallclueDuCommand, "Summarize disk usage"},
     {"echo", smallclueEchoCommand, "Print arguments"},
-    {"nextvi", smallclueElvisCommand, "Nextvi text editor"},
+    {"nextvi", smallclueEditorCommand, "Nextvi text editor"},
     {"env", smallclueEnvCommand, "Display or update environment"},
     {"false", smallclueFalseCommand, "Do nothing, unsuccessfully"},
     {"file", smallclueFileCommand, "Identify file types"},
@@ -590,7 +590,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"version", smallclueVersionCommand, "Show app version"},
     {"vproc-test", smallclueVprocTestCommand, "Run vproc/terminal diagnostics"},
     {"watch", smallclueWatchCommand, "Periodically run a command"},
-    {"vi", smallclueElvisCommand, "Alias for Nextvi text editor"},
+    {"vi", smallclueEditorCommand, "Alias for Nextvi text editor"},
     {"wc", smallclueWcCommand, "Count lines/words/bytes"},
     {"wget", smallclueWgetCommand, "Download files via HTTP(S)"},
     {"yes", smallclueYesCommand, "Repeatedly print strings"},
@@ -4375,22 +4375,53 @@ static int smallclueVersionCommand(int argc, char **argv) {
 
 typedef struct {
     const char *name;
-    const char *path;
+    const char *filename;
 } SmallclueLicense;
 
 static const SmallclueLicense kSmallclueLicenses[] = {
-    {"PSCAL", "/home/Docs/Licenses/pscal_LICENSE.txt"},
-    {"OpenSSH", "/home/Docs/Licenses/openssh_LICENSE.txt"},
-    {"curl", "/home/Docs/Licenses/curl_LICENSE.txt"},
-    {"OpenSSL", "/home/Docs/Licenses/openssl_LICENSE.txt"},
-    {"SDL2", "/home/Docs/Licenses/sdl_LICENSE.txt"},
-    {"Nextvi", "/home/Docs/Licenses/nextvi_LICENSE.txt"},
-    {"yyjson", "/home/Docs/Licenses/yyjson_LICENSE.txt"},
-    {"hterm", "/home/Docs/Licenses/hterm_LICENSE.txt"},
+    {"PSCAL", "pscal_LICENSE.txt"},
+    {"OpenSSH", "openssh_LICENSE.txt"},
+    {"curl", "curl_LICENSE.txt"},
+    {"OpenSSL", "openssl_LICENSE.txt"},
+    {"SDL2", "sdl_LICENSE.txt"},
+    {"Nextvi", "nextvi_LICENSE.txt"},
+    {"yyjson", "yyjson_LICENSE.txt"},
+    {"hterm", "hterm_LICENSE.txt"},
 };
 
 static size_t smallclueLicensesCount(void) {
     return sizeof(kSmallclueLicenses) / sizeof(kSmallclueLicenses[0]);
+}
+
+static bool smallclueLicensesResolvePath(const char *filename, char *out, size_t out_size) {
+    if (!filename || !out || out_size == 0) {
+        return false;
+    }
+    struct stat st;
+    const char *docs_root = getenv("PSCALI_DOCS_ROOT");
+    if (docs_root && *docs_root) {
+        char docs_dir[PATH_MAX];
+        if (smallclueBuildPath(docs_dir, sizeof(docs_dir), docs_root, "Licenses") == 0 &&
+            smallclueBuildPath(out, out_size, docs_dir, filename) == 0 &&
+            stat(out, &st) == 0 && S_ISREG(st.st_mode)) {
+            return true;
+        }
+    }
+    const char *home = getenv("HOME");
+    if (home && *home) {
+        char docs_dir[PATH_MAX];
+        if (smallclueBuildPath(docs_dir, sizeof(docs_dir), home, "Docs") == 0 &&
+            smallclueBuildPath(docs_dir, sizeof(docs_dir), docs_dir, "Licenses") == 0 &&
+            smallclueBuildPath(out, out_size, docs_dir, filename) == 0 &&
+            stat(out, &st) == 0 && S_ISREG(st.st_mode)) {
+            return true;
+        }
+    }
+    if (smallclueBuildPath(out, out_size, "/home/Docs/Licenses", filename) == 0 &&
+        stat(out, &st) == 0 && S_ISREG(st.st_mode)) {
+        return true;
+    }
+    return false;
 }
 
 static void smallclueLicensesRenderMenu(size_t selected) {
@@ -4429,18 +4460,16 @@ static int smallclueLicensesCommand(int argc, char **argv) {
             case '\r':
             case '\n': {
                 const SmallclueLicense *entry = &kSmallclueLicenses[selected];
-                FILE *probe = fopen(entry->path, "r");
-                if (!probe) {
-                    fprintf(stderr, "licenses: %s: %s\n", entry->path, strerror(errno));
+                char resolved[PATH_MAX];
+                if (!smallclueLicensesResolvePath(entry->filename, resolved, sizeof(resolved))) {
+                    smallclueLicensesRenderMenu(selected);
+                    fprintf(stdout, "\nlicenses: %s: not found\n", entry->filename);
+                    fprintf(stdout, "Press any key to continue.");
+                    fflush(stdout);
+                    (void)pager_read_key();
                     break;
                 }
-                fclose(probe);
-                char *argv_lic[3];
-                argv_lic[0] = "less";
-                argv_lic[1] = (char *)entry->path;
-                argv_lic[2] = NULL;
-                smallclueLicensesRenderMenu(selected);
-                (void)smallcluePagerCommand(2, argv_lic);
+                (void)smallclueMarkdownDisplayPath(resolved);
                 break;
             }
             case 'q':
@@ -4951,8 +4980,8 @@ static int smallclueScriptCommand(int argc, char **argv) {
     return 0;
 }
 
-static int smallclueElvisCommand(int argc, char **argv) {
-    return smallclueRunElvis(argc, argv);
+static int smallclueEditorCommand(int argc, char **argv) {
+    return smallclueRunEditor(argc, argv);
 }
 static int smallclueSshCommand(int argc, char **argv) {
     return smallclueRunSsh(argc, argv);

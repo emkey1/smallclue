@@ -100,7 +100,7 @@ static int smallclueSetupTty(void) {
     return fd;
 }
 
-int smallclueRunElvis(int argc, char **argv) {
+int smallclueRunEditor(int argc, char **argv) {
     /* nextvi expects xterm-ish behavior; advertise xterm-256color so SGR works. */
     char *saved_term = smallclueOverrideEnv("TERM", "xterm-256color");
 

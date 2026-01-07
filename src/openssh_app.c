@@ -50,6 +50,7 @@ extern void PSCALRuntimeInterposeBootstrap(void) __attribute__((weak));
 extern void PSCALRuntimeRegisterSessionContext(uint64_t session_id) __attribute__((weak));
 extern void PSCALRuntimeUnregisterSessionContext(uint64_t session_id) __attribute__((weak));
 #endif
+extern void pscalRuntimeDebugLog(const char *message) __attribute__((weak));
 /* Provide a weak fallback so standalone smallclue builds without the runtime
  * bridge still link cleanly on iOS. The real runtime implementation overrides
  * this when available. */
@@ -89,6 +90,11 @@ __attribute__((weak))
 void PSCALRuntimeUnregisterSessionContext(uint64_t session_id) {
     (void)session_id;
 }
+
+__attribute__((weak))
+void pscalRuntimeDebugLog(const char *message) {
+    (void)message;
+}
 #endif
 
 #if defined(PSCAL_TARGET_IOS)
@@ -104,6 +110,28 @@ __attribute__((weak))
 void pscalRuntimeSshSessionExited(uint64_t session_id, int status) {
     (void)session_id;
     (void)status;
+}
+#endif
+
+#if defined(PSCAL_TARGET_IOS)
+static bool smallclueSshDebugEnabled(void) {
+    const char *tool_debug = getenv("PSCALI_TOOL_DEBUG");
+    const char *ssh_debug = getenv("PSCALI_SSH_DEBUG");
+    if ((tool_debug && *tool_debug && strcmp(tool_debug, "0") != 0) ||
+        (ssh_debug && *ssh_debug && strcmp(ssh_debug, "0") != 0)) {
+        return true;
+    }
+    return false;
+}
+
+static void smallclueSshDebugLog(const char *message) {
+    if (!message || !smallclueSshDebugEnabled()) {
+        return;
+    }
+    if (pscalRuntimeDebugLog) {
+        pscalRuntimeDebugLog(message);
+    }
+    fprintf(stderr, "%s\n", message);
 }
 #endif
 
@@ -631,17 +659,28 @@ typedef struct {
     int argc;
     char **argv;
     VProc *vp;
+    VProcSessionStdio *session_stdio;
 } smallclueOpensshThreadContext;
 
 static void *smallclueRunOpensshEntryThread(void *arg) {
     smallclueOpensshThreadContext *ctx = (smallclueOpensshThreadContext *)arg;
     bool activated = false;
+    VProcSessionStdio *prev_stdio = NULL;
+    bool stdio_swapped = false;
     if (ctx && ctx->vp) {
         vprocActivate(ctx->vp);
         vprocRegisterThread(ctx->vp, pthread_self());
         activated = true;
     }
+    if (ctx && ctx->session_stdio) {
+        prev_stdio = vprocSessionStdioCurrent();
+        vprocSessionStdioActivate(ctx->session_stdio);
+        stdio_swapped = true;
+    }
     int status = smallclueRunOpensshEntryOnce(ctx->label, ctx->entry, ctx->argc, ctx->argv);
+    if (stdio_swapped) {
+        vprocSessionStdioActivate(prev_stdio);
+    }
     if (activated) {
         vprocUnregisterThread(ctx->vp, pthread_self());
         vprocDeactivate();
@@ -656,7 +695,8 @@ static int smallclueRunOpensshEntry(const char *label, int (*entry)(int, char **
         .entry = entry,
         .argc = argc,
         .argv = argv,
-        .vp = vprocCurrent()
+        .vp = vprocCurrent(),
+        .session_stdio = vprocSessionStdioCurrent()
     };
     pthread_t thread;
     int err = pthread_create(&thread, NULL, smallclueRunOpensshEntryThread, &ctx);
@@ -702,6 +742,13 @@ static void *smallclueRunSshSessionThread(void *arg) {
     smallclueSshSessionContext *ctx = (smallclueSshSessionContext *)arg;
     if (!ctx) {
         return NULL;
+    }
+    if (smallclueSshDebugEnabled()) {
+        char logbuf[192];
+        snprintf(logbuf, sizeof(logbuf),
+                 "[ssh-session] thread start session=%llu",
+                 (unsigned long long)ctx->session_id);
+        smallclueSshDebugLog(logbuf);
     }
     int status = 255;
     int kernel_pid = vprocEnsureKernelPid();
@@ -756,14 +803,24 @@ static void *smallclueRunSshSessionThread(void *arg) {
         (void)vprocSetPgid(pid, pid);
         (void)vprocSetForegroundPgid(pid, pid);
         vprocSetCommandLabel(pid, (ctx->argv && ctx->argv[0]) ? ctx->argv[0] : "ssh");
+        if (smallclueSshDebugEnabled()) {
+            char logbuf[192];
+            snprintf(logbuf, sizeof(logbuf),
+                     "[ssh-session] vproc created session=%llu pid=%d",
+                     (unsigned long long)ctx->session_id,
+                     pid);
+            smallclueSshDebugLog(logbuf);
+        }
     } else {
         status = 255;
         if (getenv("PSCALI_TOOL_DEBUG")) {
             fprintf(stderr, "[ssh-session] vproc create failed\n");
         }
+        smallclueSshDebugLog("[ssh-session] vproc create failed");
     }
 
     if (vp) {
+        smallclueSshDebugLog("[ssh-session] openssh entry start");
         status = smallclueRunOpensshEntryOnce("ssh", pscal_openssh_ssh_main, ctx->argc, ctx->argv);
     }
 
@@ -779,6 +836,14 @@ static void *smallclueRunSshSessionThread(void *arg) {
         vprocSessionStdioDestroy(session_stdio);
     }
 
+    if (smallclueSshDebugEnabled()) {
+        char logbuf[192];
+        snprintf(logbuf, sizeof(logbuf),
+                 "[ssh-session] thread exit session=%llu status=%d",
+                 (unsigned long long)ctx->session_id,
+                 status);
+        smallclueSshDebugLog(logbuf);
+    }
     smallclueSshSessionNotifyExit(ctx->session_id, status);
     smallclueFreeArgv(ctx->argv, ctx->argc);
     free(ctx);
@@ -801,6 +866,17 @@ int PSCALRuntimeCreateSshSession(int argc,
     *out_read_fd = -1;
     *out_write_fd = -1;
 
+    if (smallclueSshDebugEnabled()) {
+        const char *argv0 = (argc > 0 && argv && argv[0]) ? argv[0] : "(null)";
+        char logbuf[192];
+        snprintf(logbuf, sizeof(logbuf),
+                 "[ssh-session] create start session=%llu argc=%d argv0=%s",
+                 (unsigned long long)session_id,
+                 argc,
+                 argv0);
+        smallclueSshDebugLog(logbuf);
+    }
+
     PSCALRuntimeInterposeBootstrap();
     (void)vprocEnsureKernelPid();
 
@@ -809,18 +885,39 @@ int PSCALRuntimeCreateSshSession(int argc,
     int pty_num = -1;
     int pty_err = pscalPtyOpenMaster(O_RDWR, &pty_master, &pty_num);
     if (pty_err < 0) {
+        if (smallclueSshDebugEnabled()) {
+            char logbuf[128];
+            snprintf(logbuf, sizeof(logbuf),
+                     "[ssh-session] pty master failed err=%d",
+                     pty_err);
+            smallclueSshDebugLog(logbuf);
+        }
         errno = pscalCompatErrno(pty_err);
         return -1;
     }
     pty_err = pscalPtyUnlock(pty_master);
     if (pty_err < 0) {
         if (pty_master) pscal_fd_close(pty_master);
+        if (smallclueSshDebugEnabled()) {
+            char logbuf[128];
+            snprintf(logbuf, sizeof(logbuf),
+                     "[ssh-session] pty unlock failed err=%d",
+                     pty_err);
+            smallclueSshDebugLog(logbuf);
+        }
         errno = pscalCompatErrno(pty_err);
         return -1;
     }
     pty_err = pscalPtyOpenSlave(pty_num, O_RDWR, &pty_slave);
     if (pty_err < 0) {
         if (pty_master) pscal_fd_close(pty_master);
+        if (smallclueSshDebugEnabled()) {
+            char logbuf[128];
+            snprintf(logbuf, sizeof(logbuf),
+                     "[ssh-session] pty slave failed err=%d",
+                     pty_err);
+            smallclueSshDebugLog(logbuf);
+        }
         errno = pscalCompatErrno(pty_err);
         return -1;
     }
@@ -860,6 +957,13 @@ int PSCALRuntimeCreateSshSession(int argc,
     pthread_t thread;
     int err = vprocHostPthreadCreate(&thread, NULL, smallclueRunSshSessionThread, ctx);
     if (err != 0) {
+        if (smallclueSshDebugEnabled()) {
+            char logbuf[128];
+            snprintf(logbuf, sizeof(logbuf),
+                     "[ssh-session] thread create failed err=%d",
+                     err);
+            smallclueSshDebugLog(logbuf);
+        }
         if (PSCALRuntimeUnregisterSessionContext) {
             PSCALRuntimeUnregisterSessionContext(session_id);
         }
@@ -868,6 +972,14 @@ int PSCALRuntimeCreateSshSession(int argc,
         free(ctx);
         errno = err;
         return -1;
+    }
+    if (smallclueSshDebugEnabled()) {
+        char logbuf[128];
+        snprintf(logbuf, sizeof(logbuf),
+                 "[ssh-session] thread created session=%llu pty=%d",
+                 (unsigned long long)session_id,
+                 pty_num);
+        smallclueSshDebugLog(logbuf);
     }
     pthread_detach(thread);
     return 0;
@@ -938,23 +1050,9 @@ int smallclueRunSsh(int argc, char **argv) {
     int expanded_count = 0;
     char **expanded = smallclueExpandSshArgs(count, augmented, &expanded_count);
     int status = 255;
-#if defined(PSCAL_TARGET_IOS)
-    if (pscalRuntimeOpenSshSession) {
-        int rc = pscalRuntimeOpenSshSession(expanded ? expanded_count : count,
-                                            expanded ? expanded : augmented);
-        if (rc == 0) {
-            status = 0;
-            goto smallclue_ssh_done;
-        }
-        fprintf(stderr, "ssh: unable to open SSH tab\n");
-        status = 1;
-        goto smallclue_ssh_done;
-    }
-#endif
     status = smallclueRunOpensshEntry("ssh", pscal_openssh_ssh_main,
                                       expanded ? expanded_count : count,
                                       expanded ? expanded : augmented);
-smallclue_ssh_done:
     if (expanded) {
         smallclueFreeArgv(expanded, expanded_count);
     }
