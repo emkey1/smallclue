@@ -565,7 +565,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"sleep", smallclueSleepCommand, "Delay for a number of seconds"},
     {"sort", smallclueSortCommand, "Sort lines of text"},
     {"stat", smallclueStatCommand, "Display file status"},
-    {"stty", smallclueSttyCommand, "Adjust terminal rows/columns"},
+    {"stty", smallclueSttyCommand, "Report terminal settings"},
 #if defined(SMALLCLUE_WITH_EXSH)
     {"sh", smallclueShCommand, "Run the PSCAL shell front end"},
 #endif
@@ -718,8 +718,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -n numeric"},
     {"stat", "stat [-L] FILE...\n"
              "  -L follow symlinks"},
-    {"stty", "stty [-a] [rows N] [cols N]\n"
-             "  Adjust/report terminal size"},
+    {"stty", "stty [reset] [sane]\n"
+             "  Report terminal settings; apply reset/sane"},
 #if defined(SMALLCLUE_WITH_EXSH)
     {"sh", "sh\n"
            "  Launch PSCAL shell front end"},
@@ -7035,8 +7035,6 @@ static int smallclueSttyCommand(int argc, char **argv) {
     if (argc <= 1) {
         return smallclueSttyReport();
     }
-    long rows = -1;
-    long cols = -1;
     bool requestReset = false;
     bool requestSane = false;
     int index = 1;
@@ -7052,45 +7050,10 @@ static int smallclueSttyCommand(int argc, char **argv) {
             index += 1;
             continue;
         }
-        if (strcmp(arg, "rows") == 0) {
-            if (index + 1 >= argc) {
-                fprintf(stderr, "stty: missing value after 'rows'\n");
-                return 1;
-            }
-            rows = smallclueParseLong(argv[index + 1]);
-            if (rows <= 0) {
-                fprintf(stderr, "stty: invalid rows value '%s'\n", argv[index + 1]);
-                return 1;
-            }
-            index += 2;
-            continue;
-        }
-        if (strcmp(arg, "cols") == 0 || strcmp(arg, "columns") == 0) {
-            if (index + 1 >= argc) {
-                fprintf(stderr, "stty: missing value after '%s'\n", arg);
-                return 1;
-            }
-            cols = smallclueParseLong(argv[index + 1]);
-            if (cols <= 0) {
-                fprintf(stderr, "stty: invalid columns value '%s'\n", argv[index + 1]);
-                return 1;
-            }
-            index += 2;
-            continue;
-        }
-        if (strcmp(arg, "size") == 0) {
-            if (index + 2 >= argc) {
-                fprintf(stderr, "stty: 'size' requires two numbers\n");
-                return 1;
-            }
-            rows = smallclueParseLong(argv[index + 1]);
-            cols = smallclueParseLong(argv[index + 2]);
-            if (rows <= 0 || cols <= 0) {
-                fprintf(stderr, "stty: invalid size values\n");
-                return 1;
-            }
-            index += 3;
-            continue;
+        if (strcmp(arg, "rows") == 0 || strcmp(arg, "cols") == 0 ||
+            strcmp(arg, "columns") == 0 || strcmp(arg, "size") == 0) {
+            fprintf(stderr, "stty: rows/columns are not supported; use resize\n");
+            return 1;
         }
         fprintf(stderr, "stty: unsupported argument '%s'\n", arg);
         return 1;
@@ -7103,27 +7066,11 @@ static int smallclueSttyCommand(int argc, char **argv) {
         smallclueEmitTerminalSane();
     }
 
-    if (rows <= 0 && cols <= 0) {
-        if (requestReset || requestSane) {
-            return 0;
-        }
-        fprintf(stderr, "Usage: stty rows <n> [cols <n>]\n");
-        return 1;
+    if (requestReset || requestSane) {
+        return 0;
     }
-
-    if (rows <= 0) {
-        const char *env = getenv("LINES");
-        rows = env ? smallclueParseLong(env) : 24;
-        if (rows <= 0) rows = 24;
-    }
-    if (cols <= 0) {
-        const char *env = getenv("COLUMNS");
-        cols = env ? smallclueParseLong(env) : 80;
-        if (cols <= 0) cols = 80;
-    }
-
-    smallclueApplyWindowSize((int)rows, (int)cols);
-    return 0;
+    fprintf(stderr, "Usage: stty [reset] [sane]\n");
+    return 1;
 }
 
 static int smallclueResizeCommand(int argc, char **argv) {
