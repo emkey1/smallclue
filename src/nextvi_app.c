@@ -43,6 +43,46 @@ static void smallclueRestoreEnv(const char *name, char *saved) {
     }
 }
 
+typedef struct {
+    int saved_fds[3];
+    bool saved_valid[3];
+} SmallclueStdFdBackup;
+
+static void smallclueSaveStandardFds(SmallclueStdFdBackup *backup) {
+    if (!backup) {
+        return;
+    }
+    memset(backup, 0, sizeof(*backup));
+    int targets[3] = { STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO };
+    for (int i = 0; i < 3; ++i) {
+        int fd = dup(targets[i]);
+        if (fd >= 0) {
+            fcntl(fd, F_SETFD, FD_CLOEXEC);
+            backup->saved_fds[i] = fd;
+            backup->saved_valid[i] = true;
+        } else {
+            backup->saved_fds[i] = -1;
+            backup->saved_valid[i] = false;
+        }
+    }
+}
+
+static void smallclueRestoreStandardFds(SmallclueStdFdBackup *backup) {
+    if (!backup) {
+        return;
+    }
+    int targets[3] = { STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO };
+    for (int i = 0; i < 3; ++i) {
+        if (!backup->saved_valid[i] || backup->saved_fds[i] < 0) {
+            continue;
+        }
+        (void)dup2(backup->saved_fds[i], targets[i]);
+        close(backup->saved_fds[i]);
+        backup->saved_fds[i] = -1;
+        backup->saved_valid[i] = false;
+    }
+}
+
 static void smallclueResetNextviGlobals(void) {
     /* nextvi_reset_state() is called inside nextvi_main_entry; avoid double-free */
 }
@@ -91,6 +131,9 @@ static int smallclueSetupTty(void) {
         if (fd != STDOUT_FILENO) {
             dup2(fd, STDOUT_FILENO);
         }
+        if (fd != STDERR_FILENO) {
+            dup2(fd, STDERR_FILENO);
+        }
     }
 #if defined(PSCAL_TARGET_IOS)
     if (fd < 0) {
@@ -105,6 +148,9 @@ int smallclueRunEditor(int argc, char **argv) {
     char *saved_term = smallclueOverrideEnv("TERM", "xterm-256color");
 
     smallclueResetNextviGlobals();
+
+    SmallclueStdFdBackup stdio_backup;
+    smallclueSaveStandardFds(&stdio_backup);
 
     int dup_fd = smallclueSetupTty();
     struct termios saved_ios;
@@ -147,6 +193,7 @@ int smallclueRunEditor(int argc, char **argv) {
     if (dup_fd >= 0 && dup_fd != STDIN_FILENO && dup_fd != tty_fd) {
         close(dup_fd);
     }
+    smallclueRestoreStandardFds(&stdio_backup);
     smallclueRestoreEnv("TERM", saved_term);
     return status;
 }
