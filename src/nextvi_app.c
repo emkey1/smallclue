@@ -6,7 +6,9 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
 #include <termios.h>
+#include <pthread.h>
 #include "termios_shim.h"
 #if defined(PSCAL_TARGET_IOS)
 #include "common/path_virtualization.h"
@@ -22,6 +24,9 @@ static void pscalRuntimeDebugLog(const char *message) {
     (void)message;
 }
 #endif
+
+// nextvi uses process-wide globals; serialize editor runs to avoid state races.
+static pthread_mutex_t s_nextvi_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static char *smallclueOverrideEnv(const char *name, const char *value) {
     const char *current = getenv(name);
@@ -144,6 +149,16 @@ static int smallclueSetupTty(void) {
 }
 
 int smallclueRunEditor(int argc, char **argv) {
+    const char *tool_name = (argc > 0 && argv && argv[0]) ? argv[0] : "nextvi";
+    int lock_rc = pthread_mutex_trylock(&s_nextvi_lock);
+    if (lock_rc != 0) {
+        if (lock_rc == EBUSY) {
+            fprintf(stderr, "%s: editor already running in another window\n", tool_name);
+        } else {
+            fprintf(stderr, "%s: unable to acquire editor lock (%d)\n", tool_name, lock_rc);
+        }
+        return 1;
+    }
     /* nextvi expects xterm-ish behavior; advertise xterm-256color so SGR works. */
     char *saved_term = smallclueOverrideEnv("TERM", "xterm-256color");
 
@@ -195,5 +210,6 @@ int smallclueRunEditor(int argc, char **argv) {
     }
     smallclueRestoreStandardFds(&stdio_backup);
     smallclueRestoreEnv("TERM", saved_term);
+    pthread_mutex_unlock(&s_nextvi_lock);
     return status;
 }
