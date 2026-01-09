@@ -806,8 +806,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                        "  With a command: show usage if available"},
     {"licenses", "licenses\n"
                  "  Browse PSCAL and third-party licenses; use arrows/enter to view"},
-    {"dmesg", "dmesg\n"
-              "  Show PSCAL runtime log for this session"},
+    {"dmesg", "dmesg [-T]\n"
+              "  Show PSCAL runtime log for this session\n"
+              "  -T  show human-readable timestamps"},
     {"top", "top\n"
             "  Show PSCAL virtual processes and CPU ticks"},
 #endif
@@ -5671,16 +5672,130 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
 }
 
 #if defined(PSCAL_TARGET_IOS)
+static bool smallclueParseRuntimeLogLine(const char *line, time_t *out_seconds, int *out_millis, const char **out_message) {
+    if (!line || line[0] != '[') {
+        return false;
+    }
+    const char *end = strchr(line, ']');
+    if (!end) {
+        return false;
+    }
+    const char *ts_start = line + 1;
+    const char *dot = memchr(ts_start, '.', (size_t)(end - ts_start));
+    if (!dot) {
+        return false;
+    }
+    errno = 0;
+    char *sec_end = NULL;
+    long long seconds = strtoll(ts_start, &sec_end, 10);
+    if (errno != 0 || sec_end != dot) {
+        return false;
+    }
+    const char *ms_start = dot + 1;
+    if (ms_start >= end) {
+        return false;
+    }
+    int millis = 0;
+    int digits = 0;
+    for (const char *p = ms_start; p < end; ++p) {
+        if (!isdigit((unsigned char)*p)) {
+            return false;
+        }
+        if (digits < 3) {
+            millis = (millis * 10) + (*p - '0');
+        }
+        digits++;
+    }
+    if (digits == 0) {
+        return false;
+    }
+    if (digits == 1) {
+        millis *= 100;
+    } else if (digits == 2) {
+        millis *= 10;
+    }
+    if (out_seconds) {
+        *out_seconds = (time_t)seconds;
+    }
+    if (out_millis) {
+        *out_millis = millis;
+    }
+    if (out_message) {
+        const char *message = end + 1;
+        if (*message == ' ') {
+            message++;
+        }
+        *out_message = message;
+    }
+    return true;
+}
+
+static void smallclueDmesgPrintLineHuman(const char *line) {
+    time_t seconds = 0;
+    int millis = 0;
+    const char *message = NULL;
+    if (!smallclueParseRuntimeLogLine(line, &seconds, &millis, &message)) {
+        fputs(line, stdout);
+        fputc('\n', stdout);
+        return;
+    }
+    struct tm tm_val;
+    char time_buf[64];
+    if (!localtime_r(&seconds, &tm_val) ||
+        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_val) == 0) {
+        fputs(line, stdout);
+        fputc('\n', stdout);
+        return;
+    }
+    if (message && *message) {
+        fprintf(stdout, "[%s.%03d] %s\n", time_buf, millis, message);
+    } else {
+        fprintf(stdout, "[%s.%03d]\n", time_buf, millis);
+    }
+}
+
 static int smallclueDmesgCommand(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
+    smallclueResetGetopt();
+    int human = 0;
+    int opt;
+    while ((opt = getopt(argc, argv, "T")) != -1) {
+        switch (opt) {
+            case 'T':
+                human = 1;
+                break;
+            default:
+                fprintf(stderr, "usage: dmesg [-T]\n");
+                return 1;
+        }
+    }
+    if (optind < argc) {
+        fprintf(stderr, "usage: dmesg [-T]\n");
+        return 1;
+    }
     if (pscalRuntimeCopySessionLog) {
         char *snapshot = pscalRuntimeCopySessionLog();
         if (snapshot) {
-            fputs(snapshot, stdout);
-            size_t len = strlen(snapshot);
-            if (len > 0 && snapshot[len - 1] != '\n') {
-                fputc('\n', stdout);
+            if (!human) {
+                fputs(snapshot, stdout);
+                size_t len = strlen(snapshot);
+                if (len > 0 && snapshot[len - 1] != '\n') {
+                    fputc('\n', stdout);
+                }
+            } else {
+                char *cursor = snapshot;
+                while (cursor && *cursor) {
+                    char *line_end = strchr(cursor, '\n');
+                    if (line_end) {
+                        *line_end = '\0';
+                    }
+                    if (*cursor != '\0') {
+                        smallclueDmesgPrintLineHuman(cursor);
+                    }
+                    if (!line_end) {
+                        break;
+                    }
+                    cursor = line_end + 1;
+                }
             }
             fflush(stdout);
             free(snapshot);
