@@ -273,6 +273,7 @@ DEFINE_SMALLCLUE_WRAPPER("kill", kill)
 DEFINE_SMALLCLUE_WRAPPER("sh", sh)
 #endif
 DEFINE_SMALLCLUE_WRAPPER("uptime", uptime)
+DEFINE_SMALLCLUE_WRAPPER("uname", uname)
 DEFINE_SMALLCLUE_WRAPPER("file", file)
 DEFINE_SMALLCLUE_WRAPPER("scp", scp)
 DEFINE_SMALLCLUE_WRAPPER("sftp", sftp)
@@ -402,6 +403,7 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("sh", vmBuiltinSmallclue_sh, "sh");
 #endif
     registerSmallclueBuiltin("uptime", vmBuiltinSmallclue_uptime, "uptime");
+    registerSmallclueBuiltin("uname", vmBuiltinSmallclue_uname, "uname");
     registerSmallclueBuiltin("scp", vmBuiltinSmallclue_scp, "scp");
     registerSmallclueBuiltin("sftp", vmBuiltinSmallclue_sftp, "sftp");
     registerSmallclueBuiltin("ssh", vmBuiltinSmallclue_ssh, "ssh");

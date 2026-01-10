@@ -44,6 +44,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <signal.h>
 #include <sys/select.h>
 #include <glob.h>
@@ -368,6 +369,7 @@ extern int exsh_main(int argc, char **argv);
 static int smallclueShCommand(int argc, char **argv);
 #endif
 static int smallclueUptimeCommand(int argc, char **argv);
+static int smallclueUnameCommand(int argc, char **argv);
 static int smallcluePingCommand(int argc, char **argv);
 static int smallclueMarkdownCommand(int argc, char **argv);
 static int smallclueCurlCommand(int argc, char **argv);
@@ -585,6 +587,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"tr", smallclueTrCommand, "Translate or delete characters"},
     {"true", smallclueTrueCommand, "Do nothing, successfully"},
     {"type", smallclueTypeCommand, "Describe command names"},
+    {"uname", smallclueUnameCommand, "Show system information"},
     {"uniq", smallclueUniqCommand, "Report or omit repeated lines"},
     {"uptime", smallclueUptimeCommand, "Show system uptime"},
     {"version", smallclueVersionCommand, "Show app version"},
@@ -762,6 +765,14 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Exit status 0"},
     {"type", "type NAME...\n"
              "  Describe how a name is resolved"},
+    {"uname", "uname [-asnrvmp]\n"
+              "  -a show all fields\n"
+              "  -s system name\n"
+              "  -n nodename\n"
+              "  -r release\n"
+              "  -v version\n"
+              "  -m machine\n"
+              "  -p processor"},
     {"uniq", "uniq [-c] [-d] [-u] [FILE]\n"
              "  -c count\n"
              "  -d duplicates only\n"
@@ -4563,6 +4574,175 @@ static int smallclueShCommand(int argc, char **argv) {
     return exsh_main(argc, argv);
 }
 #endif
+
+#if defined(__APPLE__)
+static bool smallclueUnameCopySysctl(const char *name, char *buffer, size_t buffer_len) {
+    if (!name || !buffer || buffer_len == 0) {
+        return false;
+    }
+    size_t len = buffer_len;
+    if (sysctlbyname(name, buffer, &len, NULL, 0) != 0 || len == 0) {
+        buffer[0] = '\0';
+        return false;
+    }
+    buffer[buffer_len - 1] = '\0';
+    return buffer[0] != '\0';
+}
+
+static const char *smallclueUnameMachine(char *buffer, size_t buffer_len) {
+    const char *sim = getenv("SIMULATOR_MODEL_IDENTIFIER");
+    if (sim && *sim) {
+        snprintf(buffer, buffer_len, "%s", sim);
+        return buffer;
+    }
+    if (smallclueUnameCopySysctl("hw.machine", buffer, buffer_len)) {
+        return buffer;
+    }
+    return NULL;
+}
+#endif
+
+#if defined(PSCAL_TARGET_IOS)
+static const char *smallclueUnameIOSName(const char *machine) {
+    if (machine) {
+        if (strncmp(machine, "iPad", 4) == 0) {
+            return "iPadOS_PSCAL";
+        }
+        if (strncmp(machine, "iPhone", 6) == 0 || strncmp(machine, "iPod", 4) == 0) {
+            return "iOS_PSCAL";
+        }
+    }
+    return "iOS_PSCAL";
+}
+#endif
+
+static int smallclueUnameCommand(int argc, char **argv) {
+    bool show_sysname = false;
+    bool show_nodename = false;
+    bool show_release = false;
+    bool show_version = false;
+    bool show_machine = false;
+    bool show_processor = false;
+    bool show_all = false;
+    smallclueResetGetopt();
+    int opt;
+    while ((opt = getopt(argc, argv, "asnrvmp")) != -1) {
+        switch (opt) {
+            case 'a':
+                show_all = true;
+                break;
+            case 's':
+                show_sysname = true;
+                break;
+            case 'n':
+                show_nodename = true;
+                break;
+            case 'r':
+                show_release = true;
+                break;
+            case 'v':
+                show_version = true;
+                break;
+            case 'm':
+                show_machine = true;
+                break;
+            case 'p':
+                show_processor = true;
+                break;
+            default:
+                fputs("usage: uname [-asnrvmp]\n", stderr);
+                return 1;
+        }
+    }
+
+    if (!show_sysname && !show_nodename && !show_release &&
+        !show_version && !show_machine && !show_processor) {
+        show_sysname = true;
+    }
+    if (show_all) {
+        show_sysname = true;
+        show_nodename = true;
+        show_release = true;
+        show_version = true;
+        show_machine = true;
+    }
+
+    struct utsname info;
+    if (uname(&info) != 0) {
+        fprintf(stderr, "uname: %s\n", strerror(errno));
+        return 1;
+    }
+
+    const char *sysname = info.sysname;
+    const char *nodename = info.nodename;
+    const char *release = info.release;
+    const char *version = info.version;
+    const char *machine = info.machine;
+    const char *processor = info.machine;
+#if defined(__APPLE__)
+    char machine_buf[64];
+    if (smallclueUnameMachine(machine_buf, sizeof(machine_buf))) {
+        machine = machine_buf;
+        processor = machine_buf;
+    }
+#endif
+#if defined(PSCAL_TARGET_IOS)
+    const char *ios_name = smallclueUnameIOSName(machine);
+    if (ios_name) {
+        sysname = ios_name;
+    }
+#if defined(__APPLE__)
+    char product_version[64];
+    if (smallclueUnameCopySysctl("kern.osproductversion",
+                                 product_version,
+                                 sizeof(product_version))) {
+        release = product_version;
+    }
+#endif
+#endif
+
+    bool first = true;
+    if (show_sysname) {
+        fputs(sysname && *sysname ? sysname : "unknown", stdout);
+        first = false;
+    }
+    if (show_nodename) {
+        if (!first) {
+            putchar(' ');
+        }
+        fputs(nodename && *nodename ? nodename : "unknown", stdout);
+        first = false;
+    }
+    if (show_release) {
+        if (!first) {
+            putchar(' ');
+        }
+        fputs(release && *release ? release : "unknown", stdout);
+        first = false;
+    }
+    if (show_version) {
+        if (!first) {
+            putchar(' ');
+        }
+        fputs(version && *version ? version : "unknown", stdout);
+        first = false;
+    }
+    if (show_machine) {
+        if (!first) {
+            putchar(' ');
+        }
+        fputs(machine && *machine ? machine : "unknown", stdout);
+        first = false;
+    }
+    if (show_processor) {
+        if (!first) {
+            putchar(' ');
+        }
+        fputs(processor && *processor ? processor : "unknown", stdout);
+    }
+    putchar('\n');
+    return 0;
+}
 
 static int64_t smallclueUptimeSeconds(void) {
 #if defined(__APPLE__)
