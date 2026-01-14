@@ -191,6 +191,33 @@ static bool smallclueShouldAbort(int *out_status) {
         return true;
     }
 
+#if defined(PSCAL_TARGET_IOS)
+    /* Fallback: drain pending vproc signals so Ctrl-C/Z delivered via vprocKillShim
+     * interrupt in-process applets even when the runtime bridge is absent. */
+    int cur_pid = vprocGetPidShim();
+    if (cur_pid <= 0) {
+        cur_pid = vprocGetShellSelfPid();
+    }
+    if (cur_pid > 0) {
+        sigset_t pending;
+        sigemptyset(&pending);
+        if (vprocSigpending(cur_pid, &pending) == 0 &&
+            (sigismember(&pending, SIGINT) || sigismember(&pending, SIGTSTP))) {
+            sigset_t watchset;
+            sigemptyset(&watchset);
+            sigaddset(&watchset, SIGINT);
+            sigaddset(&watchset, SIGTSTP);
+            int signo = 0;
+            if (vprocSigwait(cur_pid, &watchset, &signo) == 0) {
+                if (out_status) {
+                    *out_status = (signo == SIGINT) ? 130 : 148;
+                }
+                return true;
+            }
+        }
+    }
+#endif
+
     if (shellRuntimeConsumeExitRequested) {
         if (shellRuntimeConsumeExitRequested()) {
             if (out_status) {
