@@ -162,11 +162,21 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
         VProcCommandScope vproc_scope;
         bool vproc_scope_active = false;
         char label[96];
+        int saved_fg_pgid = -1;
+        int session_sid = -1;
         smallclueFormatLabel(argc, argv, label, sizeof(label));
         if (label[0]) {
-            vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, label, false, true);
+            vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, label, true, true);
         } else {
-            vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, applet->name, false, true);
+            vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, applet->name, true, true);
+        }
+        if (vproc_scope_active) {
+            int shell_pid = vprocGetShellSelfPid();
+            if (shell_pid > 0) {
+                session_sid = vprocGetSid(shell_pid);
+                saved_fg_pgid = vprocGetForegroundPgid(session_sid);
+                vprocSetForegroundPgid(session_sid, vproc_scope.pid);
+            }
         }
 
         jmp_buf exit_env;
@@ -195,6 +205,9 @@ smallclue_dispatch_done:
         if (vproc_scope_active) {
             vprocCommandScopeEnd(&vproc_scope, status);
             vproc_scope_active = false;
+        }
+        if (session_sid > 0 && saved_fg_pgid > 0) {
+            vprocSetForegroundPgid(session_sid, saved_fg_pgid);
         }
         if (override_active) {
             if (PSCALRuntimePopExitOverrideWithStatus) {

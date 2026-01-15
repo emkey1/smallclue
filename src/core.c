@@ -4820,6 +4820,7 @@ static int smallclueWatchRunApplet(const SmallclueApplet *applet, int argc, char
         fprintf(stderr, "watch: %s: command not found\n", argv[0]);
         return 127;
     }
+    const char *dbg = getenv("SMALLCLUE_DEBUG");
 #if !defined(PSCAL_TARGET_IOS)
     return smallclueDispatchApplet(applet, argc, argv);
 #else
@@ -4843,10 +4844,13 @@ static int smallclueWatchRunApplet(const SmallclueApplet *applet, int argc, char
     bool scoped = vprocCommandScopeBegin(&scope,
                                          label[0] ? label : (argv && argv[0] ? argv[0] : applet->name),
                                          true,
-                                         true);
+                                         false);
     int status = smallclueDispatchApplet(applet, argc, argv);
     if (scoped) {
         vprocCommandScopeEnd(&scope, status);
+        if (dbg && *dbg) {
+            fprintf(stderr, "[smallclue] vproc end pid=%d status=%d\n", scope.pid, status);
+        }
     }
     return status;
 #endif
