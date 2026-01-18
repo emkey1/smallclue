@@ -2295,10 +2295,6 @@ static int pager_file(const char *cmd_name, const char *path, FILE *stream) {
     int force_env = pagerParseEnvBool(getenv("PSCALI_PAGER_FORCE"));
     bool force_interactive = false;
     bool disable_interactive = false;
-#if defined(PSCAL_TARGET_IOS)
-    /* Default to non-interactive when no control TTY is available in pipelines. */
-    force_interactive = false;
-#endif
     if (force_env > 0) {
         force_interactive = true;
     } else if (force_env == 0) {
@@ -2314,11 +2310,13 @@ static int pager_file(const char *cmd_name, const char *path, FILE *stream) {
     bool interactive = have_ctrl || force_interactive;
     /* If we have no viable control fd and no interactive stdio, force a
      * non-interactive dump so pipelines still produce output when no TTY. */
-    if (!have_ctrl &&
-        !pscalRuntimeStdinIsInteractive() &&
-        !pscalRuntimeStdoutIsInteractive() &&
-        !pscalRuntimeStderrIsInteractive()) {
-        interactive = false;
+    if (!force_interactive) {
+        if (!have_ctrl &&
+            !pscalRuntimeStdinIsInteractive() &&
+            !pscalRuntimeStdoutIsInteractive() &&
+            !pscalRuntimeStderrIsInteractive()) {
+            interactive = false;
+        }
     }
     if (!interactive) {
         /* No interactive input available; dump what we collected. */
