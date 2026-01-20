@@ -1208,6 +1208,8 @@ static int smallclueTopCommand(int argc, char **argv) {
     bool hide_kernel = false;
     struct termios orig_termios;
     bool have_termios = false;
+    int stdin_flags = -1;
+    bool restore_flags = false;
     struct sigaction old_int;
     bool have_old_int = false;
     for (int i = 1; i < argc; ++i) {
@@ -1243,12 +1245,18 @@ static int smallclueTopCommand(int argc, char **argv) {
     if (sigaction(SIGINT, &sa, &old_int) == 0) {
         have_old_int = true;
     }
+    stdin_flags = fcntl(STDIN_FILENO, F_GETFL);
+    if (stdin_flags != -1 && (stdin_flags & O_NONBLOCK) == 0) {
+        if (fcntl(STDIN_FILENO, F_SETFL, stdin_flags | O_NONBLOCK) == 0) {
+            restore_flags = true;
+        }
+    }
     if (isatty(STDIN_FILENO)) {
         struct termios raw;
         if (tcgetattr(STDIN_FILENO, &orig_termios) == 0) {
             raw = orig_termios;
             raw.c_lflag &= ~(ICANON | ECHO);
-            raw.c_cc[VMIN] = 1;
+            raw.c_cc[VMIN] = 0;
             raw.c_cc[VTIME] = 0;
             if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
                 have_termios = true;
@@ -1382,21 +1390,43 @@ static int smallclueTopCommand(int argc, char **argv) {
             break;
         }
 
-        /* Block for up to 1s waiting for input, then loop to refresh. */
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(STDIN_FILENO, &rfds);
-        struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
-        int rc = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
-        if (rc > 0 && FD_ISSET(STDIN_FILENO, &rfds)) {
+        /* Drain any pending input; exit on q/Q/Ctrl+C/EOF. */
+        while (1) {
             char ch = 0;
             ssize_t r = read(STDIN_FILENO, &ch, 1);
-            if (r > 0 && (ch == 'q' || ch == 'Q' || ch == 0x03)) {
-                break;
+            if (r > 0) {
+                if (ch == 'q' || ch == 'Q' || ch == 0x03) {
+                    gSmallclueTopQuit = 1;
+                    break;
+                }
+                continue; /* keep draining buffer */
             } else if (r == 0) {
+                gSmallclueTopQuit = 1;
+                break;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            } else if (errno == EINTR) {
+                if (gSmallclueTopQuit) {
+                    break;
+                }
+                continue;
+            } else {
+                gSmallclueTopQuit = 1;
                 break;
             }
-        } else if (rc < 0 && errno != EINTR) {
+        }
+        if (gSmallclueTopQuit) {
+            break;
+        }
+
+        struct timespec ts = {.tv_sec = 1, .tv_nsec = 0};
+        while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
+            if (gSmallclueTopQuit) {
+                break;
+            }
+            continue;
+        }
+        if (gSmallclueTopQuit) {
             break;
         }
     }
@@ -1404,6 +1434,9 @@ static int smallclueTopCommand(int argc, char **argv) {
     free(snapshots);
     if (have_termios) {
         tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
+    }
+    if (restore_flags && stdin_flags != -1) {
+        fcntl(STDIN_FILENO, F_SETFL, stdin_flags);
     }
     if (have_old_int) {
         sigaction(SIGINT, &old_int, NULL);
