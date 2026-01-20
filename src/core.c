@@ -412,6 +412,8 @@ static int smallclueIpAddrCommand(int argc, char **argv);
 #endif
 static int smallclueDfCommand(int argc, char **argv);
 #if defined(PSCAL_TARGET_IOS)
+static volatile sig_atomic_t gSmallclueTopQuit = 0;
+static void smallclueTopSigint(int signo);
 static int smallclueTopCommand(int argc, char **argv);
 static int smallclueDmesgCommand(int argc, char **argv);
 static int smallclueHelpCommand(int argc, char **argv);
@@ -1196,6 +1198,11 @@ static bool smallclueWriteAll(int fd, const char *data, size_t len) {
     return true;
 }
 
+static void smallclueTopSigint(int signo) {
+    (void)signo;
+    gSmallclueTopQuit = 1;
+}
+
 static int smallclueTopCommand(int argc, char **argv) {
     bool tree = true;
     bool hide_kernel = false;
@@ -1409,12 +1416,6 @@ typedef struct {
     const char *name;
     int value;
 } SmallclueSignalName;
-
-static volatile sig_atomic_t gSmallclueTopQuit = 0;
-static void smallclueTopSigint(int signo) {
-    (void)signo;
-    gSmallclueTopQuit = 1;
-}
 
 static const SmallclueSignalName kSignalNames[] = {
 #ifdef SIGHUP
