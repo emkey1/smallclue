@@ -1226,40 +1226,94 @@ static int smallclueTopCommand(int argc, char **argv) {
     VProc *self_vp = vprocCurrent();
     int self_pid = self_vp ? vprocPid(self_vp) : (int)vprocGetPidShim();
 
-    size_t snapshot_cap = vprocSnapshot(NULL, 0);
+    size_t snapshot_cap = 0;
     VProcSnapshot *snapshots = NULL;
-    if (snapshot_cap > 0) {
-        snapshots = (VProcSnapshot *)calloc(snapshot_cap, sizeof(VProcSnapshot));
-    }
-    size_t snapshot_count = snapshots ? vprocSnapshot(snapshots, snapshot_cap) : 0;
 
-    char header[160];
-    int hn = snprintf(header, sizeof(header),
-                      "%-6s %-6s %-6s %-6s %-3s %-10s %-6s %-6s %s\n",
-                      "PID", "PPID", "PGID", "SID", "FG", "STATE", "UTIME", "STIME", "CMD");
-    if (hn > 0) {
-        (void)smallclueWriteAll(STDOUT_FILENO, header, (size_t)hn);
-    }
-
-    if (tree) {
-        size_t row_cap = snapshot_count ? snapshot_count : 1;
-        VProcTreeRow *rows = (VProcTreeRow *)calloc(row_cap, sizeof(VProcTreeRow));
-        size_t row_count = rows ? vprocBuildTreeRows(snapshots, snapshot_count, rows, row_cap) : 0;
-        if (rows && row_count > row_cap) {
-            VProcTreeRow *grown = (VProcTreeRow *)realloc(rows, row_count * sizeof(VProcTreeRow));
-            if (grown) {
-                rows = grown;
-                row_cap = row_count;
+    while (1) {
+        size_t needed = vprocSnapshot(NULL, 0);
+        if (needed > snapshot_cap) {
+            VProcSnapshot *resized = (VProcSnapshot *)realloc(snapshots, needed * sizeof(VProcSnapshot));
+            if (!resized) {
+                free(snapshots);
+                fprintf(stderr, "top: out of memory\n");
+                return 1;
             }
-            row_count = rows ? vprocBuildTreeRows(snapshots, snapshot_count, rows, row_cap) : 0;
+            snapshots = resized;
+            snapshot_cap = needed;
         }
-        if (rows) {
-            for (size_t r = 0; r < row_count && r < row_cap; ++r) {
-                const VProcTreeRow *row = &rows[r];
-                if (!row || row->snapshot_index >= snapshot_count) {
-                    continue;
+        size_t snapshot_count = snapshots ? vprocSnapshot(snapshots, snapshot_cap) : 0;
+
+        /* Clear and render. */
+        fputs("\x1b[2J\x1b[H", stdout);
+
+        char header[160];
+        int hn = snprintf(header, sizeof(header),
+                          "%-6s %-6s %-6s %-6s %-3s %-10s %-6s %-6s %s\n",
+                          "PID", "PPID", "PGID", "SID", "FG", "STATE", "UTIME", "STIME", "CMD");
+        if (hn > 0) {
+            (void)smallclueWriteAll(STDOUT_FILENO, header, (size_t)hn);
+        }
+
+        if (tree) {
+            size_t row_cap = snapshot_count ? snapshot_count : 1;
+            VProcTreeRow *rows = (VProcTreeRow *)calloc(row_cap, sizeof(VProcTreeRow));
+            size_t row_count = rows ? vprocBuildTreeRows(snapshots, snapshot_count, rows, row_cap) : 0;
+            if (rows && row_count > row_cap) {
+                VProcTreeRow *grown = (VProcTreeRow *)realloc(rows, row_count * sizeof(VProcTreeRow));
+                if (grown) {
+                    rows = grown;
+                    row_cap = row_count;
                 }
-                VProcSnapshot *snap = &snapshots[row->snapshot_index];
+                row_count = rows ? vprocBuildTreeRows(snapshots, snapshot_count, rows, row_cap) : 0;
+            }
+            if (rows) {
+                for (size_t r = 0; r < row_count && r < row_cap; ++r) {
+                    const VProcTreeRow *row = &rows[r];
+                    if (!row || row->snapshot_index >= snapshot_count) {
+                        continue;
+                    }
+                    VProcSnapshot *snap = &snapshots[row->snapshot_index];
+                    if (!snap || snap->pid <= 0) {
+                        continue;
+                    }
+                    if (hide_kernel &&
+                        ((snap->command[0] && strcmp(snap->command, "kernel") == 0) ||
+                         (snap->comm[0] && strcmp(snap->comm, "kernel") == 0))) {
+                        continue;
+                    }
+                    const char *state = smallclueTopState(snap);
+                    bool fg = (snap->fg_pgid > 0 && snap->pgid == snap->fg_pgid);
+                    const char *cmd = snap->command[0] ? snap->command
+                                    : (snap->comm[0] ? snap->comm
+                                    : ((snap->pid == vprocGetShellSelfPid()) ? "shell" : "task"));
+                    if (snap->pid == self_pid) {
+                        cmd = "top";
+                    }
+
+                    char indent[96];
+                    size_t used = 0;
+                    for (int d = 0; d < row->depth && used + 2 < sizeof(indent); ++d) {
+                        indent[used++] = ' ';
+                        indent[used++] = ' ';
+                    }
+                    indent[used] = '\0';
+
+                    double ut_s = 0.0, st_s = 0.0;
+                    vprocFormatCpuTimes(snap->rusage_utime, snap->rusage_stime, &ut_s, &st_s);
+                    char line[320];
+                    int n = snprintf(line, sizeof(line),
+                                     "%-6d %-6d %-6d %-6d %-3s %-10s %-6.1f %-6.1f %s%s\n",
+                                     snap->pid, snap->parent_pid, snap->pgid, snap->sid,
+                                     fg ? "fg" : "", state, ut_s, st_s, indent, cmd);
+                    if (n > 0) {
+                        (void)smallclueWriteAll(STDOUT_FILENO, line, (size_t)n);
+                    }
+                }
+                free(rows);
+            }
+        } else {
+            for (size_t i = 0; i < snapshot_count; ++i) {
+                VProcSnapshot *snap = &snapshots[i];
                 if (!snap || snap->pid <= 0) {
                     continue;
                 }
@@ -1276,57 +1330,34 @@ static int smallclueTopCommand(int argc, char **argv) {
                 if (snap->pid == self_pid) {
                     cmd = "top";
                 }
-
-                char indent[96];
-                size_t used = 0;
-                for (int d = 0; d < row->depth && used + 2 < sizeof(indent); ++d) {
-                    indent[used++] = ' ';
-                    indent[used++] = ' ';
-                }
-                indent[used] = '\0';
-
                 double ut_s = 0.0, st_s = 0.0;
                 vprocFormatCpuTimes(snap->rusage_utime, snap->rusage_stime, &ut_s, &st_s);
                 char line[320];
                 int n = snprintf(line, sizeof(line),
-                                 "%-6d %-6d %-6d %-6d %-3s %-10s %-6.1f %-6.1f %s%s\n",
+                                 "%-6d %-6d %-6d %-6d %-3s %-10s %-6.1f %-6.1f %s\n",
                                  snap->pid, snap->parent_pid, snap->pgid, snap->sid,
-                                 fg ? "fg" : "", state, ut_s, st_s, indent, cmd);
+                                 fg ? "fg" : "", state, ut_s, st_s, cmd);
                 if (n > 0) {
                     (void)smallclueWriteAll(STDOUT_FILENO, line, (size_t)n);
                 }
             }
-            free(rows);
         }
-    } else {
-        for (size_t i = 0; i < snapshot_count; ++i) {
-            VProcSnapshot *snap = &snapshots[i];
-            if (!snap || snap->pid <= 0) {
-                continue;
+
+        fflush(stdout);
+
+        /* Poll for quit input; refresh roughly once per second otherwise. */
+        struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
+        int rc = poll(&pfd, 1, 1000);
+        if (rc > 0 && (pfd.revents & POLLIN)) {
+            char ch = 0;
+            ssize_t r = read(STDIN_FILENO, &ch, 1);
+            if (r > 0 && (ch == 'q' || ch == 'Q')) {
+                break;
             }
-            if (hide_kernel &&
-                ((snap->command[0] && strcmp(snap->command, "kernel") == 0) ||
-                 (snap->comm[0] && strcmp(snap->comm, "kernel") == 0))) {
-                continue;
-            }
-            const char *state = smallclueTopState(snap);
-            bool fg = (snap->fg_pgid > 0 && snap->pgid == snap->fg_pgid);
-            const char *cmd = snap->command[0] ? snap->command
-                            : (snap->comm[0] ? snap->comm
-                            : ((snap->pid == vprocGetShellSelfPid()) ? "shell" : "task"));
-            if (snap->pid == self_pid) {
-                cmd = "top";
-            }
-            double ut_s = 0.0, st_s = 0.0;
-            vprocFormatCpuTimes(snap->rusage_utime, snap->rusage_stime, &ut_s, &st_s);
-            char line[320];
-            int n = snprintf(line, sizeof(line),
-                             "%-6d %-6d %-6d %-6d %-3s %-10s %-6.1f %-6.1f %s\n",
-                             snap->pid, snap->parent_pid, snap->pgid, snap->sid,
-                             fg ? "fg" : "", state, ut_s, st_s, cmd);
-            if (n > 0) {
-                (void)smallclueWriteAll(STDOUT_FILENO, line, (size_t)n);
-            }
+        } else if (rc > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            break;
+        } else if (rc < 0 && errno != EINTR) {
+            break;
         }
     }
 
