@@ -1197,8 +1197,8 @@ static bool smallclueWriteAll(int fd, const char *data, size_t len) {
 static int smallclueTopCommand(int argc, char **argv) {
     bool tree = true;
     bool hide_kernel = false;
-    int stdin_flags = fcntl(STDIN_FILENO, F_GETFL);
-    bool restore_stdin_flags = false;
+    struct termios orig_termios;
+    bool have_termios = false;
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
         if (!arg) {
@@ -1224,9 +1224,16 @@ static int smallclueTopCommand(int argc, char **argv) {
             return 1;
         }
     }
-    if (stdin_flags >= 0 && (stdin_flags & O_NONBLOCK) == 0) {
-        if (fcntl(STDIN_FILENO, F_SETFL, stdin_flags | O_NONBLOCK) == 0) {
-            restore_stdin_flags = true;
+    if (isatty(STDIN_FILENO)) {
+        struct termios raw;
+        if (tcgetattr(STDIN_FILENO, &orig_termios) == 0) {
+            raw = orig_termios;
+            raw.c_lflag &= ~(ICANON | ECHO);
+            raw.c_cc[VMIN] = 0;
+            raw.c_cc[VTIME] = 0;
+            if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
+                have_termios = true;
+            }
         }
     }
 
@@ -1353,35 +1360,22 @@ static int smallclueTopCommand(int argc, char **argv) {
         fflush(stdout);
 
         /* Poll for quit input; refresh roughly once per second otherwise. */
-        if (restore_stdin_flags || (stdin_flags >= 0 && (stdin_flags & O_NONBLOCK))) {
+        struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
+        int rc = poll(&pfd, 1, 1000);
+        if (rc > 0 && (pfd.revents & POLLIN)) {
             char ch = 0;
             ssize_t r = read(STDIN_FILENO, &ch, 1);
-            if (r > 0 && (ch == 'q' || ch == 'Q')) {
-                break;
-            } else if (r == 0) {
-                break;
-            } else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            if (r > 0 && (ch == 'q' || ch == 'Q' || ch == 0x03)) {
                 break;
             }
-        } else {
-            struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
-            if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
-                char ch = 0;
-                ssize_t r = read(STDIN_FILENO, &ch, 1);
-                if (r > 0 && (ch == 'q' || ch == 'Q')) {
-                    break;
-                }
-            }
-        }
-        struct timespec ts = {.tv_sec = 1, .tv_nsec = 0};
-        while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
-            /* retry on interrupt */
+        } else if (rc < 0 && errno != EINTR) {
+            break;
         }
     }
 
     free(snapshots);
-    if (restore_stdin_flags) {
-        (void)fcntl(STDIN_FILENO, F_SETFL, stdin_flags);
+    if (have_termios) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
     }
     return 0;
 }
