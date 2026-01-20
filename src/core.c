@@ -8537,8 +8537,8 @@ static int smallclueCopyFile(const char *label, const char *src, const char *dst
         close(in_fd);
         return -1;
     }
-    if (!S_ISREG(st.st_mode)) {
-        fprintf(stderr, "%s: %s: unsupported file type\n", label, src);
+    if (S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "%s: %s: is a directory\n", label, src);
         close(in_fd);
         return -1;
     }
@@ -9088,8 +9088,8 @@ static int smallclueCpCommand(int argc, char **argv) {
             status = 1;
             continue;
         }
-        if (!S_ISREG(src_stat.st_mode)) {
-            fprintf(stderr, "cp: %s: unsupported file type\n", src);
+        if (S_ISDIR(src_stat.st_mode)) {
+            fprintf(stderr, "cp: %s: is a directory\n", src);
             status = 1;
             continue;
         }
