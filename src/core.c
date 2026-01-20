@@ -417,7 +417,6 @@ static int smallclueIpAddrCommand(int argc, char **argv);
 static int smallclueDfCommand(int argc, char **argv);
 #if defined(PSCAL_TARGET_IOS)
 static volatile sig_atomic_t gSmallclueTopQuit = 0;
-static void smallclueTopSigint(int signo);
 static int smallclueTopCommand(int argc, char **argv);
 static int smallclueDmesgCommand(int argc, char **argv);
 static int smallclueHelpCommand(int argc, char **argv);
@@ -1205,6 +1204,11 @@ static bool smallclueWriteAll(int fd, const char *data, size_t len) {
 #if defined(__APPLE__)
 static bool smallclueReadMemStats(size_t *used_kb, size_t *free_kb) {
     if (!used_kb || !free_kb) return false;
+    uint64_t memsize = 0;
+    size_t memlen = sizeof(memsize);
+    if (sysctlbyname("hw.memsize", &memsize, &memlen, NULL, 0) != 0 || memsize == 0) {
+        return false;
+    }
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
     vm_statistics64_data_t vmstat;
     if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vmstat, &count) != KERN_SUCCESS) {
@@ -1214,10 +1218,9 @@ static bool smallclueReadMemStats(size_t *used_kb, size_t *free_kb) {
     if (host_page_size(mach_host_self(), &page_size) != KERN_SUCCESS || page_size == 0) {
         return false;
     }
-    uint64_t free_pages = vmstat.free_count;
-    uint64_t used_pages = vmstat.active_count + vmstat.inactive_count + vmstat.wire_count;
-    uint64_t free_bytes = free_pages * (uint64_t)page_size;
-    uint64_t used_bytes = used_pages * (uint64_t)page_size;
+    uint64_t free_pages = vmstat.free_count + vmstat.speculative_count;
+    uint64_t used_bytes = memsize - (free_pages * (uint64_t)page_size);
+    uint64_t free_bytes = memsize - used_bytes;
     *free_kb = (size_t)(free_bytes / 1024);
     *used_kb = (size_t)(used_bytes / 1024);
     return true;
@@ -1234,6 +1237,13 @@ static bool smallclueReadCpuStats(double *usr, double *sys, double *nice, double
     uint64_t system = cpuinfo.cpu_ticks[CPU_STATE_SYSTEM];
     uint64_t nice_ticks = cpuinfo.cpu_ticks[CPU_STATE_NICE];
     uint64_t idle_ticks = cpuinfo.cpu_ticks[CPU_STATE_IDLE];
+    if (prev_user == 0 && prev_sys == 0 && prev_nice == 0 && prev_idle == 0) {
+        prev_user = user;
+        prev_sys = system;
+        prev_nice = nice_ticks;
+        prev_idle = idle_ticks;
+        return false;
+    }
     uint64_t du = user - prev_user;
     uint64_t ds = system - prev_sys;
     uint64_t dn = nice_ticks - prev_nice;
@@ -1253,11 +1263,6 @@ static bool smallclueReadCpuStats(double *usr, double *sys, double *nice, double
     return true;
 }
 #endif
-
-static void smallclueTopSigint(int signo) {
-    (void)signo;
-    gSmallclueTopQuit = 1;
-}
 
 static int smallclueTopCommand(int argc, char **argv) {
     bool tree = true;
@@ -1307,13 +1312,12 @@ static int smallclueTopCommand(int argc, char **argv) {
             restore_flags = true;
         }
     }
-    if (isatty(STDIN_FILENO)) {
+    {
         struct termios raw;
         if (tcgetattr(STDIN_FILENO, &orig_termios) == 0) {
             raw = orig_termios;
-            raw.c_lflag &= ~(ICANON | ECHO);
-            raw.c_cc[VMIN] = 0;
-            raw.c_cc[VTIME] = 0;
+            cfmakeraw(&raw);
+            raw.c_lflag |= ISIG; /* keep signals enabled for consistency */
             if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
                 have_termios = true;
             }
