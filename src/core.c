@@ -1198,6 +1198,58 @@ static bool smallclueWriteAll(int fd, const char *data, size_t len) {
     return true;
 }
 
+#if defined(__APPLE__)
+static bool smallclueReadMemStats(size_t *used_kb, size_t *free_kb) {
+    if (!used_kb || !free_kb) return false;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_statistics64_data_t vmstat;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vmstat, &count) != KERN_SUCCESS) {
+        return false;
+    }
+    natural_t page_size = 0;
+    if (host_page_size(mach_host_self(), &page_size) != KERN_SUCCESS || page_size == 0) {
+        return false;
+    }
+    uint64_t free_pages = vmstat.free_count;
+    uint64_t used_pages = vmstat.active_count + vmstat.inactive_count + vmstat.wire_count;
+    uint64_t free_bytes = free_pages * (uint64_t)page_size;
+    uint64_t used_bytes = used_pages * (uint64_t)page_size;
+    *free_kb = (size_t)(free_bytes / 1024);
+    *used_kb = (size_t)(used_bytes / 1024);
+    return true;
+}
+
+static bool smallclueReadCpuStats(double *usr, double *sys, double *nice, double *idle) {
+    static uint64_t prev_user = 0, prev_sys = 0, prev_nice = 0, prev_idle = 0;
+    host_cpu_load_info_data_t cpuinfo;
+    mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
+    if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, (host_info_t)&cpuinfo, &count) != KERN_SUCCESS) {
+        return false;
+    }
+    uint64_t user = cpuinfo.cpu_ticks[CPU_STATE_USER];
+    uint64_t system = cpuinfo.cpu_ticks[CPU_STATE_SYSTEM];
+    uint64_t nice_ticks = cpuinfo.cpu_ticks[CPU_STATE_NICE];
+    uint64_t idle_ticks = cpuinfo.cpu_ticks[CPU_STATE_IDLE];
+    uint64_t du = user - prev_user;
+    uint64_t ds = system - prev_sys;
+    uint64_t dn = nice_ticks - prev_nice;
+    uint64_t di = idle_ticks - prev_idle;
+    uint64_t total = du + ds + dn + di;
+    prev_user = user;
+    prev_sys = system;
+    prev_nice = nice_ticks;
+    prev_idle = idle_ticks;
+    if (total == 0) {
+        return false;
+    }
+    if (usr) *usr = (double)du * 100.0 / (double)total;
+    if (sys) *sys = (double)ds * 100.0 / (double)total;
+    if (nice) *nice = (double)dn * 100.0 / (double)total;
+    if (idle) *idle = (double)di * 100.0 / (double)total;
+    return true;
+}
+#endif
+
 static void smallclueTopSigint(int signo) {
     (void)signo;
     gSmallclueTopQuit = 1;
@@ -1240,7 +1292,7 @@ static int smallclueTopCommand(int argc, char **argv) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     gSmallclueTopQuit = 0;
-    sa.sa_handler = smallclueTopSigint;
+    sa.sa_handler = SIG_IGN; /* Ignore Ctrl+C; exit via 'q'. */
     sigemptyset(&sa.sa_mask);
     if (sigaction(SIGINT, &sa, &old_int) == 0) {
         have_old_int = true;
@@ -1286,6 +1338,29 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         /* Clear and render. */
         fputs("\x1b[2J\x1b[H", stdout);
+
+#if defined(__APPLE__)
+        size_t mem_used_kb = 0, mem_free_kb = 0;
+        if (smallclueReadMemStats(&mem_used_kb, &mem_free_kb)) {
+            char mem_line[160];
+            int mn = snprintf(mem_line, sizeof(mem_line),
+                              "Mem: %zuK used, %zuK free\n",
+                              mem_used_kb, mem_free_kb);
+            if (mn > 0) {
+                (void)smallclueWriteAll(STDOUT_FILENO, mem_line, (size_t)mn);
+            }
+        }
+        double cpu_usr = 0, cpu_sys = 0, cpu_nice = 0, cpu_idle = 0;
+        if (smallclueReadCpuStats(&cpu_usr, &cpu_sys, &cpu_nice, &cpu_idle)) {
+            char cpu_line[160];
+            int cn = snprintf(cpu_line, sizeof(cpu_line),
+                              "CPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\n",
+                              cpu_usr, cpu_sys, cpu_nice, cpu_idle);
+            if (cn > 0) {
+                (void)smallclueWriteAll(STDOUT_FILENO, cpu_line, (size_t)cn);
+            }
+        }
+#endif
 
         char header[160];
         int hn = snprintf(header, sizeof(header),
