@@ -1359,17 +1359,23 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         fflush(stdout);
 
-        /* Poll for quit input; refresh roughly once per second otherwise. */
+        /* Poll briefly for quit input, then sleep to pace refreshes. */
         struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
-        int rc = poll(&pfd, 1, 1000);
+        int rc = poll(&pfd, 1, 0);
         if (rc > 0 && (pfd.revents & POLLIN)) {
             char ch = 0;
             ssize_t r = read(STDIN_FILENO, &ch, 1);
             if (r > 0 && (ch == 'q' || ch == 'Q' || ch == 0x03)) {
                 break;
+            } else if (r == 0) {
+                break;
             }
         } else if (rc < 0 && errno != EINTR) {
             break;
+        }
+        struct timespec ts = {.tv_sec = 1, .tv_nsec = 0};
+        while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
+            /* keep sleeping until full second elapsed or fatal error */
         }
     }
 
