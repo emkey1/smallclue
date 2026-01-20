@@ -51,7 +51,11 @@
 #include <glob.h>
 #include "common/pscal_hosts.h"
 #if defined(__APPLE__)
+#include <TargetConditionals.h>
 #include <sys/sysctl.h>
+#include <mach/mach.h>
+#include <mach/mach_host.h>
+#include <mach/host_info.h>
 #include "common/path_truncate.h"
 #include "common/path_virtualization.h"
 void pscalRuntimeDebugLog(const char *message) __attribute__((weak));
