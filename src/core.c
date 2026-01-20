@@ -1228,7 +1228,7 @@ static int smallclueTopCommand(int argc, char **argv) {
         struct termios raw;
         if (tcgetattr(STDIN_FILENO, &orig_termios) == 0) {
             raw = orig_termios;
-            raw.c_lflag &= ~(ICANON | ECHO | ISIG);
+            raw.c_lflag &= ~(ICANON | ECHO);
             raw.c_cc[VMIN] = 0;
             raw.c_cc[VTIME] = 0;
             if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
@@ -1359,19 +1359,20 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         fflush(stdout);
 
-        /* Poll briefly for quit input, then sleep to pace refreshes. */
-        struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
-        int rc = poll(&pfd, 1, 100);
-        if (rc > 0 && (pfd.revents & POLLIN)) {
-            char ch = 0;
-            ssize_t r = read(STDIN_FILENO, &ch, 1);
-            if (r > 0 && (ch == 'q' || ch == 'Q' || ch == 0x03)) {
-                break;
-            } else if (r == 0) {
+        /* Nonblocking read for quit input, then sleep to pace refreshes. */
+        char ch = 0;
+        ssize_t r = read(STDIN_FILENO, &ch, 1);
+        if (r > 0 && (ch == 'q' || ch == 'Q' || ch == 0x03)) {
+            break;
+        } else if (r == 0) {
+            /* EOF: exit */
+            break;
+        } else if (r < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                /* nothing to do; just pace */
+            } else {
                 break;
             }
-        } else if (rc < 0 && errno != EINTR) {
-            break;
         }
         struct timespec ts = {.tv_sec = 1, .tv_nsec = 0};
         while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
