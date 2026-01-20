@@ -164,11 +164,14 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
         char label[96];
         int saved_fg_pgid = -1;
         int session_sid = -1;
+        VProc *active_vp = vprocCurrent();
+        int shell_pid = vprocGetShellSelfPid();
+        bool force_new_vproc = !(active_vp && vprocPid(active_vp) > 0 && vprocPid(active_vp) != shell_pid);
         smallclueFormatLabel(argc, argv, label, sizeof(label));
         if (label[0]) {
-            vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, label, true, true);
+            vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, label, force_new_vproc, true);
         } else {
-            vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, applet->name, true, true);
+            vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, applet->name, force_new_vproc, true);
         }
         if (vproc_scope_active) {
             int shell_pid = vprocGetShellSelfPid();

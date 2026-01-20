@@ -1196,6 +1196,7 @@ static bool smallclueWriteAll(int fd, const char *data, size_t len) {
 
 static int smallclueTopCommand(int argc, char **argv) {
     bool tree = true;
+    bool hide_kernel = false;
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
         if (!arg) {
@@ -1205,12 +1206,15 @@ static int smallclueTopCommand(int argc, char **argv) {
             tree = false;
         } else if (strcmp(arg, "--tree") == 0) {
             tree = true;
+        } else if (strcmp(arg, "--no-kernel") == 0 || strcmp(arg, "--hide-kernel") == 0) {
+            hide_kernel = true;
         } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
             const char *help =
-                "top [--tree|--flat]\n"
+                "top [--tree|--flat] [--no-kernel]\n"
                 "  Show PSCAL virtual processes.\n"
                 "  --tree (default) render parent/child tree.\n"
-                "  --flat show a flat list.\n";
+                "  --flat show a flat list.\n"
+                "  --no-kernel hide the synthetic kernel row.\n";
             (void)smallclueWriteAll(STDOUT_FILENO, help, strlen(help));
             return 0;
         } else {
@@ -1259,6 +1263,11 @@ static int smallclueTopCommand(int argc, char **argv) {
                 if (!snap || snap->pid <= 0) {
                     continue;
                 }
+                if (hide_kernel &&
+                    ((snap->command[0] && strcmp(snap->command, "kernel") == 0) ||
+                     (snap->comm[0] && strcmp(snap->comm, "kernel") == 0))) {
+                    continue;
+                }
                 const char *state = smallclueTopState(snap);
                 bool fg = (snap->fg_pgid > 0 && snap->pgid == snap->fg_pgid);
                 const char *cmd = snap->command[0] ? snap->command
@@ -1293,6 +1302,11 @@ static int smallclueTopCommand(int argc, char **argv) {
         for (size_t i = 0; i < snapshot_count; ++i) {
             VProcSnapshot *snap = &snapshots[i];
             if (!snap || snap->pid <= 0) {
+                continue;
+            }
+            if (hide_kernel &&
+                ((snap->command[0] && strcmp(snap->command, "kernel") == 0) ||
+                 (snap->comm[0] && strcmp(snap->comm, "kernel") == 0))) {
                 continue;
             }
             const char *state = smallclueTopState(snap);
@@ -4839,10 +4853,13 @@ static int smallclueWatchRunApplet(const SmallclueApplet *applet, int argc, char
     }
     label[used] = '\0';
 
+    VProc *active_vp = vprocCurrent();
+    int shell_pid = vprocGetShellSelfPid();
+    bool force_new_vproc = !(active_vp && vprocPid(active_vp) > 0 && vprocPid(active_vp) != shell_pid);
     VProcCommandScope scope;
     bool scoped = vprocCommandScopeBegin(&scope,
                                          label[0] ? label : (argv && argv[0] ? argv[0] : applet->name),
-                                         true,
+                                         force_new_vproc,
                                          false);
     int status = smallclueDispatchApplet(applet, argc, argv);
     if (scoped) {
