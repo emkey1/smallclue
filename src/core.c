@@ -55,6 +55,7 @@
 #include "common/path_virtualization.h"
 void pscalRuntimeDebugLog(const char *message) __attribute__((weak));
 #endif
+#include <signal.h>
 #if defined(PSCAL_TARGET_IOS)
 __attribute__((weak_import)) void PSCALRuntimeUpdateWindowSize(int columns, int rows);
 __attribute__((weak)) void PSCALRuntimeUpdateWindowSize(int columns, int rows) { (void)columns; (void)rows; }
@@ -1197,8 +1198,15 @@ static bool smallclueWriteAll(int fd, const char *data, size_t len) {
 static int smallclueTopCommand(int argc, char **argv) {
     bool tree = true;
     bool hide_kernel = false;
+    static volatile sig_atomic_t g_top_quit = 0;
+    auto void handle_top_sigint(int signo) {
+        (void)signo;
+        g_top_quit = 1;
+    }
     struct termios orig_termios;
     bool have_termios = false;
+    struct sigaction old_int;
+    bool have_old_int = false;
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
         if (!arg) {
@@ -1224,12 +1232,19 @@ static int smallclueTopCommand(int argc, char **argv) {
             return 1;
         }
     }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_top_sigint;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGINT, &sa, &old_int) == 0) {
+        have_old_int = true;
+    }
     if (isatty(STDIN_FILENO)) {
         struct termios raw;
         if (tcgetattr(STDIN_FILENO, &orig_termios) == 0) {
             raw = orig_termios;
             raw.c_lflag &= ~(ICANON | ECHO);
-            raw.c_cc[VMIN] = 0;
+            raw.c_cc[VMIN] = 1;
             raw.c_cc[VTIME] = 0;
             if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
                 have_termios = true;
@@ -1359,30 +1374,35 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         fflush(stdout);
 
-        /* Nonblocking read for quit input, then sleep to pace refreshes. */
-        char ch = 0;
-        ssize_t r = read(STDIN_FILENO, &ch, 1);
-        if (r > 0 && (ch == 'q' || ch == 'Q' || ch == 0x03)) {
+        if (g_top_quit) {
             break;
-        } else if (r == 0) {
-            /* EOF: exit */
-            break;
-        } else if (r < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-                /* nothing to do; just pace */
-            } else {
+        }
+
+        /* Block for up to 1s waiting for input, then loop to refresh. */
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(STDIN_FILENO, &rfds);
+        struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+        int rc = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
+        if (rc > 0 && FD_ISSET(STDIN_FILENO, &rfds)) {
+            char ch = 0;
+            ssize_t r = read(STDIN_FILENO, &ch, 1);
+            if (r > 0 && (ch == 'q' || ch == 'Q' || ch == 0x03)) {
+                break;
+            } else if (r == 0) {
                 break;
             }
-        }
-        struct timespec ts = {.tv_sec = 1, .tv_nsec = 0};
-        while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
-            /* keep sleeping until full second elapsed or fatal error */
+        } else if (rc < 0 && errno != EINTR) {
+            break;
         }
     }
 
     free(snapshots);
     if (have_termios) {
         tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
+    }
+    if (have_old_int) {
+        sigaction(SIGINT, &old_int, NULL);
     }
     return 0;
 }
