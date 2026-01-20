@@ -46,6 +46,7 @@
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <sys/select.h>
 #include <glob.h>
 #include "common/pscal_hosts.h"
@@ -1198,11 +1199,6 @@ static bool smallclueWriteAll(int fd, const char *data, size_t len) {
 static int smallclueTopCommand(int argc, char **argv) {
     bool tree = true;
     bool hide_kernel = false;
-    static volatile sig_atomic_t g_top_quit = 0;
-    auto void handle_top_sigint(int signo) {
-        (void)signo;
-        g_top_quit = 1;
-    }
     struct termios orig_termios;
     bool have_termios = false;
     struct sigaction old_int;
@@ -1234,7 +1230,8 @@ static int smallclueTopCommand(int argc, char **argv) {
     }
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = handle_top_sigint;
+    gSmallclueTopQuit = 0;
+    sa.sa_handler = smallclueTopSigint;
     sigemptyset(&sa.sa_mask);
     if (sigaction(SIGINT, &sa, &old_int) == 0) {
         have_old_int = true;
@@ -1374,7 +1371,7 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         fflush(stdout);
 
-        if (g_top_quit) {
+        if (gSmallclueTopQuit) {
             break;
         }
 
@@ -1412,6 +1409,12 @@ typedef struct {
     const char *name;
     int value;
 } SmallclueSignalName;
+
+static volatile sig_atomic_t gSmallclueTopQuit = 0;
+static void smallclueTopSigint(int signo) {
+    (void)signo;
+    gSmallclueTopQuit = 1;
+}
 
 static const SmallclueSignalName kSignalNames[] = {
 #ifdef SIGHUP
