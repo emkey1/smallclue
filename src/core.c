@@ -1273,6 +1273,8 @@ static int smallclueTopCommand(int argc, char **argv) {
     bool restore_flags = false;
     struct sigaction old_int;
     bool have_old_int = false;
+    int input_fd = STDIN_FILENO;
+    bool close_input_fd = false;
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
         if (!arg) {
@@ -1306,19 +1308,25 @@ static int smallclueTopCommand(int argc, char **argv) {
     if (sigaction(SIGINT, &sa, &old_int) == 0) {
         have_old_int = true;
     }
-    stdin_flags = fcntl(STDIN_FILENO, F_GETFL);
+    int tty_fd = open("/dev/tty", O_RDONLY | O_NONBLOCK);
+    if (tty_fd >= 0) {
+        input_fd = tty_fd;
+        close_input_fd = true;
+    }
+
+    stdin_flags = fcntl(input_fd, F_GETFL);
     if (stdin_flags != -1 && (stdin_flags & O_NONBLOCK) == 0) {
-        if (fcntl(STDIN_FILENO, F_SETFL, stdin_flags | O_NONBLOCK) == 0) {
+        if (fcntl(input_fd, F_SETFL, stdin_flags | O_NONBLOCK) == 0) {
             restore_flags = true;
         }
     }
     {
         struct termios raw;
-        if (tcgetattr(STDIN_FILENO, &orig_termios) == 0) {
+        if (tcgetattr(input_fd, &orig_termios) == 0) {
             raw = orig_termios;
             cfmakeraw(&raw);
             raw.c_lflag |= ISIG; /* keep signals enabled for consistency */
-            if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
+            if (tcsetattr(input_fd, TCSANOW, &raw) == 0) {
                 have_termios = true;
             }
         }
@@ -1476,7 +1484,7 @@ static int smallclueTopCommand(int argc, char **argv) {
         /* Drain any pending input; exit on q/Q/Ctrl+C/EOF. */
         while (1) {
             char ch = 0;
-            ssize_t r = read(STDIN_FILENO, &ch, 1);
+            ssize_t r = read(input_fd, &ch, 1);
             if (r > 0) {
                 if (ch == 'q' || ch == 'Q' || ch == 0x03) {
                     gSmallclueTopQuit = 1;
@@ -1516,13 +1524,16 @@ static int smallclueTopCommand(int argc, char **argv) {
 
     free(snapshots);
     if (have_termios) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
+        tcsetattr(input_fd, TCSANOW, &orig_termios);
     }
     if (restore_flags && stdin_flags != -1) {
-        fcntl(STDIN_FILENO, F_SETFL, stdin_flags);
+        fcntl(input_fd, F_SETFL, stdin_flags);
     }
     if (have_old_int) {
         sigaction(SIGINT, &old_int, NULL);
+    }
+    if (close_input_fd && input_fd >= 0) {
+        close(input_fd);
     }
     return 0;
 }
