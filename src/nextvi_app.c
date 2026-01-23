@@ -8,6 +8,9 @@
 #include <unistd.h>
 #include <errno.h>
 #include <termios.h>
+#include <limits.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <pthread.h>
 #include "termios_shim.h"
 #if defined(PSCAL_TARGET_IOS)
@@ -25,27 +28,117 @@ static void pscalRuntimeDebugLog(const char *message) {
 }
 #endif
 
-// nextvi uses process-wide globals; serialize editor runs to avoid state races.
-static pthread_mutex_t s_nextvi_lock = PTHREAD_MUTEX_INITIALIZER;
+// Track active editor sessions so we can block duplicate edits of the same file
+// while still allowing different files to be open in other tabs/windows.
+static pthread_mutex_t s_nextvi_sessions_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static char *smallclueOverrideEnv(const char *name, const char *value) {
-    const char *current = getenv(name);
-    char *saved = current ? strdup(current) : NULL;
-    if (value) {
-        setenv(name, value, 1);
-    } else {
-        unsetenv(name);
+typedef struct {
+    pid_t pid;
+    char *path;  // canonicalized path; NULL when unknown
+} NextviSession;
+
+static NextviSession *s_nextvi_sessions = NULL;
+static size_t s_nextvi_session_count = 0;
+static size_t s_nextvi_session_cap = 0;
+
+static void nextviFreeSession(NextviSession *session) {
+    if (!session) {
+        return;
     }
-    return saved;
+    free(session->path);
+    session->path = NULL;
+    session->pid = 0;
 }
 
-static void smallclueRestoreEnv(const char *name, char *saved) {
-    if (saved) {
-        setenv(name, saved, 1);
-        free(saved);
-    } else {
-        unsetenv(name);
+static bool nextviSessionPathExists(const char *path) {
+    if (!path) {
+        return false;
     }
+    for (size_t i = 0; i < s_nextvi_session_count; ++i) {
+        if (s_nextvi_sessions[i].path && strcmp(s_nextvi_sessions[i].path, path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int nextviSessionEnsureCapacity(void) {
+    if (s_nextvi_session_count < s_nextvi_session_cap) {
+        return 0;
+    }
+    size_t new_cap = (s_nextvi_session_cap == 0) ? 4 : s_nextvi_session_cap * 2;
+    NextviSession *resized = realloc(s_nextvi_sessions, new_cap * sizeof(NextviSession));
+    if (!resized) {
+        return -1;
+    }
+    // Zero new slots to keep free() safe.
+    memset(resized + s_nextvi_session_cap, 0, (new_cap - s_nextvi_session_cap) * sizeof(NextviSession));
+    s_nextvi_sessions = resized;
+    s_nextvi_session_cap = new_cap;
+    return 0;
+}
+
+static int nextviSessionRegister(const char *path, pid_t pid) {
+    if (nextviSessionEnsureCapacity() != 0) {
+        return -1;
+    }
+    NextviSession *slot = &s_nextvi_sessions[s_nextvi_session_count++];
+    slot->pid = pid;
+    slot->path = path ? strdup(path) : NULL;
+    return (slot->path || !path) ? 0 : -1;
+}
+
+static void nextviSessionUnregisterByPid(pid_t pid) {
+    for (size_t i = 0; i < s_nextvi_session_count; ++i) {
+        if (s_nextvi_sessions[i].pid == pid) {
+            nextviFreeSession(&s_nextvi_sessions[i]);
+            // Compact array.
+            if (i + 1 < s_nextvi_session_count) {
+                s_nextvi_sessions[i] = s_nextvi_sessions[s_nextvi_session_count - 1];
+            }
+            --s_nextvi_session_count;
+            return;
+        }
+    }
+}
+
+static char *smallclueCanonicalizePath(const char *input) {
+    if (!input || !*input) {
+        return NULL;
+    }
+    char resolved[PATH_MAX];
+    if (realpath(input, resolved)) {
+        return strdup(resolved);
+    }
+    // Fall back to building an absolute path if possible.
+    if (input[0] == '/') {
+        return strdup(input);
+    }
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd))) {
+        char joined[PATH_MAX];
+        int written = snprintf(joined, sizeof(joined), "%s/%s", cwd, input);
+        if (written > 0 && written < (int)sizeof(joined)) {
+            return strdup(joined);
+        }
+    }
+    return strdup(input);
+}
+
+static char *smallclueDetectTargetPath(int argc, char **argv) {
+    // Find the first non-option argument; treat it as the primary file.
+    for (int i = 1; i < argc; ++i) {
+        const char *arg = argv[i];
+        if (!arg || !*arg) {
+            continue;
+        }
+        // Skip flags (-x, -abc) and vi's +cmd.
+        if (arg[0] == '-' || arg[0] == '+') {
+            continue;
+        }
+        return smallclueCanonicalizePath(arg);
+    }
+    return NULL;
 }
 
 typedef struct {
@@ -148,19 +241,10 @@ static int smallclueSetupTty(void) {
     return fd;
 }
 
-int smallclueRunEditor(int argc, char **argv) {
-    const char *tool_name = (argc > 0 && argv && argv[0]) ? argv[0] : "nextvi";
-    int lock_rc = pthread_mutex_trylock(&s_nextvi_lock);
-    if (lock_rc != 0) {
-        if (lock_rc == EBUSY) {
-            fprintf(stderr, "%s: editor already running in another window\n", tool_name);
-        } else {
-            fprintf(stderr, "%s: unable to acquire editor lock (%d)\n", tool_name, lock_rc);
-        }
-        return 1;
-    }
+static int smallclueRunEditorChild(int argc, char **argv) {
     /* nextvi expects xterm-ish behavior; advertise xterm-256color so SGR works. */
-    char *saved_term = smallclueOverrideEnv("TERM", "xterm-256color");
+    const char *saved_term = getenv("TERM");
+    setenv("TERM", "xterm-256color", 1);
 
     smallclueResetNextviGlobals();
 
@@ -188,8 +272,6 @@ int smallclueRunEditor(int argc, char **argv) {
         raw.c_cc[VTIME] = 0;
         smallclueTcsetattr(tty_fd, TCSAFLUSH, &raw);
         tcflush(tty_fd, TCIFLUSH);
-    } else {
-        have_tty = false;
     }
 
     pscalRuntimeDebugLog("[smallclue] launching nextvi");
@@ -209,7 +291,70 @@ int smallclueRunEditor(int argc, char **argv) {
         close(dup_fd);
     }
     smallclueRestoreStandardFds(&stdio_backup);
-    smallclueRestoreEnv("TERM", saved_term);
-    pthread_mutex_unlock(&s_nextvi_lock);
+    if (saved_term) {
+        setenv("TERM", saved_term, 1);
+    } else {
+        unsetenv("TERM");
+    }
     return status;
+}
+
+int smallclueRunEditor(int argc, char **argv) {
+    const char *tool_name = (argc > 0 && argv && argv[0]) ? argv[0] : "nextvi";
+
+    // Identify target file and check for duplicate edit sessions.
+    char *target_path = smallclueDetectTargetPath(argc, argv);
+    pthread_mutex_lock(&s_nextvi_sessions_lock);
+    if (target_path && nextviSessionPathExists(target_path)) {
+        fprintf(stderr, "%s: %s is already open in another window\n", tool_name, target_path);
+        pthread_mutex_unlock(&s_nextvi_sessions_lock);
+        free(target_path);
+        return 1;
+    }
+    pthread_mutex_unlock(&s_nextvi_sessions_lock);
+
+    pid_t child = fork();
+    if (child < 0) {
+        perror("nextvi: fork");
+        free(target_path);
+        return 1;
+    }
+
+    if (child == 0) {
+        // Child: run the editor in isolation to avoid clobbering globals.
+        int status = smallclueRunEditorChild(argc, argv);
+        _exit(status);
+    }
+
+    // Parent: track the child session and wait for completion.
+    bool registered = false;
+    pthread_mutex_lock(&s_nextvi_sessions_lock);
+    if (nextviSessionRegister(target_path, child) == 0) {
+        registered = true;
+    } else {
+        fprintf(stderr, "%s: unable to track editor session\n", tool_name);
+    }
+    pthread_mutex_unlock(&s_nextvi_sessions_lock);
+    free(target_path);
+
+    int wstatus = 0;
+    if (waitpid(child, &wstatus, 0) < 0) {
+        perror("nextvi: waitpid");
+    }
+
+    if (registered) {
+        pthread_mutex_lock(&s_nextvi_sessions_lock);
+        nextviSessionUnregisterByPid(child);
+        pthread_mutex_unlock(&s_nextvi_sessions_lock);
+    }
+
+    if (WIFEXITED(wstatus)) {
+        return WEXITSTATUS(wstatus);
+    }
+    if (WIFSIGNALED(wstatus)) {
+        int signo = WTERMSIG(wstatus);
+        fprintf(stderr, "%s: terminated by signal %d\n", tool_name, signo);
+        return 128 + signo;
+    }
+    return 1;
 }
