@@ -31,6 +31,8 @@ static void pscalRuntimeDebugLog(const char *message) {
 // Track active editor sessions so we can block duplicate edits of the same file
 // while still allowing different files to be open in other tabs/windows.
 static pthread_mutex_t s_nextvi_sessions_lock = PTHREAD_MUTEX_INITIALIZER;
+// Fallback single-instance guard for platforms that forbid fork().
+static pthread_mutex_t s_nextvi_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
     pid_t pid;
@@ -313,23 +315,34 @@ int smallclueRunEditor(int argc, char **argv) {
     }
     pthread_mutex_unlock(&s_nextvi_sessions_lock);
 
+    bool inline_fallback = false;
     pid_t child = fork();
     if (child < 0) {
-        perror("nextvi: fork");
-        free(target_path);
-        return 1;
+        if (errno == EPERM || errno == ENOSYS) {
+            inline_fallback = true;
+        } else {
+            perror("nextvi: fork");
+            free(target_path);
+            return 1;
+        }
     }
 
-    if (child == 0) {
+    if (!inline_fallback && child == 0) {
         // Child: run the editor in isolation to avoid clobbering globals.
         int status = smallclueRunEditorChild(argc, argv);
         _exit(status);
     }
 
+    if (inline_fallback) {
+        // Single-process fallback: serialize via global lock.
+        pthread_mutex_lock(&s_nextvi_lock);
+    }
+
     // Parent: track the child session and wait for completion.
     bool registered = false;
     pthread_mutex_lock(&s_nextvi_sessions_lock);
-    if (nextviSessionRegister(target_path, child) == 0) {
+    pid_t session_pid = inline_fallback ? getpid() : child;
+    if (nextviSessionRegister(target_path, session_pid) == 0) {
         registered = true;
     } else {
         fprintf(stderr, "%s: unable to track editor session\n", tool_name);
@@ -337,24 +350,33 @@ int smallclueRunEditor(int argc, char **argv) {
     pthread_mutex_unlock(&s_nextvi_sessions_lock);
     free(target_path);
 
-    int wstatus = 0;
-    if (waitpid(child, &wstatus, 0) < 0) {
-        perror("nextvi: waitpid");
+    int exit_status = 0;
+    if (inline_fallback) {
+        exit_status = smallclueRunEditorChild(argc, argv);
+    } else {
+        int wstatus = 0;
+        if (waitpid(child, &wstatus, 0) < 0) {
+            perror("nextvi: waitpid");
+        }
+        if (WIFEXITED(wstatus)) {
+            exit_status = WEXITSTATUS(wstatus);
+        } else if (WIFSIGNALED(wstatus)) {
+            int signo = WTERMSIG(wstatus);
+            fprintf(stderr, "%s: terminated by signal %d\n", tool_name, signo);
+            exit_status = 128 + signo;
+        } else {
+            exit_status = 1;
+        }
     }
 
     if (registered) {
         pthread_mutex_lock(&s_nextvi_sessions_lock);
-        nextviSessionUnregisterByPid(child);
+        nextviSessionUnregisterByPid(session_pid);
         pthread_mutex_unlock(&s_nextvi_sessions_lock);
     }
 
-    if (WIFEXITED(wstatus)) {
-        return WEXITSTATUS(wstatus);
+    if (inline_fallback) {
+        pthread_mutex_unlock(&s_nextvi_lock);
     }
-    if (WIFSIGNALED(wstatus)) {
-        int signo = WTERMSIG(wstatus);
-        fprintf(stderr, "%s: terminated by signal %d\n", tool_name, signo);
-        return 128 + signo;
-    }
-    return 1;
+    return exit_status;
 }
