@@ -6,11 +6,11 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <errno.h>
 #include <termios.h>
 #include <limits.h>
+#include <errno.h>
+#include <sys/ioctl.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <pthread.h>
 #include "termios_shim.h"
 #if defined(PSCAL_TARGET_IOS)
@@ -31,11 +31,9 @@ static void pscalRuntimeDebugLog(const char *message) {
 // Track active editor sessions so we can block duplicate edits of the same file
 // while still allowing different files to be open in other tabs/windows.
 static pthread_mutex_t s_nextvi_sessions_lock = PTHREAD_MUTEX_INITIALIZER;
-// Fallback single-instance guard for platforms that forbid fork().
-static pthread_mutex_t s_nextvi_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
-    pid_t pid;
+    pthread_t thread;
     char *path;  // canonicalized path; NULL when unknown
 } NextviSession;
 
@@ -49,7 +47,7 @@ static void nextviFreeSession(NextviSession *session) {
     }
     free(session->path);
     session->path = NULL;
-    session->pid = 0;
+    session->thread = (pthread_t)0;
 }
 
 static bool nextviSessionPathExists(const char *path) {
@@ -80,19 +78,9 @@ static int nextviSessionEnsureCapacity(void) {
     return 0;
 }
 
-static int nextviSessionRegister(const char *path, pid_t pid) {
-    if (nextviSessionEnsureCapacity() != 0) {
-        return -1;
-    }
-    NextviSession *slot = &s_nextvi_sessions[s_nextvi_session_count++];
-    slot->pid = pid;
-    slot->path = path ? strdup(path) : NULL;
-    return (slot->path || !path) ? 0 : -1;
-}
-
-static void nextviSessionUnregisterByPid(pid_t pid) {
+static void nextviSessionUnregisterByThread(pthread_t thread) {
     for (size_t i = 0; i < s_nextvi_session_count; ++i) {
-        if (s_nextvi_sessions[i].pid == pid) {
+        if (pthread_equal(s_nextvi_sessions[i].thread, thread)) {
             nextviFreeSession(&s_nextvi_sessions[i]);
             // Compact array.
             if (i + 1 < s_nextvi_session_count) {
@@ -102,6 +90,17 @@ static void nextviSessionUnregisterByPid(pid_t pid) {
             return;
         }
     }
+}
+
+static void nextviSessionRemoveIndex(size_t idx) {
+    if (idx >= s_nextvi_session_count) {
+        return;
+    }
+    nextviFreeSession(&s_nextvi_sessions[idx]);
+    if (idx + 1 < s_nextvi_session_count) {
+        s_nextvi_sessions[idx] = s_nextvi_sessions[s_nextvi_session_count - 1];
+    }
+    --s_nextvi_session_count;
 }
 
 static char *smallclueCanonicalizePath(const char *input) {
@@ -187,6 +186,48 @@ static void smallclueResetNextviGlobals(void) {
     /* nextvi_reset_state() is called inside nextvi_main_entry; avoid double-free */
 }
 
+typedef struct {
+    int argc;
+    char **argv;
+} NextviThreadArgs;
+
+static char **smallclueCopyArgv(int argc, char **argv) {
+    if (argc <= 0 || !argv) {
+        return NULL;
+    }
+    char **copy = calloc((size_t)argc + 1, sizeof(char *));
+    if (!copy) {
+        return NULL;
+    }
+    for (int i = 0; i < argc; ++i) {
+        if (argv[i]) {
+            copy[i] = strdup(argv[i]);
+            if (!copy[i]) {
+                for (int j = 0; j < i; ++j) {
+                    free(copy[j]);
+                }
+                free(copy);
+                return NULL;
+            }
+        }
+    }
+    copy[argc] = NULL;
+    return copy;
+}
+
+static void smallclueFreeThreadArgs(NextviThreadArgs *args) {
+    if (!args) {
+        return;
+    }
+    if (args->argv) {
+        for (int i = 0; i < args->argc; ++i) {
+            free(args->argv[i]);
+        }
+        free(args->argv);
+    }
+    free(args);
+}
+
 #if defined(PSCAL_TARGET_IOS)
 static int smallclueOpenPty(void) {
     int master = posix_openpt(O_RDWR | O_NOCTTY);
@@ -255,15 +296,18 @@ static int smallclueRunEditorChild(int argc, char **argv) {
 
     int dup_fd = smallclueSetupTty();
     struct termios saved_ios;
+    bool saved_ios_valid = false;
     int tty_fd = STDIN_FILENO;
     bool have_tty = false;
     if (smallclueTcgetattr(tty_fd, &saved_ios) != 0) {
         tty_fd = dup_fd >= 0 ? dup_fd : open("/dev/tty", O_RDWR);
         if (tty_fd >= 0 && smallclueTcgetattr(tty_fd, &saved_ios) == 0) {
             have_tty = true;
+            saved_ios_valid = true;
         }
     } else {
         have_tty = true;
+        saved_ios_valid = true;
     }
     if (have_tty) {
         struct termios raw = saved_ios;
@@ -283,11 +327,25 @@ static int smallclueRunEditorChild(int argc, char **argv) {
     snprintf(resultBuf, sizeof(resultBuf), "[smallclue] nextvi returned %d", status);
     pscalRuntimeDebugLog(resultBuf);
 
-    if (have_tty) {
+    if (have_tty && saved_ios_valid) {
+        /* Restore both the descriptor we toggled and STDIN_FILENO in case they differ. */
         smallclueTcsetattr(tty_fd, TCSAFLUSH, &saved_ios);
+        if (tty_fd != STDIN_FILENO) {
+            smallclueTcsetattr(STDIN_FILENO, TCSAFLUSH, &saved_ios);
+        }
+        tcflush(STDIN_FILENO, TCIOFLUSH);
+        tcflush(tty_fd, TCIOFLUSH);
         if (tty_fd != STDIN_FILENO) {
             close(tty_fd);
         }
+    }
+    if (isatty(STDOUT_FILENO)) {
+        /* Reset scroll region, cursor keys, cursor visibility, exit alt screens, and clear display. */
+        static const char reset_seq[] = "\033[r\033[?1l\033>\033[?25h\033[?1049l\033[?47l";
+        static const char clear_seq[] = "\033[2J\033[H\r\n";
+        (void)write(STDOUT_FILENO, reset_seq, sizeof(reset_seq) - 1);
+        (void)write(STDOUT_FILENO, clear_seq, sizeof(clear_seq) - 1);
+        (void)tcdrain(STDOUT_FILENO);
     }
     if (dup_fd >= 0 && dup_fd != STDIN_FILENO && dup_fd != tty_fd) {
         close(dup_fd);
@@ -301,82 +359,72 @@ static int smallclueRunEditorChild(int argc, char **argv) {
     return status;
 }
 
+static void *smallclueRunEditorThread(void *opaque) {
+    NextviThreadArgs *args = (NextviThreadArgs *)opaque;
+    (void)smallclueRunEditorChild(args->argc, args->argv);
+
+    pthread_mutex_lock(&s_nextvi_sessions_lock);
+    nextviSessionUnregisterByThread(pthread_self());
+    pthread_mutex_unlock(&s_nextvi_sessions_lock);
+
+    smallclueFreeThreadArgs(args);
+    return NULL;
+}
+
 int smallclueRunEditor(int argc, char **argv) {
     const char *tool_name = (argc > 0 && argv && argv[0]) ? argv[0] : "nextvi";
 
-    // Identify target file and check for duplicate edit sessions.
+    NextviThreadArgs *args = calloc(1, sizeof(*args));
+    if (!args) {
+        fprintf(stderr, "%s: unable to allocate editor args\n", tool_name);
+        return 1;
+    }
+    args->argc = argc;
+    args->argv = smallclueCopyArgv(argc, argv);
+    if (!args->argv) {
+        fprintf(stderr, "%s: unable to copy argv\n", tool_name);
+        smallclueFreeThreadArgs(args);
+        return 1;
+    }
+
+    // Identify target file and reserve a session slot to block duplicates.
     char *target_path = smallclueDetectTargetPath(argc, argv);
     pthread_mutex_lock(&s_nextvi_sessions_lock);
     if (target_path && nextviSessionPathExists(target_path)) {
         fprintf(stderr, "%s: %s is already open in another window\n", tool_name, target_path);
         pthread_mutex_unlock(&s_nextvi_sessions_lock);
+        smallclueFreeThreadArgs(args);
         free(target_path);
         return 1;
     }
-    pthread_mutex_unlock(&s_nextvi_sessions_lock);
 
-    bool inline_fallback = false;
-    pid_t child = fork();
-    if (child < 0) {
-        if (errno == EPERM || errno == ENOSYS) {
-            inline_fallback = true;
-        } else {
-            perror("nextvi: fork");
-            free(target_path);
-            return 1;
-        }
-    }
-
-    if (!inline_fallback && child == 0) {
-        // Child: run the editor in isolation to avoid clobbering globals.
-        int status = smallclueRunEditorChild(argc, argv);
-        _exit(status);
-    }
-
-    if (inline_fallback) {
-        // Single-process fallback: serialize via global lock.
-        pthread_mutex_lock(&s_nextvi_lock);
-    }
-
-    // Parent: track the child session and wait for completion.
-    bool registered = false;
-    pthread_mutex_lock(&s_nextvi_sessions_lock);
-    pid_t session_pid = inline_fallback ? getpid() : child;
-    if (nextviSessionRegister(target_path, session_pid) == 0) {
-        registered = true;
-    } else {
+    if (nextviSessionEnsureCapacity() != 0) {
         fprintf(stderr, "%s: unable to track editor session\n", tool_name);
-    }
-    pthread_mutex_unlock(&s_nextvi_sessions_lock);
-    free(target_path);
-
-    int exit_status = 0;
-    if (inline_fallback) {
-        exit_status = smallclueRunEditorChild(argc, argv);
-    } else {
-        int wstatus = 0;
-        if (waitpid(child, &wstatus, 0) < 0) {
-            perror("nextvi: waitpid");
-        }
-        if (WIFEXITED(wstatus)) {
-            exit_status = WEXITSTATUS(wstatus);
-        } else if (WIFSIGNALED(wstatus)) {
-            int signo = WTERMSIG(wstatus);
-            fprintf(stderr, "%s: terminated by signal %d\n", tool_name, signo);
-            exit_status = 128 + signo;
-        } else {
-            exit_status = 1;
-        }
-    }
-
-    if (registered) {
-        pthread_mutex_lock(&s_nextvi_sessions_lock);
-        nextviSessionUnregisterByPid(session_pid);
         pthread_mutex_unlock(&s_nextvi_sessions_lock);
+        smallclueFreeThreadArgs(args);
+        free(target_path);
+        return 1;
     }
 
-    if (inline_fallback) {
-        pthread_mutex_unlock(&s_nextvi_lock);
+    size_t slot_idx = s_nextvi_session_count++;
+    s_nextvi_sessions[slot_idx].thread = (pthread_t)0;
+    s_nextvi_sessions[slot_idx].path = target_path;
+    target_path = NULL;
+
+    pthread_t tid;
+    int create_res = pthread_create(&tid, NULL, smallclueRunEditorThread, args);
+    if (create_res != 0) {
+        fprintf(stderr, "%s: unable to start editor thread (%s)\n", tool_name, strerror(create_res));
+        nextviSessionRemoveIndex(slot_idx);
+        pthread_mutex_unlock(&s_nextvi_sessions_lock);
+        smallclueFreeThreadArgs(args);
+        return 1;
     }
-    return exit_status;
+
+    s_nextvi_sessions[slot_idx].thread = tid;
+    pthread_mutex_unlock(&s_nextvi_sessions_lock);
+
+    /* Block until the editor thread finishes so the caller's TTY is not reused prematurely. */
+    (void)pthread_join(tid, NULL);
+    return 0;
 }

@@ -1322,13 +1322,27 @@ static int smallclueTopCommand(int argc, char **argv) {
     }
     {
         struct termios raw;
+        bool fetched_termios = false;
         if (tcgetattr(input_fd, &orig_termios) == 0) {
+            fetched_termios = true;
+        }
+#if defined(PSCAL_TARGET_IOS)
+        else if (vprocSessionStdioFetchTermios(input_fd, &orig_termios)) {
+            fetched_termios = true;
+        }
+#endif
+        if (fetched_termios) {
             raw = orig_termios;
             cfmakeraw(&raw);
             raw.c_lflag |= ISIG; /* keep signals enabled for consistency */
             if (tcsetattr(input_fd, TCSANOW, &raw) == 0) {
                 have_termios = true;
             }
+#if defined(PSCAL_TARGET_IOS)
+            else if (vprocSessionStdioApplyTermios(input_fd, TCSANOW, &raw)) {
+                have_termios = true;
+            }
+#endif
         }
     }
 
@@ -1337,6 +1351,13 @@ static int smallclueTopCommand(int argc, char **argv) {
 
     size_t snapshot_cap = 0;
     VProcSnapshot *snapshots = NULL;
+
+#if defined(__APPLE__)
+    /* Prime CPU counters so a single render still shows utilization. */
+    (void)smallclueReadCpuStats(NULL, NULL, NULL, NULL);
+    struct timespec prime_sleep = {.tv_sec = 0, .tv_nsec = 100000000};
+    nanosleep(&prime_sleep, &prime_sleep);
+#endif
 
     while (1) {
         size_t needed = vprocSnapshot(NULL, 0);
@@ -1370,7 +1391,7 @@ static int smallclueTopCommand(int argc, char **argv) {
         if (smallclueReadCpuStats(&cpu_usr, &cpu_sys, &cpu_nice, &cpu_idle)) {
             char cpu_line[160];
             int cn = snprintf(cpu_line, sizeof(cpu_line),
-                              "CPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\n",
+                              "CPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\n\n",
                               cpu_usr, cpu_sys, cpu_nice, cpu_idle);
             if (cn > 0) {
                 (void)smallclueWriteAll(STDOUT_FILENO, cpu_line, (size_t)cn);
@@ -1477,6 +1498,9 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         fflush(stdout);
 
+        /* Render once, then exit immediately. */
+        gSmallclueTopQuit = 1;
+
         if (gSmallclueTopQuit) {
             break;
         }
@@ -1524,7 +1548,11 @@ static int smallclueTopCommand(int argc, char **argv) {
 
     free(snapshots);
     if (have_termios) {
-        tcsetattr(input_fd, TCSANOW, &orig_termios);
+        if (tcsetattr(input_fd, TCSANOW, &orig_termios) != 0) {
+#if defined(PSCAL_TARGET_IOS)
+            (void)vprocSessionStdioApplyTermios(input_fd, TCSANOW, &orig_termios);
+#endif
+        }
     }
     if (restore_flags && stdin_flags != -1) {
         fcntl(input_fd, F_SETFL, stdin_flags);
@@ -6401,7 +6429,8 @@ static int smallclueWgetCommand(int argc, char **argv) {
 static int smallclueClearCommand(int argc, char **argv) {
     (void)argc;
     (void)argv;
-    fputs("\x1b[2J\x1b[H", stdout);
+    /* Clear screen and scrollback, then home cursor. */
+    fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
     fflush(stdout);
     return 0;
 }
