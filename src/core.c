@@ -635,6 +635,8 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"df", smallclueDfCommand, "Report filesystem usage"},
 #if defined(PSCAL_TARGET_IOS)
     {"addt", smallclueAddTabCommand, "Open an additional shell tab"},
+    {"tabadd", smallclueAddTabCommand, "Alias for addt: open an additional shell tab"},
+    {"tadd", smallclueAddTabCommand, "Alias for addt: open an additional shell tab"},
     {"smallclue-help", smallclueHelpCommand, "List available smallclue applets"},
     {"licenses", smallclueLicensesCommand, "View third-party licenses"},
     {"dmesg", smallclueDmesgCommand, "Show PSCAL runtime log for this session"},
