@@ -412,7 +412,27 @@ int smallclueRunEditor(int argc, char **argv) {
     target_path = NULL;
 
     pthread_t tid;
-    int create_res = pthread_create(&tid, NULL, smallclueRunEditorThread, args);
+
+    /* nextvi uses a regex-based highlighter that can recurse deeply; the default
+     * pthread stack on iOS is small (~512 KB) and can overflow on modest files.
+     * Bump the stack to 2 MB to avoid crashes when opening larger documents. */
+    pthread_attr_t attr;
+    int attr_init_res = pthread_attr_init(&attr);
+    if (attr_init_res == 0) {
+        size_t stack_size = 2 * 1024 * 1024; /* 2 MB */
+        if (stack_size < PTHREAD_STACK_MIN) {
+            stack_size = PTHREAD_STACK_MIN;
+        }
+        (void)pthread_attr_setstacksize(&attr, stack_size);
+    }
+
+    int create_res = pthread_create(&tid,
+                                    (attr_init_res == 0 ? &attr : NULL),
+                                    smallclueRunEditorThread,
+                                    args);
+    if (attr_init_res == 0) {
+        (void)pthread_attr_destroy(&attr);
+    }
     if (create_res != 0) {
         fprintf(stderr, "%s: unable to start editor thread (%s)\n", tool_name, strerror(create_res));
         nextviSessionRemoveIndex(slot_idx);

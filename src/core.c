@@ -704,10 +704,11 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Pager; navigation: j/k, /, n, g/G, q"},
     {"ln", "ln [-s] TARGET LINK\n"
            "  -s symbolic link"},
-    {"ls", "ls [-a] [-A] [-l] [-t] [-h] [-d] [--color[=auto|always|never]] [path ...]\n"
+    {"ls", "ls [-a] [-A] [-l] [-n] [-t] [-h] [-d] [--color[=auto|always|never]] [path ...]\n"
            "  -a show entries starting with '.' (including . and ..)\n"
            "  -A show entries starting with '.' (excluding . and ..)\n"
            "  -l long format with permissions, ownership, size, time\n"
+           "  -n numeric uid/gid (implies -l)\n"
            "  -t sort by modification time\n"
            "  -h human-readable sizes (with -l)\n"
            "  -d list directories themselves, not their contents"},
@@ -3766,15 +3767,20 @@ static void print_permissions(mode_t mode) {
     putchar(mode & S_IXOTH ? 'x' : '-');
 }
 
-static void print_long_listing(const char *filename, const struct stat *s, bool human) {
+static void print_long_listing(const char *filename, const struct stat *s, bool human, bool numeric_ids) {
     print_permissions(s->st_mode);
     printf(" %2llu", (unsigned long long)s->st_nlink);
 
-    struct passwd *pw = getpwuid(s->st_uid);
-    printf(" %-8s", pw ? pw->pw_name : "?");
+    if (numeric_ids) {
+        printf(" %-8u", (unsigned int)s->st_uid);
+        printf(" %-8u", (unsigned int)s->st_gid);
+    } else {
+        struct passwd *pw = getpwuid(s->st_uid);
+        printf(" %-8s", pw ? pw->pw_name : "?");
 
-    struct group *gr = getgrgid(s->st_gid);
-    printf(" %-8s", gr ? gr->gr_name : "?");
+        struct group *gr = getgrgid(s->st_gid);
+        printf(" %-8s", gr ? gr->gr_name : "?");
+    }
 
     if (human) {
         char sizebuf[32];
@@ -3802,6 +3808,7 @@ static int print_path_entry_with_stat(const char *path,
                                       const char *label,
                                       bool long_format,
                                       bool human,
+                                      bool numeric_ids,
                                       const struct stat *stat_buf,
                                       int color_mode,
                                       int classify) {
@@ -3842,7 +3849,7 @@ static int print_path_entry_with_stat(const char *path,
     if (long_format) {
         if (color)
             printf("\033[%dm", color);
-        print_long_listing(out, st, human);
+        print_long_listing(out, st, human, numeric_ids);
         if (color)
             printf("\033[0m");
     } else {
@@ -3874,7 +3881,7 @@ static char *join_path(const char *base, const char *name) {
 }
 
 static int print_path_entry(const char *path, const char *label, bool long_format, bool human, int color_mode, int classify) {
-    return print_path_entry_with_stat(path, label, long_format, human, NULL, color_mode, classify);
+    return print_path_entry_with_stat(path, label, long_format, human, false, NULL, color_mode, classify);
 }
 
 typedef struct {
@@ -3982,6 +3989,7 @@ static int list_directory(const char *path,
                           bool long_format,
                           bool sort_by_time,
                           bool human,
+                          bool numeric_ids,
                           int color_mode,
                           int classify) {
     DIR *d = opendir(path);
@@ -4058,17 +4066,18 @@ static int list_directory(const char *path,
         qsort(entries, count, sizeof(entries[0]), compare_ls_entries_by_mtime);
     }
 
-    if (long_format) {
-        for (size_t i = 0; i < count; ++i) {
-            status |= print_path_entry_with_stat(entries[i].full_path,
-                                                 entries[i].name,
-                                                 true,
-                                                 human,
-                                                 &entries[i].stat_buf,
-                                                 color_mode,
-                                                 classify);
-        }
-    } else {
+        if (long_format) {
+            for (size_t i = 0; i < count; ++i) {
+                status |= print_path_entry_with_stat(entries[i].full_path,
+                                                     entries[i].name,
+                                                     true,
+                                                     human,
+                                                     numeric_ids,
+                                                     &entries[i].stat_buf,
+                                                     color_mode,
+                                                     classify);
+            }
+        } else {
         print_ls_columns(entries, count, color_mode, classify);
     }
 
@@ -4124,7 +4133,8 @@ static bool smallclueLsValidateShortOptions(const char *arg,
                                             int *sort_by_time,
                                             int *list_dirs_only,
                                             int *human_sizes,
-                                            int *classify) {
+                                            int *classify,
+                                            int *numeric_ids) {
     if (!arg) {
         return true;
     }
@@ -4153,6 +4163,10 @@ static bool smallclueLsValidateShortOptions(const char *arg,
                 break;
             case 'F':
                 *classify = 1;
+                break;
+            case 'n':
+                *numeric_ids = 1;
+                *long_format = 1;
                 break;
             default:
                 fprintf(stderr, "ls: invalid option -- '%c'\n", *cursor);
@@ -4208,6 +4222,7 @@ static int smallclueLsCommand(int argc, char **argv) {
     int list_dirs_only = 0;
     int human_sizes = 0;
     int classify = 0;
+    int numeric_ids = 0;
     int color_mode = 0; /* 0=auto, 1=always, -1=never */
     smallclueResetGetopt();
 
@@ -4248,7 +4263,8 @@ static int smallclueLsCommand(int argc, char **argv) {
                                              &sort_by_time,
                                              &list_dirs_only,
                                              &human_sizes,
-                                             &classify)) {
+                                             &classify,
+                                             &numeric_ids)) {
             return 1;
         }
         idx++;
@@ -4262,10 +4278,10 @@ static int smallclueLsCommand(int argc, char **argv) {
     int paths_start = idx;
     if (paths_start >= argc) {
         if (list_dirs_only) {
-            return print_path_entry(".", ".", long_format, human_sizes, color_mode, classify) ? 1 : 0;
+            return print_path_entry_with_stat(".", ".", long_format, human_sizes, numeric_ids, NULL, color_mode, classify) ? 1 : 0;
         }
         return list_directory(".", show_all, show_almost_all, long_format,
-                              sort_by_time, human_sizes, color_mode, classify);
+                              sort_by_time, human_sizes, numeric_ids, color_mode, classify);
     }
 
     int remaining = argc - paths_start;
@@ -4286,9 +4302,9 @@ static int smallclueLsCommand(int argc, char **argv) {
                 printf("%s:\n", path);
             }
             status |= list_directory(path, show_all, show_almost_all, long_format,
-                                     sort_by_time, human_sizes, color_mode, classify);
+                                     sort_by_time, human_sizes, numeric_ids, color_mode, classify);
         } else {
-            status |= print_path_entry_with_stat(path, path, long_format, human_sizes, &stat_buf, color_mode, classify);
+            status |= print_path_entry_with_stat(path, path, long_format, human_sizes, numeric_ids, &stat_buf, color_mode, classify);
         }
     }
     return status ? 1 : 0;
