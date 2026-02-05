@@ -5207,7 +5207,9 @@ static int smallclueWatchCommand(int argc, char **argv) {
             status = abort_status;
             break;
         }
-        printf("\033[H\033[J");
+        /* Match the clear behavior of the standalone `clear` applet: clear
+         * scrollback, home cursor, then clear the visible viewport. */
+        fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
         printf("Every %.2fs: %s\n\n", interval, cmdline ? cmdline : argv[idx]);
         fflush(stdout);
         status = smallclueWatchRunApplet(applet, cmd_argc, &argv[idx]);
