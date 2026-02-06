@@ -360,6 +360,7 @@ static int smallclueFalseCommand(int argc, char **argv);
 static int smallclueYesCommand(int argc, char **argv);
 static int smallclueNoCommand(int argc, char **argv);
 static int smallclueVersionCommand(int argc, char **argv);
+static int smallclueSumCommand(int argc, char **argv);
 static int smallclueSleepCommand(int argc, char **argv);
 static int smallclueWatchCommand(int argc, char **argv);
 static int smallclueBasenameCommand(int argc, char **argv);
@@ -620,6 +621,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"traceroute", smallclueTracerouteCommand, "Trace network path to a host"},
     {"tr", smallclueTrCommand, "Translate or delete characters"},
     {"true", smallclueTrueCommand, "Do nothing, successfully"},
+    {"sum", smallclueSumCommand, "Checksum (BSD/SysV)"},
     {"type", smallclueTypeCommand, "Describe command names"},
     {"uname", smallclueUnameCommand, "Show system information"},
     {"uniq", smallclueUniqCommand, "Report or omit repeated lines"},
@@ -794,6 +796,11 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -e/-i/-k set erase/intr/kill chars"},
     {"touch", "touch FILE...\n"
               "  Update timestamps or create empty file"},
+    {"sum", "sum [-r|-s] [FILE...]\n"
+            "  BSD (-r, default): rotate-right checksum, 1K blocks.\n"
+            "  SysV (-s, --sysv): simple sum, 512-byte blocks.\n"
+            "  With no FILE or FILE '-', read standard input.\n"
+            "  Prints: <checksum> <blocks> [filename]\n"},
     {"tty", "tty [-s]\n"
             "  Print terminal name"},
     {"tr", "tr SET1 SET2\n"
@@ -1217,7 +1224,7 @@ static bool smallclueReadMemStats(size_t *used_kb, size_t *free_kb) {
     if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vmstat, &count) != KERN_SUCCESS) {
         return false;
     }
-    natural_t page_size = 0;
+    vm_size_t page_size = 0;
     if (host_page_size(mach_host_self(), &page_size) != KERN_SUCCESS || page_size == 0) {
         return false;
     }
@@ -3880,7 +3887,7 @@ static char *join_path(const char *base, const char *name) {
     return joined;
 }
 
-static int print_path_entry(const char *path, const char *label, bool long_format, bool human, int color_mode, int classify) {
+static __attribute__((unused)) int print_path_entry(const char *path, const char *label, bool long_format, bool human, int color_mode, int classify) {
     return print_path_entry_with_stat(path, label, long_format, human, false, NULL, color_mode, classify);
 }
 
@@ -4605,6 +4612,106 @@ static int smallclueNoCommand(int argc, char **argv) {
     int status = smallclueYesNoLoop(payload, 1);
     free(payload);
     return status;
+}
+
+typedef enum {
+    SMALLCLUE_SUM_BSD,
+    SMALLCLUE_SUM_SYSV
+} SmallclueSumMode;
+
+static uint16_t smallclueBsdSum(FILE *f, unsigned long long *out_blocks) {
+    uint16_t sum = 0;
+    unsigned long long total = 0;
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        sum = (uint16_t)((sum >> 1) | ((sum & 1) << 15));
+        sum = (uint16_t)((sum + (uint16_t)c) & 0xFFFF);
+        total++;
+    }
+    if (out_blocks) {
+        *out_blocks = (total + 1023ULL) / 1024ULL; /* 1K blocks */
+    }
+    return sum;
+}
+
+static uint16_t smallclueSysvSum(FILE *f, unsigned long long *out_blocks) {
+    uint32_t sum = 0;
+    unsigned long long total = 0;
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        sum += (uint8_t)c;
+        total++;
+    }
+    /* Fold to 16 bits */
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    if (out_blocks) {
+        *out_blocks = (total + 511ULL) / 512ULL; /* 512-byte blocks */
+    }
+    return (uint16_t)(sum & 0xFFFF);
+}
+
+static int smallclueSumCommand(int argc, char **argv) {
+    SmallclueSumMode mode = SMALLCLUE_SUM_BSD; /* -r default */
+    int idx = 1;
+    while (idx < argc && argv[idx][0] == '-') {
+        const char *opt = argv[idx];
+        if (strcmp(opt, "--") == 0) { idx++; break; }
+        if (strcmp(opt, "-r") == 0) { mode = SMALLCLUE_SUM_BSD; idx++; continue; }
+        if (strcmp(opt, "-s") == 0 || strcmp(opt, "--sysv") == 0) { mode = SMALLCLUE_SUM_SYSV; idx++; continue; }
+        if (strcmp(opt, "--help") == 0) {
+            fputs("usage: sum [-r|-s] [FILE...]\n", stdout);
+            fputs("  -r        BSD algorithm, 1K blocks (default)\n", stdout);
+            fputs("  -s, --sysv System V algorithm, 512-byte blocks\n", stdout);
+            return 0;
+        }
+        if (strcmp(opt, "--version") == 0) {
+            fputs("sum (smallclue) 1.0\n", stdout);
+            return 0;
+        }
+        /* Unknown option */
+        fprintf(stderr, "sum: unknown option '%s'\n", opt);
+        return 1;
+    }
+
+    int file_count = argc - idx;
+    if (file_count <= 0) {
+        argv[idx] = "-";
+        file_count = 1;
+    }
+
+    for (int i = 0; i < file_count; ++i) {
+        const char *path = argv[idx + i];
+        FILE *f = NULL;
+        bool from_stdin = (strcmp(path, "-") == 0);
+        if (from_stdin) {
+            f = stdin;
+        } else {
+            f = fopen(path, "rb");
+            if (!f) {
+                fprintf(stderr, "sum: %s: %s\n", path, strerror(errno));
+                continue;
+            }
+        }
+
+        unsigned long long blocks = 0;
+        uint16_t checksum = (mode == SMALLCLUE_SUM_BSD)
+                                ? smallclueBsdSum(f, &blocks)
+                                : smallclueSysvSum(f, &blocks);
+
+        if (!from_stdin) {
+            fclose(f);
+        } else {
+            clearerr(stdin);
+        }
+
+        if (from_stdin && file_count == 1) {
+            printf("%u %llu\n", (unsigned)checksum, blocks);
+        } else {
+            printf("%u %llu %s\n", (unsigned)checksum, blocks, path);
+        }
+    }
+    return 0;
 }
 
 static bool smallclueFormatBuildTimestamp(const char *programVersion, char *out, size_t out_len) {
