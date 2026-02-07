@@ -2539,8 +2539,72 @@ static int pagerParseEnvBool(const char *value) {
     return -1;
 }
 
+static int pagerPassthroughStream(FILE *stream) {
+    if (!stream) {
+        return 1;
+    }
+    char chunk[8192];
+    while (true) {
+        int read_err = 0;
+        ssize_t n = smallclueReadStream(stream, chunk, sizeof(chunk), &read_err);
+        if (n < 0) {
+            if (read_err) {
+                errno = read_err;
+            }
+            return 1;
+        }
+        if (n == 0) {
+            break;
+        }
+        if (fwrite(chunk, 1, (size_t)n, stdout) != (size_t)n) {
+            perror("pager: write error");
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static bool pagerStreamIsInteractive(FILE *stream) {
+    if (!stream) {
+        return false;
+    }
+    int fd = fileno(stream);
+    if (fd < 0) {
+        return false;
+    }
+    return isatty(fd) != 0;
+}
+
 static int pager_file(const char *cmd_name, const char *path, FILE *stream) {
     pager_control_fd_reset();
+    int force_env = pagerParseEnvBool(getenv("PSCALI_PAGER_FORCE"));
+#if defined(PSCAL_TARGET_IOS)
+    /* iOS safety: when pager input is a pipe and no control TTY is available,
+     * fall back to passthrough to avoid wedging. If a control TTY is available,
+     * keep normal interactive paging behavior. Set PSCALI_PAGER_FORCE=0 to
+     * force passthrough, or PSCALI_PAGER_FORCE=1 to force interactive. */
+    bool piped_stdin = (stream == stdin) && !pagerStreamIsInteractive(stream);
+    int pre_ctrl_fd = pager_control_fd();
+    bool pre_have_ctrl = (pre_ctrl_fd >= 0) && pscalRuntimeFdIsInteractive(pre_ctrl_fd);
+    if (pagerDebugEnabled()) {
+        pagerDebugLogf("[pager] iOS mode piped_stdin=%d force_env=%d pre_ctrl_fd=%d pre_have_ctrl=%d test_input=%d",
+                       piped_stdin ? 1 : 0,
+                       force_env,
+                       pre_ctrl_fd,
+                       pre_have_ctrl ? 1 : 0,
+                       pagerTestInputHasData() ? 1 : 0);
+    }
+    if (piped_stdin && force_env == 0) {
+        int status = pagerPassthroughStream(stream);
+        pager_control_fd_reset();
+        return status;
+    }
+    if (piped_stdin && force_env < 0 && !pre_have_ctrl && !pagerTestInputHasData()) {
+        int status = pagerPassthroughStream(stream);
+        pager_control_fd_reset();
+        return status;
+    }
+#endif
     PagerBuffer buffer = {0};
     if (pagerCollectLines(cmd_name, path, stream, &buffer) != 0) {
         return 1;
@@ -2548,7 +2612,6 @@ static int pager_file(const char *cmd_name, const char *path, FILE *stream) {
 
     int ctrl_fd = pager_control_fd();
     bool have_ctrl = (ctrl_fd >= 0) && pscalRuntimeFdIsInteractive(ctrl_fd);
-    int force_env = pagerParseEnvBool(getenv("PSCALI_PAGER_FORCE"));
     bool force_interactive = false;
     bool disable_interactive = false;
     if (force_env > 0) {
