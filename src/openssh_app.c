@@ -21,6 +21,7 @@
 #if defined(__has_include)
 #  if __has_include("PSCALRuntime.h")
 #    include "PSCALRuntime.h"
+#    define PSCAL_OPENSSH_HAVE_RUNTIME_BRIDGE 1
 #  else
 extern jmp_buf *PSCALRuntimeSwapExitJumpBuffer(jmp_buf *buffer) __attribute__((weak_import));
 extern int PSCALRuntimePushExitOverride(jmp_buf *buffer) __attribute__((weak_import));
@@ -51,6 +52,8 @@ extern void PSCALRuntimeRegisterSessionContext(uint64_t session_id) __attribute_
 extern void PSCALRuntimeUnregisterSessionContext(uint64_t session_id) __attribute__((weak));
 #endif
 extern void pscalRuntimeDebugLog(const char *message) __attribute__((weak));
+extern void pscalRuntimeRegisterShellThread(uint64_t session_id, pthread_t tid) __attribute__((weak));
+#if !defined(PSCAL_OPENSSH_HAVE_RUNTIME_BRIDGE)
 /* Provide a weak fallback so standalone smallclue builds without the runtime
  * bridge still link cleanly on iOS. The real runtime implementation overrides
  * this when available. */
@@ -95,6 +98,13 @@ __attribute__((weak))
 void pscalRuntimeDebugLog(const char *message) {
     (void)message;
 }
+
+__attribute__((weak))
+void pscalRuntimeRegisterShellThread(uint64_t session_id, pthread_t tid) {
+    (void)session_id;
+    (void)tid;
+}
+#endif
 #endif
 
 #if defined(PSCAL_TARGET_IOS)
@@ -660,6 +670,8 @@ typedef struct {
     char **argv;
     VProc *vp;
     VProcSessionStdio *session_stdio;
+    uint64_t session_id;
+    pthread_t caller_tid;
 } smallclueOpensshThreadContext;
 
 static void *smallclueRunOpensshEntryThread(void *arg) {
@@ -677,6 +689,13 @@ static void *smallclueRunOpensshEntryThread(void *arg) {
         vprocSessionStdioActivate(ctx->session_stdio);
         stdio_swapped = true;
     }
+    if (ctx && ctx->session_id != 0 && pscalRuntimeRegisterShellThread) {
+        pscalRuntimeRegisterShellThread(ctx->session_id, pthread_self());
+    }
+    sigset_t unblock;
+    sigemptyset(&unblock);
+    sigaddset(&unblock, SIGWINCH);
+    (void)pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
     int status = smallclueRunOpensshEntryOnce(ctx->label, ctx->entry, ctx->argc, ctx->argv);
     if (stdio_swapped) {
         vprocSessionStdioActivate(prev_stdio);
@@ -690,13 +709,20 @@ static void *smallclueRunOpensshEntryThread(void *arg) {
 
 static int smallclueRunOpensshEntry(const char *label, int (*entry)(int, char **),
                                     int argc, char **argv) {
+    VProcSessionStdio *session_stdio = vprocSessionStdioCurrent();
+    uint64_t session_id = 0;
+    if (session_stdio && session_stdio->session_id != 0) {
+        session_id = session_stdio->session_id;
+    }
     smallclueOpensshThreadContext ctx = {
         .label = label,
         .entry = entry,
         .argc = argc,
         .argv = argv,
         .vp = vprocCurrent(),
-        .session_stdio = vprocSessionStdioCurrent()
+        .session_stdio = session_stdio,
+        .session_id = session_id,
+        .caller_tid = pthread_self()
     };
     pthread_t thread;
     int err = pthread_create(&thread, NULL, smallclueRunOpensshEntryThread, &ctx);
@@ -705,6 +731,9 @@ static int smallclueRunOpensshEntry(const char *label, int (*entry)(int, char **
     }
     void *thread_ret = NULL;
     pthread_join(thread, &thread_ret);
+    if (ctx.session_id != 0 && pscalRuntimeRegisterShellThread) {
+        pscalRuntimeRegisterShellThread(ctx.session_id, ctx.caller_tid);
+    }
     return (int)(intptr_t)thread_ret;
 }
 
@@ -722,6 +751,43 @@ static void smallclueSshSessionNotifyExit(uint64_t session_id, int status) {
     if (pscalRuntimeSshSessionExited) {
         pscalRuntimeSshSessionExited(session_id, status);
     }
+}
+
+static void smallclueSshAttachControllingTty(VProcSessionStdio *session_stdio,
+                                             int sid,
+                                             int pgid) {
+#if defined(PSCAL_TARGET_IOS)
+    if (!session_stdio || !session_stdio->pty_slave ||
+        !session_stdio->pty_slave->ops || !session_stdio->pty_slave->ops->ioctl) {
+        return;
+    }
+    struct pscal_fd *pty_slave = session_stdio->pty_slave;
+    int rc_ctty = pty_slave->ops->ioctl(pty_slave, TIOCSCTTY_, (void *)(uintptr_t)1);
+    dword_t fg = (dword_t)pgid;
+    int rc_fg = pty_slave->ops->ioctl(pty_slave, TIOCSPGRP_, &fg);
+    if (smallclueSshDebugEnabled()) {
+        int tty_sid = -1;
+        int tty_fg = -1;
+        if (pty_slave->tty) {
+            tty_sid = (int)pty_slave->tty->session;
+            tty_fg = (int)pty_slave->tty->fg_group;
+        }
+        char logbuf[224];
+        snprintf(logbuf, sizeof(logbuf),
+                 "[ssh-session] tty attach sid=%d pgid=%d rc_ctty=%d rc_fg=%d tty_sid=%d tty_fg=%d",
+                 sid,
+                 pgid,
+                 rc_ctty,
+                 rc_fg,
+                 tty_sid,
+                 tty_fg);
+        smallclueSshDebugLog(logbuf);
+    }
+#else
+    (void)session_stdio;
+    (void)sid;
+    (void)pgid;
+#endif
 }
 
 static void smallclueCloseSessionFds(smallclueSshSessionContext *ctx) {
@@ -772,7 +838,6 @@ static void *smallclueRunSshSessionThread(void *arg) {
         free(ctx);
         return NULL;
     }
-    vprocSessionStdioActivate(session_stdio);
     ctx->pty_slave = NULL;
     ctx->pty_master = NULL;
 
@@ -801,7 +866,16 @@ static void *smallclueRunSshSessionThread(void *arg) {
         }
         (void)vprocSetSid(pid, pid);
         (void)vprocSetPgid(pid, pid);
+        vprocSessionStdioActivate(session_stdio);
+        smallclueSshAttachControllingTty(session_stdio, pid, pid);
         (void)vprocSetForegroundPgid(pid, pid);
+        if (pscalRuntimeRegisterShellThread) {
+            pscalRuntimeRegisterShellThread(ctx->session_id, pthread_self());
+        }
+        sigset_t unblock;
+        sigemptyset(&unblock);
+        sigaddset(&unblock, SIGWINCH);
+        (void)pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
         vprocSetCommandLabel(pid, (ctx->argv && ctx->argv[0]) ? ctx->argv[0] : "ssh");
         if (smallclueSshDebugEnabled()) {
             char logbuf[192];
