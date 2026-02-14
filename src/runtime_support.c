@@ -63,6 +63,11 @@ __attribute__((weak)) bool pscalRuntimeConsumeSigint(void) {
     return false;
 }
 
+__attribute__((weak)) bool pscalRuntimeConsumeSigtstp(void) {
+    /* Standalone build does not provide an out-of-band SIGTSTP queue. */
+    return false;
+}
+
 __attribute__((weak)) void pscalRuntimeDebugLog(const char *message) {
     if (message && *message) {
         fprintf(stderr, "%s\n", message);

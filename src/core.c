@@ -138,6 +138,7 @@ bool shellRuntimeConsumeExitRequested(void);
 #endif
 
 extern bool pscalRuntimeConsumeSigint(void);
+extern bool pscalRuntimeConsumeSigtstp(void);
 #if defined(PSCAL_TARGET_IOS)
 #if defined(__APPLE__)
 extern char *pscalRuntimeCopySessionLog(void) __attribute__((weak_import));
@@ -181,12 +182,27 @@ static void smallclueClearPendingSignals(void) {
 }
 
 static bool smallclueShouldAbort(int *out_status) {
+    const char *dbg = getenv("SMALLCLUE_DEBUG");
+    bool allow_cooperative_sigtstp = true;
+    int cur_pid = 0;
 #if defined(PSCAL_TARGET_IOS)
     VProc *vp = vprocCurrent();
     if (vp) {
         int shell_pid = vprocGetShellSelfPid();
+        cur_pid = vprocPid(vp);
+        if (cur_pid > 0 && !vprocGetStopUnsupported(cur_pid)) {
+            allow_cooperative_sigtstp = false;
+        }
         if (shell_pid <= 0 || vprocPid(vp) != shell_pid) {
             (void)vprocWaitIfStopped(vp);
+        }
+        if (dbg && *dbg) {
+            fprintf(stderr,
+                    "[smallclue] shouldAbort pid=%d shell_pid=%d stop_unsupported=%d allow_coop=%d\n",
+                    cur_pid,
+                    shell_pid,
+                    (int)vprocGetStopUnsupported(cur_pid),
+                    (int)allow_cooperative_sigtstp);
         }
     }
 #endif
@@ -194,13 +210,27 @@ static bool smallclueShouldAbort(int *out_status) {
         if (out_status) {
             *out_status = 130;
         }
+        if (dbg && *dbg) {
+            fprintf(stderr, "[smallclue] abort via runtime SIGINT\n");
+        }
+        return true;
+    }
+    if (allow_cooperative_sigtstp && pscalRuntimeConsumeSigtstp()) {
+        if (out_status) {
+            *out_status = 128 + SIGTSTP;
+        }
+        if (dbg && *dbg) {
+            fprintf(stderr, "[smallclue] abort via runtime SIGTSTP\n");
+        }
         return true;
     }
 
 #if defined(PSCAL_TARGET_IOS)
     /* Fallback: drain pending vproc signals so Ctrl-C/Z delivered via vprocKillShim
      * interrupt in-process applets even when the runtime bridge is absent. */
-    int cur_pid = vprocGetPidShim();
+    if (cur_pid <= 0) {
+        cur_pid = vprocGetPidShim();
+    }
     if (cur_pid <= 0) {
         cur_pid = vprocGetShellSelfPid();
     }
@@ -215,8 +245,17 @@ static bool smallclueShouldAbort(int *out_status) {
             sigaddset(&watchset, SIGTSTP);
             int signo = 0;
             if (vprocSigwait(cur_pid, &watchset, &signo) == 0) {
+                if (signo == SIGTSTP && !allow_cooperative_sigtstp) {
+                    if (dbg && *dbg) {
+                        fprintf(stderr, "[smallclue] ignore vproc SIGTSTP for non-coop stop\n");
+                    }
+                    return false;
+                }
                 if (out_status) {
-                    *out_status = (signo == SIGINT) ? 130 : 148;
+                    *out_status = 128 + signo;
+                }
+                if (dbg && *dbg) {
+                    fprintf(stderr, "[smallclue] abort via vproc signal %d\n", signo);
                 }
                 return true;
             }
@@ -228,6 +267,9 @@ static bool smallclueShouldAbort(int *out_status) {
         if (shellRuntimeConsumeExitRequested()) {
             if (out_status) {
                 *out_status = 130;
+            }
+            if (dbg && *dbg) {
+                fprintf(stderr, "[smallclue] abort via shell exit request\n");
             }
             return true;
         }
@@ -244,10 +286,20 @@ static bool smallclueShouldAbort(int *out_status) {
             (sigismember(&pending, SIGINT) || sigismember(&pending, SIGTSTP))) {
             int signo = 0;
             if (sigwait(&watchset, &signo) == 0) {
+                if (signo == SIGTSTP && !allow_cooperative_sigtstp) {
+                    sigprocmask(SIG_SETMASK, &oldset, NULL);
+                    if (dbg && *dbg) {
+                        fprintf(stderr, "[smallclue] ignore host SIGTSTP for non-coop stop\n");
+                    }
+                    return false;
+                }
                 if (out_status) {
-                    *out_status = (signo == SIGINT) ? 130 : 148;
+                    *out_status = 128 + signo;
                 }
                 sigprocmask(SIG_SETMASK, &oldset, NULL);
+                if (dbg && *dbg) {
+                    fprintf(stderr, "[smallclue] abort via host pending signal %d\n", signo);
+                }
                 return true;
             }
         }
@@ -417,7 +469,6 @@ static int smallclueIpAddrCommand(int argc, char **argv);
 #endif
 static int smallclueDfCommand(int argc, char **argv);
 #if defined(PSCAL_TARGET_IOS)
-static volatile sig_atomic_t gSmallclueTopQuit = 0;
 static int smallclueTopCommand(int argc, char **argv);
 static int smallclueDmesgCommand(int argc, char **argv);
 static int smallclueHelpCommand(int argc, char **argv);
@@ -1277,14 +1328,6 @@ static bool smallclueReadCpuStats(double *usr, double *sys, double *nice, double
 static int smallclueTopCommand(int argc, char **argv) {
     bool tree = true;
     bool hide_kernel = false;
-    struct termios orig_termios;
-    bool have_termios = false;
-    int stdin_flags = -1;
-    bool restore_flags = false;
-    struct sigaction old_int;
-    bool have_old_int = false;
-    int input_fd = STDIN_FILENO;
-    bool close_input_fd = false;
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
         if (!arg) {
@@ -1310,52 +1353,6 @@ static int smallclueTopCommand(int argc, char **argv) {
             return 1;
         }
     }
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    gSmallclueTopQuit = 0;
-    sa.sa_handler = SIG_IGN; /* Ignore Ctrl+C; exit via 'q'. */
-    sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGINT, &sa, &old_int) == 0) {
-        have_old_int = true;
-    }
-    int tty_fd = open("/dev/tty", O_RDONLY | O_NONBLOCK);
-    if (tty_fd >= 0) {
-        input_fd = tty_fd;
-        close_input_fd = true;
-    }
-
-    stdin_flags = fcntl(input_fd, F_GETFL);
-    if (stdin_flags != -1 && (stdin_flags & O_NONBLOCK) == 0) {
-        if (fcntl(input_fd, F_SETFL, stdin_flags | O_NONBLOCK) == 0) {
-            restore_flags = true;
-        }
-    }
-    {
-        struct termios raw;
-        bool fetched_termios = false;
-        if (tcgetattr(input_fd, &orig_termios) == 0) {
-            fetched_termios = true;
-        }
-#if defined(PSCAL_TARGET_IOS)
-        else if (vprocSessionStdioFetchTermios(input_fd, &orig_termios)) {
-            fetched_termios = true;
-        }
-#endif
-        if (fetched_termios) {
-            raw = orig_termios;
-            cfmakeraw(&raw);
-            raw.c_lflag |= ISIG; /* keep signals enabled for consistency */
-            if (tcsetattr(input_fd, TCSANOW, &raw) == 0) {
-                have_termios = true;
-            }
-#if defined(PSCAL_TARGET_IOS)
-            else if (vprocSessionStdioApplyTermios(input_fd, TCSANOW, &raw)) {
-                have_termios = true;
-            }
-#endif
-        }
-    }
-
     VProc *self_vp = vprocCurrent();
     int self_pid = self_vp ? vprocPid(self_vp) : (int)vprocGetPidShim();
 
@@ -1507,72 +1504,10 @@ static int smallclueTopCommand(int argc, char **argv) {
         }
 
         fflush(stdout);
-
-        /* Render once, then exit immediately. */
-        gSmallclueTopQuit = 1;
-
-        if (gSmallclueTopQuit) {
-            break;
-        }
-
-        /* Drain any pending input; exit on q/Q/Ctrl+C/EOF. */
-        while (1) {
-            char ch = 0;
-            ssize_t r = read(input_fd, &ch, 1);
-            if (r > 0) {
-                if (ch == 'q' || ch == 'Q' || ch == 0x03) {
-                    gSmallclueTopQuit = 1;
-                    break;
-                }
-                continue; /* keep draining buffer */
-            } else if (r == 0) {
-                gSmallclueTopQuit = 1;
-                break;
-            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
-            } else if (errno == EINTR) {
-                if (gSmallclueTopQuit) {
-                    break;
-                }
-                continue;
-            } else {
-                gSmallclueTopQuit = 1;
-                break;
-            }
-        }
-        if (gSmallclueTopQuit) {
-            break;
-        }
-
-        struct timespec ts = {.tv_sec = 1, .tv_nsec = 0};
-        while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
-            if (gSmallclueTopQuit) {
-                break;
-            }
-            continue;
-        }
-        if (gSmallclueTopQuit) {
-            break;
-        }
+        break;
     }
 
     free(snapshots);
-    if (have_termios) {
-        if (tcsetattr(input_fd, TCSANOW, &orig_termios) != 0) {
-#if defined(PSCAL_TARGET_IOS)
-            (void)vprocSessionStdioApplyTermios(input_fd, TCSANOW, &orig_termios);
-#endif
-        }
-    }
-    if (restore_flags && stdin_flags != -1) {
-        fcntl(input_fd, F_SETFL, stdin_flags);
-    }
-    if (have_old_int) {
-        sigaction(SIGINT, &old_int, NULL);
-    }
-    if (close_input_fd && input_fd >= 0) {
-        close(input_fd);
-    }
     return 0;
 }
 #endif
@@ -5384,6 +5319,17 @@ static int smallclueWatchCommand(int argc, char **argv) {
         fflush(stdout);
         status = smallclueWatchRunApplet(applet, cmd_argc, &argv[idx]);
         fflush(stdout);
+        if (status >= 128 && status < 128 + NSIG) {
+            int sig = status - 128;
+            if (sig == SIGINT || sig == SIGTSTP || sig == SIGSTOP ||
+                sig == SIGTTIN || sig == SIGTTOU) {
+                goto watch_done;
+            }
+        }
+        if (smallclueShouldAbort(&abort_status)) {
+            status = abort_status;
+            goto watch_done;
+        }
         if (max_iterations > 0) {
             iterations++;
             if (iterations >= max_iterations) {

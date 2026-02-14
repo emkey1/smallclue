@@ -520,6 +520,19 @@ typedef struct {
     char *wayland_display;
 } smallclueSshAskpassEnv;
 
+typedef struct {
+#if defined(PSCAL_TARGET_IOS)
+    VProcSessionStdio *session_stdio;
+    uint64_t session_id;
+    bool saved_stdio_passthrough;
+    bool saved_session_passthrough;
+    bool restore_stdio;
+    bool restore_session;
+#else
+    bool unused;
+#endif
+} smallclueSoftSignalScope;
+
 static bool smallclueApplySshPromptEnv(smallclueSshAskpassEnv *env) {
 #if defined(PSCAL_TARGET_IOS)
     if (!env) {
@@ -560,6 +573,50 @@ static void smallclueRestoreSshPromptEnv(smallclueSshAskpassEnv *env) {
 #else
     (void)env;
 #endif
+}
+
+static bool smallcluePushDisableSoftSignalingScope(const char *label, smallclueSoftSignalScope *scope) {
+    if (!scope) {
+        return false;
+    }
+    memset(scope, 0, sizeof(*scope));
+    if (!label || strcmp(label, "ssh") != 0) {
+        return false;
+    }
+#if defined(PSCAL_TARGET_IOS)
+    VProcSessionStdio *session_stdio = vprocSessionStdioCurrent();
+    if (!session_stdio) {
+        return false;
+    }
+    scope->session_stdio = session_stdio;
+    scope->saved_stdio_passthrough = session_stdio->control_bytes_passthrough;
+    session_stdio->control_bytes_passthrough = true;
+    scope->restore_stdio = true;
+    if (session_stdio->session_id != 0) {
+        scope->session_id = session_stdio->session_id;
+        scope->saved_session_passthrough =
+                vprocSessionGetControlBytePassthrough(session_stdio->session_id);
+        vprocSessionSetControlBytePassthrough(session_stdio->session_id, true);
+        scope->restore_session = true;
+    }
+#endif
+    return true;
+}
+
+static void smallcluePopDisableSoftSignalingScope(smallclueSoftSignalScope *scope) {
+    if (!scope) {
+        return;
+    }
+#if defined(PSCAL_TARGET_IOS)
+    if (scope->restore_stdio && scope->session_stdio) {
+        scope->session_stdio->control_bytes_passthrough = scope->saved_stdio_passthrough;
+    }
+    if (scope->restore_session && scope->session_id != 0) {
+        vprocSessionSetControlBytePassthrough(scope->session_id,
+                                              scope->saved_session_passthrough);
+    }
+#endif
+    memset(scope, 0, sizeof(*scope));
 }
 
 static int smallclueInvokeOpensshEntry(const char *label, int (*entry)(int, char **),
@@ -614,6 +671,25 @@ static int smallclueRunOpensshEntryOnce(const char *label, int (*entry)(int, cha
     sigemptyset(&ignore_action.sa_mask);
     sigaction(SIGPIPE, &ignore_action, &old_pipe);
     int status = 255;
+    int invoke_argc = argc;
+    char **invoke_argv = argv;
+    char **augmented_argv = NULL;
+    const char *setenv_option = "-oSetEnv=PSCALI_DISABLE_SOFT_SIGNALING=1";
+    if (label && strcmp(label, "ssh") == 0 && argc > 0 && argv) {
+        augmented_argv = (char **)calloc((size_t)argc + 2u, sizeof(char *));
+        if (augmented_argv) {
+            augmented_argv[0] = argv[0];
+            augmented_argv[1] = (char *)setenv_option;
+            for (int i = 1; i < argc; ++i) {
+                augmented_argv[i + 1] = argv[i];
+            }
+            invoke_argc = argc + 1;
+            invoke_argv = augmented_argv;
+        }
+    }
+    smallclueSoftSignalScope soft_signal_scope = {0};
+    bool restore_soft_signal_scope = smallcluePushDisableSoftSignalingScope(label,
+                                                                             &soft_signal_scope);
 #if defined(PSCAL_TARGET_IOS)
     jmp_buf exit_env;
     volatile int exit_status_sink = 0;
@@ -642,7 +718,7 @@ static int smallclueRunOpensshEntryOnce(const char *label, int (*entry)(int, cha
     g_smallclue_openssh_fallback_active = 1;
     pscal_openssh_set_global_exit_handler(&g_smallclue_openssh_fallback_env,
                                           &g_smallclue_openssh_fallback_code);
-    status = smallclueInvokeOpensshEntry(label, entry, argc, argv);
+    status = smallclueInvokeOpensshEntry(label, entry, invoke_argc, invoke_argv);
 smallclue_openssh_done:
     g_smallclue_openssh_fallback_active = 0;
     if (override_active) {
@@ -656,8 +732,12 @@ smallclue_openssh_done:
     pscal_openssh_set_global_exit_handler(NULL, NULL);
 #endif
 #else
-    status = smallclueInvokeOpensshEntry(label, entry, argc, argv);
+    status = smallclueInvokeOpensshEntry(label, entry, invoke_argc, invoke_argv);
 #endif
+    if (restore_soft_signal_scope) {
+        smallcluePopDisableSoftSignalingScope(&soft_signal_scope);
+    }
+    free(augmented_argv);
     sigaction(SIGPIPE, &old_pipe, NULL);
     return status;
 }
@@ -838,6 +918,10 @@ static void *smallclueRunSshSessionThread(void *arg) {
         free(ctx);
         return NULL;
     }
+    /* Dedicated SSH sessions must preserve literal ^C/^Z bytes so the remote
+     * endpoint controls interrupt/suspend semantics. */
+    session_stdio->control_bytes_passthrough = true;
+    vprocSessionSetControlBytePassthrough(ctx->session_id, true);
     ctx->pty_slave = NULL;
     ctx->pty_master = NULL;
 

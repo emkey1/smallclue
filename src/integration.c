@@ -164,22 +164,57 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
         char label[96];
         int saved_fg_pgid = -1;
         int session_sid = -1;
+        int execution_pid = -1;
+        bool cooperative_stop_guard = false;
         VProc *active_vp = vprocCurrent();
         int shell_pid = vprocGetShellSelfPid();
+        int owner_pid = (active_vp && vprocPid(active_vp) > 0) ? vprocPid(active_vp) : shell_pid;
         bool force_new_vproc = !(active_vp && vprocPid(active_vp) > 0 && vprocPid(active_vp) != shell_pid);
         smallclueFormatLabel(argc, argv, label, sizeof(label));
         if (label[0]) {
-            vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, label, force_new_vproc, true);
+            vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, label, force_new_vproc, false);
         } else {
-            vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, applet->name, force_new_vproc, true);
+            vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, applet->name, force_new_vproc, false);
         }
         if (vproc_scope_active) {
-            int shell_pid = vprocGetShellSelfPid();
+            execution_pid = vproc_scope.pid;
+            int scope_pgid = vprocGetPgid(vproc_scope.pid);
+            if (scope_pgid <= 0) {
+                scope_pgid = vproc_scope.pid;
+            }
             if (shell_pid > 0) {
                 session_sid = vprocGetSid(shell_pid);
-                saved_fg_pgid = vprocGetForegroundPgid(session_sid);
-                vprocSetForegroundPgid(session_sid, vproc_scope.pid);
             }
+            if (session_sid <= 0 && owner_pid > 0) {
+                session_sid = vprocGetSid(owner_pid);
+            }
+            if (session_sid <= 0) {
+                session_sid = vprocGetSid(vproc_scope.pid);
+            }
+            if (session_sid > 0) {
+                saved_fg_pgid = vprocGetForegroundPgid(session_sid);
+                if (saved_fg_pgid <= 0 && shell_pid > 0) {
+                    saved_fg_pgid = vprocGetPgid(shell_pid);
+                }
+                if (scope_pgid > 0) {
+                    (void)vprocSetForegroundPgid(session_sid, scope_pgid);
+                }
+            }
+        } else if (active_vp && vprocPid(active_vp) > 0) {
+            execution_pid = vprocPid(active_vp);
+        }
+        bool in_stage_vproc = (active_vp &&
+                               vprocPid(active_vp) > 0 &&
+                               shell_pid > 0 &&
+                               vprocPid(active_vp) != shell_pid);
+        if (execution_pid > 0 && execution_pid != shell_pid &&
+            vprocIsShellSelfThread() &&
+            !in_stage_vproc &&
+            !vprocGetStopUnsupported(execution_pid)) {
+            /* Builtins can execute inside an already-scoped stage vproc (no new
+             * command scope created). Keep Ctrl-Z cooperative in that case too. */
+            vprocSetStopUnsupported(execution_pid, true);
+            cooperative_stop_guard = true;
         }
 
         jmp_buf exit_env;
@@ -208,9 +243,19 @@ smallclue_dispatch_done:
         if (vproc_scope_active) {
             vprocCommandScopeEnd(&vproc_scope, status);
             vproc_scope_active = false;
+        } else if (cooperative_stop_guard && execution_pid > 0) {
+            vprocSetStopUnsupported(execution_pid, false);
         }
-        if (session_sid > 0 && saved_fg_pgid > 0) {
-            vprocSetForegroundPgid(session_sid, saved_fg_pgid);
+        int restore_sid = session_sid;
+        if (restore_sid <= 0 && shell_pid > 0) {
+            restore_sid = vprocGetSid(shell_pid);
+        }
+        int restore_fg_pgid = saved_fg_pgid;
+        if (restore_fg_pgid <= 0 && shell_pid > 0) {
+            restore_fg_pgid = vprocGetPgid(shell_pid);
+        }
+        if (restore_sid > 0 && restore_fg_pgid > 0) {
+            vprocSetForegroundPgid(restore_sid, restore_fg_pgid);
         }
         if (override_active) {
             if (PSCALRuntimePopExitOverrideWithStatus) {

@@ -15,6 +15,7 @@ bool pscalRuntimeStdinHasRealTTY(void);
 int pscalRuntimeDetectWindowCols(void);
 int pscalRuntimeDetectWindowRows(void);
 bool pscalRuntimeConsumeSigint(void);
+bool pscalRuntimeConsumeSigtstp(void);
 void pscalRuntimeDebugLog(const char *message);
 
 #endif /* SMALLCLUE_RUNTIME_TTY_H */
