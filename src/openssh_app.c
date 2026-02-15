@@ -161,9 +161,17 @@ int pscalRuntimeOpenSshSession(int argc, char **argv) __attribute__((weak));
 #endif
 
 volatile sig_atomic_t g_smallclue_openssh_exit_requested = 0;
-static sigjmp_buf g_smallclue_openssh_fallback_env;
-static volatile sig_atomic_t g_smallclue_openssh_fallback_active = 0;
-static volatile sig_atomic_t g_smallclue_openssh_fallback_code = 0;
+#ifndef SMALLCLUE_THREAD_LOCAL
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && \
+    !defined(__STDC_NO_THREADS__)
+#define SMALLCLUE_THREAD_LOCAL _Thread_local
+#else
+#define SMALLCLUE_THREAD_LOCAL __thread
+#endif
+#endif
+static SMALLCLUE_THREAD_LOCAL sigjmp_buf g_smallclue_openssh_fallback_env;
+static SMALLCLUE_THREAD_LOCAL volatile sig_atomic_t g_smallclue_openssh_fallback_active = 0;
+static SMALLCLUE_THREAD_LOCAL volatile sig_atomic_t g_smallclue_openssh_fallback_code = 0;
 
 int pscal_openssh_fallback_exit(int code) {
     if (!g_smallclue_openssh_fallback_active) {
@@ -458,6 +466,65 @@ static char **smallclueExpandSftpArgs(int argc, char **argv, int *out_count) {
 }
 
 static void smallclueEnsureWritableHomeSsh(void) {
+#if defined(PSCAL_TARGET_IOS)
+    const char *existing_runner = getenv("PSCALI_TOOL_RUNNER_PATH");
+    if (existing_runner && *existing_runner && access(existing_runner, X_OK) == 0) {
+        const char *home_existing = getenv("HOME");
+        if (home_existing && *home_existing) {
+            setenv("PSCALI_REAL_HOME", home_existing, 1);
+        }
+    } else {
+        const char *workspace = getenv("PSCALI_WORKSPACE_ROOT");
+        const char *container_root = getenv("PSCALI_CONTAINER_ROOT");
+        const char *workdir = getenv("PSCALI_WORKDIR");
+        const char *home_for_runner = getenv("HOME");
+        char candidate[PATH_MAX];
+        const char *resolved_runner = NULL;
+
+        if (!resolved_runner && workspace && *workspace) {
+            if (snprintf(candidate, sizeof(candidate), "%s/pscal_tool_runner", workspace) > 0 &&
+                access(candidate, X_OK) == 0) {
+                resolved_runner = candidate;
+            }
+        }
+        if (!resolved_runner && container_root && *container_root) {
+            if (snprintf(candidate, sizeof(candidate), "%s/Documents/pscal_tool_runner",
+                         container_root) > 0 &&
+                access(candidate, X_OK) == 0) {
+                resolved_runner = candidate;
+            }
+        }
+        if (!resolved_runner && workdir && *workdir) {
+            if (snprintf(candidate, sizeof(candidate), "%s/../pscal_tool_runner",
+                         workdir) > 0 &&
+                access(candidate, X_OK) == 0) {
+                resolved_runner = candidate;
+            }
+        }
+        if (!resolved_runner && home_for_runner && *home_for_runner) {
+            if (snprintf(candidate, sizeof(candidate), "%s/../pscal_tool_runner",
+                         home_for_runner) > 0 &&
+                access(candidate, X_OK) == 0) {
+                resolved_runner = candidate;
+            }
+        }
+        if (!resolved_runner && home_for_runner && *home_for_runner) {
+            if (snprintf(candidate, sizeof(candidate), "%s/pscal_tool_runner",
+                         home_for_runner) > 0 &&
+                access(candidate, X_OK) == 0) {
+                resolved_runner = candidate;
+            }
+        }
+
+        if (resolved_runner) {
+            setenv("PSCALI_TOOL_RUNNER_PATH", resolved_runner, 1);
+        }
+        if (home_for_runner && *home_for_runner) {
+            setenv("PSCALI_REAL_HOME", home_for_runner, 1);
+        }
+    }
+#endif
+
     const char *home = getenv("PSCALI_WORKDIR");
     if (!home || !*home) {
         home = getenv("PSCALI_CONTAINER_ROOT");
