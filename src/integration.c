@@ -301,6 +301,8 @@ DEFINE_SMALLCLUE_WRAPPER("tset", tset)
 DEFINE_SMALLCLUE_WRAPPER("tty", tty)
 DEFINE_SMALLCLUE_WRAPPER("resize", resize)
 DEFINE_SMALLCLUE_WRAPPER("sort", sort)
+DEFINE_SMALLCLUE_WRAPPER("stat", stat)
+DEFINE_SMALLCLUE_WRAPPER("sum", sum)
 DEFINE_SMALLCLUE_WRAPPER("uniq", uniq)
 DEFINE_SMALLCLUE_WRAPPER("sed", sed)
 DEFINE_SMALLCLUE_WRAPPER("cut", cut)
@@ -355,8 +357,11 @@ DEFINE_SMALLCLUE_WRAPPER("traceroute", traceroute)
 DEFINE_SMALLCLUE_WRAPPER("nslookup", nslookup)
 DEFINE_SMALLCLUE_WRAPPER("host", host)
 DEFINE_SMALLCLUE_WRAPPER("addt", addt)
+DEFINE_SMALLCLUE_WRAPPER("tabadd", tabadd)
+DEFINE_SMALLCLUE_WRAPPER("tadd", tadd)
 DEFINE_SMALLCLUE_WRAPPER("dmesg", dmesg)
 DEFINE_SMALLCLUE_WRAPPER("licenses", licenses)
+DEFINE_SMALLCLUE_WRAPPER("top", top)
 #endif
 #if defined(PSCAL_TARGET_IOS)
 DEFINE_SMALLCLUE_WRAPPER("nextvi", nextvi)
@@ -432,6 +437,8 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("tty", vmBuiltinSmallclue_tty, "tty");
     registerSmallclueBuiltin("resize", vmBuiltinSmallclue_resize, "resize");
     registerSmallclueBuiltin("sort", vmBuiltinSmallclue_sort, "sort");
+    registerSmallclueBuiltin("stat", vmBuiltinSmallclue_stat, "stat");
+    registerSmallclueBuiltin("sum", vmBuiltinSmallclue_sum, "sum");
     registerSmallclueBuiltin("uniq", vmBuiltinSmallclue_uniq, "uniq");
     registerSmallclueBuiltin("sed", vmBuiltinSmallclue_sed, "sed");
     registerSmallclueBuiltin("cut", vmBuiltinSmallclue_cut, "cut");
@@ -487,8 +494,11 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("nextvi", vmBuiltinSmallclue_nextvi, "nextvi");
     registerSmallclueBuiltin("vi", vmBuiltinSmallclue_nextvi, "vi");
     registerSmallclueBuiltin("addt", vmBuiltinSmallclue_addt, "addt");
+    registerSmallclueBuiltin("tabadd", vmBuiltinSmallclue_tabadd, "tabadd");
+    registerSmallclueBuiltin("tadd", vmBuiltinSmallclue_tadd, "tadd");
     registerSmallclueBuiltin("dmesg", vmBuiltinSmallclue_dmesg, "dmesg");
     registerSmallclueBuiltin("licenses", vmBuiltinSmallclue_licenses, "licenses");
+    registerSmallclueBuiltin("top", vmBuiltinSmallclue_top, "top");
     registerSmallclueBuiltin("vproc-test", vmBuiltinSmallclue_vproc_test, "vproc-test");
 #endif
     registerSmallclueBuiltin("wget", vmBuiltinSmallclue_wget, "wget");

@@ -872,7 +872,20 @@ static int smallclueRunOpensshEntry(const char *label, int (*entry)(int, char **
         .caller_tid = pthread_self()
     };
     pthread_t thread;
-    int err = pthread_create(&thread, NULL, smallclueRunOpensshEntryThread, &ctx);
+    pthread_attr_t attr;
+    pthread_attr_t *attrp = NULL;
+    if (pthread_attr_init(&attr) == 0) {
+        attrp = &attr;
+        size_t stack_size = 8u * 1024u * 1024u;
+        if (stack_size < (size_t)PTHREAD_STACK_MIN) {
+            stack_size = (size_t)PTHREAD_STACK_MIN;
+        }
+        (void)pthread_attr_setstacksize(&attr, stack_size);
+    }
+    int err = pthread_create(&thread, attrp, smallclueRunOpensshEntryThread, &ctx);
+    if (attrp) {
+        pthread_attr_destroy(&attr);
+    }
     if (err != 0) {
         return smallclueRunOpensshEntryOnce(label, entry, argc, argv);
     }
