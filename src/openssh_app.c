@@ -821,11 +821,160 @@ typedef struct {
     pthread_t caller_tid;
 } smallclueOpensshThreadContext;
 
+typedef struct {
+    VProc *vp;
+    int saved_stdin;
+    int saved_stdout;
+    int saved_stderr;
+    bool active;
+} smallclueVprocStdioScope;
+
+static bool smallclueMapVprocFd(VProc *vp,
+                                int target_fd,
+                                struct pscal_fd *primary_pscal,
+                                int primary_host_fd,
+                                struct pscal_fd *fallback_pscal,
+                                int fallback_host_fd) {
+    if (!vp || target_fd < 0) {
+        return false;
+    }
+    if (primary_pscal && vprocAdoptPscalFd(vp, target_fd, primary_pscal) == 0) {
+        return true;
+    }
+    if (primary_host_fd >= 0 && vprocRestoreHostFd(vp, target_fd, primary_host_fd) == 0) {
+        return true;
+    }
+    if (fallback_pscal && fallback_pscal != primary_pscal &&
+        vprocAdoptPscalFd(vp, target_fd, fallback_pscal) == 0) {
+        return true;
+    }
+    if (fallback_host_fd >= 0 && fallback_host_fd != primary_host_fd &&
+        vprocRestoreHostFd(vp, target_fd, fallback_host_fd) == 0) {
+        return true;
+    }
+    return false;
+}
+
+static bool smallcluePushVprocStdioScope(VProc *vp,
+                                         VProcSessionStdio *session_stdio,
+                                         smallclueVprocStdioScope *scope) {
+    if (!vp || !session_stdio || !scope) {
+        return false;
+    }
+    memset(scope, 0, sizeof(*scope));
+    scope->vp = vp;
+    scope->saved_stdin = -1;
+    scope->saved_stdout = -1;
+    scope->saved_stderr = -1;
+
+    scope->saved_stdin = vprocDup(vp, STDIN_FILENO);
+    scope->saved_stdout = vprocDup(vp, STDOUT_FILENO);
+    scope->saved_stderr = vprocDup(vp, STDERR_FILENO);
+
+    struct pscal_fd *in_pscal = pscal_fd_retain(session_stdio->stdin_pscal_fd
+                                                    ? session_stdio->stdin_pscal_fd
+                                                    : session_stdio->pty_slave);
+    struct pscal_fd *out_pscal = pscal_fd_retain(session_stdio->stdout_pscal_fd
+                                                     ? session_stdio->stdout_pscal_fd
+                                                     : (session_stdio->pty_slave
+                                                            ? session_stdio->pty_slave
+                                                            : session_stdio->stderr_pscal_fd));
+    struct pscal_fd *err_pscal = pscal_fd_retain(session_stdio->stderr_pscal_fd
+                                                     ? session_stdio->stderr_pscal_fd
+                                                     : (session_stdio->pty_slave
+                                                            ? session_stdio->pty_slave
+                                                            : session_stdio->stdout_pscal_fd));
+
+    bool mapped_stdin = smallclueMapVprocFd(vp,
+                                            STDIN_FILENO,
+                                            in_pscal,
+                                            session_stdio->stdin_host_fd,
+                                            NULL,
+                                            -1);
+    bool mapped_stdout = smallclueMapVprocFd(vp,
+                                             STDOUT_FILENO,
+                                             out_pscal,
+                                             session_stdio->stdout_host_fd,
+                                             err_pscal,
+                                             session_stdio->stderr_host_fd);
+    bool mapped_stderr = smallclueMapVprocFd(vp,
+                                             STDERR_FILENO,
+                                             err_pscal,
+                                             session_stdio->stderr_host_fd,
+                                             out_pscal,
+                                             session_stdio->stdout_host_fd);
+
+    if (!mapped_stdin && scope->saved_stdin >= 0) {
+        (void)vprocDup2(vp, scope->saved_stdin, STDIN_FILENO);
+    }
+    if (!mapped_stdout && scope->saved_stdout >= 0) {
+        (void)vprocDup2(vp, scope->saved_stdout, STDOUT_FILENO);
+    }
+    if (!mapped_stderr && scope->saved_stderr >= 0) {
+        (void)vprocDup2(vp, scope->saved_stderr, STDERR_FILENO);
+    }
+
+    if (in_pscal) {
+        pscal_fd_close(in_pscal);
+    }
+    if (out_pscal) {
+        pscal_fd_close(out_pscal);
+    }
+    if (err_pscal) {
+        pscal_fd_close(err_pscal);
+    }
+
+    bool rebound = mapped_stdout && (mapped_stderr || mapped_stdin);
+
+    if (!rebound) {
+        if (scope->saved_stdin >= 0) {
+            (void)vprocDup2(vp, scope->saved_stdin, STDIN_FILENO);
+            (void)vprocClose(vp, scope->saved_stdin);
+            scope->saved_stdin = -1;
+        }
+        if (scope->saved_stdout >= 0) {
+            (void)vprocDup2(vp, scope->saved_stdout, STDOUT_FILENO);
+            (void)vprocClose(vp, scope->saved_stdout);
+            scope->saved_stdout = -1;
+        }
+        if (scope->saved_stderr >= 0) {
+            (void)vprocDup2(vp, scope->saved_stderr, STDERR_FILENO);
+            (void)vprocClose(vp, scope->saved_stderr);
+            scope->saved_stderr = -1;
+        }
+        scope->vp = NULL;
+        return false;
+    }
+
+    scope->active = true;
+    return true;
+}
+
+static void smallcluePopVprocStdioScope(smallclueVprocStdioScope *scope) {
+    if (!scope || !scope->active || !scope->vp) {
+        return;
+    }
+    if (scope->saved_stdin >= 0) {
+        (void)vprocDup2(scope->vp, scope->saved_stdin, STDIN_FILENO);
+        (void)vprocClose(scope->vp, scope->saved_stdin);
+    }
+    if (scope->saved_stdout >= 0) {
+        (void)vprocDup2(scope->vp, scope->saved_stdout, STDOUT_FILENO);
+        (void)vprocClose(scope->vp, scope->saved_stdout);
+    }
+    if (scope->saved_stderr >= 0) {
+        (void)vprocDup2(scope->vp, scope->saved_stderr, STDERR_FILENO);
+        (void)vprocClose(scope->vp, scope->saved_stderr);
+    }
+    memset(scope, 0, sizeof(*scope));
+}
+
 static void *smallclueRunOpensshEntryThread(void *arg) {
     smallclueOpensshThreadContext *ctx = (smallclueOpensshThreadContext *)arg;
     bool activated = false;
     VProcSessionStdio *prev_stdio = NULL;
     bool stdio_swapped = false;
+    smallclueVprocStdioScope stdio_scope = {0};
     if (ctx && ctx->vp) {
         vprocActivate(ctx->vp);
         vprocRegisterThread(ctx->vp, pthread_self());
@@ -835,6 +984,9 @@ static void *smallclueRunOpensshEntryThread(void *arg) {
         prev_stdio = vprocSessionStdioCurrent();
         vprocSessionStdioActivate(ctx->session_stdio);
         stdio_swapped = true;
+        if (ctx->vp) {
+            (void)smallcluePushVprocStdioScope(ctx->vp, ctx->session_stdio, &stdio_scope);
+        }
     }
     if (ctx && ctx->session_id != 0 && pscalRuntimeRegisterShellThread) {
         pscalRuntimeRegisterShellThread(ctx->session_id, pthread_self());
@@ -844,6 +996,7 @@ static void *smallclueRunOpensshEntryThread(void *arg) {
     sigaddset(&unblock, SIGWINCH);
     (void)pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
     int status = smallclueRunOpensshEntryOnce(ctx->label, ctx->entry, ctx->argc, ctx->argv);
+    smallcluePopVprocStdioScope(&stdio_scope);
     if (stdio_swapped) {
         vprocSessionStdioActivate(prev_stdio);
     }
