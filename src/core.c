@@ -115,6 +115,52 @@ static const char *smallclueResolvePath(const char *path, char *buffer, size_t b
     return path;
 }
 
+static const char *smallclueDisplayPath(const char *path, char *buffer, size_t buflen) {
+    if (!path) {
+        return "";
+    }
+    if (!buffer || buflen == 0) {
+        return path;
+    }
+#if defined(__APPLE__)
+    bool stripped = false;
+    const char *home = getenv("HOME");
+    if (home && home[0] == '/') {
+        bool prefer_home_virtual = false;
+        if (strstr(home, "/Containers/Data/Application/") != NULL ||
+            strstr(path, "/Containers/Data/Application/") != NULL) {
+            prefer_home_virtual = true;
+        }
+        const char *container_root = getenv("PSCALI_CONTAINER_ROOT");
+        if (!prefer_home_virtual && container_root && container_root[0] == '/') {
+            prefer_home_virtual = true;
+        }
+        if (prefer_home_virtual) {
+            size_t home_len = strlen(home);
+            while (home_len > 1 && home[home_len - 1] == '/') {
+                home_len--;
+            }
+            if (strncmp(path, home, home_len) == 0 &&
+                (path[home_len] == '\0' || path[home_len] == '/')) {
+                const char *suffix = path + home_len;
+                int written = snprintf(buffer, buflen, "/home%s", suffix);
+                if (written >= 0 && (size_t)written < buflen) {
+                    return buffer;
+                }
+            }
+        }
+    }
+    stripped = pathTruncateStrip(path, buffer, buflen);
+    if (stripped && strcmp(buffer, path) != 0) {
+        return buffer;
+    }
+    if (stripped) {
+        return buffer;
+    }
+#endif
+    return path;
+}
+
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
 #endif
@@ -2453,6 +2499,39 @@ static int pager_terminal_rows(void) {
     return (parsed > 0) ? parsed : fallback;
 }
 
+static int pager_terminal_cols(void) {
+    int parsed = 0;
+    const char *cols = getenv("COLUMNS");
+    if (cols && *cols) {
+        parsed = atoi(cols);
+#if defined(PSCAL_TARGET_IOS)
+        if (parsed > 0) {
+            return parsed;
+        }
+#endif
+    }
+    struct winsize ws;
+    if (isatty(STDOUT_FILENO) && ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+        if (ws.ws_col > 0) {
+            return ws.ws_col;
+        }
+    }
+    int ctrl_fd = pager_control_fd();
+    if (ctrl_fd >= 0 && ioctl(ctrl_fd, TIOCGWINSZ, &ws) == 0) {
+        if (ws.ws_col > 0) {
+            return ws.ws_col;
+        }
+    }
+    if (parsed > 0) {
+        return parsed;
+    }
+    int fallback = 80;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d", parsed > 0 ? parsed : fallback);
+    setenv("COLUMNS", buf, 1);
+    return (parsed > 0) ? parsed : fallback;
+}
+
 static int pagerParseEnvBool(const char *value) {
     if (!value) {
         return -1;
@@ -3065,7 +3144,6 @@ static void markdownWriteHeading(FILE *out, const char *text, int level) {
         fputc(underline, out);
     }
     fputc('\n', out);
-    fputc('\n', out);
     free(formatted);
 }
 
@@ -3471,16 +3549,19 @@ static int smallclueMarkdownListDocuments(void) {
     MarkdownDocEntry *entries = NULL;
     size_t count = 0;
     char docs_dir[PATH_MAX];
+    char docs_dir_display[PATH_MAX];
+    const char *visible_docs_dir = NULL;
     if (markdownEnumerateDocuments(&entries, &count, docs_dir, sizeof(docs_dir)) != 0) {
         return 1;
     }
+    visible_docs_dir = smallclueDisplayPath(docs_dir, docs_dir_display, sizeof(docs_dir_display));
     if (count == 0) {
-        printf("No Markdown documents found in %s\n", docs_dir);
+        printf("No Markdown documents found in %s\n", visible_docs_dir);
         free(entries);
         return 1;
     }
     qsort(entries, count, sizeof(MarkdownDocEntry), markdownDocEntryCompare);
-    printf("Markdown documents in %s:\n\n", docs_dir);
+    printf("Markdown documents in %s:\n\n", visible_docs_dir);
     for (size_t i = 0; i < count; ++i) {
         const char *title = entries[i].title ? entries[i].title : "";
         printf("  %-24s %s\n", entries[i].name ? entries[i].name : "(unknown)", title);
@@ -3495,29 +3576,70 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
                                           size_t top,
                                           size_t cursor,
                                           size_t window,
-                                          const char *docs_dir) {
+                                          const char *docs_dir,
+                                          int term_cols,
+                                          bool show_docs_dir) {
     printf("\x1b[2J\x1b[H");
-    printf("Markdown documents (Arrow keys to navigate, Enter to open, q to quit)\n\n");
+    char header[256];
+    snprintf(header, sizeof(header),
+             "Markdown docs (Arrows=move, Enter=open, q=quit) [%zu/%zu]",
+             cursor + 1, count);
+    if (term_cols > 0 && (int)strlen(header) > term_cols) {
+        if (term_cols <= 3) {
+            fwrite(header, 1, (size_t)term_cols, stdout);
+        } else {
+            fwrite(header, 1, (size_t)(term_cols - 3), stdout);
+            fputs("...", stdout);
+        }
+        fputc('\n', stdout);
+    } else {
+        printf("%s\n", header);
+    }
     size_t end = top + window;
     if (end > count) {
         end = count;
     }
     for (size_t idx = top; idx < end; ++idx) {
+        char line[PATH_MAX * 2];
         bool highlight = (idx == cursor);
-        if (highlight) {
-            printf("\x1b[7m");
-        } else {
-            printf(" ");
-        }
         const char *name = entries[idx].name ? entries[idx].name : "(unknown)";
         const char *title = entries[idx].title ? entries[idx].title : "";
-        printf(" %-24s %s", name, title);
+        snprintf(line, sizeof(line), " %-24.24s %s", name, title);
+        if (highlight) {
+            printf("\x1b[7m");
+        }
+        if (term_cols > 0 && (int)strlen(line) > term_cols) {
+            if (term_cols <= 3) {
+                fwrite(line, 1, (size_t)term_cols, stdout);
+            } else {
+                fwrite(line, 1, (size_t)(term_cols - 3), stdout);
+                fputs("...", stdout);
+            }
+            fputc('\n', stdout);
+        } else {
+            printf("%s\n", line);
+        }
         if (highlight) {
             printf("\x1b[0m");
         }
-        printf("\n");
     }
-    printf("\nDocs directory: %s\n", docs_dir);
+    if (show_docs_dir) {
+        char docs_dir_display[PATH_MAX];
+        const char *visible_docs_dir = smallclueDisplayPath(docs_dir, docs_dir_display, sizeof(docs_dir_display));
+        char footer[PATH_MAX + 32];
+        snprintf(footer, sizeof(footer), "Docs: %s", visible_docs_dir);
+        if (term_cols > 0 && (int)strlen(footer) > term_cols) {
+            if (term_cols <= 3) {
+                fwrite(footer, 1, (size_t)term_cols, stdout);
+            } else {
+                fwrite(footer, 1, (size_t)(term_cols - 3), stdout);
+                fputs("...", stdout);
+            }
+            fputc('\n', stdout);
+        } else {
+            printf("%s\n", footer);
+        }
+    }
     fflush(stdout);
 }
 
@@ -3525,17 +3647,20 @@ static int markdownInteractiveSelectDocument(void) {
     MarkdownDocEntry *entries = NULL;
     size_t count = 0;
     char docs_dir[PATH_MAX];
+    char docs_dir_display[PATH_MAX];
+    const char *visible_docs_dir = NULL;
     if (markdownEnumerateDocuments(&entries, &count, docs_dir, sizeof(docs_dir)) != 0) {
         return 1;
     }
+    visible_docs_dir = smallclueDisplayPath(docs_dir, docs_dir_display, sizeof(docs_dir_display));
     if (count == 0) {
-        printf("No Markdown documents found in %s\n", docs_dir);
+        printf("No Markdown documents found in %s\n", visible_docs_dir);
         free(entries);
         return 1;
     }
     qsort(entries, count, sizeof(MarkdownDocEntry), markdownDocEntryCompare);
     if (!pscalRuntimeStdoutIsInteractive()) {
-        printf("Markdown documents in %s:\n\n", docs_dir);
+        printf("Markdown documents in %s:\n\n", visible_docs_dir);
         for (size_t i = 0; i < count; ++i) {
             const char *title = entries[i].title ? entries[i].title : "";
             printf("  %-24s %s\n", entries[i].name ? entries[i].name : "(unknown)", title);
@@ -3547,22 +3672,36 @@ static int markdownInteractiveSelectDocument(void) {
 
     size_t cursor = 0;
     size_t top = 0;
-    int rows = pager_terminal_rows();
-    size_t window = (rows > 6) ? (size_t)(rows - 4) : (count < 4 ? count : 4);
-    if (window == 0) window = 1;
-    if (window > count) window = count;
     char selected[PATH_MAX];
     bool running = true;
     bool has_selection = false;
 
     while (running) {
+        int rows = pager_terminal_rows();
+        int cols = pager_terminal_cols();
+        if (rows < 1) {
+            rows = 1;
+        }
+        bool show_docs_dir = rows >= 4;
+        size_t reserved_lines = show_docs_dir ? 2 : 1; /* header + optional docs footer */
+        size_t window = 1;
+        if ((size_t)rows > reserved_lines) {
+            window = (size_t)rows - reserved_lines;
+        }
+        if (window > count) {
+            window = count;
+        }
+
         if (cursor < top) {
             top = cursor;
         } else if (cursor >= top + window) {
             top = cursor - window + 1;
         }
+        if (top + window > count) {
+            top = (count > window) ? (count - window) : 0;
+        }
 
-        markdownInteractiveRenderList(entries, count, top, cursor, window, docs_dir);
+        markdownInteractiveRenderList(entries, count, top, cursor, window, docs_dir, cols, show_docs_dir);
 
         int key = pager_read_key();
         switch (key) {
