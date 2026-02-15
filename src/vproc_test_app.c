@@ -182,8 +182,53 @@ static VprocTestResult vprocTestVprocRead(const char *payload, const char **deta
 }
 
 int pscalVprocTestChildMain(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
+    const char *mode = getenv("PSCAL_VPROC_TEST_CHILD_MODE");
+    if (mode && strcmp(mode, "authprompt") == 0) {
+        (void)argc;
+        (void)argv;
+        char *pass = read_passphrase("vproc-test-child password:", 0);
+        if (!pass || pass[0] == '\0') {
+            if (pass) {
+                free(pass);
+            }
+            fprintf(stderr, "[vproc-test-child] empty\n");
+            return 91;
+        }
+        fprintf(stderr, "[vproc-test-child] accepted len=%zu\n", strlen(pass));
+        free(pass);
+        /* Non-zero keeps scp from claiming transfer success; this shim is for
+         * stdin/prompt regression coverage only. */
+        return 92;
+    } else if (mode && strcmp(mode, "authprompt_hold") == 0) {
+        (void)argc;
+        (void)argv;
+        char *pass = read_passphrase("vproc-test-child password:", 0);
+        if (!pass || pass[0] == '\0') {
+            if (pass) {
+                free(pass);
+            }
+            fprintf(stderr, "[vproc-test-child] empty\n");
+            return 91;
+        }
+        fprintf(stderr, "[vproc-test-child] accepted len=%zu\n", strlen(pass));
+        free(pass);
+        /* Keep stdin open and drain incoming bytes so scp does not exit
+         * immediately on protocol I/O while prompt-path tests run. */
+        for (;;) {
+            unsigned char sink = 0;
+            ssize_t rd = read(STDIN_FILENO, &sink, 1);
+            if (rd == 0) {
+                break;
+            }
+            if (rd < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+        }
+        return 93;
+    }
     return 0;
 }
 
