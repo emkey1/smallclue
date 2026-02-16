@@ -343,6 +343,7 @@ DEFINE_SMALLCLUE_WRAPPER("sftp", sftp)
 DEFINE_SMALLCLUE_WRAPPER("script", script)
 DEFINE_SMALLCLUE_WRAPPER("ssh", ssh)
 DEFINE_SMALLCLUE_WRAPPER("ssh-keygen", sshkeygen)
+DEFINE_SMALLCLUE_WRAPPER("ssh-copy-id", sshcopyid)
 #if defined(PSCAL_TARGET_IOS)
 DEFINE_SMALLCLUE_WRAPPER("mkdir", mkdir)
 DEFINE_SMALLCLUE_WRAPPER("cp", cp)
@@ -476,6 +477,7 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("sftp", vmBuiltinSmallclue_sftp, "sftp");
     registerSmallclueBuiltin("ssh", vmBuiltinSmallclue_ssh, "ssh");
     registerSmallclueBuiltin("ssh-keygen", vmBuiltinSmallclue_sshkeygen, "ssh-keygen");
+    registerSmallclueBuiltin("ssh-copy-id", vmBuiltinSmallclue_sshcopyid, "ssh-copy-id");
 #if defined(PSCAL_TARGET_IOS)
     registerSmallclueBuiltin("mkdir", vmBuiltinSmallclue_mkdir, "mkdir");
     registerSmallclueBuiltin("cp", vmBuiltinSmallclue_cp, "cp");

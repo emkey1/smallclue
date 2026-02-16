@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <ctype.h>
 #include <sys/stat.h>
 #include "common/path_truncate.h"
 #include "pscal_openssh_hooks.h"
@@ -566,6 +567,19 @@ static bool smallclueApplyVirtualHome(char **saved_home, char **saved_pscali_hom
     if (!pathTruncateStrip(home, stripped, sizeof(stripped))) {
         return false;
     }
+    if (strcmp(stripped, "/") == 0) {
+        const char *container_root = getenv("PSCALI_CONTAINER_ROOT");
+        const char *workdir = getenv("PSCALI_WORKDIR");
+        if ((container_root && *container_root) || (workdir && *workdir)) {
+            if (snprintf(stripped, sizeof(stripped), "%s", "/home") <= 0) {
+                return false;
+            }
+        } else {
+            /* When truncation root equals HOME (common on host builds), keep the
+             * original HOME to avoid collapsing into "/.ssh". */
+            return false;
+        }
+    }
     if (strcmp(stripped, home) == 0) {
         return false;
     }
@@ -575,6 +589,7 @@ static bool smallclueApplyVirtualHome(char **saved_home, char **saved_pscali_hom
     if (saved_pscali_home) {
         *saved_pscali_home = smallclueDupEnv("PSCALI_HOME");
     }
+    setenv("PSCALI_REAL_HOME", home, 1);
     setenv("HOME", stripped, 1);
     setenv("PSCALI_HOME", stripped, 1);
     return true;
@@ -1520,6 +1535,558 @@ int smallclueRunSshKeygen(int argc, char **argv) {
     char *saved_pscali_home = NULL;
     bool restore_home = smallclueApplyVirtualHome(&saved_home, &saved_pscali_home);
     int status = smallclueRunOpensshEntry("ssh-keygen", pscal_openssh_ssh_keygen_main, argc, argv);
+    if (restore_home) {
+        smallclueRestoreEnv("HOME", saved_home);
+        smallclueRestoreEnv("PSCALI_HOME", saved_pscali_home);
+    }
+    free(saved_home);
+    free(saved_pscali_home);
+    return status;
+}
+
+typedef struct {
+    char **items;
+    int count;
+    int capacity;
+} smallclueStringList;
+
+static void smallclueStringListInit(smallclueStringList *list) {
+    if (!list) {
+        return;
+    }
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static void smallclueStringListFree(smallclueStringList *list) {
+    if (!list || !list->items) {
+        return;
+    }
+    for (int i = 0; i < list->count; ++i) {
+        free(list->items[i]);
+    }
+    free(list->items);
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static bool smallclueStringListReserve(smallclueStringList *list, int needed) {
+    if (!list) {
+        return false;
+    }
+    if (needed <= list->capacity) {
+        return true;
+    }
+    int new_capacity = list->capacity > 0 ? list->capacity : 8;
+    while (new_capacity < needed) {
+        if (new_capacity > (INT_MAX / 2)) {
+            return false;
+        }
+        new_capacity *= 2;
+    }
+    char **resized = (char **)realloc(list->items, (size_t)new_capacity * sizeof(char *));
+    if (!resized) {
+        return false;
+    }
+    list->items = resized;
+    list->capacity = new_capacity;
+    return true;
+}
+
+static bool smallclueStringListPushDup(smallclueStringList *list, const char *value) {
+    if (!smallclueStringListReserve(list, list->count + 1)) {
+        return false;
+    }
+    list->items[list->count] = smallclueDupString(value);
+    if (!list->items[list->count]) {
+        return false;
+    }
+    list->count++;
+    return true;
+}
+
+static bool smallclueStringListPushTake(smallclueStringList *list, char *value) {
+    if (!smallclueStringListReserve(list, list->count + 1)) {
+        return false;
+    }
+    list->items[list->count++] = value;
+    return true;
+}
+
+static void smallclueSshCopyIdUsage(void) {
+    fprintf(stderr,
+            "usage: ssh-copy-id [-f] [-n] [-s] [-i [IDENTITY_FILE]] "
+            "[-t TARGET_PATH] [-F SSH_CONFIG] [[-o SSH_OPTION] ...] "
+            "[-p PORT] [USER@]HOST\n");
+}
+
+static bool smallclueEndsWith(const char *value, const char *suffix) {
+    if (!value || !suffix) {
+        return false;
+    }
+    size_t vlen = strlen(value);
+    size_t slen = strlen(suffix);
+    return vlen >= slen && strcmp(value + (vlen - slen), suffix) == 0;
+}
+
+static bool smallclueLooksLikeIdentityPath(const char *value) {
+    if (!value || !*value) {
+        return false;
+    }
+    if (value[0] == '/' || value[0] == '.' || value[0] == '~' || strchr(value, '/')) {
+        return true;
+    }
+    if (smallclueEndsWith(value, ".pub")) {
+        return true;
+    }
+    if (access(value, R_OK) == 0) {
+        return true;
+    }
+    char candidate[PATH_MAX];
+    if (snprintf(candidate, sizeof(candidate), "%s.pub", value) > 0 &&
+        access(candidate, R_OK) == 0) {
+        return true;
+    }
+    return false;
+}
+
+static char *smallclueExpandTildePath(const char *path) {
+    if (!path) {
+        return NULL;
+    }
+    if (path[0] != '~' || path[1] != '/') {
+        return smallclueDupString(path);
+    }
+    const char *home = getenv("HOME");
+    if (!home || !*home) {
+        return smallclueDupString(path);
+    }
+    size_t total = strlen(home) + strlen(path);
+    char *expanded = (char *)malloc(total);
+    if (!expanded) {
+        return NULL;
+    }
+    snprintf(expanded, total, "%s%s", home, path + 1);
+    return expanded;
+}
+
+static char *smallclueResolvePublicKeyPath(const char *identity_arg) {
+    char *candidate = NULL;
+    if (identity_arg && *identity_arg) {
+        candidate = smallclueExpandTildePath(identity_arg);
+        if (!candidate) {
+            return NULL;
+        }
+        if (!smallclueEndsWith(candidate, ".pub")) {
+            size_t total = strlen(candidate) + 5;
+            char *with_pub = (char *)malloc(total);
+            if (!with_pub) {
+                free(candidate);
+                return NULL;
+            }
+            snprintf(with_pub, total, "%s.pub", candidate);
+            free(candidate);
+            candidate = with_pub;
+        }
+        if (candidate[0] == '/') {
+            char expanded[PATH_MAX];
+            if (pathTruncateExpand(candidate, expanded, sizeof(expanded))) {
+                free(candidate);
+                candidate = smallclueDupString(expanded);
+            }
+        }
+        if (!candidate || access(candidate, R_OK) != 0) {
+            free(candidate);
+            return NULL;
+        }
+        return candidate;
+    }
+
+    const char *home = getenv("HOME");
+    const char *pscal_home = getenv("PSCALI_HOME");
+    const char *real_home = getenv("PSCALI_REAL_HOME");
+    const char *workdir = getenv("PSCALI_WORKDIR");
+    const char *defaults[] = {
+        "id_ed25519.pub",
+        "id_ecdsa.pub",
+        "id_rsa.pub",
+        "id_dsa.pub"
+    };
+    const char *roots[] = {
+        home,
+        pscal_home,
+        real_home,
+        workdir,
+        "."
+    };
+    char path[PATH_MAX];
+    for (size_t root_index = 0; root_index < sizeof(roots) / sizeof(roots[0]); ++root_index) {
+        const char *root = roots[root_index];
+        if (!root || !*root) {
+            continue;
+        }
+        for (size_t i = 0; i < sizeof(defaults) / sizeof(defaults[0]); ++i) {
+            if (snprintf(path, sizeof(path), "%s/.ssh/%s", root, defaults[i]) <= 0) {
+                continue;
+            }
+            char *expanded = smallclueExpandAbsolutePath(path);
+            if (!expanded) {
+                continue;
+            }
+            if (access(expanded, R_OK) == 0) {
+                return expanded;
+            }
+            free(expanded);
+        }
+    }
+    return NULL;
+}
+
+static bool smallclueLoadPublicKeys(const char *path, smallclueStringList *keys) {
+    if (!path || !*path || !keys) {
+        return false;
+    }
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        return false;
+    }
+    char *line = NULL;
+    size_t cap = 0;
+    bool ok = true;
+    while (ok) {
+        ssize_t nread = getline(&line, &cap, fp);
+        if (nread < 0) {
+            break;
+        }
+        while (nread > 0 && (line[nread - 1] == '\n' || line[nread - 1] == '\r')) {
+            line[--nread] = '\0';
+        }
+        char *start = line;
+        while (*start && isspace((unsigned char)*start)) {
+            start++;
+        }
+        if (*start == '\0' || *start == '#') {
+            continue;
+        }
+        ok = smallclueStringListPushDup(keys, start);
+    }
+    free(line);
+    fclose(fp);
+    return ok && keys->count > 0;
+}
+
+static char *smallclueShellSingleQuote(const char *value) {
+    const char *src = value ? value : "";
+    size_t total = 2;
+    for (const char *p = src; *p; ++p) {
+        total += (*p == '\'') ? 4 : 1;
+    }
+    char *out = (char *)malloc(total + 1);
+    if (!out) {
+        return NULL;
+    }
+    char *dst = out;
+    *dst++ = '\'';
+    for (const char *p = src; *p; ++p) {
+        if (*p == '\'') {
+            memcpy(dst, "'\\''", 4);
+            dst += 4;
+        } else {
+            *dst++ = *p;
+        }
+    }
+    *dst++ = '\'';
+    *dst = '\0';
+    return out;
+}
+
+static bool smallclueAppendText(char **buf, size_t *len, size_t *cap, const char *text) {
+    if (!buf || !len || !cap || !text) {
+        return false;
+    }
+    size_t add = strlen(text);
+    size_t needed = *len + add + 1;
+    if (needed > *cap) {
+        size_t new_cap = (*cap > 0) ? *cap : 256;
+        while (new_cap < needed) {
+            if (new_cap > (SIZE_MAX / 2)) {
+                return false;
+            }
+            new_cap *= 2;
+        }
+        char *resized = (char *)realloc(*buf, new_cap);
+        if (!resized) {
+            return false;
+        }
+        *buf = resized;
+        *cap = new_cap;
+    }
+    memcpy(*buf + *len, text, add + 1);
+    *len += add;
+    return true;
+}
+
+static char *smallclueBuildInstallCommand(const smallclueStringList *keys,
+                                          const char *target_path,
+                                          bool force) {
+    if (!keys || keys->count <= 0) {
+        return NULL;
+    }
+    char *quoted_target = smallclueShellSingleQuote(target_path ? target_path : ".ssh/authorized_keys");
+    if (!quoted_target) {
+        return NULL;
+    }
+
+    char *cmd = NULL;
+    size_t cmd_len = 0;
+    size_t cmd_cap = 0;
+    bool ok = true;
+    ok = ok && smallclueAppendText(&cmd, &cmd_len, &cmd_cap,
+                                   "umask 077; AUTH_KEY_FILE=");
+    ok = ok && smallclueAppendText(&cmd, &cmd_len, &cmd_cap, quoted_target);
+    ok = ok && smallclueAppendText(&cmd, &cmd_len, &cmd_cap,
+                                   "; AUTH_KEY_DIR=$(dirname \"$AUTH_KEY_FILE\"); "
+                                   "mkdir -p \"$AUTH_KEY_DIR\" && touch \"$AUTH_KEY_FILE\" && "
+                                   "chmod 600 \"$AUTH_KEY_FILE\";");
+    free(quoted_target);
+
+    for (int i = 0; ok && i < keys->count; ++i) {
+        char *quoted_key = smallclueShellSingleQuote(keys->items[i]);
+        if (!quoted_key) {
+            ok = false;
+            break;
+        }
+        if (force) {
+            ok = ok && smallclueAppendText(&cmd, &cmd_len, &cmd_cap, " printf '%s\\n' ");
+            ok = ok && smallclueAppendText(&cmd, &cmd_len, &cmd_cap, quoted_key);
+            ok = ok && smallclueAppendText(&cmd, &cmd_len, &cmd_cap, " >> \"$AUTH_KEY_FILE\";");
+        } else {
+            ok = ok && smallclueAppendText(&cmd, &cmd_len, &cmd_cap, " grep -qxF -- ");
+            ok = ok && smallclueAppendText(&cmd, &cmd_len, &cmd_cap, quoted_key);
+            ok = ok && smallclueAppendText(&cmd, &cmd_len, &cmd_cap,
+                                           " \"$AUTH_KEY_FILE\" || printf '%s\\n' ");
+            ok = ok && smallclueAppendText(&cmd, &cmd_len, &cmd_cap, quoted_key);
+            ok = ok && smallclueAppendText(&cmd, &cmd_len, &cmd_cap, " >> \"$AUTH_KEY_FILE\";");
+        }
+        free(quoted_key);
+    }
+
+    if (!ok) {
+        free(cmd);
+        cmd = NULL;
+    }
+    return cmd;
+}
+
+int smallclueRunSshCopyId(int argc, char **argv) {
+    smallclueEnsureWritableHomeSsh();
+    char *saved_home = NULL;
+    char *saved_pscali_home = NULL;
+    bool restore_home = smallclueApplyVirtualHome(&saved_home, &saved_pscali_home);
+    smallclueSshAskpassEnv askpass_env = {0};
+    bool restore_askpass = smallclueApplySshPromptEnv(&askpass_env);
+
+    int status = 1;
+    bool force = false;
+    bool dry_run = false;
+    bool use_sftp_mode = false;
+    char *identity_arg = NULL;
+    char *target_path = NULL;
+    char *target_host = NULL;
+    smallclueStringList ssh_passthrough;
+    smallclueStringList keys;
+    smallclueStringList ssh_argv;
+    smallclueStringListInit(&ssh_passthrough);
+    smallclueStringListInit(&keys);
+    smallclueStringListInit(&ssh_argv);
+
+    int i = 1;
+    while (i < argc) {
+        const char *arg = argv[i];
+        if (!arg) {
+            ++i;
+            continue;
+        }
+        if (strcmp(arg, "--") == 0) {
+            ++i;
+            break;
+        }
+        if (arg[0] != '-' || strcmp(arg, "-") == 0) {
+            break;
+        }
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "-?") == 0) {
+            smallclueSshCopyIdUsage();
+            status = 0;
+            goto smallclue_ssh_copy_id_cleanup;
+        }
+        if (strcmp(arg, "-f") == 0) {
+            force = true;
+            ++i;
+            continue;
+        }
+        if (strcmp(arg, "-n") == 0) {
+            dry_run = true;
+            ++i;
+            continue;
+        }
+        if (strcmp(arg, "-s") == 0) {
+            use_sftp_mode = true;
+            ++i;
+            continue;
+        }
+        if (strcmp(arg, "-i") == 0) {
+            if (i + 1 < argc && argv[i + 1] && argv[i + 1][0] != '-' &&
+                smallclueLooksLikeIdentityPath(argv[i + 1])) {
+                free(identity_arg);
+                identity_arg = smallclueDupString(argv[i + 1]);
+                i += 2;
+            } else {
+                ++i;
+            }
+            continue;
+        }
+        if (arg[0] == '-' && arg[1] == 'i' && arg[2] != '\0') {
+            free(identity_arg);
+            identity_arg = smallclueDupString(arg + 2);
+            ++i;
+            continue;
+        }
+        if (strcmp(arg, "-t") == 0) {
+            if (i + 1 >= argc || !argv[i + 1]) {
+                fprintf(stderr, "ssh-copy-id: option requires an argument -- t\n");
+                smallclueSshCopyIdUsage();
+                goto smallclue_ssh_copy_id_cleanup;
+            }
+            free(target_path);
+            target_path = smallclueDupString(argv[i + 1]);
+            i += 2;
+            continue;
+        }
+        if (strcmp(arg, "-o") == 0 || strcmp(arg, "-F") == 0 || strcmp(arg, "-p") == 0) {
+            if (i + 1 >= argc || !argv[i + 1]) {
+                fprintf(stderr, "ssh-copy-id: option requires an argument -- %s\n", arg);
+                smallclueSshCopyIdUsage();
+                goto smallclue_ssh_copy_id_cleanup;
+            }
+            if (!smallclueStringListPushDup(&ssh_passthrough, arg) ||
+                !smallclueStringListPushDup(&ssh_passthrough, argv[i + 1])) {
+                fprintf(stderr, "ssh-copy-id: out of memory\n");
+                goto smallclue_ssh_copy_id_cleanup;
+            }
+            i += 2;
+            continue;
+        }
+        if (arg[0] == '-' &&
+            (arg[1] == 'o' || arg[1] == 'F' || arg[1] == 'p') &&
+            arg[2] != '\0') {
+            if (!smallclueStringListPushDup(&ssh_passthrough, arg)) {
+                fprintf(stderr, "ssh-copy-id: out of memory\n");
+                goto smallclue_ssh_copy_id_cleanup;
+            }
+            ++i;
+            continue;
+        }
+        fprintf(stderr, "ssh-copy-id: unsupported option '%s'\n", arg);
+        smallclueSshCopyIdUsage();
+        goto smallclue_ssh_copy_id_cleanup;
+    }
+
+    if (i < argc) {
+        target_host = smallclueDupString(argv[i++]);
+    }
+    if (!target_host || i < argc) {
+        smallclueSshCopyIdUsage();
+        goto smallclue_ssh_copy_id_cleanup;
+    }
+
+    char *pub_key_path = smallclueResolvePublicKeyPath(identity_arg);
+    if (!pub_key_path) {
+        if (identity_arg && *identity_arg) {
+            fprintf(stderr, "ssh-copy-id: identity file not found: %s(.pub)\n", identity_arg);
+        } else {
+            fprintf(stderr, "ssh-copy-id: no default public key found under ~/.ssh\n");
+        }
+        goto smallclue_ssh_copy_id_cleanup;
+    }
+
+    if (!smallclueLoadPublicKeys(pub_key_path, &keys)) {
+        fprintf(stderr, "ssh-copy-id: failed to read public key(s) from %s\n", pub_key_path);
+        free(pub_key_path);
+        goto smallclue_ssh_copy_id_cleanup;
+    }
+
+    if (!target_path) {
+        target_path = smallclueDupString(".ssh/authorized_keys");
+        if (!target_path) {
+            fprintf(stderr, "ssh-copy-id: out of memory\n");
+            free(pub_key_path);
+            goto smallclue_ssh_copy_id_cleanup;
+        }
+    }
+
+    if (use_sftp_mode) {
+        fprintf(stderr, "ssh-copy-id: warning: -s mode not implemented; using ssh command mode\n");
+    }
+
+    if (dry_run) {
+        fprintf(stderr, "ssh-copy-id: dry-run: would install %d key(s) from %s to %s:%s\n",
+                keys.count,
+                pub_key_path,
+                target_host,
+                target_path);
+        status = 0;
+        free(pub_key_path);
+        goto smallclue_ssh_copy_id_cleanup;
+    }
+
+    char *remote_command = smallclueBuildInstallCommand(&keys, target_path, force);
+    if (!remote_command) {
+        fprintf(stderr, "ssh-copy-id: out of memory\n");
+        free(pub_key_path);
+        goto smallclue_ssh_copy_id_cleanup;
+    }
+
+    bool argv_ok = true;
+    argv_ok = argv_ok && smallclueStringListPushDup(&ssh_argv, "ssh");
+    argv_ok = argv_ok && smallclueStringListPushDup(&ssh_argv, "-tt");
+    argv_ok = argv_ok && smallclueStringListPushDup(&ssh_argv, "-a");
+    argv_ok = argv_ok && smallclueStringListPushDup(&ssh_argv, "-x");
+    for (int opt_index = 0; argv_ok && opt_index < ssh_passthrough.count; ++opt_index) {
+        argv_ok = smallclueStringListPushDup(&ssh_argv, ssh_passthrough.items[opt_index]);
+    }
+    argv_ok = argv_ok && smallclueStringListPushDup(&ssh_argv, target_host);
+    argv_ok = argv_ok && smallclueStringListPushTake(&ssh_argv, remote_command);
+    if (!argv_ok) {
+        fprintf(stderr, "ssh-copy-id: out of memory\n");
+        free(pub_key_path);
+        free(remote_command);
+        goto smallclue_ssh_copy_id_cleanup;
+    }
+
+    int expanded_count = 0;
+    char **expanded = smallclueExpandSshArgs(ssh_argv.count, ssh_argv.items, &expanded_count);
+    status = smallclueRunOpensshEntry("ssh",
+                                      pscal_openssh_ssh_main,
+                                      expanded ? expanded_count : ssh_argv.count,
+                                      expanded ? expanded : ssh_argv.items);
+    if (expanded) {
+        smallclueFreeArgv(expanded, expanded_count);
+    }
+    free(pub_key_path);
+
+smallclue_ssh_copy_id_cleanup:
+    free(identity_arg);
+    free(target_path);
+    free(target_host);
+    smallclueStringListFree(&ssh_passthrough);
+    smallclueStringListFree(&keys);
+    smallclueStringListFree(&ssh_argv);
+
+    if (restore_askpass) {
+        smallclueRestoreSshPromptEnv(&askpass_env);
+    }
     if (restore_home) {
         smallclueRestoreEnv("HOME", saved_home);
         smallclueRestoreEnv("PSCALI_HOME", saved_pscali_home);

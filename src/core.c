@@ -494,6 +494,7 @@ static int smallclueSshCommand(int argc, char **argv);
 static int smallclueScpCommand(int argc, char **argv);
 static int smallclueSftpCommand(int argc, char **argv);
 static int smallclueSshKeygenCommand(int argc, char **argv);
+static int smallclueSshCopyIdCommand(int argc, char **argv);
 static int smallcluePbcopyCommand(int argc, char **argv);
 static int smallcluePbpasteCommand(int argc, char **argv);
 #if defined(SMALLCLUE_WITH_EXSH)
@@ -708,6 +709,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"script", smallclueScriptCommand, "Record terminal output to a file"},
     {"ssh", smallclueSshCommand, "OpenSSH client"},
     {"ssh-keygen", smallclueSshKeygenCommand, "Generate SSH key pairs"},
+    {"ssh-copy-id", smallclueSshCopyIdCommand, "Install SSH public keys on a remote host"},
     {"tail", smallclueTailCommand, "Print the last lines of files"},
     {"tee", smallclueTeeCommand, "Copy stdin to files and stdout"},
     {"telnet", smallclueTelnetCommand, "Simple TCP telnet client"},
@@ -875,6 +877,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  OpenSSH client"},
     {"ssh-keygen", "ssh-keygen [-t TYPE] [-f FILE] [-C COMMENT]\n"
                    "  Generate SSH key pairs"},
+    {"ssh-copy-id", "ssh-copy-id [-f] [-n] [-s] [-i [IDENTITY_FILE]] [USER@]HOST\n"
+                    "  Install local public key(s) to remote authorized_keys"},
     {"tail", "tail [-n N] [FILE...]\n"
              "  Default N=10"},
     {"tee", "tee [-a] FILE...\n"
@@ -5729,6 +5733,9 @@ static int smallclueSftpCommand(int argc, char **argv) {
 }
 static int smallclueSshKeygenCommand(int argc, char **argv) {
     return smallclueRunSshKeygen(argc, argv);
+}
+static int smallclueSshCopyIdCommand(int argc, char **argv) {
+    return smallclueRunSshCopyId(argc, argv);
 }
 #if defined(PSCAL_TARGET_IOS)
 static int smallclueAddTabCommand(int argc, char **argv) {
