@@ -324,6 +324,7 @@ DEFINE_SMALLCLUE_WRAPPER("no", no)
 DEFINE_SMALLCLUE_WRAPPER("version", version)
 DEFINE_SMALLCLUE_WRAPPER("vproc-test", vproc_test)
 DEFINE_SMALLCLUE_WRAPPER("sleep", sleepcmd)
+DEFINE_SMALLCLUE_WRAPPER("time", timecmd)
 DEFINE_SMALLCLUE_WRAPPER("basename", basename)
 DEFINE_SMALLCLUE_WRAPPER("dirname", dirname)
 DEFINE_SMALLCLUE_WRAPPER("tee", tee)
@@ -506,6 +507,7 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("wget", vmBuiltinSmallclue_wget, "wget");
     registerSmallclueBuiltin("watch", vmBuiltinSmallclue_watch, "watch");
     registerSmallclueBuiltin("version", vmBuiltinSmallclue_version, "version");
+    registerSmallclueBuiltin("time", vmBuiltinSmallclue_timecmd, "time");
 #if defined(PSCAL_TARGET_IOS)
     registerSmallclueBuiltin("smallclue-help", vmBuiltinSmallclue_smallclue_help, "smallclue-help");
 #endif

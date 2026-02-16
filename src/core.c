@@ -28,6 +28,7 @@
 #include <limits.h>
 #include <libgen.h>
 #include <pwd.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -460,6 +461,7 @@ static int smallclueNoCommand(int argc, char **argv);
 static int smallclueVersionCommand(int argc, char **argv);
 static int smallclueSumCommand(int argc, char **argv);
 static int smallclueSleepCommand(int argc, char **argv);
+static int smallclueTimeCommand(int argc, char **argv);
 static int smallclueWatchCommand(int argc, char **argv);
 static int smallclueBasenameCommand(int argc, char **argv);
 static int smallclueDirnameCommand(int argc, char **argv);
@@ -714,6 +716,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"tee", smallclueTeeCommand, "Copy stdin to files and stdout"},
     {"telnet", smallclueTelnetCommand, "Simple TCP telnet client"},
     {"test", smallclueTestCommand, "Evaluate expressions"},
+    {"time", smallclueTimeCommand, "Measure command runtime"},
     {"tset", smallclueTsetCommand, "Initialize terminal settings"},
     {"touch", smallclueTouchCommand, "Update file timestamps"},
     {"tty", smallclueTtyCommand, "Print terminal name"},
@@ -889,6 +892,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                    "  Trace network path using the system traceroute command"},
     {"test", "test EXPRESSION\n"
              "  File: -f -d -e; String: = != -z; Int: -eq -ne -lt -le -gt -ge"},
+    {"time", "time command [args...]\n"
+             "  Run a smallclue applet and print real/user/sys timing"},
     {"tset", "tset [-IQqs] [-e CH] [-i CH] [-k CH] [-r] [TERM]\n"
              "  Set TERM and initialize terminal\n"
              "  -s emit shell commands\n"
@@ -5408,6 +5413,78 @@ static int smallclueUptimeCommand(int argc, char **argv) {
         printf("up %02d:%02d:%02d\n", hours, minutes, secs);
     }
     return 0;
+}
+
+static double smallclueTimevalDiffSeconds(const struct timeval *end, const struct timeval *start) {
+    if (!end || !start) {
+        return 0.0;
+    }
+    double seconds = (double)(end->tv_sec - start->tv_sec);
+    seconds += ((double)(end->tv_usec - start->tv_usec) / 1000000.0);
+    if (seconds < 0.0) {
+        return 0.0;
+    }
+    return seconds;
+}
+
+static void smallclueTimePrintMetric(const char *label, double seconds) {
+    if (!label) {
+        return;
+    }
+    if (seconds < 0.0) {
+        seconds = 0.0;
+    }
+    long minutes = (long)(seconds / 60.0);
+    double remainder = seconds - ((double)minutes * 60.0);
+    if (remainder < 0.0) {
+        remainder = 0.0;
+    }
+    printf("%s\t%ldm%.3fs\n", label, minutes, remainder);
+}
+
+static int smallclueTimeCommand(int argc, char **argv) {
+    if (argc < 2 || !argv[1] || argv[1][0] == '\0') {
+        fprintf(stderr, "usage: time command [args...]\n");
+        return 1;
+    }
+
+    const SmallclueApplet *applet = smallclueFindApplet(argv[1]);
+    if (!applet) {
+        fprintf(stderr, "time: %s: command not found\n", argv[1]);
+        return 127;
+    }
+
+    struct timespec start_real = {0};
+    struct timespec end_real = {0};
+    struct rusage start_usage = {0};
+    struct rusage end_usage = {0};
+    bool have_real = (clock_gettime(CLOCK_MONOTONIC, &start_real) == 0);
+    bool have_usage = (getrusage(RUSAGE_SELF, &start_usage) == 0);
+
+    int status = smallclueDispatchApplet(applet, argc - 1, &argv[1]);
+
+    if (have_real) {
+        have_real = (clock_gettime(CLOCK_MONOTONIC, &end_real) == 0);
+    }
+    if (have_usage) {
+        have_usage = (getrusage(RUSAGE_SELF, &end_usage) == 0);
+    }
+
+    double real_seconds = 0.0;
+    if (have_real) {
+        real_seconds = (double)(end_real.tv_sec - start_real.tv_sec);
+        real_seconds += ((double)(end_real.tv_nsec - start_real.tv_nsec) / 1000000000.0);
+        if (real_seconds < 0.0) {
+            real_seconds = 0.0;
+        }
+    }
+    double user_seconds = have_usage ? smallclueTimevalDiffSeconds(&end_usage.ru_utime, &start_usage.ru_utime) : 0.0;
+    double sys_seconds = have_usage ? smallclueTimevalDiffSeconds(&end_usage.ru_stime, &start_usage.ru_stime) : 0.0;
+
+    smallclueTimePrintMetric("real", real_seconds);
+    smallclueTimePrintMetric("user", user_seconds);
+    smallclueTimePrintMetric("sys", sys_seconds);
+    return status;
 }
 
 static int smallclueWatchRunApplet(const SmallclueApplet *applet, int argc, char **argv) {
