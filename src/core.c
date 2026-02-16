@@ -2202,6 +2202,9 @@ static int pagerTestInputNext(void) {
 }
 
 static _Thread_local int pager_control_fd_value = -2;
+#if defined(PSCAL_TARGET_IOS)
+static _Thread_local bool pager_session_queue_enabled = false;
+#endif
 
 // Duplicate an FD for pager control input only if it can be read from.
 static int pagerDupForRead(int fd) {
@@ -2350,6 +2353,36 @@ static void pager_control_fd_reset(void) {
     }
 }
 
+#if defined(PSCAL_TARGET_IOS)
+static bool pagerUseSessionInputQueue(void) {
+    VProcSessionStdio *session = vprocSessionStdioCurrent();
+    if (!session) {
+        return false;
+    }
+    bool has_pscal_stdin = session->stdin_pscal_fd &&
+                           session->stdin_pscal_fd->ops &&
+                           session->stdin_pscal_fd->ops->read;
+    bool has_session_stdin = (session->stdin_host_fd >= 0) ||
+                             has_pscal_stdin ||
+                             (session->input != NULL);
+    if (!has_session_stdin) {
+        return false;
+    }
+    return pscalRuntimeStdinIsInteractive() ||
+           pscalRuntimeStdoutIsInteractive() ||
+           pscalRuntimeStderrIsInteractive() ||
+           has_pscal_stdin;
+}
+
+static ssize_t pagerReadSessionByte(unsigned char *out, bool nonblocking) {
+    if (!out) {
+        errno = EINVAL;
+        return -1;
+    }
+    return vprocSessionReadInputShimMode(out, 1, nonblocking);
+}
+#endif
+
 static int pager_read_key(void) {
     pagerInitTestInput();
     int scripted = pagerTestInputNext();
@@ -2360,18 +2393,26 @@ static int pager_read_key(void) {
         return 'q';
     }
     int fd = pager_control_fd();
+#if defined(PSCAL_TARGET_IOS)
+    bool use_session_queue = pager_session_queue_enabled && pagerUseSessionInputQueue();
+#else
+    bool use_session_queue = false;
+#endif
     if (fd < 0) {
-        return 'q';
+        if (!use_session_queue) {
+            return 'q';
+        }
     }
-    int fd_is_tty = pscalRuntimeFdIsInteractive(fd) ? 1 : 0;
+    int fd_is_tty = (fd >= 0 && pscalRuntimeFdIsInteractive(fd)) ? 1 : 0;
     if (pagerDebugEnabled()) {
-        pagerDebugLogf("[pager] read key fd=%d isatty=%d", fd, fd_is_tty);
+        pagerDebugLogf("[pager] read key fd=%d isatty=%d use_session=%d",
+                       fd, fd_is_tty, use_session_queue ? 1 : 0);
     }
-    if (!fd_is_tty) {
+    if (!fd_is_tty && !use_session_queue) {
         return 'q';
     }
     struct termios orig;
-    int tcget_rc = smallclueTcgetattr(fd, &orig);
+    int tcget_rc = (fd >= 0) ? smallclueTcgetattr(fd, &orig) : -1;
     bool have_termios = (tcget_rc == 0);
     if (pagerDebugEnabled()) {
         int err = (tcget_rc != 0) ? errno : 0;
@@ -2400,19 +2441,27 @@ static int pager_read_key(void) {
     }
     int result = 'q';
     for (;;) {
-        struct pollfd pfd = { .fd = fd, .events = POLLIN };
-        int poll_rc = poll(&pfd, 1, -1);
-        if (poll_rc < 0) {
-            if (errno == EINTR) {
+        unsigned char ch = 0;
+        ssize_t n = -1;
+#if defined(PSCAL_TARGET_IOS)
+        if (use_session_queue) {
+            n = pagerReadSessionByte(&ch, false);
+        } else
+#endif
+        {
+            struct pollfd pfd = { .fd = fd, .events = POLLIN };
+            int poll_rc = poll(&pfd, 1, -1);
+            if (poll_rc < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if ((pfd.revents & POLLIN) == 0) {
                 continue;
             }
-            break;
+            n = read(fd, &ch, 1);
         }
-        if ((pfd.revents & POLLIN) == 0) {
-            continue;
-        }
-        unsigned char ch = 0;
-        ssize_t n = read(fd, &ch, 1);
         if (pagerDebugEnabled()) {
             if (n <= 0) {
                 int err = errno;
@@ -2427,10 +2476,37 @@ static int pager_read_key(void) {
         }
         if (ch == '\x1b') {
             unsigned char seq[3] = {0};
-            if (read(fd, &seq[0], 1) == 1 && seq[0] == '[') {
-                if (read(fd, &seq[1], 1) == 1) {
+            ssize_t seq0 = -1;
+#if defined(PSCAL_TARGET_IOS)
+            if (use_session_queue) {
+                seq0 = pagerReadSessionByte(&seq[0], false);
+            } else
+#endif
+            {
+                seq0 = read(fd, &seq[0], 1);
+            }
+            if (seq0 == 1 && seq[0] == '[') {
+                ssize_t seq1 = -1;
+#if defined(PSCAL_TARGET_IOS)
+                if (use_session_queue) {
+                    seq1 = pagerReadSessionByte(&seq[1], false);
+                } else
+#endif
+                {
+                    seq1 = read(fd, &seq[1], 1);
+                }
+                if (seq1 == 1) {
                     if (seq[1] >= '0' && seq[1] <= '9') {
-                        if (read(fd, &seq[2], 1) == 1 && seq[2] == '~') {
+                        ssize_t seq2 = -1;
+#if defined(PSCAL_TARGET_IOS)
+                        if (use_session_queue) {
+                            seq2 = pagerReadSessionByte(&seq[2], false);
+                        } else
+#endif
+                        {
+                            seq2 = read(fd, &seq[2], 1);
+                        }
+                        if (seq2 == 1 && seq[2] == '~') {
                             if (seq[1] == '5') {
                                 result = PAGER_KEY_PAGE_UP;
                             } else if (seq[1] == '6') {
@@ -2687,7 +2763,15 @@ static int pager_file(const char *cmd_name, const char *path, FILE *stream) {
         page_rows = 1;
     }
 
-    int status = pagerInteractiveSession(cmd_name, &buffer, page_rows);
+    int status = 0;
+#if defined(PSCAL_TARGET_IOS)
+    bool prev_session_queue = pager_session_queue_enabled;
+    pager_session_queue_enabled = true;
+    status = pagerInteractiveSession(cmd_name, &buffer, page_rows);
+    pager_session_queue_enabled = prev_session_queue;
+#else
+    status = pagerInteractiveSession(cmd_name, &buffer, page_rows);
+#endif
     pagerBufferFree(&buffer);
     pager_control_fd_reset();
     return status;
