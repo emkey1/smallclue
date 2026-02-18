@@ -30,9 +30,11 @@ Functionally similar to BusyBox, `smallclue` combines many common tools (like `l
 * **file**: Determine file type.
 * **stat**: Display file status.
 * **basename** / **dirname**: Parse path components.
+* **find**: Search for files and directories.
 
 ### Text Processing & Filtering
 * **cat**: Concatenate and print files.
+* **echo**: Print arguments to standard output.
 * **grep**: File pattern searcher (supports `-i`, `-v`, `-n`).
 * **head** / **tail**: Output the first/last part of files (tail supports `-f` follow).
 * **more** / **less**: File paging filters.
@@ -43,6 +45,7 @@ Functionally similar to BusyBox, `smallclue` combines many common tools (like `l
 * **sed**: Stream editor (basic substitution support).
 * **tr**: Translate or delete characters.
 * **tee**: Read from standard input and write to standard output and files.
+* **sum**: BSD/SysV checksum utility.
 
 ### Editors & Viewers
 * **vi** / **nextvi**: A small, efficient vi-like text editor.
@@ -53,6 +56,7 @@ Functionally similar to BusyBox, `smallclue` combines many common tools (like `l
 * **scp**: Secure copy (OpenSSH).
 * **sftp**: Secure file transfer (OpenSSH).
 * **ssh-keygen**: Generate authentication keys.
+* **ssh-copy-id**: Install SSH public keys on a remote host.
 * **ping**: TCP-based ping utility.
 * **curl** / **wget**: Tools for transferring data with URL syntax (wrappers).
 * **telnet**: Simple Telnet client.
@@ -66,23 +70,37 @@ Functionally similar to BusyBox, `smallclue` combines many common tools (like `l
 * **ps**: Report a snapshot of current processes.
 * **kill**: Send signals to processes.
 * **uptime**: Tell how long the system has been running.
+* **uname**: Print system information.
+* **id**: Print user identity information.
 * **date**: Print or set the system date and time.
 * **cal**: Display a calendar.
 * **clear** / **cls**: Clear the terminal screen.
 * **sleep**: Delay for a specified amount of time.
 * **tset**: Modify terminal settings.
+* **stty**: Inspect or modify terminal settings.
 * **tty**: Report tty.
+* **resize**: Synchronize terminal row/column settings with the host.
+* **script**: Record terminal output to a file.
 * **watch**: Execute a program periodically, showing output fullscreen.
+* **time**: Measure command runtime.
+* **type**: Describe command names.
 * **xargs**: Build and execute command lines from standard input.
+* **pbcopy** / **pbpaste**: Clipboard helpers (on iOS/iPadOS these integrate with the system clipboard).
 * **test** / **[**: Evaluate conditional expressions.
 * **true** / **false**: Return success or failure status.
+* **yes** / **no**: Repeatedly print strings (with success/failure exit semantics).
+* **version**: Print smallclue/PSCAL version info.
+* **vproc-test**: Run vproc/terminal diagnostics.
 
-### iOS / Runtime Utilities
-* **pbcopy**: Copy data from stdin to the iOS system clipboard.
-* **pbpaste**: Paste data from the iOS system clipboard to stdout.
+### iOS / iPadOS Only Applets
+These applets are only registered on `PSCAL_TARGET_IOS` builds.
+
+* **addt**: Open an additional shell tab.
+* **tabadd** / **tadd**: Aliases for `addt`.
+* **smallclue-help**: List available smallclue applets and command help.
 * **dmesg**: Prints the PSCAL runtime session log.
+* **top**: Show PSCAL virtual processes.
 * **licenses**: View open source licenses included in the distribution.
-* **resize** / **stty**: Terminal setting manipulation.
 
 ## Usage
 
