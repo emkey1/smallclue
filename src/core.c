@@ -3054,43 +3054,50 @@ static void markdownParseTableRow(char *line, MarkdownTableRow *row) {
     if (!row) return;
     row->col_count = 0;
     if (!line) return;
-    char *cursor = line;
-    if (*cursor == '|') {
-        cursor++;
+    char *start = line;
+    if (*start == '|') {
+        start++;
     }
-    char *start = cursor;
-    while (*cursor) {
-        if (*cursor == '|') {
-            *cursor = '\0';
+    while (start) {
+        char *delim = strchr(start, '|');
+        if (delim) {
+            *delim = '\0';
             if (row->col_count < MARKDOWN_MAX_TABLE_COLS) {
                 row->cells[row->col_count++] = strdup(markdownTrimInline(start));
             }
-            start = cursor + 1;
+            start = delim + 1;
+            if (*start == '\0') {
+                break;
+            }
+            continue;
         }
-        cursor++;
-    }
-    if (*start) {
         if (row->col_count < MARKDOWN_MAX_TABLE_COLS) {
             row->cells[row->col_count++] = strdup(markdownTrimInline(start));
         }
+        break;
     }
 }
 
 static int markdownIsSeparatorRow(const MarkdownTableRow *row) {
     if (!row || row->col_count == 0) return 0;
-    const char *cell = row->cells[0];
-    if (!cell) return 0;
-    int has_dash = 0;
-    for (const char *p = cell; *p; ++p) {
-        if (*p == '-') {
-            has_dash = 1;
-        } else if (*p == ':' || isspace((unsigned char)*p)) {
-            continue;
-        } else {
+    for (int i = 0; i < row->col_count; ++i) {
+        const char *cell = row->cells[i];
+        if (!cell) return 0;
+        int has_dash = 0;
+        for (const char *p = cell; *p; ++p) {
+            if (*p == '-') {
+                has_dash = 1;
+            } else if (*p == ':' || isspace((unsigned char)*p)) {
+                continue;
+            } else {
+                return 0;
+            }
+        }
+        if (!has_dash) {
             return 0;
         }
     }
-    return has_dash;
+    return 1;
 }
 
 static int markdownTableWrapLen(const char *text, int max_width, int offset) {
@@ -3159,9 +3166,18 @@ static void markdownRenderTable(FILE *out, MarkdownTableRow *rows, int row_count
             continue;
         }
         int offsets[MARKDOWN_MAX_TABLE_COLS] = {0};
-        bool done = false;
-        while (!done) {
-            done = true;
+        while (true) {
+            bool has_remaining = false;
+            for (int j = 0; j < max_cols; ++j) {
+                const char *text = (j < rows[i].col_count && rows[i].cells[j]) ? rows[i].cells[j] : "";
+                if (offsets[j] < (int)strlen(text)) {
+                    has_remaining = true;
+                    break;
+                }
+            }
+            if (!has_remaining) {
+                break;
+            }
             fputs("  |", out);
             for (int j = 0; j < max_cols; ++j) {
                 const char *text = (j < rows[i].col_count && rows[i].cells[j]) ? rows[i].cells[j] : "";
@@ -3169,7 +3185,6 @@ static void markdownRenderTable(FILE *out, MarkdownTableRow *rows, int row_count
                 int len = (int)strlen(text);
                 int off = offsets[j];
                 if (off < len) {
-                    done = false;
                     int take = markdownTableWrapLen(text, width, off);
                     fprintf(out, " %-*.*s", width, take, text + off);
                     offsets[j] += take;
@@ -3222,6 +3237,49 @@ static int markdownHeadingLevel(const char *text) {
     return 0;
 }
 
+static int markdownSetextHeadingLevel(const char *text) {
+    if (!text) return 0;
+    char marker = 0;
+    int count = 0;
+    for (const char *p = text; *p; ++p) {
+        if (isspace((unsigned char)*p)) {
+            continue;
+        }
+        if (*p != '=' && *p != '-') {
+            return 0;
+        }
+        if (marker == 0) {
+            marker = *p;
+        } else if (*p != marker) {
+            return 0;
+        }
+        count++;
+    }
+    if (count < 3) {
+        return 0;
+    }
+    return (marker == '=') ? 1 : 2;
+}
+
+static char markdownFenceMarker(const char *text) {
+    if (!text || !*text) {
+        return '\0';
+    }
+    if (*text != '`' && *text != '~') {
+        return '\0';
+    }
+    char marker = *text;
+    int count = 0;
+    while (*text == marker) {
+        count++;
+        text++;
+    }
+    if (count >= 3) {
+        return marker;
+    }
+    return '\0';
+}
+
 static void markdownWriteHeading(FILE *out, const char *text, int level) {
     if (!text || !*text) return;
     char *formatted = markdownSimplifyInline(text);
@@ -3236,6 +3294,7 @@ static void markdownWriteHeading(FILE *out, const char *text, int level) {
     for (size_t i = 0; i < underline_len; ++i) {
         fputc(underline, out);
     }
+    fputc('\n', out);
     fputc('\n', out);
     free(formatted);
 }
@@ -3275,6 +3334,18 @@ static bool markdownExtractListItem(char *line, char **content, char *firstPrefi
     if ((*p == '-' || *p == '*' || *p == '+') && (p[1] == ' ' || p[1] == '\t')) {
         p++;
         while (*p == ' ' || *p == '\t') p++;
+        if (p[0] == '[' &&
+            (p[1] == ' ' || p[1] == 'x' || p[1] == 'X') &&
+            p[2] == ']' &&
+            (p[3] == ' ' || p[3] == '\t')) {
+            const char *checkbox = (p[1] == ' ') ? "• [ ] " : "• [x] ";
+            p += 4;
+            while (*p == ' ' || *p == '\t') p++;
+            *content = p;
+            markdownBuildPrefix(firstPrefix, firstSize, indent, checkbox);
+            markdownBuildPrefix(subPrefix, subSize, indent + 6, "      ");
+            return true;
+        }
         *content = p;
         markdownBuildPrefix(firstPrefix, firstSize, indent, "• ");
         markdownBuildPrefix(subPrefix, subSize, indent + 2, "  ");
@@ -3336,13 +3407,14 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
     char *line = NULL;
     size_t line_cap = 0;
     ssize_t line_len;
-    bool in_code_block = false;
+    char code_fence = '\0';
     bool in_table = false;
     char *paragraph = NULL;
     size_t paragraph_len = 0;
     size_t paragraph_cap = 0;
     MarkdownTableRow table_rows[MARKDOWN_MAX_TABLE_ROWS];
     int table_row_count = 0;
+    bool has_blank_separator = false;
 
     if (label && *label) {
         fprintf(output, "%s\n", label);
@@ -3355,6 +3427,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
         }
         fputc('\n', output);
         fputc('\n', output);
+        has_blank_separator = true;
     }
 
     while (true) {
@@ -3380,15 +3453,28 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             *--end = '\0';
         }
 
-        if (strncmp(trimmed, "```", 3) == 0) {
+        char fence = markdownFenceMarker(trimmed);
+        if (fence != '\0') {
+            bool had_paragraph = paragraph_len > 0;
             markdownFlushParagraph(output, &paragraph, &paragraph_len);
-            in_code_block = !in_code_block;
+            if (had_paragraph) {
+                has_blank_separator = true;
+            }
+            if (code_fence == '\0') {
+                code_fence = fence;
+                has_blank_separator = false;
+            } else if (code_fence == fence) {
+                code_fence = '\0';
+                fputc('\n', output);
+                has_blank_separator = true;
+            }
             continue;
         }
 
-        if (in_code_block) {
+        if (code_fence != '\0') {
             /* Preserve leading whitespace/tabs inside fenced code blocks. */
             fprintf(output, "    %s\n", line);
+            has_blank_separator = false;
             continue;
         }
 
@@ -3397,19 +3483,49 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 markdownRenderTable(output, table_rows, table_row_count);
                 table_row_count = 0;
                 in_table = false;
+                has_blank_separator = true;
             }
-            markdownFlushParagraph(output, &paragraph, &paragraph_len);
-            fputc('\n', output);
+            if (paragraph_len > 0) {
+                markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                has_blank_separator = true;
+            } else if (!has_blank_separator) {
+                fputc('\n', output);
+                has_blank_separator = true;
+            }
+            continue;
+        }
+
+        int setext_heading = markdownSetextHeadingLevel(trimmed);
+        if (setext_heading > 0 && paragraph_len > 0) {
+            if (in_table) {
+                markdownRenderTable(output, table_rows, table_row_count);
+                table_row_count = 0;
+                in_table = false;
+                has_blank_separator = true;
+            }
+            paragraph[paragraph_len] = '\0';
+            char *heading_text = markdownTrimInline(paragraph);
+            if (heading_text && *heading_text) {
+                markdownWriteHeading(output, heading_text, setext_heading);
+                has_blank_separator = true;
+            }
+            paragraph_len = 0;
+            paragraph[0] = '\0';
             continue;
         }
 
         if (markdownIsHorizontalRule(trimmed)) {
+            bool had_paragraph = paragraph_len > 0;
             markdownFlushParagraph(output, &paragraph, &paragraph_len);
+            if (had_paragraph) {
+                has_blank_separator = true;
+            }
             for (int i = 0; i < MARKDOWN_WRAP_WIDTH; ++i) {
                 fputc('-', output);
             }
             fputc('\n', output);
             fputc('\n', output);
+            has_blank_separator = true;
             continue;
         }
 
@@ -3419,11 +3535,17 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 markdownRenderTable(output, table_rows, table_row_count);
                 table_row_count = 0;
                 in_table = false;
+                has_blank_separator = true;
             }
+            bool had_paragraph = paragraph_len > 0;
             markdownFlushParagraph(output, &paragraph, &paragraph_len);
+            if (had_paragraph) {
+                has_blank_separator = true;
+            }
             const char *heading_text = trimmed + heading;
             while (*heading_text == ' ' || *heading_text == '\t') heading_text++;
             markdownWriteHeading(output, heading_text, heading);
+            has_blank_separator = true;
             continue;
         }
 
@@ -3432,8 +3554,13 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 markdownRenderTable(output, table_rows, table_row_count);
                 table_row_count = 0;
                 in_table = false;
+                has_blank_separator = true;
             }
+            bool had_paragraph = paragraph_len > 0;
             markdownFlushParagraph(output, &paragraph, &paragraph_len);
+            if (had_paragraph) {
+                has_blank_separator = true;
+            }
             char *quote = trimmed + 1;
             while (*quote == ' ' || *quote == '\t') quote++;
             char *formatted = markdownSimplifyInline(quote);
@@ -3442,6 +3569,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 free(formatted);
             }
             fputc('\n', output);
+            has_blank_separator = true;
             continue;
         }
 
@@ -3453,7 +3581,11 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
         }
         if (pipe_count >= 2) {
             if (!in_table) {
+                bool had_paragraph = paragraph_len > 0;
                 markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                if (had_paragraph) {
+                    has_blank_separator = true;
+                }
                 in_table = true;
                 table_row_count = 0;
             }
@@ -3470,27 +3602,39 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             markdownRenderTable(output, table_rows, table_row_count);
             table_row_count = 0;
             in_table = false;
+            has_blank_separator = true;
         }
 
         char *list_text = NULL;
         char prefix_first[32];
         char prefix_sub[32];
         if (markdownExtractListItem(trimmed, &list_text, prefix_first, sizeof(prefix_first), prefix_sub, sizeof(prefix_sub))) {
+            bool had_paragraph = paragraph_len > 0;
             markdownFlushParagraph(output, &paragraph, &paragraph_len);
+            if (had_paragraph) {
+                has_blank_separator = true;
+            }
             char *formatted = markdownSimplifyInline(list_text);
             if (formatted) {
                 markdownWrapAndWrite(output, formatted, prefix_first, prefix_sub, MARKDOWN_WRAP_WIDTH);
                 free(formatted);
             }
+            has_blank_separator = false;
             continue;
         }
 
         markdownParagraphAppend(&paragraph, &paragraph_len, &paragraph_cap, trimmed);
+        has_blank_separator = false;
     }
 
+    bool had_paragraph = paragraph_len > 0;
     markdownFlushParagraph(output, &paragraph, &paragraph_len);
+    if (had_paragraph) {
+        has_blank_separator = true;
+    }
     if (in_table) {
         markdownRenderTable(output, table_rows, table_row_count);
+        has_blank_separator = true;
     }
     free(paragraph);
     free(line);
