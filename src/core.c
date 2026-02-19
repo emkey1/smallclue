@@ -423,6 +423,17 @@ typedef struct {
     size_t capacity;
 } SmallclueLineVector;
 
+typedef struct MarkdownLinkEntry {
+    char *text;
+    char *target;
+} MarkdownLinkEntry;
+
+typedef struct MarkdownLinkList {
+    MarkdownLinkEntry *items;
+    size_t count;
+    size_t capacity;
+} MarkdownLinkList;
+
 static int smallclueEchoCommand(int argc, char **argv);
 static int smallclueLsCommand(int argc, char **argv);
 static int smallclueCatCommand(int argc, char **argv);
@@ -509,6 +520,7 @@ static int smallcluePingCommand(int argc, char **argv);
 static int smallclueMarkdownCommand(int argc, char **argv);
 static int smallclueCurlCommand(int argc, char **argv);
 static int smallclueWgetCommand(int argc, char **argv);
+static int smallclueHttpFetch(const char *cmd_name, const char *url, const char *destinationPath);
 static int smallclueTelnetCommand(int argc, char **argv);
 static int smallclueTracerouteCommand(int argc, char **argv);
 static int smallclueNslookupCommand(int argc, char **argv);
@@ -816,8 +828,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  -t sort by modification time\n"
            "  -h human-readable sizes (with -l)\n"
            "  -d list directories themselves, not their contents"},
-    {"md", "md [-i] [FILE]\n"
-           "  View Markdown document\n"
+    {"md", "md [-i] [FILE|URL]\n"
+           "  View Markdown/HTML document; press 'o' to open links in-page\n"
            "  -i interactive mode.  Makes ~/Docs browsable"},
     {"mkdir", "mkdir [-p] DIR...\n"
               "  -p create parents as needed"},
@@ -989,6 +1001,7 @@ static const char * __attribute__((unused)) smallclueLookupHelp(const char *name
 
 static const char *pager_command_name(const char *name);
 static int pager_read_key(void);
+static char *pagerReadLogicalLine(const PagerBuffer *buffer, size_t line_index, bool *had_newline);
 
 static void pagerBell(void) {
     fputc('\a', stdout);
@@ -1959,7 +1972,7 @@ static int pagerCollectLines(const char *cmd_name, const char *path, FILE *strea
     return 0;
 }
 
-static void pagerRenderPage(const PagerBuffer *buffer, size_t start, int page_rows) {
+static void pagerRenderPage(const PagerBuffer *buffer, size_t start, int page_rows, const char *highlight_target) {
     if (!buffer || !buffer->file || !buffer->offsets) {
         return;
     }
@@ -1971,40 +1984,29 @@ static void pagerRenderPage(const PagerBuffer *buffer, size_t start, int page_ro
     if (end > buffer->line_count) {
         end = buffer->line_count;
     }
-    char chunk[4096];
     for (size_t i = start; i < end; ++i) {
-        size_t begin = buffer->offsets[i];
-        size_t finish = buffer->offsets[i + 1];
-        if (finish > buffer->length) {
-            finish = buffer->length;
+        bool had_newline = false;
+        char *line = pagerReadLogicalLine(buffer, i, &had_newline);
+        if (!line) {
+            continue;
         }
-        if (fseeko(buffer->file, (off_t)begin, SEEK_SET) != 0) {
-            break;
+        if (highlight_target && *highlight_target) {
+            char *hit = strstr(line, highlight_target);
+            if (hit) {
+                size_t prefix_len = (size_t)(hit - line);
+                fwrite(line, 1, prefix_len, stdout);
+                fputs("\x1b[7m", stdout);
+                fwrite(hit, 1, strlen(highlight_target), stdout);
+                fputs("\x1b[0m", stdout);
+                fputs(hit + strlen(highlight_target), stdout);
+            } else {
+                fputs(line, stdout);
+            }
+        } else {
+            fputs(line, stdout);
         }
-        size_t remaining = (finish > begin) ? (finish - begin) : 0;
-        while (remaining > 0) {
-            size_t to_read = remaining;
-            if (to_read > sizeof(chunk)) {
-                to_read = sizeof(chunk);
-            }
-            size_t read_bytes = fread(chunk, 1, to_read, buffer->file);
-            if (read_bytes == 0) {
-                break;
-            }
-            fwrite(chunk, 1, read_bytes, stdout);
-            remaining -= read_bytes;
-            if (read_bytes < to_read) {
-                break;
-            }
-        }
-        if (finish == begin) {
-            fputc('\n', stdout);
-        } else if (fseeko(buffer->file, (off_t)(finish - 1), SEEK_SET) == 0) {
-            int last = fgetc(buffer->file);
-            if (last != '\n') {
-                fputc('\n', stdout);
-            }
-        }
+        fputc('\n', stdout);
+        free(line);
     }
     fflush(stdout);
 }
@@ -2022,7 +2024,12 @@ static size_t pagerMaxTop(const PagerBuffer *buffer, int page_rows) {
 
 static int pagerPromptAndRead(const char *cmd_name) {
     const char *label = pager_command_name(cmd_name);
-    fprintf(stdout, "\r--%s-- (Space=next, b=prev, arrows=scroll, q=quit) ", label);
+    bool md_mode = (label && strcmp(label, "md") == 0);
+    if (md_mode) {
+        fprintf(stdout, "\r--%s-- (Space=next, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit) ", label);
+    } else {
+        fprintf(stdout, "\r--%s-- (Space=next, b=prev, arrows=scroll, q=quit) ", label);
+    }
     fflush(stdout);
     int key = pager_read_key();
     fputs("\r\x1b[K", stdout);
@@ -2030,19 +2037,194 @@ static int pagerPromptAndRead(const char *cmd_name) {
     return key;
 }
 
+static _Thread_local int pager_last_exit_key = 'q';
+static _Thread_local int pager_last_md_link_index = -1;
+static _Thread_local const MarkdownLinkList *pager_active_md_links = NULL;
+
+static int pagerLastExitKey(void) {
+    return pager_last_exit_key;
+}
+
+static int pagerLastMdLinkIndex(void) {
+    return pager_last_md_link_index;
+}
+
+static void pagerSetActiveMarkdownLinks(const MarkdownLinkList *links) {
+    pager_active_md_links = links;
+}
+
+static char *pagerReadLogicalLine(const PagerBuffer *buffer, size_t line_index, bool *had_newline) {
+    if (!buffer || !buffer->file || !buffer->offsets || line_index >= buffer->line_count) {
+        return NULL;
+    }
+    size_t begin = buffer->offsets[line_index];
+    size_t finish = buffer->offsets[line_index + 1];
+    if (finish > buffer->length) {
+        finish = buffer->length;
+    }
+    size_t raw_len = (finish > begin) ? (finish - begin) : 0;
+    char *line = (char *)malloc(raw_len + 1);
+    if (!line) {
+        return NULL;
+    }
+    if (had_newline) {
+        *had_newline = false;
+    }
+    if (raw_len == 0) {
+        line[0] = '\0';
+        return line;
+    }
+    if (fseeko(buffer->file, (off_t)begin, SEEK_SET) != 0) {
+        free(line);
+        return NULL;
+    }
+    size_t read_bytes = fread(line, 1, raw_len, buffer->file);
+    if (read_bytes != raw_len) {
+        free(line);
+        return NULL;
+    }
+    size_t len = raw_len;
+    if (len > 0 && line[len - 1] == '\n') {
+        len--;
+        if (had_newline) {
+            *had_newline = true;
+        }
+    }
+    line[len] = '\0';
+    return line;
+}
+
+static int markdownLinkListFindTargetIndex(const MarkdownLinkList *links, const char *target) {
+    if (!links || !target || !*target) {
+        return -1;
+    }
+    for (size_t i = 0; i < links->count; ++i) {
+        if (links->items[i].target && strcmp(links->items[i].target, target) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static bool pagerIndexListContains(const size_t *items, size_t count, size_t value) {
+    for (size_t i = 0; i < count; ++i) {
+        if (items[i] == value) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static size_t pagerFindIndexPosition(const size_t *items, size_t count, size_t value) {
+    for (size_t i = 0; i < count; ++i) {
+        if (items[i] == value) {
+            return i;
+        }
+    }
+    return SIZE_MAX;
+}
+
+static size_t *pagerCollectVisibleMdLinkIndices(const PagerBuffer *buffer,
+                                                size_t start,
+                                                int page_rows,
+                                                const MarkdownLinkList *links,
+                                                size_t *count_out) {
+    if (count_out) {
+        *count_out = 0;
+    }
+    if (!buffer || !links || !count_out || links->count == 0) {
+        return NULL;
+    }
+    if (page_rows < 1) {
+        page_rows = 1;
+    }
+    size_t end = start + (size_t)page_rows;
+    if (end > buffer->line_count) {
+        end = buffer->line_count;
+    }
+
+    size_t *indices = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+
+    for (size_t line_index = start; line_index < end; ++line_index) {
+        bool had_newline = false;
+        char *line = pagerReadLogicalLine(buffer, line_index, &had_newline);
+        if (!line) {
+            continue;
+        }
+        const char *p = line;
+        while (*p) {
+            const char *open = strchr(p, '[');
+            if (!open) {
+                break;
+            }
+            const char *digits = open + 1;
+            if (!isdigit((unsigned char)*digits)) {
+                p = open + 1;
+                continue;
+            }
+            char *endptr = NULL;
+            long marker = strtol(digits, &endptr, 10);
+            if (endptr && *endptr == ']' && marker > 0) {
+                size_t link_index = (size_t)(marker - 1);
+                if (link_index < links->count && !pagerIndexListContains(indices, count, link_index)) {
+                    if (count == capacity) {
+                        size_t new_capacity = (capacity == 0) ? 8 : capacity * 2;
+                        size_t *resized = (size_t *)realloc(indices, new_capacity * sizeof(size_t));
+                        if (!resized) {
+                            free(line);
+                            free(indices);
+                            *count_out = 0;
+                            return NULL;
+                        }
+                        indices = resized;
+                        capacity = new_capacity;
+                    }
+                    indices[count++] = link_index;
+                }
+                p = endptr + 1;
+                continue;
+            }
+            p = open + 1;
+        }
+        free(line);
+    }
+    *count_out = count;
+    return indices;
+}
+
 static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, int page_rows) {
     if (!buffer || buffer->line_count == 0) {
+        pager_last_exit_key = 'q';
+        pager_last_md_link_index = -1;
         return 0;
     }
     if (page_rows < 1) {
         page_rows = 1;
     }
 
+    const char *label = pager_command_name(cmd_name);
+    bool md_mode = (label && strcmp(label, "md") == 0);
+    const MarkdownLinkList *md_links = md_mode ? pager_active_md_links : NULL;
     size_t top = 0;
     bool redraw = true;
+    size_t selected_md_link_index = SIZE_MAX;
     while (1) {
         if (redraw) {
-            pagerRenderPage(buffer, top, page_rows);
+            char *highlight = NULL;
+            if (md_links && selected_md_link_index != SIZE_MAX &&
+                selected_md_link_index < md_links->count) {
+                char marker[32];
+                snprintf(marker, sizeof(marker), "[%zu]", selected_md_link_index + 1);
+                size_t marker_len = strlen(marker);
+                highlight = (char *)malloc(marker_len + 1);
+                if (highlight) {
+                    memcpy(highlight, marker, marker_len + 1);
+                }
+            }
+            pagerRenderPage(buffer, top, page_rows, highlight);
+            free(highlight);
             redraw = false;
         }
         int key = pagerPromptAndRead(cmd_name);
@@ -2051,6 +2233,13 @@ static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, in
             case 'Q':
             case 3:
             case 4:
+                pager_last_exit_key = key;
+                pager_last_md_link_index = -1;
+                return 0;
+            case 'o':
+            case 'O':
+                pager_last_exit_key = key;
+                pager_last_md_link_index = -1;
                 return 0;
             case ' ':
             case PAGER_KEY_PAGE_DOWN: {
@@ -2083,8 +2272,44 @@ static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, in
                 }
                 break;
             }
+            case '[':
+            case ']': {
+                if (!md_links || md_links->count == 0) {
+                    pagerBell();
+                    break;
+                }
+                size_t visible_count = 0;
+                size_t *visible = pagerCollectVisibleMdLinkIndices(buffer, top, page_rows, md_links, &visible_count);
+                if (!visible || visible_count == 0) {
+                    free(visible);
+                    pagerBell();
+                    break;
+                }
+                bool reverse = (key == '[');
+                size_t pos = pagerFindIndexPosition(visible, visible_count, selected_md_link_index);
+                if (pos == SIZE_MAX) {
+                    pos = reverse ? (visible_count - 1) : 0;
+                } else if (reverse) {
+                    pos = (pos == 0) ? (visible_count - 1) : (pos - 1);
+                } else {
+                    pos = (pos + 1) % visible_count;
+                }
+                selected_md_link_index = visible[pos];
+                pager_last_md_link_index = (int)selected_md_link_index;
+                free(visible);
+                redraw = true;
+                break;
+            }
             case '\n':
             case '\r':
+                if (md_links &&
+                    selected_md_link_index != SIZE_MAX &&
+                    selected_md_link_index < md_links->count) {
+                    pager_last_md_link_index = (int)selected_md_link_index;
+                    pager_last_exit_key = 'o';
+                    return 0;
+                }
+                /* fall through */
             case PAGER_KEY_ARROW_DOWN: {
                 size_t page = (size_t)page_rows;
                 if (top + page < buffer->line_count) {
@@ -2109,6 +2334,8 @@ static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, in
                 break;
         }
     }
+    pager_last_exit_key = 'q';
+    pager_last_md_link_index = -1;
     return 0;
 }
 
@@ -2388,6 +2615,100 @@ static ssize_t pagerReadSessionByte(unsigned char *out, bool nonblocking) {
 }
 #endif
 
+static ssize_t pagerReadByteWithTimeout(int fd,
+                                        bool use_session_queue,
+                                        unsigned char *out,
+                                        bool required,
+                                        int timeout_ms) {
+    if (!out) {
+        errno = EINVAL;
+        return -1;
+    }
+#if defined(PSCAL_TARGET_IOS)
+    if (use_session_queue) {
+        if (required) {
+            for (;;) {
+                ssize_t n = pagerReadSessionByte(out, false);
+                if (n < 0 && errno == EINTR) {
+                    continue;
+                }
+                return n;
+            }
+        }
+        int waited_ms = 0;
+        while (true) {
+            ssize_t n = pagerReadSessionByte(out, true);
+            if (n == 1) {
+                return 1;
+            }
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                return n;
+            }
+            if (timeout_ms <= 0 || waited_ms >= timeout_ms) {
+                return 0;
+            }
+            struct timespec nap = {0};
+            nap.tv_nsec = 1000000L; /* 1ms */
+            (void)nanosleep(&nap, NULL);
+            waited_ms++;
+        }
+    }
+#else
+    (void)use_session_queue;
+#endif
+    if (fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    for (;;) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int wait_ms = required ? -1 : timeout_ms;
+        int poll_rc = poll(&pfd, 1, wait_ms);
+        if (poll_rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (poll_rc == 0) {
+            return 0;
+        }
+        if ((pfd.revents & (POLLIN | POLLHUP)) == 0) {
+            return 0;
+        }
+        ssize_t n = read(fd, out, 1);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        return n;
+    }
+}
+
+static int pagerDecodeCsiSequence(const char *seq) {
+    if (!seq || !*seq) {
+        return '\x1b';
+    }
+    size_t len = strlen(seq);
+    char final = seq[len - 1];
+    if (final == 'A' || final == 'B' || final == 'a' || final == 'b') {
+        bool is_up = (final == 'A' || final == 'a');
+        return is_up ? PAGER_KEY_ARROW_UP : PAGER_KEY_ARROW_DOWN;
+    }
+    if (final == '~') {
+        int code = atoi(seq);
+        if (code == 5) {
+            return PAGER_KEY_PAGE_UP;
+        }
+        if (code == 6) {
+            return PAGER_KEY_PAGE_DOWN;
+        }
+    }
+    return '\x1b';
+}
+
 static int pager_read_key(void) {
     pagerInitTestInput();
     int scripted = pagerTestInputNext();
@@ -2445,28 +2766,10 @@ static int pager_read_key(void) {
         }
     }
     int result = 'q';
+    const int seq_timeout_ms = 120;
     for (;;) {
         unsigned char ch = 0;
-        ssize_t n = -1;
-#if defined(PSCAL_TARGET_IOS)
-        if (use_session_queue) {
-            n = pagerReadSessionByte(&ch, false);
-        } else
-#endif
-        {
-            struct pollfd pfd = { .fd = fd, .events = POLLIN };
-            int poll_rc = poll(&pfd, 1, -1);
-            if (poll_rc < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                break;
-            }
-            if ((pfd.revents & POLLIN) == 0) {
-                continue;
-            }
-            n = read(fd, &ch, 1);
-        }
+        ssize_t n = pagerReadByteWithTimeout(fd, use_session_queue, &ch, true, seq_timeout_ms);
         if (pagerDebugEnabled()) {
             if (n <= 0) {
                 int err = errno;
@@ -2480,55 +2783,33 @@ static int pager_read_key(void) {
             break;
         }
         if (ch == '\x1b') {
-            unsigned char seq[3] = {0};
-            ssize_t seq0 = -1;
-#if defined(PSCAL_TARGET_IOS)
-            if (use_session_queue) {
-                seq0 = pagerReadSessionByte(&seq[0], false);
-            } else
-#endif
-            {
-                seq0 = read(fd, &seq[0], 1);
-            }
-            if (seq0 == 1 && seq[0] == '[') {
-                ssize_t seq1 = -1;
-#if defined(PSCAL_TARGET_IOS)
-                if (use_session_queue) {
-                    seq1 = pagerReadSessionByte(&seq[1], false);
-                } else
-#endif
-                {
-                    seq1 = read(fd, &seq[1], 1);
-                }
-                if (seq1 == 1) {
-                    if (seq[1] >= '0' && seq[1] <= '9') {
-                        ssize_t seq2 = -1;
-#if defined(PSCAL_TARGET_IOS)
-                        if (use_session_queue) {
-                            seq2 = pagerReadSessionByte(&seq[2], false);
-                        } else
-#endif
-                        {
-                            seq2 = read(fd, &seq[2], 1);
-                        }
-                        if (seq2 == 1 && seq[2] == '~') {
-                            if (seq[1] == '5') {
-                                result = PAGER_KEY_PAGE_UP;
-                            } else if (seq[1] == '6') {
-                                result = PAGER_KEY_PAGE_DOWN;
-                            } else {
-                                result = '\x1b';
-                            }
-                        } else {
-                            result = '\x1b';
-                        }
-                    } else if (seq[1] == 'A') {
-                        result = PAGER_KEY_ARROW_UP;
-                    } else if (seq[1] == 'B') {
-                        result = PAGER_KEY_ARROW_DOWN;
-                    } else {
-                        result = '\x1b';
+            unsigned char leader = 0;
+            ssize_t leader_n = pagerReadByteWithTimeout(fd, use_session_queue, &leader, false, seq_timeout_ms);
+            if (leader_n != 1) {
+                result = '\x1b';
+            } else if (leader == '[') {
+                char seq[32];
+                size_t seq_len = 0;
+                while (seq_len + 1 < sizeof(seq)) {
+                    unsigned char next = 0;
+                    ssize_t next_n = pagerReadByteWithTimeout(fd, use_session_queue, &next, false, seq_timeout_ms);
+                    if (next_n != 1) {
+                        break;
                     }
+                    seq[seq_len++] = (char)next;
+                    if (next >= 0x40 && next <= 0x7e) {
+                        break;
+                    }
+                }
+                seq[seq_len] = '\0';
+                result = pagerDecodeCsiSequence(seq);
+            } else if (leader == 'O') {
+                unsigned char final = 0;
+                ssize_t final_n = pagerReadByteWithTimeout(fd, use_session_queue, &final, false, seq_timeout_ms);
+                if (final_n == 1 && final == 'A') {
+                    result = PAGER_KEY_ARROW_UP;
+                } else if (final_n == 1 && final == 'B') {
+                    result = PAGER_KEY_ARROW_DOWN;
                 } else {
                     result = '\x1b';
                 }
@@ -2676,6 +2957,8 @@ static bool pagerStreamIsInteractive(FILE *stream) {
 
 static int pager_file(const char *cmd_name, const char *path, FILE *stream) {
     pager_control_fd_reset();
+    pager_last_exit_key = 'q';
+    pager_last_md_link_index = -1;
     int force_env = pagerParseEnvBool(getenv("PSCALI_PAGER_FORCE"));
 #if defined(PSCAL_TARGET_IOS)
     /* iOS safety: when pager input is a pipe and no control TTY is available,
@@ -2787,6 +3070,12 @@ static int pager_file(const char *cmd_name, const char *path, FILE *stream) {
 #define MARKDOWN_MAX_TABLE_COLS 50
 #define MARKDOWN_MIN_COL_WIDTH 10
 
+typedef enum {
+    MARKDOWN_INPUT_MODE_MARKDOWN = 0,
+    MARKDOWN_INPUT_MODE_HTML,
+    MARKDOWN_INPUT_MODE_AUTO
+} MarkdownInputMode;
+
 typedef struct {
     char *cells[MARKDOWN_MAX_TABLE_COLS];
     int col_count;
@@ -2798,6 +3087,8 @@ typedef struct {
     char *path;
 } MarkdownDocEntry;
 
+static _Thread_local MarkdownLinkList *gMarkdownActiveLinks = NULL;
+
 static char *markdownExtractTitle(const char *path);
 
 static void markdownDocEntryFree(MarkdownDocEntry *entry) {
@@ -2808,6 +3099,131 @@ static void markdownDocEntryFree(MarkdownDocEntry *entry) {
     entry->name = NULL;
     entry->title = NULL;
     entry->path = NULL;
+}
+
+static void markdownLinkListFree(MarkdownLinkList *links) {
+    if (!links) {
+        return;
+    }
+    for (size_t i = 0; i < links->count; ++i) {
+        free(links->items[i].text);
+        free(links->items[i].target);
+        links->items[i].text = NULL;
+        links->items[i].target = NULL;
+    }
+    free(links->items);
+    links->items = NULL;
+    links->count = 0;
+    links->capacity = 0;
+}
+
+static char *markdownDupTrimmed(const char *text) {
+    if (!text) {
+        return strdup("");
+    }
+    const char *start = text;
+    while (*start && isspace((unsigned char)*start)) {
+        start++;
+    }
+    const char *end = start + strlen(start);
+    while (end > start && isspace((unsigned char)end[-1])) {
+        end--;
+    }
+    size_t len = (size_t)(end - start);
+    char *dup = (char *)malloc(len + 1);
+    if (!dup) {
+        return NULL;
+    }
+    if (len > 0) {
+        memcpy(dup, start, len);
+    }
+    dup[len] = '\0';
+    return dup;
+}
+
+static bool markdownLinkListContainsTarget(const MarkdownLinkList *links, const char *target) {
+    if (!links || !target || !*target) {
+        return false;
+    }
+    for (size_t i = 0; i < links->count; ++i) {
+        if (links->items[i].target && strcmp(links->items[i].target, target) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool markdownLinkListAppend(MarkdownLinkList *links, const char *text, const char *target) {
+    if (!links || !target || !*target) {
+        return false;
+    }
+    if (markdownLinkListContainsTarget(links, target)) {
+        return true;
+    }
+    if (links->count == links->capacity) {
+        size_t new_capacity = (links->capacity == 0) ? 8 : links->capacity * 2;
+        MarkdownLinkEntry *resized = (MarkdownLinkEntry *)realloc(links->items, new_capacity * sizeof(MarkdownLinkEntry));
+        if (!resized) {
+            return false;
+        }
+        links->items = resized;
+        links->capacity = new_capacity;
+    }
+    char *text_dup = markdownDupTrimmed(text ? text : "");
+    char *target_dup = markdownDupTrimmed(target);
+    if (!text_dup || !target_dup) {
+        free(text_dup);
+        free(target_dup);
+        return false;
+    }
+    if (text_dup[0] == '\0') {
+        free(text_dup);
+        text_dup = strdup(target_dup);
+        if (!text_dup) {
+            free(target_dup);
+            return false;
+        }
+    }
+    links->items[links->count].text = text_dup;
+    links->items[links->count].target = target_dup;
+    links->count++;
+    return true;
+}
+
+static bool markdownInlineAppendSpan(char **buffer, size_t *length, size_t *capacity, const char *text, size_t text_len);
+
+static int markdownRegisterLinkAndGetDisplayNumber(MarkdownLinkList *links, const char *text, const char *target) {
+    if (!links || !target || !*target) {
+        return -1;
+    }
+    int existing = markdownLinkListFindTargetIndex(links, target);
+    if (existing >= 0) {
+        return existing + 1;
+    }
+    size_t before = links->count;
+    if (!markdownLinkListAppend(links, text, target)) {
+        return -1;
+    }
+    if (links->count > before) {
+        return (int)links->count;
+    }
+    existing = markdownLinkListFindTargetIndex(links, target);
+    return (existing >= 0) ? (existing + 1) : -1;
+}
+
+static bool markdownInlineAppendLinkMarker(char **buffer,
+                                           size_t *length,
+                                           size_t *capacity,
+                                           int link_display_number) {
+    if (!buffer || !length || !capacity) {
+        return false;
+    }
+    if (link_display_number > 0) {
+        char marker[32];
+        snprintf(marker, sizeof(marker), " [%d]", link_display_number);
+        return markdownInlineAppendSpan(buffer, length, capacity, marker, strlen(marker));
+    }
+    return markdownInlineAppendSpan(buffer, length, capacity, " [link]", 7);
 }
 
 static int markdownEnumerateDocuments(MarkdownDocEntry **entries_out,
@@ -2888,12 +3304,20 @@ static int markdownEnumerateDocuments(MarkdownDocEntry **entries_out,
     return 0;
 }
 
-static void markdownParagraphAppend(char **buffer, size_t *length, size_t *capacity, const char *text) {
+static void markdownParagraphAppendWithSeparator(char **buffer,
+                                                 size_t *length,
+                                                 size_t *capacity,
+                                                 const char *text,
+                                                 const char *separator) {
     if (!text || !*text) {
         return;
     }
+    if (!separator) {
+        separator = " ";
+    }
     size_t text_len = strlen(text);
-    size_t needed = *length + text_len + 2;
+    size_t sep_len = (*length > 0) ? strlen(separator) : 0;
+    size_t needed = *length + sep_len + text_len + 1;
     if (needed > *capacity) {
         size_t new_capacity = (*capacity == 0) ? 128 : *capacity * 2;
         while (new_capacity < needed) {
@@ -2906,12 +3330,464 @@ static void markdownParagraphAppend(char **buffer, size_t *length, size_t *capac
         *buffer = resized;
         *capacity = new_capacity;
     }
-    if (*length > 0) {
-        (*buffer)[(*length)++] = ' ';
+    if (*length > 0 && sep_len > 0) {
+        memcpy(*buffer + *length, separator, sep_len);
+        *length += sep_len;
     }
     memcpy(*buffer + *length, text, text_len);
     *length += text_len;
     (*buffer)[*length] = '\0';
+}
+
+static const char *markdownSkipSoftWhitespace(const char *text);
+static bool markdownLooksLikeNewsMetaLine(const char *line);
+
+static bool markdownLineLooksLikeLinkOnly(const char *line) {
+    if (!line || !*line) {
+        return false;
+    }
+    const char *probe = markdownSkipSoftWhitespace(line);
+    if (!*probe) {
+        return false;
+    }
+    if (!(probe[0] == '[' ||
+          (probe[0] == '-' && probe[1] == ' ' && probe[2] == '[') ||
+          (probe[0] == '*' && probe[1] == ' ' && probe[2] == '[') ||
+          (probe[0] == '+' && probe[1] == ' ' && probe[2] == '[') ||
+          ((unsigned char)probe[0] == 0xE2 && (unsigned char)probe[1] == 0x80 &&
+           (unsigned char)probe[2] == 0xA2 && probe[3] == ' ' && probe[4] == '['))) {
+        return false;
+    }
+    return strstr(probe, "](") != NULL;
+}
+
+static void markdownAppendTokenFixed(char *buffer, size_t *length, size_t capacity, const char *text) {
+    if (!buffer || !length || capacity == 0 || !text || !*text) {
+        return;
+    }
+    size_t text_len = strlen(text);
+    size_t room = (capacity > *length) ? (capacity - *length - 1) : 0;
+    if (room == 0) {
+        return;
+    }
+    if (*length > 0) {
+        if (room <= 1) {
+            return;
+        }
+        buffer[(*length)++] = ' ';
+        room--;
+    }
+    if (text_len > room) {
+        text_len = room;
+    }
+    if (text_len > 0) {
+        memcpy(buffer + *length, text, text_len);
+        *length += text_len;
+        buffer[*length] = '\0';
+    }
+}
+
+static bool markdownIsEmailTokenChar(char ch) {
+    unsigned char u = (unsigned char)ch;
+    return isalnum(u) || ch == '.' || ch == '_' || ch == '%' || ch == '+' || ch == '-';
+}
+
+static bool markdownCanInsertSpace(char *buffer, size_t *length, size_t capacity, size_t at) {
+    if (!buffer || !length || *length + 1 >= capacity || at > *length) {
+        return false;
+    }
+    memmove(buffer + at + 1, buffer + at, *length - at + 1);
+    buffer[at] = ' ';
+    (*length)++;
+    return true;
+}
+
+static void markdownReplaceAllInPlace(char *buffer,
+                                      size_t *length,
+                                      size_t capacity,
+                                      const char *from,
+                                      const char *to) {
+    if (!buffer || !length || !from || !to) {
+        return;
+    }
+    size_t from_len = strlen(from);
+    size_t to_len = strlen(to);
+    if (from_len == 0 || from_len >= capacity) {
+        return;
+    }
+    char *pos = strstr(buffer, from);
+    while (pos) {
+        size_t at = (size_t)(pos - buffer);
+        if (to_len > from_len) {
+            size_t grow = to_len - from_len;
+            if (*length + grow + 1 > capacity) {
+                break;
+            }
+            memmove(buffer + at + to_len, buffer + at + from_len, *length - at - from_len + 1);
+            *length += grow;
+        } else if (to_len < from_len) {
+            size_t shrink = from_len - to_len;
+            memmove(buffer + at + to_len, buffer + at + from_len, *length - at - from_len + 1);
+            *length -= shrink;
+        }
+        if (to_len > 0) {
+            memcpy(buffer + at, to, to_len);
+        }
+        pos = strstr(buffer + at + to_len, from);
+    }
+}
+
+static void markdownNormalizeDisplaySpacing(const char *input, char *output, size_t output_size) {
+    if (!output || output_size == 0) {
+        return;
+    }
+    output[0] = '\0';
+    if (!input || !*input) {
+        return;
+    }
+    if (strstr(input, "://")) {
+        snprintf(output, output_size, "%s", input);
+        return;
+    }
+    size_t out_len = 0;
+    for (size_t i = 0; input[i]; ++i) {
+        char ch = input[i];
+        if (out_len > 0) {
+            char prev = output[out_len - 1];
+            char next = input[i + 1];
+            bool insert_space = false;
+            if (islower((unsigned char)prev) && isupper((unsigned char)ch)) {
+                insert_space = true;
+            } else if (isdigit((unsigned char)prev) && isalpha((unsigned char)ch)) {
+                insert_space = true;
+            } else if (isalnum((unsigned char)prev) && ch == '[') {
+                insert_space = true;
+            } else if (isalnum((unsigned char)prev) && ch == '#') {
+                insert_space = true;
+            } else if (isupper((unsigned char)prev) && isupper((unsigned char)ch) &&
+                       islower((unsigned char)next)) {
+                insert_space = true;
+            }
+            if (insert_space && !isspace((unsigned char)prev)) {
+                if (!markdownCanInsertSpace(output, &out_len, output_size, out_len)) {
+                    break;
+                }
+            }
+        }
+        if (out_len + 1 >= output_size) {
+            break;
+        }
+        output[out_len++] = ch;
+        output[out_len] = '\0';
+        if (ch == '@' && out_len >= 2) {
+            size_t local_start = out_len - 1;
+            while (local_start > 0 && markdownIsEmailTokenChar(output[local_start - 1])) {
+                local_start--;
+            }
+            if (local_start > 0 &&
+                isalnum((unsigned char)output[local_start - 1]) &&
+                !isspace((unsigned char)output[local_start - 1])) {
+                if (!markdownCanInsertSpace(output, &out_len, output_size, local_start)) {
+                    break;
+                }
+            }
+        }
+    }
+    markdownReplaceAllInPlace(output, &out_len, output_size, "inquirespress@", "inquires press@");
+    markdownReplaceAllInPlace(output, &out_len, output_size, "inquiriessupport@", "inquiries support@");
+    markdownReplaceAllInPlace(output, &out_len, output_size, "inquiressupport@", "inquires support@");
+    markdownReplaceAllInPlace(output, &out_len, output_size, "assetsDownload", "assets Download");
+    output[out_len] = '\0';
+}
+
+static char *markdownTrimAsciiInPlace(char *text) {
+    if (!text) {
+        return text;
+    }
+    while (*text && isspace((unsigned char)*text)) {
+        text++;
+    }
+    char *end = text + strlen(text);
+    while (end > text && isspace((unsigned char)end[-1])) {
+        *--end = '\0';
+    }
+    return text;
+}
+
+static bool markdownExtractFragmentLinkLabel(const char *line,
+                                             char *label_out,
+                                             size_t label_out_size,
+                                             char *meta_out,
+                                             size_t meta_out_size) {
+    if (!line || !label_out || label_out_size == 0) {
+        return false;
+    }
+    label_out[0] = '\0';
+    if (meta_out && meta_out_size > 0) {
+        meta_out[0] = '\0';
+    }
+    char normalized[4096];
+    markdownNormalizeDisplaySpacing(line, normalized, sizeof(normalized));
+    char *probe = markdownTrimAsciiInPlace(normalized);
+    if (!*probe || strcmp(probe, "[") == 0 || strcmp(probe, "]") == 0) {
+        return false;
+    }
+
+    char local_meta[512];
+    local_meta[0] = '\0';
+    const char *title = probe;
+    char *heading = strstr(probe, "####");
+    if (heading) {
+        *heading = '\0';
+        char *meta = markdownTrimAsciiInPlace(probe);
+        title = markdownTrimAsciiInPlace(heading + 4);
+        if (*meta && markdownLooksLikeNewsMetaLine(meta)) {
+            snprintf(local_meta, sizeof(local_meta), "%s", meta);
+        }
+    } else {
+        while (*title == '#') {
+            title++;
+        }
+        while (*title && isspace((unsigned char)*title)) {
+            title++;
+        }
+    }
+
+    if (*title == '\0' && *probe) {
+        title = probe;
+    }
+    if (markdownLooksLikeNewsMetaLine(title)) {
+        if (meta_out && meta_out_size > 0) {
+            snprintf(meta_out, meta_out_size, "%s", title);
+        }
+        return false;
+    }
+
+    if (meta_out && meta_out_size > 0 && local_meta[0]) {
+        snprintf(meta_out, meta_out_size, "%s", local_meta);
+    }
+    snprintf(label_out, label_out_size, "%s", title);
+    return label_out[0] != '\0';
+}
+
+static bool markdownIsFragmentedBulletLinkOpen(const char *line, const char **prefix_out) {
+    if (prefix_out) {
+        *prefix_out = NULL;
+    }
+    if (!line || !*line) {
+        return false;
+    }
+    const char *probe = markdownSkipSoftWhitespace(line);
+    if (strcmp(probe, "• [") == 0) {
+        if (prefix_out) *prefix_out = "• ";
+        return true;
+    }
+    if (strcmp(probe, "- [") == 0) {
+        if (prefix_out) *prefix_out = "- ";
+        return true;
+    }
+    if (strcmp(probe, "* [") == 0) {
+        if (prefix_out) *prefix_out = "* ";
+        return true;
+    }
+    if (strcmp(probe, "+ [") == 0) {
+        if (prefix_out) *prefix_out = "+ ";
+        return true;
+    }
+    return false;
+}
+
+static bool markdownIsFragmentedLinkOpen(const char *line, const char **prefix_out) {
+    if (prefix_out) {
+        *prefix_out = NULL;
+    }
+    if (!line || !*line) {
+        return false;
+    }
+    const char *probe = markdownSkipSoftWhitespace(line);
+    if (strcmp(probe, "[") == 0) {
+        if (prefix_out) {
+            *prefix_out = "";
+        }
+        return true;
+    }
+    return markdownIsFragmentedBulletLinkOpen(line, prefix_out);
+}
+
+static bool markdownParseFragmentedLinkClose(const char *line,
+                                             char *target_out,
+                                             size_t target_out_size,
+                                             const char **suffix_out) {
+    if (suffix_out) {
+        *suffix_out = NULL;
+    }
+    if (!line || !target_out || target_out_size == 0) {
+        return false;
+    }
+    target_out[0] = '\0';
+    const char *probe = markdownSkipSoftWhitespace(line);
+    if (strncmp(probe, "](", 2) != 0) {
+        return false;
+    }
+    const char *target_start = probe + 2;
+    const char *target_end = strchr(target_start, ')');
+    if (!target_end || target_end == target_start) {
+        return false;
+    }
+    size_t target_len = (size_t)(target_end - target_start);
+    if (target_len >= target_out_size) {
+        target_len = target_out_size - 1;
+    }
+    memcpy(target_out, target_start, target_len);
+    target_out[target_len] = '\0';
+    if (suffix_out) {
+        const char *suffix = target_end + 1;
+        while (*suffix && isspace((unsigned char)*suffix)) {
+            suffix++;
+        }
+        *suffix_out = suffix;
+    }
+    return true;
+}
+
+static bool markdownInlineEnsureCapacity(char **buffer, size_t *capacity, size_t needed) {
+    if (!buffer || !capacity) {
+        return false;
+    }
+    if (needed <= *capacity) {
+        return true;
+    }
+    size_t new_capacity = (*capacity == 0) ? 128 : *capacity;
+    while (new_capacity < needed) {
+        if (new_capacity > SIZE_MAX / 2) {
+            return false;
+        }
+        new_capacity *= 2;
+    }
+    char *resized = (char *)realloc(*buffer, new_capacity);
+    if (!resized) {
+        return false;
+    }
+    *buffer = resized;
+    *capacity = new_capacity;
+    return true;
+}
+
+static bool markdownInlineAppendSpan(char **buffer, size_t *length, size_t *capacity, const char *text, size_t text_len) {
+    if (!buffer || !length || !capacity || !text) {
+        return false;
+    }
+    size_t needed = *length + text_len + 1;
+    if (!markdownInlineEnsureCapacity(buffer, capacity, needed)) {
+        return false;
+    }
+    if (text_len > 0) {
+        memcpy(*buffer + *length, text, text_len);
+        *length += text_len;
+    }
+    (*buffer)[*length] = '\0';
+    return true;
+}
+
+static bool markdownInlineAppendChar(char **buffer, size_t *length, size_t *capacity, char ch) {
+    return markdownInlineAppendSpan(buffer, length, capacity, &ch, 1);
+}
+
+static bool markdownHtmlExtractAttr(const char *attrs, const char *name, char *out, size_t out_size) {
+    if (!attrs || !name || !out || out_size == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    const size_t name_len = strlen(name);
+    const char *p = attrs;
+
+    while (*p) {
+        while (*p && isspace((unsigned char)*p)) {
+            p++;
+        }
+        if (*p == '\0' || *p == '/' || *p == '>') {
+            break;
+        }
+
+        const char *key_start = p;
+        while (*p && (isalnum((unsigned char)*p) || *p == '-' || *p == '_' || *p == ':')) {
+            p++;
+        }
+        size_t key_len = (size_t)(p - key_start);
+        if (key_len == 0) {
+            p++;
+            continue;
+        }
+
+        while (*p && isspace((unsigned char)*p)) {
+            p++;
+        }
+
+        const char *value_start = "";
+        size_t value_len = 0;
+        if (*p == '=') {
+            p++;
+            while (*p && isspace((unsigned char)*p)) {
+                p++;
+            }
+            if (*p == '"' || *p == '\'') {
+                char quote = *p++;
+                value_start = p;
+                while (*p && *p != quote) {
+                    p++;
+                }
+                value_len = (size_t)(p - value_start);
+                if (*p == quote) {
+                    p++;
+                }
+            } else {
+                value_start = p;
+                while (*p && !isspace((unsigned char)*p) && *p != '/' && *p != '>') {
+                    p++;
+                }
+                value_len = (size_t)(p - value_start);
+            }
+        }
+
+        if (key_len == name_len && strncasecmp(key_start, name, name_len) == 0) {
+            if (value_len >= out_size) {
+                value_len = out_size - 1;
+            }
+            memcpy(out, value_start, value_len);
+            out[value_len] = '\0';
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool markdownHtmlTagSupported(const char *name) {
+    if (!name || !*name) {
+        return false;
+    }
+    return strcmp(name, "a") == 0 ||
+           strcmp(name, "img") == 0 ||
+           strcmp(name, "p") == 0 ||
+           strcmp(name, "div") == 0 ||
+           strcmp(name, "span") == 0 ||
+           strcmp(name, "strong") == 0 ||
+           strcmp(name, "em") == 0 ||
+           strcmp(name, "b") == 0 ||
+           strcmp(name, "i") == 0 ||
+           strcmp(name, "u") == 0 ||
+           strcmp(name, "picture") == 0 ||
+           strcmp(name, "source") == 0 ||
+           strcmp(name, "br") == 0 ||
+           strcmp(name, "hr") == 0 ||
+           strcmp(name, "center") == 0 ||
+           strcmp(name, "small") == 0 ||
+           strcmp(name, "sub") == 0 ||
+           strcmp(name, "sup") == 0 ||
+           strcmp(name, "mark") == 0 ||
+           strcmp(name, "code") == 0 ||
+           strcmp(name, "kbd") == 0 ||
+           strcmp(name, "blockquote") == 0;
 }
 
 static char *markdownSimplifyInline(const char *text) {
@@ -2919,14 +3795,165 @@ static char *markdownSimplifyInline(const char *text) {
         return strdup("");
     }
     size_t len = strlen(text);
-    size_t cap = len * 2 + 1;
+    size_t cap = len * 2 + 64;
     char *buffer = (char *)malloc(cap);
     if (!buffer) {
         return strdup(text);
     }
     size_t dst = 0;
+    bool anchor_active = false;
+    size_t anchor_start = 0;
+    char anchor_href[1024];
+    anchor_href[0] = '\0';
+
     for (size_t i = 0; text[i]; ) {
         char ch = text[i];
+        if (ch == '<') {
+            size_t close = i + 1;
+            while (text[close] && text[close] != '>') {
+                close++;
+            }
+            if (text[close] == '>') {
+                char tag[1024];
+                size_t raw_len = close - (i + 1);
+                size_t copy_len = raw_len < sizeof(tag) - 1 ? raw_len : sizeof(tag) - 1;
+                memcpy(tag, text + i + 1, copy_len);
+                tag[copy_len] = '\0';
+
+                char *work = tag;
+                while (*work && isspace((unsigned char)*work)) {
+                    work++;
+                }
+                bool closing = false;
+                if (*work == '/') {
+                    closing = true;
+                    work++;
+                    while (*work && isspace((unsigned char)*work)) {
+                        work++;
+                    }
+                }
+
+                if (isalpha((unsigned char)*work)) {
+                    char *name_start = work;
+                    while (*work && (isalnum((unsigned char)*work) || *work == '-' || *work == '_')) {
+                        *work = (char)tolower((unsigned char)*work);
+                        work++;
+                    }
+                    char *name_end = work;
+                    while (*work && isspace((unsigned char)*work)) {
+                        work++;
+                    }
+                    char *attrs = work;
+                    char *tail = tag + strlen(tag);
+                    while (tail > attrs && isspace((unsigned char)tail[-1])) {
+                        *--tail = '\0';
+                    }
+                    bool self_closing = false;
+                    if (tail > attrs && tail[-1] == '/') {
+                        self_closing = true;
+                        *--tail = '\0';
+                        while (tail > attrs && isspace((unsigned char)tail[-1])) {
+                            *--tail = '\0';
+                        }
+                    }
+
+                    *name_end = '\0';
+                    const char *name = name_start;
+
+                    if (!markdownHtmlTagSupported(name)) {
+                        size_t original_len = close - i + 1;
+                        if (!markdownInlineAppendSpan(&buffer, &dst, &cap, text + i, original_len)) {
+                            free(buffer);
+                            return strdup(text);
+                        }
+                        i = close + 1;
+                        continue;
+                    }
+
+                    if (strcmp(name, "a") == 0) {
+                        if (closing) {
+                            if (anchor_active && anchor_href[0] != '\0') {
+                                size_t content_len = (dst > anchor_start) ? (dst - anchor_start) : 0;
+                                char *anchor_label = NULL;
+                                if (content_len > 0) {
+                                    anchor_label = (char *)malloc(content_len + 1);
+                                    if (anchor_label) {
+                                        memcpy(anchor_label, buffer + anchor_start, content_len);
+                                        anchor_label[content_len] = '\0';
+                                    }
+                                }
+                                int link_display_number = -1;
+                                if (gMarkdownActiveLinks) {
+                                    link_display_number =
+                                        markdownRegisterLinkAndGetDisplayNumber(gMarkdownActiveLinks,
+                                                                                anchor_label ? anchor_label : anchor_href,
+                                                                                anchor_href);
+                                }
+                                if (content_len == 0) {
+                                    if (!markdownInlineAppendSpan(&buffer, &dst, &cap, "link", 4)) {
+                                        free(anchor_label);
+                                        free(buffer);
+                                        return strdup(text);
+                                    }
+                                }
+                                if (!markdownInlineAppendLinkMarker(&buffer, &dst, &cap, link_display_number)) {
+                                    free(anchor_label);
+                                    free(buffer);
+                                    return strdup(text);
+                                }
+                                free(anchor_label);
+                            }
+                            anchor_active = false;
+                            anchor_href[0] = '\0';
+                        } else {
+                            anchor_active = true;
+                            anchor_start = dst;
+                            if (!markdownHtmlExtractAttr(attrs, "href", anchor_href, sizeof(anchor_href))) {
+                                anchor_href[0] = '\0';
+                            }
+                            if (self_closing) {
+                                anchor_active = false;
+                            }
+                        }
+                        i = close + 1;
+                        continue;
+                    }
+
+                    if (!closing && strcmp(name, "img") == 0) {
+                        char alt[512];
+                        if (markdownHtmlExtractAttr(attrs, "alt", alt, sizeof(alt)) && alt[0] != '\0') {
+                            if (!markdownInlineAppendSpan(&buffer, &dst, &cap, alt, strlen(alt))) {
+                                free(buffer);
+                                return strdup(text);
+                            }
+                        } else {
+                            char src[1024];
+                            if (markdownHtmlExtractAttr(attrs, "src", src, sizeof(src)) && src[0] != '\0') {
+                                if (!markdownInlineAppendSpan(&buffer, &dst, &cap, src, strlen(src))) {
+                                    free(buffer);
+                                    return strdup(text);
+                                }
+                            }
+                        }
+                        i = close + 1;
+                        continue;
+                    }
+
+                    if (!closing && (strcmp(name, "br") == 0 || strcmp(name, "hr") == 0)) {
+                        if (!markdownInlineAppendChar(&buffer, &dst, &cap, ' ')) {
+                            free(buffer);
+                            return strdup(text);
+                        }
+                        i = close + 1;
+                        continue;
+                    }
+
+                    /* Drop all other HTML tags but keep surrounding text. */
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
         if (ch == '`') {
             i++;
             continue;
@@ -2951,23 +3978,55 @@ static char *markdownSimplifyInline(const char *text) {
                     url_end++;
                 }
                 if (text[url_end] == ')') {
-                    for (size_t j = i + 1; j < close; ++j) {
-                        buffer[dst++] = text[j];
-                    }
-                    if (url_end > url_start) {
-                        buffer[dst++] = ' ';
-                        buffer[dst++] = '(';
-                        for (size_t j = url_start; j < url_end; ++j) {
-                            buffer[dst++] = text[j];
+                    size_t link_label_len = close - (i + 1);
+                    size_t link_url_len = url_end - url_start;
+                    char *link_label = NULL;
+                    char *link_url = NULL;
+                    int link_display_number = -1;
+                    if (gMarkdownActiveLinks) {
+                        link_label = (char *)malloc(link_label_len + 1);
+                        link_url = (char *)malloc(link_url_len + 1);
+                        if (link_label && link_url) {
+                            memcpy(link_label, text + i + 1, link_label_len);
+                            link_label[link_label_len] = '\0';
+                            memcpy(link_url, text + url_start, link_url_len);
+                            link_url[link_url_len] = '\0';
+                            link_display_number =
+                                markdownRegisterLinkAndGetDisplayNumber(gMarkdownActiveLinks, link_label, link_url);
                         }
-                        buffer[dst++] = ')';
                     }
+                    if (link_label_len > 0) {
+                        for (size_t j = i + 1; j < close; ++j) {
+                            if (!markdownInlineAppendChar(&buffer, &dst, &cap, text[j])) {
+                                free(link_label);
+                                free(link_url);
+                                free(buffer);
+                                return strdup(text);
+                            }
+                        }
+                    } else if (!markdownInlineAppendSpan(&buffer, &dst, &cap, "link", 4)) {
+                        free(link_label);
+                        free(link_url);
+                        free(buffer);
+                        return strdup(text);
+                    }
+                    if (!markdownInlineAppendLinkMarker(&buffer, &dst, &cap, link_display_number)) {
+                        free(link_label);
+                        free(link_url);
+                        free(buffer);
+                        return strdup(text);
+                    }
+                    free(link_label);
+                    free(link_url);
                     i = url_end + 1;
                     continue;
                 }
             }
         }
-        buffer[dst++] = ch;
+        if (!markdownInlineAppendChar(&buffer, &dst, &cap, ch)) {
+            free(buffer);
+            return strdup(text);
+        }
         i++;
     }
     buffer[dst] = '\0';
@@ -3284,9 +4343,6 @@ static void markdownWriteHeading(FILE *out, const char *text, int level) {
     if (!text || !*text) return;
     char *formatted = markdownSimplifyInline(text);
     if (!formatted) return;
-    for (char *p = formatted; *p; ++p) {
-        *p = (char)toupper((unsigned char)*p);
-    }
     fprintf(out, "%s\n", formatted);
     char underline = (level == 1) ? '=' : '-';
     size_t len = strlen(formatted);
@@ -3400,6 +4456,980 @@ static void markdownFlushParagraph(FILE *out, char **paragraph, size_t *length) 
     **paragraph = '\0';
 }
 
+static bool markdownTextEnsureCapacity(char **buffer, size_t *capacity, size_t needed) {
+    if (!buffer || !capacity) {
+        return false;
+    }
+    if (needed <= *capacity) {
+        return true;
+    }
+    size_t new_capacity = (*capacity == 0) ? 256 : *capacity;
+    while (new_capacity < needed) {
+        if (new_capacity > SIZE_MAX / 2) {
+            return false;
+        }
+        new_capacity *= 2;
+    }
+    char *resized = (char *)realloc(*buffer, new_capacity);
+    if (!resized) {
+        return false;
+    }
+    *buffer = resized;
+    *capacity = new_capacity;
+    return true;
+}
+
+static bool markdownTextAppendSpan(char **buffer, size_t *length, size_t *capacity, const char *text, size_t text_len) {
+    if (!buffer || !length || !capacity || (!text && text_len > 0)) {
+        return false;
+    }
+    size_t needed = *length + text_len + 1;
+    if (!markdownTextEnsureCapacity(buffer, capacity, needed)) {
+        return false;
+    }
+    if (text_len > 0) {
+        memcpy(*buffer + *length, text, text_len);
+        *length += text_len;
+    }
+    (*buffer)[*length] = '\0';
+    return true;
+}
+
+static bool markdownTextAppendChar(char **buffer, size_t *length, size_t *capacity, char ch) {
+    return markdownTextAppendSpan(buffer, length, capacity, &ch, 1);
+}
+
+static bool markdownTextAppendNewlines(char **buffer, size_t *length, size_t *capacity, size_t count) {
+    if (!buffer || !length || !capacity) {
+        return false;
+    }
+    size_t existing = 0;
+    while (existing < *length && (*buffer)[*length - existing - 1] == '\n') {
+        existing++;
+    }
+    size_t required = (count > existing) ? (count - existing) : 0;
+    for (size_t i = 0; i < required; ++i) {
+        if (!markdownTextAppendChar(buffer, length, capacity, '\n')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool markdownHtmlDecodeEntity(const char *html, size_t *index, char *decoded) {
+    if (!html || !index || !decoded) {
+        return false;
+    }
+    size_t i = *index;
+    if (html[i] != '&') {
+        return false;
+    }
+    const char *p = html + i;
+    if (strncmp(p, "&amp;", 5) == 0) {
+        *decoded = '&';
+        *index += 5;
+        return true;
+    }
+    if (strncmp(p, "&lt;", 4) == 0) {
+        *decoded = '<';
+        *index += 4;
+        return true;
+    }
+    if (strncmp(p, "&gt;", 4) == 0) {
+        *decoded = '>';
+        *index += 4;
+        return true;
+    }
+    if (strncmp(p, "&quot;", 6) == 0) {
+        *decoded = '"';
+        *index += 6;
+        return true;
+    }
+    if (strncmp(p, "&#39;", 5) == 0 || strncmp(p, "&apos;", 6) == 0) {
+        *decoded = '\'';
+        *index += (p[2] == '3') ? 5 : 6;
+        return true;
+    }
+    if (strncmp(p, "&nbsp;", 6) == 0) {
+        *decoded = ' ';
+        *index += 6;
+        return true;
+    }
+    if (p[1] == '#') {
+        size_t j = 2;
+        int base = 10;
+        if (p[j] == 'x' || p[j] == 'X') {
+            base = 16;
+            j++;
+        }
+        unsigned value = 0;
+        bool have_digit = false;
+        while (p[j] && p[j] != ';') {
+            unsigned digit;
+            if (p[j] >= '0' && p[j] <= '9') {
+                digit = (unsigned)(p[j] - '0');
+            } else if (base == 16 && p[j] >= 'a' && p[j] <= 'f') {
+                digit = (unsigned)(10 + (p[j] - 'a'));
+            } else if (base == 16 && p[j] >= 'A' && p[j] <= 'F') {
+                digit = (unsigned)(10 + (p[j] - 'A'));
+            } else {
+                have_digit = false;
+                break;
+            }
+            have_digit = true;
+            value = value * (unsigned)base + digit;
+            if (value > 0x10FFFFu) {
+                have_digit = false;
+                break;
+            }
+            j++;
+        }
+        if (have_digit && p[j] == ';') {
+            *index += j + 1;
+            if (value == 0x27u) {
+                *decoded = '\'';
+                return true;
+            }
+            if (value == 0x22u) {
+                *decoded = '"';
+                return true;
+            }
+            if (value == 0x26u) {
+                *decoded = '&';
+                return true;
+            }
+            if (value == 0x3Cu) {
+                *decoded = '<';
+                return true;
+            }
+            if (value == 0x3Eu) {
+                *decoded = '>';
+                return true;
+            }
+            if (value == 0xA0u) {
+                *decoded = ' ';
+                return true;
+            }
+            if (value >= 32u && value <= 126u) {
+                *decoded = (char)value;
+                return true;
+            }
+            *decoded = ' ';
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool markdownParseHtmlTag(const char *raw, char *name_out, size_t name_out_size,
+                                 char *attrs_out, size_t attrs_out_size, bool *closing, bool *self_closing) {
+    if (!raw || !name_out || name_out_size == 0 || !attrs_out || attrs_out_size == 0 || !closing || !self_closing) {
+        return false;
+    }
+    name_out[0] = '\0';
+    attrs_out[0] = '\0';
+    *closing = false;
+    *self_closing = false;
+
+    const char *p = raw;
+    while (*p && isspace((unsigned char)*p)) {
+        p++;
+    }
+    if (*p == '/') {
+        *closing = true;
+        p++;
+        while (*p && isspace((unsigned char)*p)) {
+            p++;
+        }
+    }
+    if (!isalpha((unsigned char)*p)) {
+        return false;
+    }
+    size_t name_len = 0;
+    while (*p && (isalnum((unsigned char)*p) || *p == '-' || *p == '_')) {
+        if (name_len + 1 < name_out_size) {
+            name_out[name_len++] = (char)tolower((unsigned char)*p);
+        }
+        p++;
+    }
+    name_out[name_len] = '\0';
+
+    while (*p && isspace((unsigned char)*p)) {
+        p++;
+    }
+    size_t attrs_len = strlen(p);
+    while (attrs_len > 0 && isspace((unsigned char)p[attrs_len - 1])) {
+        attrs_len--;
+    }
+    if (attrs_len > 0 && p[attrs_len - 1] == '/') {
+        *self_closing = true;
+        attrs_len--;
+        while (attrs_len > 0 && isspace((unsigned char)p[attrs_len - 1])) {
+            attrs_len--;
+        }
+    }
+    if (attrs_len >= attrs_out_size) {
+        attrs_len = attrs_out_size - 1;
+    }
+    if (attrs_len > 0) {
+        memcpy(attrs_out, p, attrs_len);
+    }
+    attrs_out[attrs_len] = '\0';
+    return name_len > 0;
+}
+
+static int markdownHeadingLevelFromTag(const char *tag_name) {
+    if (!tag_name || strlen(tag_name) != 2 || tag_name[0] != 'h') {
+        return 0;
+    }
+    if (tag_name[1] >= '1' && tag_name[1] <= '6') {
+        return tag_name[1] - '0';
+    }
+    return 0;
+}
+
+static bool markdownIsLikelyHtmlDocument(const char *content) {
+    if (!content || !*content) {
+        return false;
+    }
+    const char *scan = content;
+    while (*scan && isspace((unsigned char)*scan)) {
+        scan++;
+    }
+    if (strncasecmp(scan, "<!doctype html", 14) == 0) {
+        return true;
+    }
+    if (strncasecmp(scan, "<html", 5) == 0) {
+        return true;
+    }
+    if (strstr(content, "<html") || strstr(content, "<body") || strstr(content, "</html>")) {
+        return true;
+    }
+    return false;
+}
+
+static char *markdownConvertHtmlToMarkdownish(const char *html) {
+    if (!html) {
+        return strdup("");
+    }
+    size_t len = strlen(html);
+    size_t cap = len * 2 + 256;
+    char *out = (char *)malloc(cap);
+    if (!out) {
+        return strdup("");
+    }
+    out[0] = '\0';
+    size_t dst = 0;
+
+    bool in_script = false;
+    bool in_style = false;
+    bool in_noscript = false;
+    bool anchor_active = false;
+    bool anchor_suppress_text = false;
+    char anchor_href[2048];
+    anchor_href[0] = '\0';
+
+    for (size_t i = 0; html[i]; ) {
+        if (html[i] == '<') {
+            size_t close = i + 1;
+            while (html[close] && html[close] != '>') {
+                close++;
+            }
+            if (!html[close]) {
+                break;
+            }
+            size_t raw_len = close - (i + 1);
+            char raw_tag[2048];
+            size_t copy_len = raw_len < sizeof(raw_tag) - 1 ? raw_len : sizeof(raw_tag) - 1;
+            memcpy(raw_tag, html + i + 1, copy_len);
+            raw_tag[copy_len] = '\0';
+
+            if (strncmp(raw_tag, "!--", 3) == 0) {
+                const char *comment_end = strstr(html + i + 4, "-->");
+                if (comment_end) {
+                    i = (size_t)(comment_end - html) + 3;
+                } else {
+                    i = close + 1;
+                }
+                continue;
+            }
+
+            char tag_name[64];
+            char attrs[2048];
+            bool closing = false;
+            bool self_closing = false;
+            if (!markdownParseHtmlTag(raw_tag, tag_name, sizeof(tag_name), attrs, sizeof(attrs), &closing, &self_closing)) {
+                i = close + 1;
+                continue;
+            }
+
+            if (in_script) {
+                if (closing && strcmp(tag_name, "script") == 0) {
+                    in_script = false;
+                }
+                i = close + 1;
+                continue;
+            }
+            if (in_style) {
+                if (closing && strcmp(tag_name, "style") == 0) {
+                    in_style = false;
+                }
+                i = close + 1;
+                continue;
+            }
+            if (in_noscript) {
+                if (closing && strcmp(tag_name, "noscript") == 0) {
+                    in_noscript = false;
+                }
+                i = close + 1;
+                continue;
+            }
+
+            if (!closing && strcmp(tag_name, "script") == 0) {
+                in_script = true;
+                i = close + 1;
+                continue;
+            }
+            if (!closing && strcmp(tag_name, "style") == 0) {
+                in_style = true;
+                i = close + 1;
+                continue;
+            }
+            if (!closing && strcmp(tag_name, "noscript") == 0) {
+                in_noscript = true;
+                i = close + 1;
+                continue;
+            }
+
+            int heading_level = markdownHeadingLevelFromTag(tag_name);
+            if (!closing && heading_level > 0) {
+                if (!markdownTextAppendNewlines(&out, &dst, &cap, 2)) {
+                    free(out);
+                    return strdup("");
+                }
+                for (int h = 0; h < heading_level; ++h) {
+                    if (!markdownTextAppendChar(&out, &dst, &cap, '#')) {
+                        free(out);
+                        return strdup("");
+                    }
+                }
+                if (!markdownTextAppendChar(&out, &dst, &cap, ' ')) {
+                    free(out);
+                    return strdup("");
+                }
+                i = close + 1;
+                continue;
+            }
+            if (closing && heading_level > 0) {
+                if (!markdownTextAppendNewlines(&out, &dst, &cap, 2)) {
+                    free(out);
+                    return strdup("");
+                }
+                i = close + 1;
+                continue;
+            }
+
+            if (!closing && strcmp(tag_name, "a") == 0) {
+                if (markdownHtmlExtractAttr(attrs, "href", anchor_href, sizeof(anchor_href))) {
+                    if (anchor_href[0] == '#' ||
+                        strncasecmp(anchor_href, "javascript:", 11) == 0) {
+                        anchor_active = false;
+                        anchor_suppress_text = true;
+                    } else {
+                        anchor_active = true;
+                        anchor_suppress_text = false;
+                        if (!markdownTextAppendChar(&out, &dst, &cap, '[')) {
+                            free(out);
+                            return strdup("");
+                        }
+                    }
+                } else {
+                    anchor_active = false;
+                    anchor_suppress_text = false;
+                    anchor_href[0] = '\0';
+                }
+                i = close + 1;
+                continue;
+            }
+            if (closing && strcmp(tag_name, "a") == 0) {
+                if (anchor_active && anchor_href[0] != '\0') {
+                    if (!markdownTextAppendSpan(&out, &dst, &cap, "](", 2) ||
+                        !markdownTextAppendSpan(&out, &dst, &cap, anchor_href, strlen(anchor_href)) ||
+                        !markdownTextAppendChar(&out, &dst, &cap, ')')) {
+                        free(out);
+                        return strdup("");
+                    }
+                }
+                anchor_active = false;
+                anchor_suppress_text = false;
+                anchor_href[0] = '\0';
+                i = close + 1;
+                continue;
+            }
+
+            if (!closing && strcmp(tag_name, "img") == 0) {
+                char alt[1024];
+                if (markdownHtmlExtractAttr(attrs, "alt", alt, sizeof(alt)) && alt[0] != '\0') {
+                    if (!markdownTextAppendSpan(&out, &dst, &cap, alt, strlen(alt))) {
+                        free(out);
+                        return strdup("");
+                    }
+                }
+                i = close + 1;
+                continue;
+            }
+
+            if (!closing && (strcmp(tag_name, "li") == 0)) {
+                if (!markdownTextAppendNewlines(&out, &dst, &cap, 1) ||
+                    !markdownTextAppendSpan(&out, &dst, &cap, "- ", 2)) {
+                    free(out);
+                    return strdup("");
+                }
+                i = close + 1;
+                continue;
+            }
+
+            if (!closing && (strcmp(tag_name, "br") == 0 || strcmp(tag_name, "hr") == 0)) {
+                if (!markdownTextAppendNewlines(&out, &dst, &cap, 1)) {
+                    free(out);
+                    return strdup("");
+                }
+                i = close + 1;
+                continue;
+            }
+
+            if (!closing &&
+                (strcmp(tag_name, "p") == 0 || strcmp(tag_name, "div") == 0 ||
+                 strcmp(tag_name, "section") == 0 || strcmp(tag_name, "article") == 0 ||
+                 strcmp(tag_name, "header") == 0 || strcmp(tag_name, "footer") == 0 ||
+                 strcmp(tag_name, "blockquote") == 0 || strcmp(tag_name, "table") == 0 ||
+                 strcmp(tag_name, "tr") == 0 || strcmp(tag_name, "ul") == 0 || strcmp(tag_name, "ol") == 0)) {
+                if (!markdownTextAppendNewlines(&out, &dst, &cap, 2)) {
+                    free(out);
+                    return strdup("");
+                }
+                i = close + 1;
+                continue;
+            }
+
+            if (closing &&
+                (strcmp(tag_name, "p") == 0 || strcmp(tag_name, "div") == 0 ||
+                 strcmp(tag_name, "section") == 0 || strcmp(tag_name, "article") == 0 ||
+                 strcmp(tag_name, "header") == 0 || strcmp(tag_name, "footer") == 0 ||
+                 strcmp(tag_name, "blockquote") == 0 || strcmp(tag_name, "table") == 0 ||
+                 strcmp(tag_name, "tr") == 0)) {
+                if (!markdownTextAppendNewlines(&out, &dst, &cap, 2)) {
+                    free(out);
+                    return strdup("");
+                }
+                i = close + 1;
+                continue;
+            }
+
+            i = close + 1;
+            continue;
+        }
+
+        if (html[i] == '&') {
+            char decoded = '\0';
+            size_t next = i;
+            if (markdownHtmlDecodeEntity(html, &next, &decoded)) {
+                if (!markdownTextAppendChar(&out, &dst, &cap, decoded)) {
+                    free(out);
+                    return strdup("");
+                }
+                i = next;
+                continue;
+            }
+        }
+
+        char ch = html[i++];
+        if (anchor_suppress_text) {
+            continue;
+        }
+        if (!markdownTextAppendChar(&out, &dst, &cap, ch)) {
+            free(out);
+            return strdup("");
+        }
+    }
+
+    if (anchor_active && anchor_href[0] != '\0') {
+        (void)markdownTextAppendSpan(&out, &dst, &cap, "](", 2);
+        (void)markdownTextAppendSpan(&out, &dst, &cap, anchor_href, strlen(anchor_href));
+        (void)markdownTextAppendChar(&out, &dst, &cap, ')');
+    }
+    out[dst] = '\0';
+    return out;
+}
+
+static int markdownReadAll(FILE *input, char **out_data, size_t *out_len) {
+    if (!input || !out_data || !out_len) {
+        return -1;
+    }
+    *out_data = NULL;
+    *out_len = 0;
+    size_t cap = 0;
+    size_t len = 0;
+    char chunk[8192];
+    while (true) {
+        int read_err = 0;
+        ssize_t n = smallclueReadStream(input, chunk, sizeof(chunk), &read_err);
+        if (n < 0) {
+            free(*out_data);
+            *out_data = NULL;
+            *out_len = 0;
+            errno = read_err ? read_err : errno;
+            return -1;
+        }
+        if (n == 0) {
+            break;
+        }
+        size_t needed = len + (size_t)n + 1;
+        if (needed > cap) {
+            size_t new_cap = (cap == 0) ? 16384 : cap;
+            while (new_cap < needed) {
+                if (new_cap > SIZE_MAX / 2) {
+                    free(*out_data);
+                    *out_data = NULL;
+                    *out_len = 0;
+                    errno = ENOMEM;
+                    return -1;
+                }
+                new_cap *= 2;
+            }
+            char *resized = (char *)realloc(*out_data, new_cap);
+            if (!resized) {
+                free(*out_data);
+                *out_data = NULL;
+                *out_len = 0;
+                errno = ENOMEM;
+                return -1;
+            }
+            *out_data = resized;
+            cap = new_cap;
+        }
+        memcpy(*out_data + len, chunk, (size_t)n);
+        len += (size_t)n;
+    }
+    if (!*out_data) {
+        *out_data = strdup("");
+        if (!*out_data) {
+            errno = ENOMEM;
+            return -1;
+        }
+    } else {
+        (*out_data)[len] = '\0';
+    }
+    *out_len = len;
+    return 0;
+}
+
+static bool markdownContainsIgnoreCase(const char *text, const char *needle) {
+    if (!text || !needle) {
+        return false;
+    }
+    size_t needle_len = strlen(needle);
+    if (needle_len == 0) {
+        return true;
+    }
+    size_t text_len = strlen(text);
+    if (needle_len > text_len) {
+        return false;
+    }
+    for (size_t i = 0; i + needle_len <= text_len; ++i) {
+        if (strncasecmp(text + i, needle, needle_len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool markdownLooksLikeNewsMetaLine(const char *line) {
+    if (!line || !*line) {
+        return false;
+    }
+    const char *probe = markdownSkipSoftWhitespace(line);
+    if (!*probe) {
+        return false;
+    }
+    if (markdownContainsIgnoreCase(probe, "announcement") ||
+        markdownContainsIgnoreCase(probe, "press release") ||
+        markdownContainsIgnoreCase(probe, "updated ")) {
+        return true;
+    }
+    static const char *months[] = {
+        "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november", "december",
+        "jan ", "feb ", "mar ", "apr ", "jun ", "jul ", "aug ", "sep ", "sept ", "oct ", "nov ", "dec "
+    };
+    bool month_hit = false;
+    for (size_t i = 0; i < sizeof(months) / sizeof(months[0]); ++i) {
+        if (markdownContainsIgnoreCase(probe, months[i])) {
+            month_hit = true;
+            break;
+        }
+    }
+    if (!month_hit) {
+        return false;
+    }
+    int digit_count = 0;
+    for (const char *p = probe; *p; ++p) {
+        if (isdigit((unsigned char)*p)) {
+            digit_count++;
+        }
+    }
+    return digit_count >= 3;
+}
+
+static bool markdownLooksLikeCssSelectorLine(const char *line) {
+    if (!line || !*line) {
+        return false;
+    }
+    const char *probe = markdownSkipSoftWhitespace(line);
+    if (!*probe) {
+        return false;
+    }
+    if (strstr(probe, "://") || strchr(probe, ';')) {
+        return false;
+    }
+    const char *brace = strchr(probe, '{');
+    if (!brace) {
+        return false;
+    }
+    /* CSS keyframe selectors like 0%{ / 100%{ */
+    if (brace > probe && brace[-1] == '%') {
+        bool digits_only = true;
+        for (const char *p = probe; p < brace - 1; ++p) {
+            if (!isdigit((unsigned char)*p) && !isspace((unsigned char)*p)) {
+                digits_only = false;
+                break;
+            }
+        }
+        if (digits_only) {
+            return true;
+        }
+    }
+    bool saw_alpha = false;
+    for (const char *p = probe; p < brace; ++p) {
+        unsigned char ch = (unsigned char)*p;
+        if (isalpha(ch)) {
+            saw_alpha = true;
+            continue;
+        }
+        if (isdigit(ch) || isspace(ch) || ch == '.' || ch == '#' || ch == '[' || ch == ']' ||
+            ch == ':' || ch == '-' || ch == '_' || ch == ',' || ch == '>' || ch == '+' ||
+            ch == '~' || ch == '*' || ch == '(' || ch == ')' || ch == '%') {
+            continue;
+        }
+        return false;
+    }
+    if (!saw_alpha) {
+        return false;
+    }
+    for (const char *p = brace + 1; *p; ++p) {
+        if (!isspace((unsigned char)*p) && *p != '}') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static const char *markdownSkipSoftWhitespace(const char *text) {
+    if (!text) {
+        return "";
+    }
+    const unsigned char *p = (const unsigned char *)text;
+    while (*p) {
+        if (isspace(*p)) {
+            p++;
+            continue;
+        }
+        /* UTF-8 NBSP */
+        if (p[0] == 0xC2 && p[1] == 0xA0) {
+            p += 2;
+            continue;
+        }
+        /* UTF-8 zero-width spaces */
+        if (p[0] == 0xE2 && p[1] == 0x80 &&
+            (p[2] == 0x8B || p[2] == 0x8C || p[2] == 0x8D)) {
+            p += 3;
+            continue;
+        }
+        break;
+    }
+    return (const char *)p;
+}
+
+static bool markdownLooksLikeWebNoiseLine(const char *line) {
+    if (!line || !*line) {
+        return false;
+    }
+    const char *probe = markdownSkipSoftWhitespace(line);
+    if (!*probe) {
+        return false;
+    }
+
+    if (markdownContainsIgnoreCase(probe, "<script") ||
+        markdownContainsIgnoreCase(probe, "</script") ||
+        markdownContainsIgnoreCase(probe, "<style") ||
+        markdownContainsIgnoreCase(probe, "</style")) {
+        return true;
+    }
+
+    if (strstr(probe, "localStorage.") ||
+        strstr(probe, "document.") ||
+        strstr(probe, "window.") ||
+        strstr(probe, "getElement") ||
+        strstr(probe, "w-mod-") ||
+        strstr(probe, "intellimize") ||
+        strstr(probe, "webflow") ||
+        strstr(probe, "var(--") ||
+        strstr(probe, "@media") ||
+        strstr(probe, ":root") ||
+        strstr(probe, "!important") ||
+        strstr(probe, "minmax(") ||
+        strstr(probe, "calc(") ||
+        strstr(probe, "/*") ||
+        strstr(probe, "*/")) {
+        return true;
+    }
+    if (markdownLooksLikeCssSelectorLine(probe)) {
+        return true;
+    }
+
+    size_t len = strlen(probe);
+    if (strcmp(probe, "/") == 0) {
+        return true;
+    }
+    if (strcmp(probe, "-") == 0) {
+        return true;
+    }
+    if (markdownContainsIgnoreCase(probe, "skip to main content") ||
+        markdownContainsIgnoreCase(probe, "skip to footer")) {
+        return true;
+    }
+    if (strcmp(probe, "[") == 0 || strcmp(probe, "]") == 0) {
+        return true;
+    }
+    if (strncmp(probe, "](#", 3) == 0 || strncmp(probe, "[#", 2) == 0) {
+        return true;
+    }
+    if (strncmp(probe, "](", 2) == 0) {
+        const char *target = probe + 2;
+        const char *close = strchr(target, ')');
+        if (close && close > target) {
+            size_t target_len = (size_t)(close - target);
+            if ((target_len >= 7 && strncasecmp(target, "http://", 7) == 0) ||
+                (target_len >= 8 && strncasecmp(target, "https://", 8) == 0) ||
+                (target_len >= 7 && strncasecmp(target, "mailto:", 7) == 0) ||
+                target[0] == '/' || target[0] == '#') {
+                return true;
+            }
+        }
+    }
+    if ((strcmp(probe, "- [") == 0 || strcmp(probe, "* [") == 0 || strcmp(probe, "• [") == 0)) {
+        return true;
+    }
+    if (markdownContainsIgnoreCase(probe, "@-webkit-keyframes") ||
+        markdownContainsIgnoreCase(probe, "@keyframes")) {
+        return true;
+    }
+    if (probe[0] == '@' &&
+        (markdownContainsIgnoreCase(probe, "keyframes") || markdownContainsIgnoreCase(probe, "media"))) {
+        return true;
+    }
+    if (probe[0] == '/' && strchr(probe, ' ') && !strstr(probe, "://")) {
+        return true;
+    }
+    if (strcmp(probe, "{") == 0 || strcmp(probe, "}") == 0 ||
+        strcmp(probe, "};") == 0 || strcmp(probe, "{;") == 0) {
+        return true;
+    }
+    if (len > 4 && probe[0] == '/' && strchr(probe, ' ') && strchr(probe + 1, '/')) {
+        return true;
+    }
+    if (strstr(probe, ":where(") || strstr(probe, ":has(") || strstr(probe, "::")) {
+        return true;
+    }
+    if (strchr(probe, '{') &&
+        (strchr(probe, '.') || strchr(probe, '#') || strchr(probe, '[') || strchr(probe, ':') ||
+         strchr(probe, '>') || strchr(probe, '~') || strchr(probe, '+') ||
+         strstr(probe, "html") || strstr(probe, "body") || strstr(probe, "dialog") || strstr(probe, "button"))) {
+        return true;
+    }
+    if (len > 8 && probe[len - 1] == ',' &&
+        (strchr(probe, '.') || strchr(probe, '[') || strchr(probe, ':'))) {
+        return true;
+    }
+    if (len > 1 && len <= 6 && probe[len - 1] == ',' &&
+        isalpha((unsigned char)probe[0]) && !strstr(probe, "://")) {
+        bool tiny_selector = true;
+        for (size_t i = 0; i + 1 < len; ++i) {
+            unsigned char ch = (unsigned char)probe[i];
+            if (!(isalnum(ch) || ch == '-' || ch == '_')) {
+                tiny_selector = false;
+                break;
+            }
+        }
+        if (tiny_selector) {
+            return true;
+        }
+    }
+    int comma_count = 0;
+    for (const char *p = probe; *p; ++p) {
+        if (*p == ',') {
+            comma_count++;
+        }
+    }
+    if (comma_count >= 2 &&
+        (strchr(probe, '.') || strchr(probe, '[') || strchr(probe, ':') || strstr(probe, "button") || strstr(probe, "html"))) {
+        return true;
+    }
+    if (len > 2 && probe[0] == '-' && probe[1] == '-' && strchr(probe, ':')) {
+        return true;
+    }
+    if ((probe[0] == '.' || probe[0] == '#' || probe[0] == '[' || probe[0] == ':' || probe[0] == '@') &&
+        strchr(probe, '{')) {
+        return true;
+    }
+    if (len < 28) {
+        return false;
+    }
+
+    size_t visible = 0;
+    size_t punctuation = 0;
+    size_t letters = 0;
+    for (const char *p = probe; *p; ++p) {
+        unsigned char ch = (unsigned char)*p;
+        if (isspace(ch)) {
+            continue;
+        }
+        visible++;
+        if (isalnum(ch)) {
+            if (isalpha(ch)) {
+                letters++;
+            }
+        } else {
+            punctuation++;
+        }
+    }
+    if (visible == 0) {
+        return false;
+    }
+
+    bool css_shape = (strchr(probe, '{') && strchr(probe, '}') &&
+                      strchr(probe, ':') && strchr(probe, ';'));
+    bool js_shape = (strstr(probe, "=>") || strstr(probe, "function(") || strstr(probe, "||") || strstr(probe, "&&"));
+    if (css_shape || js_shape) {
+        return true;
+    }
+
+    const char *colon = strchr(probe, ':');
+    const char *semi = strchr(probe, ';');
+    if (colon && semi && colon < semi &&
+        !strstr(probe, "http://") && !strstr(probe, "https://")) {
+        const char *next_colon = strchr(semi + 1, ':');
+        if (next_colon) {
+            return true;
+        }
+        size_t prop_len = (size_t)(colon - probe);
+        if (prop_len > 0 && prop_len <= 40) {
+            bool prop_ok = true;
+            bool has_letter = false;
+            for (size_t i = 0; i < prop_len; ++i) {
+                unsigned char ch = (unsigned char)probe[i];
+                if (isspace(ch) || ch == '-' || ch == '_') {
+                    continue;
+                }
+                if (isalpha(ch)) {
+                    has_letter = true;
+                    continue;
+                }
+                prop_ok = false;
+                break;
+            }
+            if (prop_ok && has_letter) {
+                return true;
+            }
+        }
+    }
+
+    int css_hits = 0;
+    if (markdownContainsIgnoreCase(probe, "display:")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "margin-")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "padding")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "max-width")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "min-width")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "min-height")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "max-height")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "height:")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "width:")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "overflow")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "font-")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "line-height")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "letter-spacing")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "background")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "border")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "opacity:")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "transform:")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "position:")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "text-align")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "grid-")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "align-")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "justify-")) css_hits++;
+    if (markdownContainsIgnoreCase(probe, "object-fit")) css_hits++;
+    if (css_hits >= 2) {
+        return true;
+    }
+    if (css_hits >= 1 && strchr(probe, ';') && strchr(probe, ':')) {
+        return true;
+    }
+
+    /* Dense symbol-heavy lines with very low natural-language signal. */
+    return (punctuation * 100 / visible) >= 28 && letters * 100 / visible < 60;
+}
+
+static bool markdownShouldStartCssNoiseBlock(const char *line) {
+    if (!line || !*line) {
+        return false;
+    }
+    const char *probe = markdownSkipSoftWhitespace(line);
+    if (!*probe) {
+        return false;
+    }
+    if (strstr(probe, "!important") ||
+        strstr(probe, "var(--") ||
+        strstr(probe, "@media") ||
+        strstr(probe, "@keyframes") ||
+        strstr(probe, "@-webkit-keyframes") ||
+        strstr(probe, ":root") ||
+        strstr(probe, "calc(") ||
+        strstr(probe, "minmax(") ||
+        strstr(probe, ":where(") ||
+        strstr(probe, ":has(") ||
+        strstr(probe, "::") ||
+        strstr(probe, "/*") ||
+        strstr(probe, "*/")) {
+        return true;
+    }
+    if (markdownLooksLikeCssSelectorLine(probe)) {
+        return true;
+    }
+    if ((probe[0] == '-' && probe[1] == '-') || probe[0] == '.' || probe[0] == '#' ||
+        probe[0] == '[' || probe[0] == ':' || probe[0] == '@') {
+        return true;
+    }
+    if (probe[0] == '/' && strchr(probe, ' ') && !strstr(probe, "://")) {
+        return true;
+    }
+    size_t len = strlen(probe);
+    if (len > 0 && probe[len - 1] == ',' &&
+        (strchr(probe, '.') || strchr(probe, '[') || strchr(probe, ':'))) {
+        return true;
+    }
+    return strchr(probe, '{') || strchr(probe, '}');
+}
+
 static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
     if (!input || !output) {
         return 1;
@@ -3415,6 +5445,17 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
     MarkdownTableRow table_rows[MARKDOWN_MAX_TABLE_ROWS];
     int table_row_count = 0;
     bool has_blank_separator = false;
+    bool suppress_script_block = false;
+    bool suppress_style_block = false;
+    bool suppress_css_noise_block = false;
+    bool fragmented_link_active = false;
+    char fragmented_link_prefix[8] = {0};
+    char fragmented_link_text[4096] = {0};
+    size_t fragmented_link_text_len = 0;
+    int fragmented_link_line_count = 0;
+    bool fragmented_link_label_locked = false;
+    char fragmented_link_meta[512] = {0};
+    bool paragraph_link_only_chain = false;
 
     if (label && *label) {
         fprintf(output, "%s\n", label);
@@ -3452,6 +5493,234 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
         while (end > trimmed && isspace((unsigned char)end[-1])) {
             *--end = '\0';
         }
+        char reconstructed_line[8192];
+        reconstructed_line[0] = '\0';
+        char normalized_line[8192];
+        normalized_line[0] = '\0';
+        const char *fragment_prefix = NULL;
+        if (fragmented_link_active) {
+            if (*trimmed == '\0') {
+                continue;
+            }
+            if (markdownIsFragmentedLinkOpen(trimmed, &fragment_prefix)) {
+                snprintf(fragmented_link_prefix, sizeof(fragmented_link_prefix), "%s", fragment_prefix ? fragment_prefix : "");
+                fragmented_link_text[0] = '\0';
+                fragmented_link_text_len = 0;
+                fragmented_link_line_count = 0;
+                fragmented_link_label_locked = false;
+                fragmented_link_meta[0] = '\0';
+                continue;
+            }
+            char close_target[2048];
+            const char *close_suffix = NULL;
+            if (markdownParseFragmentedLinkClose(trimmed, close_target, sizeof(close_target), &close_suffix)) {
+                const char *suffix_probe = markdownSkipSoftWhitespace(close_suffix ? close_suffix : "");
+                bool chained_open = (*suffix_probe == '[');
+                bool suppress_target = (close_target[0] == '#') ||
+                                       (strncasecmp(close_target, "javascript:", 11) == 0);
+                if (!suppress_target && fragmented_link_text_len > 0) {
+                    if (fragmented_link_meta[0] != '\0') {
+                        if (in_table) {
+                            markdownRenderTable(output, table_rows, table_row_count);
+                            table_row_count = 0;
+                            in_table = false;
+                            has_blank_separator = true;
+                            paragraph_link_only_chain = false;
+                        }
+                        if (paragraph_len > 0) {
+                            markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                            has_blank_separator = true;
+                            paragraph_link_only_chain = false;
+                        }
+                        char *meta_formatted = markdownSimplifyInline(fragmented_link_meta);
+                        if (meta_formatted && *meta_formatted) {
+                            fprintf(output, "%s\n", meta_formatted);
+                            has_blank_separator = false;
+                        }
+                        free(meta_formatted);
+                    }
+                    if (close_suffix && *close_suffix && !chained_open) {
+                        snprintf(reconstructed_line, sizeof(reconstructed_line), "%s[%s](%s) %s",
+                                 fragmented_link_prefix, fragmented_link_text, close_target, close_suffix);
+                    } else {
+                        snprintf(reconstructed_line, sizeof(reconstructed_line), "%s[%s](%s)",
+                                 fragmented_link_prefix, fragmented_link_text, close_target);
+                    }
+                    trimmed = reconstructed_line;
+                } else {
+                    trimmed = "";
+                }
+                fragmented_link_active = chained_open;
+                fragmented_link_prefix[0] = '\0';
+                fragmented_link_text[0] = '\0';
+                fragmented_link_text_len = 0;
+                fragmented_link_line_count = 0;
+                fragmented_link_label_locked = false;
+                fragmented_link_meta[0] = '\0';
+                if (*trimmed == '\0') {
+                    continue;
+                }
+            } else {
+                if (markdownIsHorizontalRule(trimmed) && fragmented_link_text_len > 0) {
+                    fragmented_link_label_locked = true;
+                    continue;
+                }
+                if (fragmented_link_label_locked) {
+                    continue;
+                }
+                if (strcmp(trimmed, "[") != 0 && strcmp(trimmed, "]") != 0) {
+                    char label_piece[4096];
+                    char meta_piece[512];
+                    if (!markdownExtractFragmentLinkLabel(trimmed,
+                                                          label_piece, sizeof(label_piece),
+                                                          meta_piece, sizeof(meta_piece))) {
+                        if (meta_piece[0] != '\0' && fragmented_link_meta[0] == '\0') {
+                            snprintf(fragmented_link_meta, sizeof(fragmented_link_meta), "%s", meta_piece);
+                        }
+                        continue;
+                    }
+                    if (meta_piece[0] != '\0' && fragmented_link_meta[0] == '\0') {
+                        snprintf(fragmented_link_meta, sizeof(fragmented_link_meta), "%s", meta_piece);
+                    }
+                    if (fragmented_link_line_count < 1) {
+                        markdownAppendTokenFixed(fragmented_link_text, &fragmented_link_text_len,
+                                                 sizeof(fragmented_link_text), label_piece);
+                        fragmented_link_line_count++;
+                    }
+                }
+                continue;
+            }
+        } else {
+            char close_target[2048];
+            const char *close_suffix = NULL;
+            if (markdownParseFragmentedLinkClose(trimmed, close_target, sizeof(close_target), &close_suffix)) {
+                const char *suffix_probe = markdownSkipSoftWhitespace(close_suffix ? close_suffix : "");
+                if (*suffix_probe == '[') {
+                    fragmented_link_active = true;
+                    fragmented_link_prefix[0] = '\0';
+                    fragmented_link_text[0] = '\0';
+                    fragmented_link_text_len = 0;
+                    fragmented_link_line_count = 0;
+                    fragmented_link_label_locked = false;
+                    fragmented_link_meta[0] = '\0';
+                }
+                /* Drop dangling close fragments like ](/...) and ](/...)[ */
+                continue;
+            }
+            if (markdownIsFragmentedLinkOpen(trimmed, &fragment_prefix)) {
+                fragmented_link_active = true;
+                snprintf(fragmented_link_prefix, sizeof(fragmented_link_prefix), "%s", fragment_prefix ? fragment_prefix : "");
+                fragmented_link_text[0] = '\0';
+                fragmented_link_text_len = 0;
+                fragmented_link_line_count = 0;
+                fragmented_link_label_locked = false;
+                fragmented_link_meta[0] = '\0';
+                continue;
+            }
+        }
+
+        markdownNormalizeDisplaySpacing(trimmed, normalized_line, sizeof(normalized_line));
+        if (normalized_line[0]) {
+            trimmed = normalized_line;
+        }
+
+        if (suppress_css_noise_block) {
+            if (*trimmed == '\0') {
+                suppress_css_noise_block = false;
+                continue;
+            }
+            if (markdownLooksLikeWebNoiseLine(trimmed)) {
+                continue;
+            }
+            suppress_css_noise_block = false;
+        }
+
+        if (suppress_script_block) {
+            if (markdownContainsIgnoreCase(trimmed, "</script")) {
+                suppress_script_block = false;
+            }
+            continue;
+        }
+        if (suppress_style_block) {
+            if (markdownContainsIgnoreCase(trimmed, "</style")) {
+                suppress_style_block = false;
+            }
+            continue;
+        }
+        if (markdownContainsIgnoreCase(trimmed, "<script")) {
+            if (!markdownContainsIgnoreCase(trimmed, "</script")) {
+                suppress_script_block = true;
+            }
+            if (in_table) {
+                markdownRenderTable(output, table_rows, table_row_count);
+                table_row_count = 0;
+                in_table = false;
+                has_blank_separator = true;
+                paragraph_link_only_chain = false;
+            }
+            if (paragraph_len > 0) {
+                markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                has_blank_separator = true;
+                paragraph_link_only_chain = false;
+            }
+            continue;
+        }
+        if (markdownContainsIgnoreCase(trimmed, "<style")) {
+            if (!markdownContainsIgnoreCase(trimmed, "</style")) {
+                suppress_style_block = true;
+            }
+            if (in_table) {
+                markdownRenderTable(output, table_rows, table_row_count);
+                table_row_count = 0;
+                in_table = false;
+                has_blank_separator = true;
+                paragraph_link_only_chain = false;
+            }
+            if (paragraph_len > 0) {
+                markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                has_blank_separator = true;
+                paragraph_link_only_chain = false;
+            }
+            continue;
+        }
+        if (strchr(trimmed, ':') && strchr(trimmed, ';') &&
+            !strstr(trimmed, "http://") && !strstr(trimmed, "https://") &&
+            !strstr(trimmed, "](")) {
+            if (in_table) {
+                markdownRenderTable(output, table_rows, table_row_count);
+                table_row_count = 0;
+                in_table = false;
+                has_blank_separator = true;
+                paragraph_link_only_chain = false;
+            }
+            if (paragraph_len > 0) {
+                markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                has_blank_separator = true;
+                paragraph_link_only_chain = false;
+            }
+            if (markdownShouldStartCssNoiseBlock(trimmed)) {
+                suppress_css_noise_block = true;
+            }
+            continue;
+        }
+        if (markdownLooksLikeWebNoiseLine(trimmed)) {
+            if (markdownShouldStartCssNoiseBlock(trimmed)) {
+                suppress_css_noise_block = true;
+            }
+            if (in_table) {
+                markdownRenderTable(output, table_rows, table_row_count);
+                table_row_count = 0;
+                in_table = false;
+                has_blank_separator = true;
+                paragraph_link_only_chain = false;
+            }
+            if (paragraph_len > 0) {
+                markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                has_blank_separator = true;
+                paragraph_link_only_chain = false;
+            }
+            continue;
+        }
 
         char fence = markdownFenceMarker(trimmed);
         if (fence != '\0') {
@@ -3459,6 +5728,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             markdownFlushParagraph(output, &paragraph, &paragraph_len);
             if (had_paragraph) {
                 has_blank_separator = true;
+                paragraph_link_only_chain = false;
             }
             if (code_fence == '\0') {
                 code_fence = fence;
@@ -3484,14 +5754,17 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 table_row_count = 0;
                 in_table = false;
                 has_blank_separator = true;
+                paragraph_link_only_chain = false;
             }
             if (paragraph_len > 0) {
                 markdownFlushParagraph(output, &paragraph, &paragraph_len);
                 has_blank_separator = true;
+                paragraph_link_only_chain = false;
             } else if (!has_blank_separator) {
                 fputc('\n', output);
                 has_blank_separator = true;
             }
+            paragraph_link_only_chain = false;
             continue;
         }
 
@@ -3502,6 +5775,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 table_row_count = 0;
                 in_table = false;
                 has_blank_separator = true;
+                paragraph_link_only_chain = false;
             }
             paragraph[paragraph_len] = '\0';
             char *heading_text = markdownTrimInline(paragraph);
@@ -3511,6 +5785,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             }
             paragraph_len = 0;
             paragraph[0] = '\0';
+            paragraph_link_only_chain = false;
             continue;
         }
 
@@ -3519,6 +5794,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             markdownFlushParagraph(output, &paragraph, &paragraph_len);
             if (had_paragraph) {
                 has_blank_separator = true;
+                paragraph_link_only_chain = false;
             }
             for (int i = 0; i < MARKDOWN_WRAP_WIDTH; ++i) {
                 fputc('-', output);
@@ -3536,11 +5812,13 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 table_row_count = 0;
                 in_table = false;
                 has_blank_separator = true;
+                paragraph_link_only_chain = false;
             }
             bool had_paragraph = paragraph_len > 0;
             markdownFlushParagraph(output, &paragraph, &paragraph_len);
             if (had_paragraph) {
                 has_blank_separator = true;
+                paragraph_link_only_chain = false;
             }
             const char *heading_text = trimmed + heading;
             while (*heading_text == ' ' || *heading_text == '\t') heading_text++;
@@ -3555,11 +5833,13 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 table_row_count = 0;
                 in_table = false;
                 has_blank_separator = true;
+                paragraph_link_only_chain = false;
             }
             bool had_paragraph = paragraph_len > 0;
             markdownFlushParagraph(output, &paragraph, &paragraph_len);
             if (had_paragraph) {
                 has_blank_separator = true;
+                paragraph_link_only_chain = false;
             }
             char *quote = trimmed + 1;
             while (*quote == ' ' || *quote == '\t') quote++;
@@ -3585,6 +5865,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 markdownFlushParagraph(output, &paragraph, &paragraph_len);
                 if (had_paragraph) {
                     has_blank_separator = true;
+                    paragraph_link_only_chain = false;
                 }
                 in_table = true;
                 table_row_count = 0;
@@ -3603,6 +5884,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             table_row_count = 0;
             in_table = false;
             has_blank_separator = true;
+            paragraph_link_only_chain = false;
         }
 
         char *list_text = NULL;
@@ -3613,6 +5895,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             markdownFlushParagraph(output, &paragraph, &paragraph_len);
             if (had_paragraph) {
                 has_blank_separator = true;
+                paragraph_link_only_chain = false;
             }
             char *formatted = markdownSimplifyInline(list_text);
             if (formatted) {
@@ -3620,10 +5903,16 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 free(formatted);
             }
             has_blank_separator = false;
+            paragraph_link_only_chain = false;
             continue;
         }
-
-        markdownParagraphAppend(&paragraph, &paragraph_len, &paragraph_cap, trimmed);
+        bool link_only_line = markdownLineLooksLikeLinkOnly(trimmed);
+        const char *separator = " ";
+        if (paragraph_len > 0 && paragraph_link_only_chain && link_only_line) {
+            separator = " · ";
+        }
+        markdownParagraphAppendWithSeparator(&paragraph, &paragraph_len, &paragraph_cap, trimmed, separator);
+        paragraph_link_only_chain = link_only_line;
         has_blank_separator = false;
     }
 
@@ -3631,6 +5920,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
     markdownFlushParagraph(output, &paragraph, &paragraph_len);
     if (had_paragraph) {
         has_blank_separator = true;
+        paragraph_link_only_chain = false;
     }
     if (in_table) {
         markdownRenderTable(output, table_rows, table_row_count);
@@ -3688,14 +5978,88 @@ static int markdownResolvePath(const char *input, char *resolved, size_t resolve
     return -1;
 }
 
-static int smallclueMarkdownDisplayStream(const char *label, FILE *input) {
+static bool markdownHasHtmlExtension(const char *path) {
+    if (!path) {
+        return false;
+    }
+    const char *dot = strrchr(path, '.');
+    if (!dot) {
+        return false;
+    }
+    return strcasecmp(dot, ".html") == 0 || strcasecmp(dot, ".htm") == 0;
+}
+
+static MarkdownInputMode markdownInputModeForFilePath(const char *path) {
+    return markdownHasHtmlExtension(path) ? MARKDOWN_INPUT_MODE_HTML : MARKDOWN_INPUT_MODE_MARKDOWN;
+}
+
+static int smallclueMarkdownDisplayStreamEx(const char *label,
+                                            FILE *input,
+                                            MarkdownInputMode input_mode,
+                                            MarkdownLinkList *links_out,
+                                            int *exit_key_out,
+                                            int *selected_link_index_out) {
+    if (exit_key_out) {
+        *exit_key_out = 'q';
+    }
+    if (selected_link_index_out) {
+        *selected_link_index_out = -1;
+    }
+    if (!input) {
+        return 1;
+    }
+
+    char *raw_data = NULL;
+    size_t raw_len = 0;
+    if (markdownReadAll(input, &raw_data, &raw_len) != 0) {
+        return 1;
+    }
+
+    char *render_source = raw_data;
+    char *converted_html = NULL;
+    bool convert_html = (input_mode == MARKDOWN_INPUT_MODE_HTML) ||
+                        (input_mode == MARKDOWN_INPUT_MODE_AUTO && markdownIsLikelyHtmlDocument(raw_data));
+    if (convert_html) {
+        converted_html = markdownConvertHtmlToMarkdownish(raw_data);
+        if (converted_html) {
+            render_source = converted_html;
+        }
+    }
+
+    FILE *source = tmpfile();
+    if (!source) {
+        free(converted_html);
+        free(raw_data);
+        return 1;
+    }
+    if (render_source && *render_source) {
+        size_t source_len = strlen(render_source);
+        if (fwrite(render_source, 1, source_len, source) != source_len) {
+            fclose(source);
+            free(converted_html);
+            free(raw_data);
+            return 1;
+        }
+    }
+    fflush(source);
+    rewind(source);
+
     FILE *buffer = tmpfile();
     bool direct = false;
     if (!buffer) {
         buffer = stdout;
         direct = true;
     }
-    if (markdownRenderStream(label, input, buffer) != 0) {
+
+    MarkdownLinkList *previous_links = gMarkdownActiveLinks;
+    gMarkdownActiveLinks = links_out;
+    int render_status = markdownRenderStream(label, source, buffer);
+    gMarkdownActiveLinks = previous_links;
+    fclose(source);
+    free(converted_html);
+    free(raw_data);
+
+    if (render_status != 0) {
         if (!direct) {
             fclose(buffer);
         }
@@ -3703,35 +6067,425 @@ static int smallclueMarkdownDisplayStream(const char *label, FILE *input) {
     }
     if (direct) {
         fflush(buffer);
+        if (exit_key_out) {
+            *exit_key_out = 'q';
+        }
         return 0;
     }
     fflush(buffer);
     rewind(buffer);
+    const MarkdownLinkList *prev_active_links = pager_active_md_links;
+    pagerSetActiveMarkdownLinks(links_out);
     int status = pager_file("md", label ? label : "(stdin)", buffer);
+    pagerSetActiveMarkdownLinks(prev_active_links);
+    if (exit_key_out) {
+        *exit_key_out = pagerLastExitKey();
+    }
+    if (selected_link_index_out) {
+        *selected_link_index_out = pagerLastMdLinkIndex();
+    }
     fclose(buffer);
     return status;
 }
 
+static bool markdownIsRemoteTarget(const char *target) {
+    if (!target) {
+        return false;
+    }
+    return strncasecmp(target, "http://", 7) == 0 ||
+           strncasecmp(target, "https://", 8) == 0;
+}
+
+static bool markdownLooksLikeUrl(const char *value) {
+    if (!value) {
+        return false;
+    }
+    return markdownIsRemoteTarget(value) ||
+           strncasecmp(value, "mailto:", 7) == 0;
+}
+
+static int markdownFetchUrlToTemp(const char *url, char *path_out, size_t path_out_size) {
+    if (!url || !path_out || path_out_size == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    const char *tmp_root = getenv("TMPDIR");
+    if (!tmp_root || !*tmp_root) {
+        tmp_root = "/tmp";
+    }
+    char tmpl[PATH_MAX];
+    snprintf(tmpl, sizeof(tmpl), "%s/md-fetch-XXXXXX", tmp_root);
+    int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        return -1;
+    }
+    close(fd);
+    if (smallclueHttpFetch("md", url, tmpl) != 0) {
+        unlink(tmpl);
+        return -1;
+    }
+    strncpy(path_out, tmpl, path_out_size - 1);
+    path_out[path_out_size - 1] = '\0';
+    return 0;
+}
+
+static char *markdownResolveLinkTarget(const char *base, const char *href) {
+    if (!href || !*href) {
+        return NULL;
+    }
+    while (*href && isspace((unsigned char)*href)) {
+        href++;
+    }
+    if (*href == '\0') {
+        return NULL;
+    }
+    if (href[0] == '#') {
+        return base ? strdup(base) : NULL;
+    }
+    if (markdownLooksLikeUrl(href)) {
+        return strdup(href);
+    }
+    if (base && markdownIsRemoteTarget(base)) {
+        const char *scheme_end = strstr(base, "://");
+        if (!scheme_end) {
+            return strdup(href);
+        }
+        if (strncmp(href, "//", 2) == 0) {
+            size_t scheme_len = (size_t)(scheme_end - base);
+            size_t href_len = strlen(href);
+            char *combined = (char *)malloc(scheme_len + 1 + href_len + 1);
+            if (!combined) {
+                return NULL;
+            }
+            memcpy(combined, base, scheme_len);
+            combined[scheme_len] = ':';
+            memcpy(combined + scheme_len + 1, href, href_len + 1);
+            return combined;
+        }
+        const char *origin_end = strchr(scheme_end + 3, '/');
+        size_t origin_len = origin_end ? (size_t)(origin_end - base) : strlen(base);
+        if (href[0] == '/') {
+            size_t href_len = strlen(href);
+            char *combined = (char *)malloc(origin_len + href_len + 1);
+            if (!combined) {
+                return NULL;
+            }
+            memcpy(combined, base, origin_len);
+            memcpy(combined + origin_len, href, href_len + 1);
+            return combined;
+        }
+
+        char base_copy[PATH_MAX * 2];
+        strncpy(base_copy, base, sizeof(base_copy) - 1);
+        base_copy[sizeof(base_copy) - 1] = '\0';
+        char *query = strchr(base_copy, '?');
+        if (query) *query = '\0';
+        char *fragment = strchr(base_copy, '#');
+        if (fragment) *fragment = '\0';
+        char *last_slash = strrchr(base_copy, '/');
+        if (!last_slash || (size_t)(last_slash - base_copy) < origin_len) {
+            size_t copy_len = origin_len;
+            if (copy_len + 1 >= sizeof(base_copy)) {
+                return NULL;
+            }
+            base_copy[copy_len] = '/';
+            base_copy[copy_len + 1] = '\0';
+        } else {
+            last_slash[1] = '\0';
+        }
+        size_t dir_len = strlen(base_copy);
+        size_t href_len = strlen(href);
+        char *combined = (char *)malloc(dir_len + href_len + 1);
+        if (!combined) {
+            return NULL;
+        }
+        memcpy(combined, base_copy, dir_len);
+        memcpy(combined + dir_len, href, href_len + 1);
+        return combined;
+    }
+
+    if (href[0] == '/') {
+        return strdup(href);
+    }
+
+    if (base && *base) {
+        char resolved_base[PATH_MAX];
+        const char *base_path = base;
+        if (!markdownIsRemoteTarget(base) && markdownResolvePath(base, resolved_base, sizeof(resolved_base)) == 0) {
+            base_path = resolved_base;
+        }
+        char work[PATH_MAX];
+        strncpy(work, base_path, sizeof(work) - 1);
+        work[sizeof(work) - 1] = '\0';
+        char *slash = strrchr(work, '/');
+        if (slash) {
+            slash[1] = '\0';
+        } else {
+            work[0] = '\0';
+        }
+        size_t work_len = strlen(work);
+        size_t href_len = strlen(href);
+        char *combined = (char *)malloc(work_len + href_len + 1);
+        if (!combined) {
+            return NULL;
+        }
+        memcpy(combined, work, work_len);
+        memcpy(combined + work_len, href, href_len + 1);
+        return combined;
+    }
+    return strdup(href);
+}
+
+static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const char *source_label) {
+    if (!links || links->count == 0) {
+        return -1;
+    }
+    size_t cursor = 0;
+    size_t top = 0;
+    bool running = true;
+
+    while (running) {
+        int rows = pager_terminal_rows();
+        int cols = pager_terminal_cols();
+        if (rows < 1) rows = 1;
+        size_t reserved = 2;
+        size_t window = (size_t)rows > reserved ? (size_t)rows - reserved : 1;
+        if (window > links->count) window = links->count;
+
+        if (cursor < top) top = cursor;
+        if (cursor >= top + window) top = cursor - window + 1;
+        if (top + window > links->count) {
+            top = (links->count > window) ? (links->count - window) : 0;
+        }
+
+        printf("\x1b[2J\x1b[H");
+        if (source_label && *source_label) {
+            printf("Links in %s (%zu/%zu)  [Arrows=move Enter=open q=cancel]\n",
+                   source_label, cursor + 1, links->count);
+        } else {
+            printf("Links (%zu/%zu)  [Arrows=move Enter=open q=cancel]\n",
+                   cursor + 1, links->count);
+        }
+
+        size_t end = top + window;
+        if (end > links->count) end = links->count;
+        for (size_t i = top; i < end; ++i) {
+            bool active = (i == cursor);
+            const char *text = links->items[i].text ? links->items[i].text : "(link)";
+            const char *target = links->items[i].target ? links->items[i].target : "";
+            char line[PATH_MAX * 3];
+            snprintf(line, sizeof(line), "%3zu. %s (%s)", i + 1, text, target);
+            if (active) printf("\x1b[7m");
+            if (cols > 0 && (int)strlen(line) > cols) {
+                if (cols > 3) {
+                    fwrite(line, 1, (size_t)(cols - 3), stdout);
+                    fputs("...", stdout);
+                } else {
+                    fwrite(line, 1, (size_t)cols, stdout);
+                }
+                fputc('\n', stdout);
+            } else {
+                printf("%s\n", line);
+            }
+            if (active) printf("\x1b[0m");
+        }
+        fflush(stdout);
+
+        int key = pager_read_key();
+        switch (key) {
+            case PAGER_KEY_ARROW_DOWN:
+                if (cursor + 1 < links->count) cursor++;
+                else pagerBell();
+                break;
+            case PAGER_KEY_ARROW_UP:
+                if (cursor > 0) cursor--;
+                else pagerBell();
+                break;
+            case PAGER_KEY_PAGE_DOWN:
+            case ' ':
+                if (cursor + window < links->count) cursor += window;
+                else if (cursor + 1 < links->count) cursor = links->count - 1;
+                else pagerBell();
+                break;
+            case PAGER_KEY_PAGE_UP:
+            case 'b':
+            case 'B':
+                if (cursor >= window) cursor -= window;
+                else if (cursor > 0) cursor = 0;
+                else pagerBell();
+                break;
+            case '\n':
+            case '\r':
+                printf("\x1b[2J\x1b[H");
+                fflush(stdout);
+                return (int)cursor;
+            case 'q':
+            case 'Q':
+            case 3:
+                printf("\x1b[2J\x1b[H");
+                fflush(stdout);
+                return -1;
+            default:
+                break;
+        }
+    }
+    return -1;
+}
+
+static int smallclueMarkdownBrowseTarget(const char *initial_target) {
+    if (!initial_target || !*initial_target) {
+        return 1;
+    }
+
+    char **stack = NULL;
+    size_t depth = 0;
+    size_t capacity = 0;
+    int overall_status = 0;
+
+    char *root = strdup(initial_target);
+    if (!root) {
+        return 1;
+    }
+    capacity = 4;
+    stack = (char **)calloc(capacity, sizeof(char *));
+    if (!stack) {
+        free(root);
+        return 1;
+    }
+    stack[depth++] = root;
+
+    while (depth > 0) {
+        const char *current = stack[depth - 1];
+        MarkdownLinkList links = {0};
+        int exit_key = 'q';
+        int selected_link_index = -1;
+        int status = 0;
+
+        if (markdownIsRemoteTarget(current)) {
+            char fetched_path[PATH_MAX];
+            if (markdownFetchUrlToTemp(current, fetched_path, sizeof(fetched_path)) != 0) {
+                status = 1;
+            } else {
+                FILE *fp = fopen(fetched_path, "r");
+                if (!fp) {
+                    fprintf(stderr, "md: %s: %s\n", fetched_path, strerror(errno));
+                    status = 1;
+                } else {
+                    status = smallclueMarkdownDisplayStreamEx(current,
+                                                              fp,
+                                                              MARKDOWN_INPUT_MODE_AUTO,
+                                                              &links,
+                                                              &exit_key,
+                                                              &selected_link_index);
+                    fclose(fp);
+                }
+                unlink(fetched_path);
+            }
+        } else {
+            char resolved[PATH_MAX];
+            if (markdownResolvePath(current, resolved, sizeof(resolved)) != 0) {
+                fprintf(stderr, "md: %s: %s\n", current, strerror(errno));
+                status = 1;
+            } else {
+                FILE *fp = fopen(resolved, "r");
+                if (!fp) {
+                    fprintf(stderr, "md: %s: %s\n", resolved, strerror(errno));
+                    status = 1;
+                } else {
+                    status = smallclueMarkdownDisplayStreamEx(resolved,
+                                                              fp,
+                                                              markdownInputModeForFilePath(resolved),
+                                                              &links,
+                                                              &exit_key,
+                                                              &selected_link_index);
+                    fclose(fp);
+                }
+            }
+        }
+
+        if (status != 0) {
+            markdownLinkListFree(&links);
+            overall_status = 1;
+            break;
+        }
+
+        if ((exit_key == 'o' || exit_key == 'O')) {
+            if (links.count == 0) {
+                pagerBell();
+                markdownLinkListFree(&links);
+                continue;
+            }
+            int selected = -1;
+            if (selected_link_index >= 0 && (size_t)selected_link_index < links.count) {
+                selected = selected_link_index;
+            } else {
+                selected = markdownInteractiveSelectLink(&links, current);
+            }
+            if (selected >= 0 && (size_t)selected < links.count) {
+                char *next_target = markdownResolveLinkTarget(current, links.items[selected].target);
+                if (!next_target || !*next_target) {
+                    free(next_target);
+                    pagerBell();
+                    markdownLinkListFree(&links);
+                    continue;
+                }
+                if (markdownLooksLikeUrl(next_target) && !markdownIsRemoteTarget(next_target)) {
+                    fprintf(stderr, "md: unsupported link target: %s\n", next_target);
+                    free(next_target);
+                    markdownLinkListFree(&links);
+                    continue;
+                }
+                if (!markdownIsRemoteTarget(next_target) && !markdownLooksLikeUrl(next_target)) {
+                    char resolved_next[PATH_MAX];
+                    if (markdownResolvePath(next_target, resolved_next, sizeof(resolved_next)) == 0) {
+                        free(next_target);
+                        next_target = strdup(resolved_next);
+                    }
+                }
+                if (!next_target) {
+                    markdownLinkListFree(&links);
+                    overall_status = 1;
+                    break;
+                }
+                if (depth == capacity) {
+                    size_t new_capacity = capacity * 2;
+                    char **resized = (char **)realloc(stack, new_capacity * sizeof(char *));
+                    if (!resized) {
+                        free(next_target);
+                        markdownLinkListFree(&links);
+                        overall_status = 1;
+                        break;
+                    }
+                    stack = resized;
+                    capacity = new_capacity;
+                }
+                stack[depth++] = next_target;
+                markdownLinkListFree(&links);
+                continue;
+            }
+            markdownLinkListFree(&links);
+            continue;
+        }
+
+        markdownLinkListFree(&links);
+        if (exit_key == 'q' && depth > 1) {
+            free(stack[depth - 1]);
+            stack[depth - 1] = NULL;
+            depth--;
+            continue;
+        }
+        break;
+    }
+
+    for (size_t i = 0; i < depth; ++i) {
+        free(stack[i]);
+    }
+    free(stack);
+    return overall_status;
+}
+
 static int smallclueMarkdownDisplayPath(const char *path) {
-    if (!path) {
-        return 1;
-    }
-    if (strcmp(path, "-") == 0) {
-        return smallclueMarkdownDisplayStream("(stdin)", stdin);
-    }
-    char resolved[PATH_MAX];
-    if (markdownResolvePath(path, resolved, sizeof(resolved)) != 0) {
-        fprintf(stderr, "md: %s: %s\n", path, strerror(errno));
-        return 1;
-    }
-    FILE *fp = fopen(resolved, "r");
-    if (!fp) {
-        fprintf(stderr, "md: %s: %s\n", resolved, strerror(errno));
-        return 1;
-    }
-    int status = smallclueMarkdownDisplayStream(resolved, fp);
-    fclose(fp);
-    return status;
+    return smallclueMarkdownBrowseTarget(path);
 }
 
 static char *markdownExtractTitle(const char *path) {
@@ -4005,7 +6759,7 @@ static int markdownInteractiveSelectDocument(void) {
     if (!has_selection) {
         return 0;
     }
-    int status = smallclueMarkdownDisplayPath(selected);
+    int status = smallclueMarkdownBrowseTarget(selected);
     if (status == 0) {
         // After viewing a document, return to the list.
         return markdownInteractiveSelectDocument();
@@ -6906,7 +9660,7 @@ static int smallclueMarkdownCommand(int argc, char **argv) {
                 list_only = 1;
                 break;
             default:
-                fprintf(stderr, "usage: md [-i | -l] [file ...]\n");
+                fprintf(stderr, "usage: md [-i | -l] [file|url ...]\n");
                 return 1;
         }
     }
@@ -6922,7 +9676,7 @@ static int smallclueMarkdownCommand(int argc, char **argv) {
     }
     int status = 0;
     for (int i = optind; i < argc; ++i) {
-        status |= smallclueMarkdownDisplayPath(argv[i]);
+        status |= smallclueMarkdownBrowseTarget(argv[i]);
     }
     return status ? 1 : 0;
 }
@@ -10067,11 +12821,17 @@ int smallclueMain(int argc, char **argv) {
     smallclueRedirectFromEnv();
     const SmallclueApplet *applet = NULL;
     char *call_name = basename(argv[0]);
+    const char *direct_url_target = NULL;
+    bool invoked_via_smallclue_name = false;
 
     if (strcmp(call_name, "smallclue") == 0 || strcmp(call_name, "smallclu") == 0) {
+        invoked_via_smallclue_name = true;
         if (argc < 2) {
             print_usage();
             return 1;
+        }
+        if (markdownIsRemoteTarget(argv[1])) {
+            direct_url_target = argv[1];
         }
         call_name = argv[1];
         argv++;
@@ -10079,6 +12839,16 @@ int smallclueMain(int argc, char **argv) {
     }
 
     applet = smallclueFindApplet(call_name);
+    if (!applet && invoked_via_smallclue_name && direct_url_target) {
+        applet = smallclueFindApplet("md");
+        if (applet) {
+            char *md_argv[3];
+            md_argv[0] = (char *)"md";
+            md_argv[1] = (char *)direct_url_target;
+            md_argv[2] = NULL;
+            return smallclueDispatchApplet(applet, 2, md_argv);
+        }
+    }
     if (!applet) {
         fprintf(stderr, "smallclue: '%s' applet not found.\n\n", call_name);
         print_usage();
