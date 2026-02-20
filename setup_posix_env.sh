@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+# Check for root privileges
+if [ "$(id -u)" -ne 0 ]; then
+    echo "This script requires root privileges to set up the rootfs correctly."
+    echo "Please run with sudo: sudo $0"
+    exit 1
+fi
+
 # 1. Create dummy headers
 echo "Creating dummy headers..."
 mkdir -p src/core
@@ -185,6 +192,8 @@ ROOTFS="rootfs"
 echo "Setting up $ROOTFS..."
 rm -rf "$ROOTFS"
 mkdir -p "$ROOTFS"/{bin,usr/bin,etc,tmp,var,home/username,dev,proc,sys,root}
+chown -R 1000:1000 "$ROOTFS/home/username"
+chmod 1777 "$ROOTFS/tmp"
 
 # 5. Install smallclue
 cp smallclue "$ROOTFS/bin/"
