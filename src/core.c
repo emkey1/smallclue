@@ -5806,6 +5806,32 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             }
         }
 
+        char fence = markdownFenceMarker(trimmed);
+        if (fence != '\0') {
+            bool had_paragraph = paragraph_len > 0;
+            markdownFlushParagraph(output, &paragraph, &paragraph_len);
+            if (had_paragraph) {
+                has_blank_separator = true;
+                paragraph_link_only_chain = false;
+            }
+            if (code_fence == '\0') {
+                code_fence = fence;
+                has_blank_separator = false;
+            } else if (code_fence == fence) {
+                code_fence = '\0';
+                fputc('\n', output);
+                has_blank_separator = true;
+            }
+            continue;
+        }
+
+        if (code_fence != '\0') {
+            /* Preserve leading whitespace/tabs inside fenced code blocks. */
+            fprintf(output, "    %s\n", line);
+            has_blank_separator = false;
+            continue;
+        }
+
         markdownNormalizeDisplaySpacing(trimmed, normalized_line, sizeof(normalized_line));
         if (normalized_line[0]) {
             trimmed = normalized_line;
@@ -5906,32 +5932,6 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
-            continue;
-        }
-
-        char fence = markdownFenceMarker(trimmed);
-        if (fence != '\0') {
-            bool had_paragraph = paragraph_len > 0;
-            markdownFlushParagraph(output, &paragraph, &paragraph_len);
-            if (had_paragraph) {
-                has_blank_separator = true;
-                paragraph_link_only_chain = false;
-            }
-            if (code_fence == '\0') {
-                code_fence = fence;
-                has_blank_separator = false;
-            } else if (code_fence == fence) {
-                code_fence = '\0';
-                fputc('\n', output);
-                has_blank_separator = true;
-            }
-            continue;
-        }
-
-        if (code_fence != '\0') {
-            /* Preserve leading whitespace/tabs inside fenced code blocks. */
-            fprintf(output, "    %s\n", line);
-            has_blank_separator = false;
             continue;
         }
 
