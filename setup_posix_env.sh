@@ -346,9 +346,13 @@ echo "Populating /dev..."
 if [ "$(uname -s)" = "Linux" ]; then
     # Standard Linux device nodes
     # Try mknod first (some containers restrict this)
+    USE_MKNOD=0
     if mknod -m 666 "$ROOTFS/dev/test_null" c 1 3 2>/dev/null; then
         rm -f "$ROOTFS/dev/test_null"
-        # mknod works, proceed
+        USE_MKNOD=1
+    fi
+
+    if [ "$USE_MKNOD" -eq 1 ]; then
         echo "Creating devices using mknod..."
         mknod -m 666 "$ROOTFS/dev/null" c 1 3
         mknod -m 666 "$ROOTFS/dev/zero" c 1 5
@@ -357,8 +361,19 @@ if [ "$(uname -s)" = "Linux" ]; then
         mknod -m 666 "$ROOTFS/dev/tty" c 5 0
         mknod -m 622 "$ROOTFS/dev/console" c 5 1
         mknod -m 666 "$ROOTFS/dev/ptmx" c 5 2
-    else
-        echo "Notice: mknod failed or not permitted. Attempting fallback to bind mounts..."
+
+        # Verify that devices were actually created.
+        # In some environments (e.g. certain container configurations), mknod might return
+        # success but fail to create the node, or create it in a way that is not visible.
+        if [ ! -c "$ROOTFS/dev/null" ]; then
+            echo "Warning: mknod appeared to succeed but /dev/null is missing or not a char device."
+            echo "Falling back to bind mounts..."
+            USE_MKNOD=0
+        fi
+    fi
+
+    if [ "$USE_MKNOD" -eq 0 ]; then
+        echo "Notice: Using bind mounts for /dev..."
         # Fallback: bind mount devices
         # Note: These bind mounts persist until unmounted. The cleanup step at start of script handles them on re-run.
         for dev in null zero random urandom tty console ptmx; do
