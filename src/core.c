@@ -17,7 +17,15 @@
 #include "ios/vproc.h"
 #include "ios/tty/pscal_tty.h"
 #endif
+#if defined(__has_include)
+#if __has_include("../../core/build_info.h")
+#include "../../core/build_info.h"
+#else
 #include "core/build_info.h"
+#endif
+#else
+#include "core/build_info.h"
+#endif
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
