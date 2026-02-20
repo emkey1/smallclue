@@ -325,6 +325,17 @@ fi
 # 4. Setup rootfs
 ROOTFS="rootfs"
 echo "Setting up $ROOTFS..."
+
+if [ "$(uname -s)" = "Linux" ] && [ -d "$ROOTFS" ]; then
+    # Cleanup previous mounts if any (reverse order for nested mounts)
+    # Use readlink -f to get absolute path for reliable matching
+    ABS_ROOTFS=$(readlink -f "$ROOTFS")
+    mount | awk -v root="$ABS_ROOTFS" '$3 == root || $3 ~ "^" root "/" {print $3}' | sort -r | while read -r mountpoint; do
+        echo "Unmounting $mountpoint..."
+        umount "$mountpoint" || true
+    done
+fi
+
 rm -rf "$ROOTFS"
 mkdir -p "$ROOTFS"/{bin,usr/bin,etc,tmp,var,home/username,dev,proc,sys,root}
 chown -R 1000:1000 "$ROOTFS/home/username"
@@ -334,17 +345,30 @@ chmod 1777 "$ROOTFS/tmp"
 echo "Populating /dev..."
 if [ "$(uname -s)" = "Linux" ]; then
     # Standard Linux device nodes
-    # Some container environments or distros might restrict mknod, but for chroot it's standard.
-    if ! mknod -m 666 "$ROOTFS/dev/null" c 1 3 2>/dev/null; then
-        # Fallback if mknod fails (e.g. unprivileged container) - try bind mount if possible or warn
-        echo "Warning: mknod failed. You might need to bind mount /dev manually."
-    else
+    # Try mknod first (some containers restrict this)
+    if mknod -m 666 "$ROOTFS/dev/test_null" c 1 3 2>/dev/null; then
+        rm -f "$ROOTFS/dev/test_null"
+        # mknod works, proceed
+        echo "Creating devices using mknod..."
+        mknod -m 666 "$ROOTFS/dev/null" c 1 3
         mknod -m 666 "$ROOTFS/dev/zero" c 1 5
         mknod -m 666 "$ROOTFS/dev/random" c 1 8
         mknod -m 666 "$ROOTFS/dev/urandom" c 1 9
         mknod -m 666 "$ROOTFS/dev/tty" c 5 0
         mknod -m 622 "$ROOTFS/dev/console" c 5 1
         mknod -m 666 "$ROOTFS/dev/ptmx" c 5 2
+    else
+        echo "Notice: mknod failed or not permitted. Attempting fallback to bind mounts..."
+        # Fallback: bind mount devices
+        # Note: These bind mounts persist until unmounted. The cleanup step at start of script handles them on re-run.
+        for dev in null zero random urandom tty console ptmx; do
+            if [ -e "/dev/$dev" ]; then
+                touch "$ROOTFS/dev/$dev"
+                mount --bind "/dev/$dev" "$ROOTFS/dev/$dev"
+            else
+                echo "Warning: Host device /dev/$dev not found, skipping."
+            fi
+        done
     fi
     mkdir -p "$ROOTFS/dev/shm"
     mkdir -p "$ROOTFS/dev/pts"
