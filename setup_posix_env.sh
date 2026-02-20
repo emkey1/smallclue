@@ -71,6 +71,11 @@ bool pathTruncateStrip(const char *path, char *buffer, size_t buflen) {
     buffer[buflen - 1] = '\0';
     return false; /* Did not modify */
 }
+
+int exsh_main(int argc, char **argv) {
+    printf("exsh: shell stub\n");
+    return 0;
+}
 EOF
 
 # 3. Compile smallclue
@@ -81,7 +86,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
     EXTRA_C_DEFS="-D_DARWIN_C_SOURCE"
 fi
 
-gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${EXTRA_C_DEFS} \
+gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -DSMALLCLUE_WITH_EXSH ${EXTRA_C_DEFS} \
     -I. -Isrc -lpthread \
     src/main.c \
     src/core.c \

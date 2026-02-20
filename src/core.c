@@ -729,6 +729,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"stat", smallclueStatCommand, "Display file status"},
     {"stty", smallclueSttyCommand, "Report terminal settings"},
 #if defined(SMALLCLUE_WITH_EXSH)
+    {"exsh", smallclueShCommand, "Run the PSCAL shell front end"},
     {"sh", smallclueShCommand, "Run the PSCAL shell front end"},
 #endif
     {"scp", smallclueScpCommand, "Securely copy files over SSH"},
