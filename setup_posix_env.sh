@@ -8,6 +8,13 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+# 0. Check for dependencies
+if [ ! -d "third-party" ]; then
+    echo "Dependencies not found. Fetching..."
+    chmod +x fetch_dependencies.sh
+    ./fetch_dependencies.sh
+fi
+
 # 1. Create dummy headers
 echo "Creating dummy headers..."
 mkdir -p src/core
@@ -56,6 +63,12 @@ struct sshkey {
 EOF
 
 # 2. Create extra stubs
+cat > src/openssh_globals.c <<EOF
+#include <signal.h>
+volatile sig_atomic_t pscal_openssh_interrupted = 0;
+int pscal_openssh_showprogress = 1;
+EOF
+
 cat > src/runtime_stubs_extra.c <<EOF
 #include "smallclue.h"
 #include <stdbool.h>
@@ -160,8 +173,78 @@ if [ -f third-party/nextvi/vi.c ]; then
 fi
 
 OPENSSH_SRC="src/openssh_stubs.c"
-# To build with real OpenSSH, you must manually compile the libraries and link them.
-# For now, we default to stubs unless explicitly overridden.
+OPENSSH_OBJS=""
+OPENSSH_LIBS=""
+OPENSSH_SHIM="src/openssh_shim.c"
+
+OPENSSH_DIR="third-party/openssh"
+if [ -d "$OPENSSH_DIR" ]; then
+    echo "Configuring OpenSSH..."
+    if [ ! -f "$OPENSSH_DIR/Makefile" ]; then
+        (cd "$OPENSSH_DIR" && ./configure)
+    fi
+
+    echo "Patching OpenSSH..."
+    # Rename usage first
+    # scp.c
+    if grep -q "void cleanup_exit" "$OPENSSH_DIR/scp.c"; then
+        sed -i 's/\bcleanup_exit\b/scp_cleanup_exit/g' "$OPENSSH_DIR/scp.c"
+    fi
+    if grep -q "volatile sig_atomic_t interrupted" "$OPENSSH_DIR/scp.c"; then
+        sed -i 's/\binterrupted\b/pscal_openssh_interrupted/g' "$OPENSSH_DIR/scp.c"
+        # Now change definitions to extern
+        sed -i 's/volatile sig_atomic_t pscal_openssh_interrupted = 0;/extern volatile sig_atomic_t pscal_openssh_interrupted;/g' "$OPENSSH_DIR/scp.c"
+    fi
+    if grep -q "int showprogress" "$OPENSSH_DIR/scp.c"; then
+        sed -i 's/\bshowprogress\b/pscal_openssh_showprogress/g' "$OPENSSH_DIR/scp.c"
+        sed -i 's/int pscal_openssh_showprogress = 1;/extern int pscal_openssh_showprogress;/g' "$OPENSSH_DIR/scp.c"
+    fi
+
+    # sftp.c
+    if grep -q "volatile sig_atomic_t interrupted" "$OPENSSH_DIR/sftp.c"; then
+        sed -i 's/\binterrupted\b/pscal_openssh_interrupted/g' "$OPENSSH_DIR/sftp.c"
+        sed -i 's/volatile sig_atomic_t pscal_openssh_interrupted = 0;/extern volatile sig_atomic_t pscal_openssh_interrupted;/g' "$OPENSSH_DIR/sftp.c"
+    fi
+    if grep -q "int showprogress" "$OPENSSH_DIR/sftp.c"; then
+        sed -i 's/\bshowprogress\b/pscal_openssh_showprogress/g' "$OPENSSH_DIR/sftp.c"
+        sed -i 's/int pscal_openssh_showprogress = 1;/extern int pscal_openssh_showprogress;/g' "$OPENSSH_DIR/sftp.c"
+    fi
+
+    # sftp-client.c
+    if grep -q "volatile sig_atomic_t interrupted" "$OPENSSH_DIR/sftp-client.c"; then
+        sed -i 's/\binterrupted\b/pscal_openssh_interrupted/g' "$OPENSSH_DIR/sftp-client.c"
+    fi
+    if grep -q "extern int showprogress" "$OPENSSH_DIR/sftp-client.c"; then
+        sed -i 's/\bshowprogress\b/pscal_openssh_showprogress/g' "$OPENSSH_DIR/sftp-client.c"
+        sed -i 's/extern int showprogress;/extern int pscal_openssh_showprogress;/g' "$OPENSSH_DIR/sftp-client.c"
+    fi
+
+    # Force rebuild of patched files
+    rm -f "$OPENSSH_DIR/scp.o" "$OPENSSH_DIR/sftp.o" "$OPENSSH_DIR/sftp-client.o"
+
+    echo "Building OpenSSH objects..."
+    (cd "$OPENSSH_DIR" && make -j4 libssh.a openbsd-compat/libopenbsd-compat.a \
+        ssh.o readconf.o clientloop.o sshtty.o sshconnect.o sshconnect2.o mux.o ssh-sk-client.o \
+        scp.o progressmeter.o sftp-common.o sftp-client.o sftp-glob.o \
+        sftp.o sftp-usergroup.o \
+        ssh-keygen.o sshsig.o)
+
+    OPENSSH_OBJS="$OPENSSH_DIR/ssh.o $OPENSSH_DIR/readconf.o $OPENSSH_DIR/clientloop.o $OPENSSH_DIR/sshtty.o \
+$OPENSSH_DIR/sshconnect.o $OPENSSH_DIR/sshconnect2.o $OPENSSH_DIR/mux.o $OPENSSH_DIR/ssh-sk-client.o \
+$OPENSSH_DIR/scp.o $OPENSSH_DIR/progressmeter.o $OPENSSH_DIR/sftp-common.o $OPENSSH_DIR/sftp-client.o $OPENSSH_DIR/sftp-glob.o \
+$OPENSSH_DIR/sftp.o $OPENSSH_DIR/sftp-usergroup.o \
+$OPENSSH_DIR/ssh-keygen.o $OPENSSH_DIR/sshsig.o"
+
+    # Link against built static libs and system libs (zlib, crypto)
+    # On Linux with -static, -lcrypto -lz will use static versions if available.
+    OPENSSH_LIBS="$OPENSSH_DIR/libssh.a $OPENSSH_DIR/openbsd-compat/libopenbsd-compat.a -lcrypto -lz"
+
+    # Include globals and stubs
+    OPENSSH_SRC="src/openssh_stubs.c src/openssh_globals.c"
+
+    # Do not link shim if using real openssh (avoid dns symbol conflict)
+    OPENSSH_SHIM=""
+fi
 
 gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -DSMALLCLUE_WITH_EXSH ${EXTRA_C_DEFS} \
     -I. -Isrc ${EXTRA_LD_FLAGS} -lpthread \
@@ -171,10 +254,12 @@ gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -DSMALL
     src/nextvi_app.c \
     ${NEXTVI_SRC} \
     ${OPENSSH_SRC} \
+    ${OPENSSH_OBJS} \
     src/openssh_app.c \
     src/vproc_test_app.c \
-    src/openssh_shim.c \
+    ${OPENSSH_SHIM} \
     src/runtime_stubs_extra.c \
+    ${OPENSSH_LIBS} \
     -o smallclue
 
 if [ ! -f smallclue ]; then
