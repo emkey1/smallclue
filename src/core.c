@@ -3065,7 +3065,7 @@ static int pager_file(const char *cmd_name, const char *path, FILE *stream) {
         force_interactive = false;
     }
 
-    bool interactive = have_ctrl || force_interactive;
+    bool interactive = (have_ctrl || force_interactive) && !disable_interactive;
     /* If we have no viable control fd and no interactive stdio, force a
      * non-interactive dump so pipelines still produce output when no TTY. */
     if (!force_interactive) {
@@ -5811,6 +5811,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             trimmed = normalized_line;
         }
 
+        if (code_fence == '\0') {
         if (suppress_css_noise_block) {
             if (*trimmed == '\0') {
                 suppress_css_noise_block = false;
@@ -5907,6 +5908,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             continue;
+        }
         }
 
         char fence = markdownFenceMarker(trimmed);
@@ -6035,7 +6037,6 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 markdownWrapAndWrite(output, formatted, "> ", "> ", MARKDOWN_WRAP_WIDTH);
                 free(formatted);
             }
-            fputc('\n', output);
             has_blank_separator = true;
             continue;
         }
@@ -6077,7 +6078,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
         char *list_text = NULL;
         char prefix_first[32];
         char prefix_sub[32];
-        if (markdownExtractListItem(trimmed, &list_text, prefix_first, sizeof(prefix_first), prefix_sub, sizeof(prefix_sub))) {
+        if (markdownExtractListItem(line, &list_text, prefix_first, sizeof(prefix_first), prefix_sub, sizeof(prefix_sub))) {
             bool had_paragraph = paragraph_len > 0;
             markdownFlushParagraph(output, &paragraph, &paragraph_len);
             if (had_paragraph) {
