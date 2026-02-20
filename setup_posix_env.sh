@@ -227,10 +227,10 @@ chmod +x "$ROOTFS/etc/rc"
 echo "Creating enter_chroot.sh..."
 cat > enter_chroot.sh <<EOF
 #!/bin/sh
-# Check for root privileges
+# Check for root privileges and auto-elevate
 if [ "\$(id -u)" -ne 0 ]; then
-    echo "Please run as root (use sudo)."
-    exit 1
+    echo "Entering chroot as root..."
+    exec sudo "\$0" "\$@"
 fi
 # Execute chroot with explicit shell to override user's SHELL env var
 exec chroot $ROOTFS /bin/sh -l
@@ -248,7 +248,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
     echo "    ./smallclue ls -la"
     echo "  For a true chroot-style environment, use Linux."
 else
-    echo "To enter the environment (requires sudo):"
+    echo "To enter the environment:"
     echo "  ./enter_chroot.sh"
     echo ""
     echo "Or run specific commands:"
