@@ -36,6 +36,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/types.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/ip_icmp.h>
@@ -44,7 +45,6 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <sys/types.h>
 #include <sys/utsname.h>
 #include <signal.h>
 #include <stdatomic.h>
