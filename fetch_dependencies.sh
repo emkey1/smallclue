@@ -57,10 +57,14 @@ if [ -d "$OPENSSH_DIR" ]; then
     # Try configure if autoreconf is available or if configure exists
     if [ -f "$OPENSSH_DIR/configure" ]; then
         echo "Configuring OpenSSH..."
-        (cd "$OPENSSH_DIR" && ./configure) || echo "OpenSSH configure failed (ignoring)."
-    elif type autoreconf >/dev/null 2>&1; then
+        (cd "$OPENSSH_DIR" && ./configure)
+    elif command -v autoreconf >/dev/null 2>&1; then
         echo "Generating configure for OpenSSH..."
-        (cd "$OPENSSH_DIR" && autoreconf -i && ./configure) || echo "OpenSSH autoreconf/configure failed (ignoring)."
+        (cd "$OPENSSH_DIR" && autoreconf -i && ./configure)
+    else
+        echo "Error: autoreconf not found. Cannot configure OpenSSH."
+        echo "Please install autoconf."
+        exit 1
     fi
 fi
 

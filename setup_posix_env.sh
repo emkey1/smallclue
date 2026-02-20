@@ -193,13 +193,28 @@ OPENSSH_DIR="third-party/openssh"
 if [ -d "$OPENSSH_DIR" ]; then
     echo "Configuring OpenSSH..."
     if [ ! -f "$OPENSSH_DIR/Makefile" ]; then
-        (cd "$OPENSSH_DIR" && ./configure)
+        if [ ! -f "$OPENSSH_DIR/configure" ]; then
+            echo "configure script missing. Attempting to generate with autoreconf..."
+            if command -v autoreconf >/dev/null 2>&1; then
+                (cd "$OPENSSH_DIR" && autoreconf -i)
+            else
+                echo "Error: autoreconf not found. Please install autoconf to build OpenSSH."
+                exit 1
+            fi
+        fi
+
+        if [ -f "$OPENSSH_DIR/configure" ]; then
+            (cd "$OPENSSH_DIR" && ./configure)
+        else
+            echo "Error: configure script not found and could not be generated."
+            exit 1
+        fi
     fi
 
     echo "Patching OpenSSH..."
     # Rename usage first
     # scp.c
-    if grep -q "void cleanup_exit" "$OPENSSH_DIR/scp.c"; then
+    if grep -q "cleanup_exit" "$OPENSSH_DIR/scp.c"; then
         sed -i 's/\bcleanup_exit\b/scp_cleanup_exit/g' "$OPENSSH_DIR/scp.c"
     fi
     if grep -q "volatile sig_atomic_t interrupted" "$OPENSSH_DIR/scp.c"; then
