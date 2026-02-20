@@ -9,10 +9,22 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 0. Check for dependencies
-if [ ! -d "third-party" ]; then
-    echo "Dependencies not found. Fetching..."
+MISSING_DEPS=0
+if [ ! -d "third-party/nextvi/.git" ]; then
+    echo "Nextvi repository missing or incomplete."
+    MISSING_DEPS=1
+fi
+if [ ! -d "third-party/openssh/.git" ]; then
+    echo "OpenSSH repository missing or incomplete."
+    MISSING_DEPS=1
+fi
+
+if [ "$MISSING_DEPS" -eq 1 ]; then
+    echo "Fetching dependencies..."
     chmod +x fetch_dependencies.sh
     ./fetch_dependencies.sh
+else
+    echo "Dependencies verified."
 fi
 
 # 1. Create dummy headers
