@@ -22,7 +22,8 @@ NEXTVI_MAIN=$(grep -l "int main" "$THIRD_PARTY_DIR/nextvi"/*.c | head -n 1)
 if [ -f "$NEXTVI_MAIN" ]; then
     echo "Patching nextvi main in $NEXTVI_MAIN..."
     # Match "int main(" and replace with "int nextvi_main_entry("
-    sed -i 's/int main(/int nextvi_main_entry(/g' "$NEXTVI_MAIN"
+    sed -i.bak 's/int main(/int nextvi_main_entry(/g' "$NEXTVI_MAIN"
+    rm -f "${NEXTVI_MAIN}.bak"
 
     # Add nextvi_reset_state stub if not present
     if ! grep -q "void nextvi_reset_state" "$NEXTVI_MAIN"; then
@@ -48,9 +49,10 @@ if [ -d "$OPENSSH_DIR" ]; then
             FUNC_NAME="pscal_openssh_$(echo $tool | tr '-' '_')_main"
             echo "Patching $tool in $SRC_FILE..."
             # Replace "main(" at start of line (return type on prev line)
-            sed -i "s/^main(/$FUNC_NAME(/g" "$SRC_FILE"
+            sed -i.bak "s/^main(/$FUNC_NAME(/g" "$SRC_FILE"
             # Replace "int main(" at start of line
-            sed -i "s/^int main(/int $FUNC_NAME(/g" "$SRC_FILE"
+            sed -i.bak "s/^int main(/int $FUNC_NAME(/g" "$SRC_FILE"
+            rm -f "$SRC_FILE.bak"
         fi
     done
 
@@ -59,11 +61,24 @@ if [ -d "$OPENSSH_DIR" ]; then
         echo "Configuring OpenSSH..."
         (cd "$OPENSSH_DIR" && ./configure)
     elif command -v autoreconf >/dev/null 2>&1; then
-        echo "Generating configure for OpenSSH..."
-        (cd "$OPENSSH_DIR" && autoreconf -i && ./configure)
+        echo "Generating configure for OpenSSH (this may take a moment)..."
+        if ! (cd "$OPENSSH_DIR" && autoreconf -i > autoreconf.log 2>&1); then
+            echo "Error: autoreconf failed."
+            echo "--- autoreconf output ---"
+            cat "$OPENSSH_DIR/autoreconf.log"
+            echo "-------------------------"
+            echo "Please ensure you have autoconf and automake installed."
+            exit 1
+        fi
+        (cd "$OPENSSH_DIR" && ./configure)
     else
         echo "Error: autoreconf not found. Cannot configure OpenSSH."
-        echo "Please install autoconf."
+        echo "Please install autoconf (and automake)."
+        if [ "$(uname -s)" = "Darwin" ]; then
+            echo "On macOS: brew install autoconf automake"
+        else
+            echo "On Linux: sudo apt-get install autoconf automake"
+        fi
         exit 1
     fi
 fi
