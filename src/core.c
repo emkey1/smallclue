@@ -672,6 +672,118 @@ typedef struct SmallclueAppletHelp {
     const char *usage;
 } SmallclueAppletHelp;
 
+static int smallclueSuCommand(int argc, char **argv) {
+    const char *usage = "usage: su [-] [username] [-c command]\n";
+    const char *user = "root";
+    const char *command = NULL;
+    bool login = false;
+
+    int arg_idx = 1;
+    if (arg_idx < argc && strcmp(argv[arg_idx], "-") == 0) {
+        login = true;
+        arg_idx++;
+    }
+
+    if (arg_idx < argc && argv[arg_idx][0] != '-') {
+        user = argv[arg_idx++];
+    }
+
+    if (arg_idx < argc) {
+        if (strcmp(argv[arg_idx], "-c") == 0) {
+            if (arg_idx + 1 >= argc) {
+                fputs(usage, stderr);
+                return 1;
+            }
+            command = argv[arg_idx + 1];
+            arg_idx += 2;
+        } else if (strcmp(argv[arg_idx], "-") == 0) {
+             if (!login) {
+                 login = true;
+                 arg_idx++;
+             }
+        }
+    }
+
+    struct passwd *pw = getpwnam(user);
+    if (!pw) {
+        fprintf(stderr, "su: user %s does not exist\n", user);
+        return 1;
+    }
+
+    uid_t current_uid = getuid();
+    if (current_uid != 0 && current_uid != pw->pw_uid) {
+        fprintf(stderr, "su: permission denied (must be root)\n");
+        return 1;
+    }
+
+    if (initgroups(user, pw->pw_gid) != 0) {
+        perror("su: initgroups");
+        return 1;
+    }
+    if (setgid(pw->pw_gid) != 0) {
+        perror("su: setgid");
+        return 1;
+    }
+    if (setuid(pw->pw_uid) != 0) {
+        perror("su: setuid");
+        return 1;
+    }
+
+    if (login) {
+        setenv("HOME", pw->pw_dir, 1);
+        setenv("SHELL", pw->pw_shell, 1);
+        setenv("USER", pw->pw_name, 1);
+        setenv("LOGNAME", pw->pw_name, 1);
+        if (chdir(pw->pw_dir) != 0) {
+            fprintf(stderr, "su: warning: cannot change directory to %s: %s\n", pw->pw_dir, strerror(errno));
+        }
+    }
+
+    const char *shell = pw->pw_shell;
+    if (!shell || !*shell) {
+        shell = "/bin/sh";
+    }
+
+    if (command) {
+        execl(shell, shell, "-c", command, (char *)NULL);
+        perror("su: exec");
+        return 127;
+    } else {
+        const char *arg0 = shell;
+        if (login) {
+             const char *base = strrchr(shell, '/');
+             if (base) base++; else base = shell;
+             char *dashed = (char *)malloc(strlen(base) + 2);
+             if (dashed) {
+                 dashed[0] = '-';
+                 strcpy(dashed + 1, base);
+                 arg0 = dashed;
+             }
+        }
+        execl(shell, arg0, (char *)NULL);
+        perror("su: exec");
+        return 127;
+    }
+}
+
+static int smallclueSudoCommand(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: sudo command [args...]\n");
+        return 1;
+    }
+
+    if (getuid() != 0) {
+        if (setuid(0) != 0 || setgid(0) != 0) {
+             fprintf(stderr, "sudo: permission denied (must be setuid root)\n");
+             return 1;
+        }
+    }
+
+    execvp(argv[1], &argv[1]);
+    fprintf(stderr, "sudo: %s: %s\n", argv[1], strerror(errno));
+    return (errno == ENOENT) ? 127 : 126;
+}
+
 static const SmallclueApplet kSmallclueApplets[] = {
     {"[", smallclueBracketCommand, "Evaluate expressions"},
     {"basename", smallclueBasenameCommand, "Strip directory prefix"},
@@ -738,6 +850,8 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"ssh", smallclueSshCommand, "OpenSSH client"},
     {"ssh-keygen", smallclueSshKeygenCommand, "Generate SSH key pairs"},
     {"ssh-copy-id", smallclueSshCopyIdCommand, "Install SSH public keys on a remote host"},
+    {"su", smallclueSuCommand, "Change user ID or become superuser"},
+    {"sudo", smallclueSudoCommand, "Execute a command as another user"},
     {"tail", smallclueTailCommand, "Print the last lines of files"},
     {"tee", smallclueTeeCommand, "Copy stdin to files and stdout"},
     {"telnet", smallclueTelnetCommand, "Simple TCP telnet client"},
@@ -921,6 +1035,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                    "  Generate SSH key pairs"},
     {"ssh-copy-id", "ssh-copy-id [-f] [-n] [-s] [-i [IDENTITY_FILE]] [USER@]HOST\n"
                     "  Install local public key(s) to remote authorized_keys"},
+    {"su", "su [-] [username] [-c command]\n"
+           "  Change user ID or become superuser"},
+    {"sudo", "sudo command [args...]\n"
+             "  Execute a command as another user"},
     {"tail", "tail [-n N] [FILE...]\n"
              "  Default N=10"},
     {"tee", "tee [-a] FILE...\n"
