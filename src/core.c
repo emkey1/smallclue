@@ -511,6 +511,10 @@ static int smallclueSshKeygenCommand(int argc, char **argv);
 static int smallclueSshCopyIdCommand(int argc, char **argv);
 static int smallcluePbcopyCommand(int argc, char **argv);
 static int smallcluePbpasteCommand(int argc, char **argv);
+static int smallclueInitCommand(int argc, char **argv);
+static int smallclueRunitCommand(int argc, char **argv);
+static int smallclueMdevCommand(int argc, char **argv);
+static int smallclueHaltCommand(int argc, char **argv);
 #if defined(SMALLCLUE_WITH_EXSH)
 extern int exsh_main(int argc, char **argv);
 static int smallclueShCommand(int argc, char **argv);
@@ -700,12 +704,15 @@ static const SmallclueApplet kSmallclueApplets[] = {
 #if SMALLCLUE_HAS_IFADDRS
     {"ipaddr", smallclueIpAddrCommand, "Show interface IP addresses"},
 #endif
+    {"halt", smallclueHaltCommand, "Halt the system"},
     {"host", smallclueHostCommand, "DNS lookup utility"},
+    {"init", smallclueInitCommand, "System initialization"},
     {"kill", smallclueKillCommand, "Send signals to processes"},
     {"less", smallcluePagerCommand, "Paginate file contents"},
     {"ln", smallclueLnCommand, "Create links"},
     {"ls", smallclueLsCommand, "List directory contents"},
     {"md", smallclueMarkdownCommand, "Read Markdown documents"},
+    {"mdev", smallclueMdevCommand, "Device manager"},
     {"mkdir", smallclueMkdirCommand, "Create directories"},
     {"more", smallcluePagerCommand, "Paginate file contents"},
     {"mv", smallclueMvCommand, "Move or rename files"},
@@ -714,11 +721,14 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"pbcopy", smallcluePbcopyCommand, "Copy stdin to the system clipboard"},
     {"pbpaste", smallcluePbpasteCommand, "Paste the system clipboard to stdout"},
     {"ping", smallcluePingCommand, "TCP ping utility"},
+    {"poweroff", smallclueHaltCommand, "Power off the system"},
     {"ps", smallcluePsCommand, "Show simple process information"},
     {"pwd", smallcluePwdCommand, "Print working directory"},
+    {"reboot", smallclueHaltCommand, "Reboot the system"},
     {"resize", smallclueResizeCommand, "Synchronize terminal rows/columns"},
     {"rm", smallclueRmCommand, "Remove files"},
     {"rmdir", smallclueRmdirCommand, "Remove empty directories"},
+    {"runit", smallclueRunitCommand, "System service supervisor"},
     {"sed", smallclueSedCommand, "Stream editor for simple substitutions"},
     {"sleep", smallclueSleepCommand, "Delay for a number of seconds"},
     {"sort", smallclueSortCommand, "Sort lines of text"},
@@ -764,6 +774,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"poweroff", smallcluePoweroffCommand, "Power off the system"},
     {"runit", smallclueRunitCommand, "Service supervisor"},
     {"mdev", smallclueMdevCommand, "Device scanner"},
+
 #if defined(PSCAL_TARGET_IOS)
     {"addt", smallclueAddTabCommand, "Open an additional shell tab"},
     {"tabadd", smallclueAddTabCommand, "Alias for addt: open an additional shell tab"},
@@ -821,10 +832,14 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -i ignore case\n"
              "  -n line numbers\n"
              "  -v invert match"},
+    {"halt", "halt [-f]\n"
+             "  Halt the system"},
     {"head", "head [-n N] [FILE...]\n"
              "  Default N=10"},
     {"id", "id\n"
            "  Show uid/gid info"},
+    {"init", "init\n"
+             "  System initialization (PID 1)"},
 #if SMALLCLUE_HAS_IFADDRS
     {"ipaddr", "ipaddr\n"
                "  Show interface IP addresses"},
@@ -846,6 +861,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"md", "md [-i] [FILE|URL]\n"
            "  View Markdown/HTML document; press 'o' to open links in-page\n"
            "  -i interactive mode.  Makes ~/Docs browsable"},
+    {"mdev", "mdev [-s]\n"
+             "  Device manager (scan only)"},
     {"mkdir", "mkdir [-p] DIR...\n"
               "  -p create parents as needed"},
     {"more", "more [FILE...]\n"
@@ -869,10 +886,14 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                 "  Paste system clipboard to stdout"},
     {"ping", "ping HOST [PORT]\n"
              "  TCP ping (default port 80)"},
+    {"poweroff", "poweroff [-f]\n"
+             "  Power off the system"},
     {"ps", "ps\n"
            "  Show simple process list"},
     {"pwd", "pwd\n"
             "  Print working directory"},
+    {"reboot", "reboot [-f]\n"
+             "  Reboot the system"},
     {"resize", "resize [COLUMNS ROWS]\n"
                "  Report or set terminal size"},
     {"rm", "rm [-r] [-f] FILE...\n"
@@ -880,6 +901,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  -f force"},
     {"rmdir", "rmdir DIR...\n"
               "  Remove empty directories"},
+    {"runit", "runit\n"
+             "  Service supervisor"},
     {"sed", "sed 's/old/new/g' [FILE...]\n"
             "  Simple substitution support"},
     {"sleep", "sleep SECONDS\n"
@@ -4421,7 +4444,7 @@ static void markdownWriteHeading(FILE *out, const char *text, int level) {
         fputc(underline, out);
     }
     fputc('\n', out);
-    fputc('\n', out);
+
     free(formatted);
 }
 
@@ -13363,6 +13386,43 @@ static int smallclueInitCommand(int argc, char **argv) {
                 perror("init: wait");
                 sleep(1);
             }
+    /* Basic init implementation:
+     * 1. Block signals
+     * 2. Run /etc/rc if present
+     * 3. Reap zombies loop
+     */
+
+    printf("smallclue init: starting...\n");
+
+    if (access("/etc/rc", X_OK) == 0) {
+        printf("smallclue init: running /etc/rc\n");
+        pid_t pid = fork();
+        if (pid == 0) {
+            execl("/etc/rc", "/etc/rc", NULL);
+            exit(127);
+        } else if (pid > 0) {
+            waitpid(pid, NULL, 0);
+        }
+    } else {
+        printf("smallclue init: /etc/rc not found or not executable\n");
+    }
+
+    /* Ignore signals that might terminate us */
+    signal(SIGTERM, SIG_IGN);
+    signal(SIGINT, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
+    signal(SIGQUIT, SIG_IGN);
+
+    printf("smallclue init: entering main loop\n");
+    while (1) {
+        int status;
+        pid_t pid = wait(&status);
+        if (pid < 0) {
+            if (errno == ECHILD) {
+                /* No children left, sleep to avoid busy loop */
+                sleep(1);
+            }
+            continue;
         }
     }
     return 0;
@@ -13390,6 +13450,39 @@ static int smallcluePoweroffCommand(int argc, char **argv) {
     (void)argv;
     printf("Powering off...\n");
     /* In a real system, we'd call reboot(RB_POWER_OFF). */
+
+static int smallclueMdevCommand(int argc, char **argv) {
+    int scan = 0;
+    smallclueResetGetopt();
+    int opt;
+    while ((opt = getopt(argc, argv, "s")) != -1) {
+        if (opt == 's') {
+            scan = 1;
+        } else {
+            fprintf(stderr, "usage: mdev [-s]\n");
+            return 1;
+        }
+    }
+
+    if (scan) {
+        printf("mdev: scanning /sys...\n");
+        // In a real implementation, we would traverse /sys and populate /dev.
+        // For SmallClue/iOS, devices are typically static or virtualized.
+        return 0;
+    }
+
+    // mdev hotplug mode (called by kernel)
+    // Needs environment variables like ACTION, DEVPATH, SUBSYSTEM.
+    const char *action = getenv("ACTION");
+    const char *devpath = getenv("DEVPATH");
+    if (action && devpath) {
+        printf("mdev: action=%s devpath=%s\n", action, devpath);
+    } else {
+        fprintf(stderr, "mdev: missing ACTION or DEVPATH env\n");
+        return 1;
+    }
+
+
     return 0;
 }
 
@@ -13404,5 +13497,82 @@ static int smallclueMdevCommand(int argc, char **argv) {
     (void)argc;
     (void)argv;
     fprintf(stderr, "mdev: device scanner (stub)\n");
+
+    // Minimal runit implementation:
+    // Scans /etc/service (or arg) and spawns 'run' scripts.
+    // Does not implement full supervision (restart, control).
+
+    const char *service_dir = "/etc/service";
+    if (argc > 1) {
+        service_dir = argv[1];
+    }
+
+    DIR *dir = opendir(service_dir);
+    if (!dir) {
+        fprintf(stderr, "runit: cannot open service directory '%s': %s\n", service_dir, strerror(errno));
+        return 1;
+    }
+
+    printf("runit: starting services in %s\n", service_dir);
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s/run", service_dir, entry->d_name);
+
+        if (access(path, X_OK) == 0) {
+            printf("runit: starting %s\n", entry->d_name);
+            pid_t pid = fork();
+            if (pid == 0) {
+                execl(path, path, NULL);
+                fprintf(stderr, "runit: failed to exec %s: %s\n", path, strerror(errno));
+                exit(127);
+            }
+        }
+    }
+    closedir(dir);
+
+    // Reap children
+    while (1) {
+        int status;
+        pid_t pid = wait(&status);
+        if (pid < 0) {
+            if (errno == ECHILD) {
+                // No children left, sleep to avoid busy loop
+                sleep(1);
+            }
+            continue;
+        }
+    }
+    return 0;
+}
+
+static int smallclueHaltCommand(int argc, char **argv) {
+    int force = 0;
+    smallclueResetGetopt();
+    int opt;
+    while ((opt = getopt(argc, argv, "f")) != -1) {
+        if (opt == 'f') force = 1;
+    }
+
+    const char *cmd = "halt";
+    if (argc > 0) cmd = argv[0];
+
+    printf("System %s requested%s...\n", cmd, force ? " (forced)" : "");
+
+    // On a real system, we would signal init (PID 1).
+    // kill(1, SIGTERM);
+
+#if defined(PSCAL_TARGET_IOS)
+    // On iOS/PSCAL, we can just exit the shell runtime.
+    exit(0);
+#else
+    // On Linux, invoke reboot() syscall if we are root/init?
+    // For now, just exit.
+    exit(0);
+#endif
+
     return 0;
 }
