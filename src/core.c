@@ -37,6 +37,9 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/types.h>
+#if defined(__linux__) || defined(linux) || defined(__linux)
+#include <sys/sysmacros.h>
+#endif
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/ip_icmp.h>
@@ -485,6 +488,7 @@ static int smallclueXargsCommand(int argc, char **argv);
 static int smallcluePsCommand(int argc, char **argv);
 static int smallclueKillCommand(int argc, char **argv);
 static int smallclueMkdirCommand(int argc, char **argv);
+static int smallclueMknodCommand(int argc, char **argv);
 static void smallclueEmitTerminalSane(void);
 #if defined(PSCAL_TARGET_IOS)
 static bool smallclueSessionPtyName(char *buf, size_t buf_len);
@@ -820,6 +824,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"md", smallclueMarkdownCommand, "Read Markdown documents"},
     {"mdev", smallclueMdevCommand, "Device manager"},
     {"mkdir", smallclueMkdirCommand, "Create directories"},
+    {"mknod", smallclueMknodCommand, "Create special files"},
     {"more", smallcluePagerCommand, "Paginate file contents"},
     {"mv", smallclueMvCommand, "Move or rename files"},
     {"nslookup", smallclueNslookupCommand, "DNS lookup utility"},
@@ -968,6 +973,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Device manager (scan only)"},
     {"mkdir", "mkdir [-p] DIR...\n"
               "  -p create parents as needed"},
+    {"mknod", "mknod [-m mode] NAME TYPE [MAJOR MINOR]\n"
+              "  Create special files (b=block, c/u=char, p=fifo)"},
     {"more", "more [FILE...]\n"
              "  Pager (alias of less)"},
     {"mv", "mv SRC... DEST\n"
@@ -12820,6 +12827,74 @@ static int smallclueMkdirCommand(int argc, char **argv) {
         }
     }
     return status;
+}
+
+static int smallclueMknodCommand(int argc, char **argv) {
+    mode_t mode = 0666;
+    smallclueResetGetopt();
+    int opt;
+    while ((opt = getopt(argc, argv, "m:")) != -1) {
+        switch (opt) {
+            case 'm':
+                {
+                    char *endptr = NULL;
+                    long val = strtol(optarg, &endptr, 8);
+                    if (endptr && *endptr == '\0' && val >= 0 && val <= 07777) {
+                        mode = (mode_t)val;
+                    } else {
+                        fprintf(stderr, "mknod: invalid mode '%s'\n", optarg);
+                        return 1;
+                    }
+                }
+                break;
+            default:
+                fprintf(stderr, "usage: mknod [-m mode] NAME TYPE [MAJOR MINOR]\n");
+                return 1;
+        }
+    }
+
+    if (optind >= argc) {
+        fprintf(stderr, "mknod: missing operand\n");
+        return 1;
+    }
+
+    const char *name = argv[optind];
+    if (optind + 1 >= argc) {
+        fprintf(stderr, "mknod: missing type operand\n");
+        return 1;
+    }
+    const char *type_str = argv[optind + 1];
+    char type = type_str[0];
+
+    dev_t dev = 0;
+
+    if (type == 'b' || type == 'c' || type == 'u') {
+        if (optind + 3 >= argc) {
+            fprintf(stderr, "mknod: missing major/minor operands\n");
+            return 1;
+        }
+        int major = atoi(argv[optind + 2]);
+        int minor = atoi(argv[optind + 3]);
+        dev = makedev(major, minor);
+    }
+
+    if (type == 'b') {
+        mode |= S_IFBLK;
+    } else if (type == 'c' || type == 'u') {
+        mode |= S_IFCHR;
+    } else if (type == 'p') {
+        mode |= S_IFIFO;
+    } else {
+        fprintf(stderr, "mknod: invalid type '%c'\n", type);
+        return 1;
+    }
+
+    if (mknod(name, mode, dev) != 0) {
+        perror("mknod");
+        return 1;
+    }
+
+    return 0;
 }
 
 static int smallclueFileCommand(int argc, char **argv) {
