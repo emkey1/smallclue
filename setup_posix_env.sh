@@ -18,6 +18,7 @@ bool pathTruncateStrip(const char *path, char *buffer, size_t buflen);
 EOF
 
 mkdir -p third-party/openssh
+if [ ! -f third-party/openssh/pscal_runtime_hooks.h ]; then
 cat > third-party/openssh/pscal_runtime_hooks.h <<EOF
 #ifndef PSCAL_RUNTIME_HOOKS_H
 #define PSCAL_RUNTIME_HOOKS_H
@@ -35,6 +36,7 @@ void pscal_openssh_set_global_exit_handler(sigjmp_buf *env, volatile sig_atomic_
 void pscal_openssh_request_exit(int code);
 #endif
 EOF
+fi
 
 mkdir -p third-party/ios_system/ssh_keygen
 cat > third-party/ios_system/ssh_keygen/sshkey.h <<EOF
@@ -86,14 +88,24 @@ if [ "$(uname -s)" = "Darwin" ]; then
     EXTRA_C_DEFS="-D_DARWIN_C_SOURCE"
 fi
 
+NEXTVI_SRC="src/nextvi_stubs.c"
+if [ -f third-party/nextvi/vi.c ]; then
+    echo "Using Nextvi from third-party/nextvi..."
+    NEXTVI_SRC="third-party/nextvi/vi.c"
+fi
+
+OPENSSH_SRC="src/openssh_stubs.c"
+# To build with real OpenSSH, you must manually compile the libraries and link them.
+# For now, we default to stubs unless explicitly overridden.
+
 gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -DSMALLCLUE_WITH_EXSH ${EXTRA_C_DEFS} \
     -I. -Isrc -lpthread \
     src/main.c \
     src/core.c \
     src/runtime_support.c \
     src/nextvi_app.c \
-    src/nextvi_stubs.c \
-    src/openssh_stubs.c \
+    ${NEXTVI_SRC} \
+    ${OPENSSH_SRC} \
     src/openssh_app.c \
     src/vproc_test_app.c \
     src/openssh_shim.c \

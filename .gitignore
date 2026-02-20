@@ -1,1 +1,6 @@
 build/
+third-party/
+rootfs/
+smallclue
+src/core/build_info.h
+src/runtime_stubs_extra.c
