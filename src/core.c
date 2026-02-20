@@ -406,7 +406,8 @@ enum {
     PAGER_KEY_ARROW_UP = 1000,
     PAGER_KEY_ARROW_DOWN,
     PAGER_KEY_PAGE_UP,
-    PAGER_KEY_PAGE_DOWN
+    PAGER_KEY_PAGE_DOWN,
+    PAGER_KEY_RESIZE
 };
 
 typedef struct {
@@ -2195,6 +2196,16 @@ static size_t *pagerCollectVisibleMdLinkIndices(const PagerBuffer *buffer,
     return indices;
 }
 
+static volatile sig_atomic_t g_pager_sigwinch_received = 0;
+
+static void pagerSigwinchHandler(int signo) {
+    if (signo == SIGWINCH) {
+        g_pager_sigwinch_received = 1;
+    }
+}
+
+static int pager_terminal_rows(void);
+
 static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, int page_rows) {
     if (!buffer || buffer->line_count == 0) {
         pager_last_exit_key = 'q';
@@ -2205,12 +2216,21 @@ static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, in
         page_rows = 1;
     }
 
+    struct sigaction sa, old_sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = pagerSigwinchHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGWINCH, &sa, &old_sa);
+
     const char *label = pager_command_name(cmd_name);
     bool md_mode = (label && strcmp(label, "md") == 0);
     const MarkdownLinkList *md_links = md_mode ? pager_active_md_links : NULL;
     size_t top = 0;
     bool redraw = true;
     size_t selected_md_link_index = SIZE_MAX;
+    int ret = 0;
+
     while (1) {
         if (redraw) {
             char *highlight = NULL;
@@ -2230,18 +2250,27 @@ static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, in
         }
         int key = pagerPromptAndRead(cmd_name);
         switch (key) {
+            case PAGER_KEY_RESIZE:
+                g_pager_sigwinch_received = 0;
+                {
+                    int new_rows = pager_terminal_rows();
+                    page_rows = (new_rows > 1) ? new_rows - 1 : new_rows;
+                    if (page_rows < 1) page_rows = 1;
+                }
+                redraw = true;
+                break;
             case 'q':
             case 'Q':
             case 3:
             case 4:
                 pager_last_exit_key = key;
                 pager_last_md_link_index = -1;
-                return 0;
+                goto done;
             case 'o':
             case 'O':
                 pager_last_exit_key = key;
                 pager_last_md_link_index = -1;
-                return 0;
+                goto done;
             case ' ':
             case PAGER_KEY_PAGE_DOWN: {
                 size_t max_top = pagerMaxTop(buffer, page_rows);
@@ -2308,7 +2337,7 @@ static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, in
                     selected_md_link_index < md_links->count) {
                     pager_last_md_link_index = (int)selected_md_link_index;
                     pager_last_exit_key = 'o';
-                    return 0;
+                    goto done;
                 }
                 /* fall through */
             case PAGER_KEY_ARROW_DOWN: {
@@ -2337,7 +2366,9 @@ static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, in
     }
     pager_last_exit_key = 'q';
     pager_last_md_link_index = -1;
-    return 0;
+done:
+    sigaction(SIGWINCH, &old_sa, NULL);
+    return ret;
 }
 
 static int print_file(const char *path, FILE *stream) {
@@ -2629,8 +2660,14 @@ static ssize_t pagerReadByteWithTimeout(int fd,
     if (use_session_queue) {
         if (required) {
             for (;;) {
+                if (g_pager_sigwinch_received) {
+                    return -2;
+                }
                 ssize_t n = pagerReadSessionByte(out, false);
                 if (n < 0 && errno == EINTR) {
+                    if (g_pager_sigwinch_received) {
+                        return -2;
+                    }
                     continue;
                 }
                 return n;
@@ -2638,11 +2675,17 @@ static ssize_t pagerReadByteWithTimeout(int fd,
         }
         int waited_ms = 0;
         while (true) {
+            if (g_pager_sigwinch_received) {
+                return -2;
+            }
             ssize_t n = pagerReadSessionByte(out, true);
             if (n == 1) {
                 return 1;
             }
             if (n < 0 && errno == EINTR) {
+                if (g_pager_sigwinch_received) {
+                    return -2;
+                }
                 continue;
             }
             if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -2665,11 +2708,17 @@ static ssize_t pagerReadByteWithTimeout(int fd,
         return -1;
     }
     for (;;) {
+        if (g_pager_sigwinch_received) {
+            return -2;
+        }
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
         int wait_ms = required ? -1 : timeout_ms;
         int poll_rc = poll(&pfd, 1, wait_ms);
         if (poll_rc < 0) {
             if (errno == EINTR) {
+                if (g_pager_sigwinch_received) {
+                    return -2;
+                }
                 continue;
             }
             return -1;
@@ -2682,6 +2731,9 @@ static ssize_t pagerReadByteWithTimeout(int fd,
         }
         ssize_t n = read(fd, out, 1);
         if (n < 0 && errno == EINTR) {
+            if (g_pager_sigwinch_received) {
+                return -2;
+            }
             continue;
         }
         return n;
@@ -2771,6 +2823,10 @@ static int pager_read_key(void) {
     for (;;) {
         unsigned char ch = 0;
         ssize_t n = pagerReadByteWithTimeout(fd, use_session_queue, &ch, true, seq_timeout_ms);
+        if (n == -2) {
+            result = PAGER_KEY_RESIZE;
+            break;
+        }
         if (pagerDebugEnabled()) {
             if (n <= 0) {
                 int err = errno;
