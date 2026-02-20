@@ -311,6 +311,10 @@ DEFINE_SMALLCLUE_WRAPPER("tr", tr)
 DEFINE_SMALLCLUE_WRAPPER("id", id)
 DEFINE_SMALLCLUE_WRAPPER("pbcopy", pbcopy)
 DEFINE_SMALLCLUE_WRAPPER("pbpaste", pbpaste)
+DEFINE_SMALLCLUE_WRAPPER("init", init)
+DEFINE_SMALLCLUE_WRAPPER("runit", runit)
+DEFINE_SMALLCLUE_WRAPPER("mdev", mdev)
+DEFINE_SMALLCLUE_WRAPPER("halt", halt)
 #if SMALLCLUE_HAS_IFADDRS
 DEFINE_SMALLCLUE_WRAPPER("ipaddr", ipaddr)
 #endif
@@ -449,6 +453,12 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("id", vmBuiltinSmallclue_id, "id");
     registerSmallclueBuiltin("pbcopy", vmBuiltinSmallclue_pbcopy, "pbcopy");
     registerSmallclueBuiltin("pbpaste", vmBuiltinSmallclue_pbpaste, "pbpaste");
+    registerSmallclueBuiltin("init", vmBuiltinSmallclue_init, "init");
+    registerSmallclueBuiltin("runit", vmBuiltinSmallclue_runit, "runit");
+    registerSmallclueBuiltin("mdev", vmBuiltinSmallclue_mdev, "mdev");
+    registerSmallclueBuiltin("halt", vmBuiltinSmallclue_halt, "halt");
+    registerSmallclueBuiltin("poweroff", vmBuiltinSmallclue_halt, "poweroff");
+    registerSmallclueBuiltin("reboot", vmBuiltinSmallclue_halt, "reboot");
 #if SMALLCLUE_HAS_IFADDRS
     registerSmallclueBuiltin("ipaddr", vmBuiltinSmallclue_ipaddr, "ipaddr");
 #endif
