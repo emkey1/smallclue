@@ -193,42 +193,80 @@ OPENSSH_DIR="third-party/openssh"
 if [ -d "$OPENSSH_DIR" ]; then
     echo "Configuring OpenSSH..."
     if [ ! -f "$OPENSSH_DIR/Makefile" ]; then
-        (cd "$OPENSSH_DIR" && ./configure)
+        if [ ! -f "$OPENSSH_DIR/configure" ]; then
+            echo "configure script missing. Attempting to generate with autoreconf (this may take a moment)..."
+            if command -v autoreconf >/dev/null 2>&1; then
+                if ! (cd "$OPENSSH_DIR" && autoreconf -i > autoreconf.log 2>&1); then
+                    echo "Error: autoreconf failed."
+                    echo "--- autoreconf output ---"
+                    cat "$OPENSSH_DIR/autoreconf.log"
+                    echo "-------------------------"
+                    echo "Please ensure you have autoconf and automake installed."
+                    exit 1
+                fi
+            else
+                echo "Error: autoreconf not found. Please install autoconf to build OpenSSH."
+                if [ "$(uname -s)" = "Darwin" ]; then
+                    echo "On macOS: brew install autoconf automake"
+                else
+                    echo "On Linux: sudo apt-get install autoconf automake"
+                fi
+                exit 1
+            fi
+        fi
+
+        if [ -f "$OPENSSH_DIR/configure" ]; then
+            (cd "$OPENSSH_DIR" && ./configure)
+        else
+            echo "Error: configure script not found and could not be generated."
+            exit 1
+        fi
     fi
 
     echo "Patching OpenSSH..."
     # Rename usage first
     # scp.c
-    if grep -q "void cleanup_exit" "$OPENSSH_DIR/scp.c"; then
-        sed -i 's/\bcleanup_exit\b/scp_cleanup_exit/g' "$OPENSSH_DIR/scp.c"
+    if grep -q "cleanup_exit" "$OPENSSH_DIR/scp.c"; then
+        sed -i.bak 's/\bcleanup_exit\b/scp_cleanup_exit/g' "$OPENSSH_DIR/scp.c"
+        # Add prototype to avoid implicit declaration warning
+        if ! grep -q "void scp_cleanup_exit(int);" "$OPENSSH_DIR/scp.c"; then
+             sed -i.bak '/#include "includes.h"/a void scp_cleanup_exit(int);' "$OPENSSH_DIR/scp.c"
+        fi
+        rm -f "$OPENSSH_DIR/scp.c.bak"
     fi
     if grep -q "volatile sig_atomic_t interrupted" "$OPENSSH_DIR/scp.c"; then
-        sed -i 's/\binterrupted\b/pscal_openssh_interrupted/g' "$OPENSSH_DIR/scp.c"
+        sed -i.bak 's/\binterrupted\b/pscal_openssh_interrupted/g' "$OPENSSH_DIR/scp.c"
         # Now change definitions to extern
-        sed -i 's/volatile sig_atomic_t pscal_openssh_interrupted = 0;/extern volatile sig_atomic_t pscal_openssh_interrupted;/g' "$OPENSSH_DIR/scp.c"
+        sed -i.bak 's/volatile sig_atomic_t pscal_openssh_interrupted = 0;/extern volatile sig_atomic_t pscal_openssh_interrupted;/g' "$OPENSSH_DIR/scp.c"
+        rm -f "$OPENSSH_DIR/scp.c.bak"
     fi
     if grep -q "int showprogress" "$OPENSSH_DIR/scp.c"; then
-        sed -i 's/\bshowprogress\b/pscal_openssh_showprogress/g' "$OPENSSH_DIR/scp.c"
-        sed -i 's/int pscal_openssh_showprogress = 1;/extern int pscal_openssh_showprogress;/g' "$OPENSSH_DIR/scp.c"
+        sed -i.bak 's/\bshowprogress\b/pscal_openssh_showprogress/g' "$OPENSSH_DIR/scp.c"
+        sed -i.bak 's/int pscal_openssh_showprogress = 1;/extern int pscal_openssh_showprogress;/g' "$OPENSSH_DIR/scp.c"
+        rm -f "$OPENSSH_DIR/scp.c.bak"
     fi
 
     # sftp.c
     if grep -q "volatile sig_atomic_t interrupted" "$OPENSSH_DIR/sftp.c"; then
-        sed -i 's/\binterrupted\b/pscal_openssh_interrupted/g' "$OPENSSH_DIR/sftp.c"
-        sed -i 's/volatile sig_atomic_t pscal_openssh_interrupted = 0;/extern volatile sig_atomic_t pscal_openssh_interrupted;/g' "$OPENSSH_DIR/sftp.c"
+        sed -i.bak 's/\binterrupted\b/pscal_openssh_interrupted/g' "$OPENSSH_DIR/sftp.c"
+        sed -i.bak 's/volatile sig_atomic_t pscal_openssh_interrupted = 0;/extern volatile sig_atomic_t pscal_openssh_interrupted;/g' "$OPENSSH_DIR/sftp.c"
+        rm -f "$OPENSSH_DIR/sftp.c.bak"
     fi
     if grep -q "int showprogress" "$OPENSSH_DIR/sftp.c"; then
-        sed -i 's/\bshowprogress\b/pscal_openssh_showprogress/g' "$OPENSSH_DIR/sftp.c"
-        sed -i 's/int pscal_openssh_showprogress = 1;/extern int pscal_openssh_showprogress;/g' "$OPENSSH_DIR/sftp.c"
+        sed -i.bak 's/\bshowprogress\b/pscal_openssh_showprogress/g' "$OPENSSH_DIR/sftp.c"
+        sed -i.bak 's/int pscal_openssh_showprogress = 1;/extern int pscal_openssh_showprogress;/g' "$OPENSSH_DIR/sftp.c"
+        rm -f "$OPENSSH_DIR/sftp.c.bak"
     fi
 
     # sftp-client.c
     if grep -q "volatile sig_atomic_t interrupted" "$OPENSSH_DIR/sftp-client.c"; then
-        sed -i 's/\binterrupted\b/pscal_openssh_interrupted/g' "$OPENSSH_DIR/sftp-client.c"
+        sed -i.bak 's/\binterrupted\b/pscal_openssh_interrupted/g' "$OPENSSH_DIR/sftp-client.c"
+        rm -f "$OPENSSH_DIR/sftp-client.c.bak"
     fi
     if grep -q "extern int showprogress" "$OPENSSH_DIR/sftp-client.c"; then
-        sed -i 's/\bshowprogress\b/pscal_openssh_showprogress/g' "$OPENSSH_DIR/sftp-client.c"
-        sed -i 's/extern int showprogress;/extern int pscal_openssh_showprogress;/g' "$OPENSSH_DIR/sftp-client.c"
+        sed -i.bak 's/\bshowprogress\b/pscal_openssh_showprogress/g' "$OPENSSH_DIR/sftp-client.c"
+        sed -i.bak 's/extern int showprogress;/extern int pscal_openssh_showprogress;/g' "$OPENSSH_DIR/sftp-client.c"
+        rm -f "$OPENSSH_DIR/sftp-client.c.bak"
     fi
 
     # Force rebuild of patched files
