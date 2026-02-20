@@ -542,6 +542,7 @@ static int smallclueHelpCommand(int argc, char **argv);
 static int smallclueAddTabCommand(int argc, char **argv);
 #endif
 
+
 static int smallclueNslookupCommand(int argc, char **argv) {
     const char *usage = "usage: nslookup [-v] host [port]\n";
     bool verbose = false;
@@ -761,6 +762,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"yes", smallclueYesCommand, "Repeatedly print strings"},
     {"xargs", smallclueXargsCommand, "Build command lines from stdin"},
     {"df", smallclueDfCommand, "Report filesystem usage"},
+
 #if defined(PSCAL_TARGET_IOS)
     {"addt", smallclueAddTabCommand, "Open an additional shell tab"},
     {"tabadd", smallclueAddTabCommand, "Alias for addt: open an additional shell tab"},
@@ -873,13 +875,13 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"ping", "ping HOST [PORT]\n"
              "  TCP ping (default port 80)"},
     {"poweroff", "poweroff [-f]\n"
-                 "  Power off the system"},
+             "  Power off the system"},
     {"ps", "ps\n"
            "  Show simple process list"},
     {"pwd", "pwd\n"
             "  Print working directory"},
     {"reboot", "reboot [-f]\n"
-               "  Reboot the system"},
+             "  Reboot the system"},
     {"resize", "resize [COLUMNS ROWS]\n"
                "  Report or set terminal size"},
     {"rm", "rm [-r] [-f] FILE...\n"
@@ -888,7 +890,7 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"rmdir", "rmdir DIR...\n"
               "  Remove empty directories"},
     {"runit", "runit\n"
-              "  Service supervisor"},
+             "  Service supervisor"},
     {"sed", "sed 's/old/new/g' [FILE...]\n"
             "  Simple substitution support"},
     {"sleep", "sleep SECONDS\n"
@@ -4430,6 +4432,7 @@ static void markdownWriteHeading(FILE *out, const char *text, int level) {
         fputc(underline, out);
     }
     fputc('\n', out);
+
     free(formatted);
 }
 
@@ -13335,10 +13338,16 @@ static int smallcluePbpasteCommand(int argc, char **argv) {
 static int smallclueInitCommand(int argc, char **argv) {
     (void)argc;
     (void)argv;
-    // Basic init implementation:
-    // 1. Block signals
-    // 2. Run /etc/rc if present
-    // 3. Reap zombies loop
+    if (getpid() != 1) {
+        fprintf(stderr, "init: must be run as PID 1\n");
+        return 1;
+    }
+
+    /* Basic init implementation:
+     * 1. Block signals
+     * 2. Run /etc/rc if present
+     * 3. Reap zombies loop
+     */
 
     printf("smallclue init: starting...\n");
 
@@ -13355,7 +13364,7 @@ static int smallclueInitCommand(int argc, char **argv) {
         printf("smallclue init: /etc/rc not found or not executable\n");
     }
 
-    // Ignore signals that might terminate us
+    /* Ignore signals that might terminate us */
     signal(SIGTERM, SIG_IGN);
     signal(SIGINT, SIG_IGN);
     signal(SIGTSTP, SIG_IGN);
@@ -13367,7 +13376,7 @@ static int smallclueInitCommand(int argc, char **argv) {
         pid_t pid = wait(&status);
         if (pid < 0) {
             if (errno == ECHILD) {
-                // No children left, sleep to avoid busy loop
+                /* No children left, sleep to avoid busy loop */
                 sleep(1);
             }
             continue;
@@ -13375,6 +13384,7 @@ static int smallclueInitCommand(int argc, char **argv) {
     }
     return 0;
 }
+
 
 static int smallclueMdevCommand(int argc, char **argv) {
     int scan = 0;
@@ -13407,12 +13417,14 @@ static int smallclueMdevCommand(int argc, char **argv) {
         return 1;
     }
 
+
     return 0;
 }
 
 static int smallclueRunitCommand(int argc, char **argv) {
     (void)argc;
     (void)argv;
+
     // Minimal runit implementation:
     // Scans /etc/service (or arg) and spawns 'run' scripts.
     // Does not implement full supervision (restart, control).
@@ -13488,5 +13500,6 @@ static int smallclueHaltCommand(int argc, char **argv) {
     // For now, just exit.
     exit(0);
 #endif
+
     return 0;
 }
