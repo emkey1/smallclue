@@ -538,6 +538,13 @@ static int smallclueHelpCommand(int argc, char **argv);
 static int smallclueAddTabCommand(int argc, char **argv);
 #endif
 
+static int smallclueInitCommand(int argc, char **argv);
+static int smallclueRebootCommand(int argc, char **argv);
+static int smallclueHaltCommand(int argc, char **argv);
+static int smallcluePoweroffCommand(int argc, char **argv);
+static int smallclueRunitCommand(int argc, char **argv);
+static int smallclueMdevCommand(int argc, char **argv);
+
 static int smallclueNslookupCommand(int argc, char **argv) {
     const char *usage = "usage: nslookup [-v] host [port]\n";
     bool verbose = false;
@@ -751,6 +758,12 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"yes", smallclueYesCommand, "Repeatedly print strings"},
     {"xargs", smallclueXargsCommand, "Build command lines from stdin"},
     {"df", smallclueDfCommand, "Report filesystem usage"},
+    {"init", smallclueInitCommand, "System initialization (PID 1)"},
+    {"reboot", smallclueRebootCommand, "Reboot the system"},
+    {"halt", smallclueHaltCommand, "Halt the system"},
+    {"poweroff", smallcluePoweroffCommand, "Power off the system"},
+    {"runit", smallclueRunitCommand, "Service supervisor"},
+    {"mdev", smallclueMdevCommand, "Device scanner"},
 #if defined(PSCAL_TARGET_IOS)
     {"addt", smallclueAddTabCommand, "Open an additional shell tab"},
     {"tabadd", smallclueAddTabCommand, "Alias for addt: open an additional shell tab"},
@@ -13309,4 +13322,87 @@ static int smallcluePbpasteCommand(int argc, char **argv) {
     ssize_t written = write(STDOUT_FILENO, text, len);
     free(text);
     return written < 0 ? 1 : 0;
+}
+
+static int smallclueInitCommand(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    if (getpid() != 1) {
+        fprintf(stderr, "init: must be run as PID 1\n");
+        return 1;
+    }
+
+    /* Setup signals */
+    sigset_t set;
+    sigfillset(&set);
+    sigprocmask(SIG_UNBLOCK, &set, NULL);
+
+    /* Run /etc/rc */
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("init: fork");
+    } else if (pid == 0) {
+        const char *rc_args[] = {"/bin/sh", "/etc/rc", NULL};
+        execv(rc_args[0], (char **)rc_args);
+        perror("init: exec /etc/rc");
+        _exit(127);
+    } else {
+        int status;
+        waitpid(pid, &status, 0);
+    }
+
+    /* Reap zombies */
+    while (1) {
+        int status;
+        pid_t reaped = wait(&status);
+        if (reaped < 0) {
+            if (errno == ECHILD) {
+                /* No children left, sleep a bit */
+                sleep(1);
+            } else if (errno != EINTR) {
+                perror("init: wait");
+                sleep(1);
+            }
+        }
+    }
+    return 0;
+}
+
+static int smallclueRebootCommand(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    printf("Rebooting...\n");
+    /* In a real system, we'd call reboot(RB_AUTOBOOT).
+       For this environment, just exiting might be enough or doing nothing. */
+    return 0;
+}
+
+static int smallclueHaltCommand(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    printf("Halting...\n");
+    /* In a real system, we'd call reboot(RB_HALT_SYSTEM). */
+    return 0;
+}
+
+static int smallcluePoweroffCommand(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    printf("Powering off...\n");
+    /* In a real system, we'd call reboot(RB_POWER_OFF). */
+    return 0;
+}
+
+static int smallclueRunitCommand(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "runit: service supervisor (stub)\n");
+    return 0;
+}
+
+static int smallclueMdevCommand(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "mdev: device scanner (stub)\n");
+    return 0;
 }

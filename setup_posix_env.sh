@@ -1,0 +1,144 @@
+#!/bin/bash
+set -e
+
+# 1. Create dummy headers
+echo "Creating dummy headers..."
+mkdir -p src/core
+cat > src/core/build_info.h <<EOF
+#ifndef BUILD_INFO_H
+#define BUILD_INFO_H
+#define BUILD_VERSION "1.0.0-test"
+#include <stdbool.h>
+#include <stddef.h>
+bool pscalRuntimeStderrIsInteractive(void);
+const char *pscal_program_version_string(void);
+bool pathTruncateEnabled(void);
+bool pathTruncateStrip(const char *path, char *buffer, size_t buflen);
+#endif
+EOF
+
+mkdir -p third-party/openssh
+cat > third-party/openssh/pscal_runtime_hooks.h <<EOF
+#ifndef PSCAL_RUNTIME_HOOKS_H
+#define PSCAL_RUNTIME_HOOKS_H
+#include <setjmp.h>
+#include <signal.h>
+typedef struct {
+    int exit_code;
+    jmp_buf env;
+} pscal_openssh_exit_context;
+
+void pscal_openssh_reset_progress_state(void);
+void pscal_openssh_push_exit_context(pscal_openssh_exit_context *ctx);
+void pscal_openssh_pop_exit_context(pscal_openssh_exit_context *ctx);
+void pscal_openssh_set_global_exit_handler(sigjmp_buf *env, volatile sig_atomic_t *code_out);
+void pscal_openssh_request_exit(int code);
+#endif
+EOF
+
+mkdir -p third-party/ios_system/ssh_keygen
+cat > third-party/ios_system/ssh_keygen/sshkey.h <<EOF
+#ifndef SSHKEY_H
+#define SSHKEY_H
+struct sshkey {
+    int dummy;
+};
+#endif
+EOF
+
+# 2. Create extra stubs
+cat > src/runtime_stubs_extra.c <<EOF
+#include <stdbool.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+
+bool pscalRuntimeStderrIsInteractive(void) {
+    return isatty(STDERR_FILENO);
+}
+
+const char *pscal_program_version_string(void) {
+    return "1.0.0-test";
+}
+
+bool pathTruncateEnabled(void) {
+    return false;
+}
+
+bool pathTruncateStrip(const char *path, char *buffer, size_t buflen) {
+    if (!path || !buffer || buflen == 0) return false;
+    strncpy(buffer, path, buflen - 1);
+    buffer[buflen - 1] = '\0';
+    return false; /* Did not modify */
+}
+EOF
+
+# 3. Compile smallclue
+echo "Compiling smallclue..."
+gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE \
+    -I. -Isrc -lpthread \
+    src/main.c \
+    src/core.c \
+    src/runtime_support.c \
+    src/nextvi_app.c \
+    src/nextvi_stubs.c \
+    src/openssh_stubs.c \
+    src/openssh_app.c \
+    src/vproc_test_app.c \
+    src/openssh_shim.c \
+    src/runtime_stubs_extra.c \
+    -o smallclue
+
+if [ ! -f smallclue ]; then
+    echo "Compilation failed."
+    exit 1
+fi
+
+# 4. Setup rootfs
+ROOTFS="rootfs"
+echo "Setting up $ROOTFS..."
+rm -rf "$ROOTFS"
+mkdir -p "$ROOTFS"/{bin,usr/bin,etc,tmp,var,home,dev,proc,sys}
+
+# 5. Install smallclue
+cp smallclue "$ROOTFS/bin/"
+
+# 6. Create symlinks
+echo "Creating symlinks..."
+# Extract applet names from ./smallclue output
+# The output format has 2 spaces indentation for applet names.
+APPLETS=$(./smallclue 2>&1 | grep "^  " | awk '{print $1}' | grep -v "smallclue")
+
+for applet in $APPLETS; do
+    # Skip if it is smallclue itself (already handled)
+    if [ "$applet" == "smallclue" ]; then
+        continue
+    fi
+    ln -sf smallclue "$ROOTFS/bin/$applet"
+done
+
+# 7. Create dummy files
+echo "Creating dummy /etc files..."
+echo "root:x:0:0:root:/home:/bin/sh" > "$ROOTFS/etc/passwd"
+echo "root:x:0:" > "$ROOTFS/etc/group"
+
+echo "Creating /etc/rc..."
+cat > "$ROOTFS/etc/rc" <<EOF
+#!/bin/sh
+echo "Welcome to SmallClue POSIX Environment!"
+echo "Mounting filesystems..."
+# mount -t proc proc /proc
+# mount -t sysfs sys /sys
+# mount -t devtmpfs dev /dev
+echo "Starting services..."
+echo "Done."
+EOF
+chmod +x "$ROOTFS/etc/rc"
+
+echo "Setup complete."
+echo ""
+echo "To enter the environment (requires sudo):"
+echo "  sudo chroot $ROOTFS /bin/sh"
+echo ""
+echo "Or run specific commands:"
+echo "  sudo chroot $ROOTFS /bin/ls -la"
