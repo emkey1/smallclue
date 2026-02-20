@@ -521,6 +521,7 @@ static int smallclueMarkdownCommand(int argc, char **argv);
 static int smallclueCurlCommand(int argc, char **argv);
 static int smallclueWgetCommand(int argc, char **argv);
 static int smallclueHttpFetch(const char *cmd_name, const char *url, const char *destinationPath);
+static int smallclueHttpFetchToMemory(const char *cmd_name, const char *url, char **data_out, size_t *len_out);
 static int smallclueTelnetCommand(int argc, char **argv);
 static int smallclueTracerouteCommand(int argc, char **argv);
 static int smallclueNslookupCommand(int argc, char **argv);
@@ -4555,6 +4556,36 @@ static bool markdownHtmlDecodeEntity(const char *html, size_t *index, char *deco
         *index += 6;
         return true;
     }
+    if (strncmp(p, "&copy;", 6) == 0) {
+        *decoded = 'c';
+        *index += 6;
+        return true;
+    }
+    if (strncmp(p, "&raquo;", 7) == 0 || strncmp(p, "&raquo", 6) == 0) {
+        *decoded = '>';
+        *index += (p[6] == ';') ? 7 : 6;
+        return true;
+    }
+    if (strncmp(p, "&laquo;", 7) == 0 || strncmp(p, "&laquo", 6) == 0) {
+        *decoded = '<';
+        *index += (p[6] == ';') ? 7 : 6;
+        return true;
+    }
+    if (strncmp(p, "&middot;", 8) == 0) {
+        *decoded = '.';
+        *index += 8;
+        return true;
+    }
+    if (strncmp(p, "&bull;", 6) == 0) {
+        *decoded = '*';
+        *index += 6;
+        return true;
+    }
+    if (strncmp(p, "&ndash;", 7) == 0 || strncmp(p, "&mdash;", 7) == 0) {
+        *decoded = '-';
+        *index += 7;
+        return true;
+    }
     if (p[1] == '#') {
         size_t j = 2;
         int base = 10;
@@ -4708,11 +4739,57 @@ static bool markdownIsLikelyHtmlDocument(const char *content) {
     return false;
 }
 
+static const char *markdownFindIgnoreCase(const char *text, const char *needle) {
+    if (!text || !needle || !*needle) {
+        return text;
+    }
+    size_t needle_len = strlen(needle);
+    for (const char *p = text; *p; ++p) {
+        if (strncasecmp(p, needle, needle_len) == 0) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+static const char *markdownFindIgnoreCaseBounded(const char *text, const char *limit, const char *needle) {
+    if (!text || !limit || !needle || !*needle || text >= limit) {
+        return NULL;
+    }
+    size_t needle_len = strlen(needle);
+    if (needle_len == 0) {
+        return text;
+    }
+    for (const char *p = text; p < limit; ++p) {
+        size_t remaining = (size_t)(limit - p);
+        if (remaining < needle_len) {
+            break;
+        }
+        if (strncasecmp(p, needle, needle_len) == 0) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
 static char *markdownConvertHtmlToMarkdownish(const char *html) {
     if (!html) {
         return strdup("");
     }
     size_t len = strlen(html);
+    size_t start_index = 0;
+    size_t stop_index = len;
+    const char *body_tag = markdownFindIgnoreCase(html, "<body");
+    if (body_tag) {
+        const char *body_open = strchr(body_tag, '>');
+        if (body_open && body_open[1] != '\0') {
+            start_index = (size_t)((body_open + 1) - html);
+            const char *body_close = markdownFindIgnoreCase(body_open + 1, "</body");
+            if (body_close && body_close > body_open) {
+                stop_index = (size_t)(body_close - html);
+            }
+        }
+    }
     size_t cap = len * 2 + 256;
     char *out = (char *)malloc(cap);
     if (!out) {
@@ -4724,18 +4801,64 @@ static char *markdownConvertHtmlToMarkdownish(const char *html) {
     bool in_script = false;
     bool in_style = false;
     bool in_noscript = false;
+    bool in_template = false;
+    bool in_svg = false;
+    bool in_iframe = false;
+    bool in_canvas = false;
+    bool in_object = false;
+    bool in_embed = false;
     bool anchor_active = false;
     bool anchor_suppress_text = false;
     char anchor_href[2048];
     anchor_href[0] = '\0';
 
-    for (size_t i = 0; html[i]; ) {
+    for (size_t i = start_index; i < stop_index && html[i]; ) {
+        if (in_script || in_style || in_noscript || in_template ||
+            in_svg || in_iframe || in_canvas || in_object || in_embed) {
+            const char *tag_name = NULL;
+            if (in_script) tag_name = "script";
+            else if (in_style) tag_name = "style";
+            else if (in_noscript) tag_name = "noscript";
+            else if (in_template) tag_name = "template";
+            else if (in_svg) tag_name = "svg";
+            else if (in_iframe) tag_name = "iframe";
+            else if (in_canvas) tag_name = "canvas";
+            else if (in_object) tag_name = "object";
+            else if (in_embed) tag_name = "embed";
+
+            char close_needle[64];
+            snprintf(close_needle, sizeof(close_needle), "</%s", tag_name ? tag_name : "");
+            const char *close_tag = markdownFindIgnoreCaseBounded(html + i,
+                                                                  html + stop_index,
+                                                                  close_needle);
+            if (!close_tag) {
+                break;
+            }
+            const char *close_gt = close_tag;
+            while (close_gt < html + stop_index && *close_gt && *close_gt != '>') {
+                close_gt++;
+            }
+            if (close_gt >= html + stop_index || !*close_gt) {
+                break;
+            }
+            i = (size_t)(close_gt - html) + 1;
+            in_script = false;
+            in_style = false;
+            in_noscript = false;
+            in_template = false;
+            in_svg = false;
+            in_iframe = false;
+            in_canvas = false;
+            in_object = false;
+            in_embed = false;
+            continue;
+        }
         if (html[i] == '<') {
             size_t close = i + 1;
-            while (html[close] && html[close] != '>') {
+            while (close < stop_index && html[close] && html[close] != '>') {
                 close++;
             }
-            if (!html[close]) {
+            if (close >= stop_index || !html[close]) {
                 break;
             }
             size_t raw_len = close - (i + 1);
@@ -4746,7 +4869,7 @@ static char *markdownConvertHtmlToMarkdownish(const char *html) {
 
             if (strncmp(raw_tag, "!--", 3) == 0) {
                 const char *comment_end = strstr(html + i + 4, "-->");
-                if (comment_end) {
+                if (comment_end && (size_t)(comment_end - html) < stop_index) {
                     i = (size_t)(comment_end - html) + 3;
                 } else {
                     i = close + 1;
@@ -4763,28 +4886,6 @@ static char *markdownConvertHtmlToMarkdownish(const char *html) {
                 continue;
             }
 
-            if (in_script) {
-                if (closing && strcmp(tag_name, "script") == 0) {
-                    in_script = false;
-                }
-                i = close + 1;
-                continue;
-            }
-            if (in_style) {
-                if (closing && strcmp(tag_name, "style") == 0) {
-                    in_style = false;
-                }
-                i = close + 1;
-                continue;
-            }
-            if (in_noscript) {
-                if (closing && strcmp(tag_name, "noscript") == 0) {
-                    in_noscript = false;
-                }
-                i = close + 1;
-                continue;
-            }
-
             if (!closing && strcmp(tag_name, "script") == 0) {
                 in_script = true;
                 i = close + 1;
@@ -4797,6 +4898,36 @@ static char *markdownConvertHtmlToMarkdownish(const char *html) {
             }
             if (!closing && strcmp(tag_name, "noscript") == 0) {
                 in_noscript = true;
+                i = close + 1;
+                continue;
+            }
+            if (!closing && strcmp(tag_name, "template") == 0) {
+                in_template = true;
+                i = close + 1;
+                continue;
+            }
+            if (!closing && strcmp(tag_name, "svg") == 0) {
+                in_svg = true;
+                i = close + 1;
+                continue;
+            }
+            if (!closing && strcmp(tag_name, "iframe") == 0) {
+                in_iframe = true;
+                i = close + 1;
+                continue;
+            }
+            if (!closing && strcmp(tag_name, "canvas") == 0) {
+                in_canvas = true;
+                i = close + 1;
+                continue;
+            }
+            if (!closing && strcmp(tag_name, "object") == 0) {
+                in_object = true;
+                i = close + 1;
+                continue;
+            }
+            if (!closing && strcmp(tag_name, "embed") == 0) {
+                in_embed = true;
                 i = close + 1;
                 continue;
             }
@@ -5993,34 +6124,26 @@ static MarkdownInputMode markdownInputModeForFilePath(const char *path) {
     return markdownHasHtmlExtension(path) ? MARKDOWN_INPUT_MODE_HTML : MARKDOWN_INPUT_MODE_MARKDOWN;
 }
 
-static int smallclueMarkdownDisplayStreamEx(const char *label,
-                                            FILE *input,
-                                            MarkdownInputMode input_mode,
-                                            MarkdownLinkList *links_out,
-                                            int *exit_key_out,
-                                            int *selected_link_index_out) {
+static int smallclueMarkdownDisplayDataEx(const char *label,
+                                          const char *raw_data,
+                                          MarkdownInputMode input_mode,
+                                          MarkdownLinkList *links_out,
+                                          int *exit_key_out,
+                                          int *selected_link_index_out) {
     if (exit_key_out) {
         *exit_key_out = 'q';
     }
     if (selected_link_index_out) {
         *selected_link_index_out = -1;
     }
-    if (!input) {
-        return 1;
-    }
 
-    char *raw_data = NULL;
-    size_t raw_len = 0;
-    if (markdownReadAll(input, &raw_data, &raw_len) != 0) {
-        return 1;
-    }
-
-    char *render_source = raw_data;
+    const char *source_data = raw_data ? raw_data : "";
     char *converted_html = NULL;
+    const char *render_source = source_data;
     bool convert_html = (input_mode == MARKDOWN_INPUT_MODE_HTML) ||
-                        (input_mode == MARKDOWN_INPUT_MODE_AUTO && markdownIsLikelyHtmlDocument(raw_data));
+                        (input_mode == MARKDOWN_INPUT_MODE_AUTO && markdownIsLikelyHtmlDocument(source_data));
     if (convert_html) {
-        converted_html = markdownConvertHtmlToMarkdownish(raw_data);
+        converted_html = markdownConvertHtmlToMarkdownish(source_data);
         if (converted_html) {
             render_source = converted_html;
         }
@@ -6029,15 +6152,13 @@ static int smallclueMarkdownDisplayStreamEx(const char *label,
     FILE *source = tmpfile();
     if (!source) {
         free(converted_html);
-        free(raw_data);
         return 1;
     }
-    if (render_source && *render_source) {
+    if (*render_source) {
         size_t source_len = strlen(render_source);
         if (fwrite(render_source, 1, source_len, source) != source_len) {
             fclose(source);
             free(converted_html);
-            free(raw_data);
             return 1;
         }
     }
@@ -6057,7 +6178,6 @@ static int smallclueMarkdownDisplayStreamEx(const char *label,
     gMarkdownActiveLinks = previous_links;
     fclose(source);
     free(converted_html);
-    free(raw_data);
 
     if (render_status != 0) {
         if (!direct) {
@@ -6088,6 +6208,38 @@ static int smallclueMarkdownDisplayStreamEx(const char *label,
     return status;
 }
 
+static int smallclueMarkdownDisplayStreamEx(const char *label,
+                                            FILE *input,
+                                            MarkdownInputMode input_mode,
+                                            MarkdownLinkList *links_out,
+                                            int *exit_key_out,
+                                            int *selected_link_index_out) {
+    if (exit_key_out) {
+        *exit_key_out = 'q';
+    }
+    if (selected_link_index_out) {
+        *selected_link_index_out = -1;
+    }
+    if (!input) {
+        return 1;
+    }
+
+    char *raw_data = NULL;
+    size_t raw_len = 0;
+    if (markdownReadAll(input, &raw_data, &raw_len) != 0) {
+        return 1;
+    }
+    (void)raw_len;
+    int status = smallclueMarkdownDisplayDataEx(label,
+                                                raw_data,
+                                                input_mode,
+                                                links_out,
+                                                exit_key_out,
+                                                selected_link_index_out);
+    free(raw_data);
+    return status;
+}
+
 static bool markdownIsRemoteTarget(const char *target) {
     if (!target) {
         return false;
@@ -6104,28 +6256,22 @@ static bool markdownLooksLikeUrl(const char *value) {
            strncasecmp(value, "mailto:", 7) == 0;
 }
 
-static int markdownFetchUrlToTemp(const char *url, char *path_out, size_t path_out_size) {
-    if (!url || !path_out || path_out_size == 0) {
+static int markdownFetchUrlToMemory(const char *url, char **data_out, size_t *len_out) {
+    if (!url || !data_out || !len_out) {
         errno = EINVAL;
         return -1;
     }
-    const char *tmp_root = getenv("TMPDIR");
-    if (!tmp_root || !*tmp_root) {
-        tmp_root = "/tmp";
-    }
-    char tmpl[PATH_MAX];
-    snprintf(tmpl, sizeof(tmpl), "%s/md-fetch-XXXXXX", tmp_root);
-    int fd = mkstemp(tmpl);
-    if (fd < 0) {
+    *data_out = NULL;
+    *len_out = 0;
+    if (smallclueHttpFetchToMemory("md", url, data_out, len_out) != 0) {
+        if (*data_out) {
+            free(*data_out);
+            *data_out = NULL;
+        }
+        *len_out = 0;
+        errno = EIO;
         return -1;
     }
-    close(fd);
-    if (smallclueHttpFetch("md", url, tmpl) != 0) {
-        unlink(tmpl);
-        return -1;
-    }
-    strncpy(path_out, tmpl, path_out_size - 1);
-    path_out[path_out_size - 1] = '\0';
     return 0;
 }
 
@@ -6362,24 +6508,19 @@ static int smallclueMarkdownBrowseTarget(const char *initial_target) {
         int status = 0;
 
         if (markdownIsRemoteTarget(current)) {
-            char fetched_path[PATH_MAX];
-            if (markdownFetchUrlToTemp(current, fetched_path, sizeof(fetched_path)) != 0) {
+            char *remote_data = NULL;
+            size_t remote_len = 0;
+            if (markdownFetchUrlToMemory(current, &remote_data, &remote_len) != 0) {
                 status = 1;
             } else {
-                FILE *fp = fopen(fetched_path, "r");
-                if (!fp) {
-                    fprintf(stderr, "md: %s: %s\n", fetched_path, strerror(errno));
-                    status = 1;
-                } else {
-                    status = smallclueMarkdownDisplayStreamEx(current,
-                                                              fp,
-                                                              MARKDOWN_INPUT_MODE_AUTO,
-                                                              &links,
-                                                              &exit_key,
-                                                              &selected_link_index);
-                    fclose(fp);
-                }
-                unlink(fetched_path);
+                (void)remote_len;
+                status = smallclueMarkdownDisplayDataEx(current,
+                                                        remote_data,
+                                                        MARKDOWN_INPUT_MODE_AUTO,
+                                                        &links,
+                                                        &exit_key,
+                                                        &selected_link_index);
+                free(remote_data);
             }
         } else {
             char resolved[PATH_MAX];
@@ -6768,6 +6909,25 @@ static int markdownInteractiveSelectDocument(void) {
 }
 
 #if defined(PSCAL_HAS_LIBCURL)
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} SmallclueCurlMemory;
+
+static void smallclueCurlApplyCommonOptions(CURL *curl, const char *url) {
+    if (!curl) {
+        return;
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "smallclue-http/1.0");
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+}
+
 static size_t smallclueCurlWriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     FILE *dest = (FILE *)userp;
     size_t bytes = size * nmemb;
@@ -6775,6 +6935,34 @@ static size_t smallclueCurlWriteCallback(void *contents, size_t size, size_t nme
     if (fwrite(contents, 1, bytes, dest) != bytes) {
         return 0;
     }
+    return bytes;
+}
+
+static size_t smallclueCurlWriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
+    SmallclueCurlMemory *buffer = (SmallclueCurlMemory *)userp;
+    size_t bytes = size * nmemb;
+    if (!buffer || bytes == 0) {
+        return bytes;
+    }
+    size_t needed = buffer->len + bytes + 1;
+    if (needed > buffer->cap) {
+        size_t new_cap = (buffer->cap == 0) ? 16384 : buffer->cap;
+        while (new_cap < needed) {
+            if (new_cap > SIZE_MAX / 2) {
+                return 0;
+            }
+            new_cap *= 2;
+        }
+        char *resized = (char *)realloc(buffer->data, new_cap);
+        if (!resized) {
+            return 0;
+        }
+        buffer->data = resized;
+        buffer->cap = new_cap;
+    }
+    memcpy(buffer->data + buffer->len, contents, bytes);
+    buffer->len += bytes;
+    buffer->data[buffer->len] = '\0';
     return bytes;
 }
 #endif
@@ -6838,9 +7026,7 @@ static int smallclueHttpFetch(const char *cmd_name, const char *url, const char 
         }
         close_dest = true;
     }
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "smallclue-http/1.0");
+    smallclueCurlApplyCommonOptions(curl, url);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, smallclueCurlWriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, dest);
     CURLcode res = curl_easy_perform(curl);
@@ -6854,6 +7040,61 @@ static int smallclueHttpFetch(const char *cmd_name, const char *url, const char 
         curl_easy_cleanup(curl);
         return 1;
     }
+    curl_easy_cleanup(curl);
+    return 0;
+#endif
+}
+
+static int smallclueHttpFetchToMemory(const char *cmd_name, const char *url, char **data_out, size_t *len_out) {
+#if !defined(PSCAL_HAS_LIBCURL)
+    (void)data_out;
+    (void)len_out;
+    fprintf(stderr, "%s: networking support is unavailable in this build.\n", cmd_name ? cmd_name : "curl");
+    return 1;
+#else
+    if (!data_out || !len_out) {
+        return 1;
+    }
+    *data_out = NULL;
+    *len_out = 0;
+    if (!url || !*url) {
+        fprintf(stderr, "%s: missing URL\n", cmd_name ? cmd_name : "curl");
+        return 1;
+    }
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        fprintf(stderr, "%s: failed to initialise libcurl\n", cmd_name ? cmd_name : "curl");
+        return 1;
+    }
+    SmallclueCurlMemory buffer = {0};
+    smallclueCurlApplyCommonOptions(curl, url);
+    bool is_md_fetch = (cmd_name && strcmp(cmd_name, "md") == 0);
+    if (is_md_fetch) {
+        /* Keep md browsing responsive on problematic endpoints. */
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 25L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 64L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 10L);
+    }
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, smallclueCurlWriteMemoryCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        fprintf(stderr, "%s: %s: %s\n", cmd_name ? cmd_name : "curl", url, curl_easy_strerror(res));
+        curl_easy_cleanup(curl);
+        free(buffer.data);
+        return 1;
+    }
+    if (!buffer.data) {
+        buffer.data = strdup("");
+        if (!buffer.data) {
+            curl_easy_cleanup(curl);
+            return 1;
+        }
+        buffer.len = 0;
+    }
+    *data_out = buffer.data;
+    *len_out = buffer.len;
     curl_easy_cleanup(curl);
     return 0;
 #endif
