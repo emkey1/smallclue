@@ -120,6 +120,17 @@ __attribute__((weak)) bool pathTruncateExpand(const char *path, char *buffer, si
     return true;
 }
 
+__attribute__((weak)) bool pathTruncateEnabled(void) {
+    return false;
+}
+
+__attribute__((weak)) bool pathTruncateStrip(const char *path, char *buffer, size_t buflen) {
+    if (!path || !buffer || buflen == 0) return false;
+    strncpy(buffer, path, buflen - 1);
+    buffer[buflen - 1] = '\0';
+    return false; /* Did not modify */
+}
+
 __attribute__((weak)) void pscalHostsSetLogEnabled(int enabled) {
     (void)enabled;
 }
