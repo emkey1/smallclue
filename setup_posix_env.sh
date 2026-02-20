@@ -292,6 +292,38 @@ mkdir -p "$ROOTFS"/{bin,usr/bin,etc,tmp,var,home/username,dev,proc,sys,root}
 chown -R 1000:1000 "$ROOTFS/home/username"
 chmod 1777 "$ROOTFS/tmp"
 
+# 4.5 Populate /dev
+echo "Populating /dev..."
+if [ "$(uname -s)" = "Linux" ]; then
+    # Standard Linux device nodes
+    # Some container environments or distros might restrict mknod, but for chroot it's standard.
+    if ! mknod -m 666 "$ROOTFS/dev/null" c 1 3 2>/dev/null; then
+        # Fallback if mknod fails (e.g. unprivileged container) - try bind mount if possible or warn
+        echo "Warning: mknod failed. You might need to bind mount /dev manually."
+    else
+        mknod -m 666 "$ROOTFS/dev/zero" c 1 5
+        mknod -m 666 "$ROOTFS/dev/random" c 1 8
+        mknod -m 666 "$ROOTFS/dev/urandom" c 1 9
+        mknod -m 666 "$ROOTFS/dev/tty" c 5 0
+        mknod -m 622 "$ROOTFS/dev/console" c 5 1
+        mknod -m 666 "$ROOTFS/dev/ptmx" c 5 2
+    fi
+    mkdir -p "$ROOTFS/dev/shm"
+    mkdir -p "$ROOTFS/dev/pts"
+elif [ "$(uname -s)" = "Darwin" ]; then
+    # macOS device nodes (Major/Minor may vary by OS version, these are common for recent macOS)
+    # /dev/null
+    mknod -m 666 "$ROOTFS/dev/null" c 3 2 || echo "Failed to create /dev/null"
+    # /dev/zero
+    mknod -m 666 "$ROOTFS/dev/zero" c 3 3 || echo "Failed to create /dev/zero"
+    # /dev/tty
+    mknod -m 666 "$ROOTFS/dev/tty" c 2 0 || echo "Failed to create /dev/tty"
+    # /dev/random
+    mknod -m 666 "$ROOTFS/dev/random" c 14 0 || echo "Failed to create /dev/random"
+    # /dev/urandom
+    mknod -m 666 "$ROOTFS/dev/urandom" c 14 1 || echo "Failed to create /dev/urandom"
+fi
+
 # 5. Install smallclue
 cp smallclue "$ROOTFS/bin/"
 if [ "$(uname -s)" = "Darwin" ] && [ -n "${SMALLCLUE_CODESIGN_IDENTITY:-}" ]; then
