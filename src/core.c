@@ -4408,7 +4408,6 @@ static void markdownWriteHeading(FILE *out, const char *text, int level) {
         fputc(underline, out);
     }
     fputc('\n', out);
-    fputc('\n', out);
     free(formatted);
 }
 
