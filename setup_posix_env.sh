@@ -50,10 +50,13 @@ EOF
 
 # 2. Create extra stubs
 cat > src/runtime_stubs_extra.c <<EOF
+#include "smallclue.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdlib.h>
+#include <errno.h>
 
 bool pscalRuntimeStderrIsInteractive(void) {
     return isatty(STDERR_FILENO);
@@ -75,7 +78,58 @@ bool pathTruncateStrip(const char *path, char *buffer, size_t buflen) {
 }
 
 int exsh_main(int argc, char **argv) {
-    printf("exsh: shell stub\n");
+    printf("SmallClue Shell (minimal)\n");
+    char line[1024];
+    while (1) {
+        char cwd[1024];
+        if (getcwd(cwd, sizeof(cwd))) {
+            printf("%s %% ", cwd);
+        } else {
+            printf("? %% ");
+        }
+        fflush(stdout);
+
+        if (!fgets(line, sizeof(line), stdin)) {
+            break;
+        }
+
+        size_t len = strlen(line);
+        if (len > 0 && line[len-1] == '\n') {
+            line[len-1] = '\0';
+            len--;
+        }
+        if (len == 0) continue;
+
+        char *args[64];
+        int nargs = 0;
+        char *token = strtok(line, " \t");
+        while (token && nargs < 63) {
+            args[nargs++] = token;
+            token = strtok(NULL, " \t");
+        }
+        args[nargs] = NULL;
+
+        if (nargs == 0) continue;
+
+        if (strcmp(args[0], "exit") == 0) {
+            break;
+        }
+        if (strcmp(args[0], "cd") == 0) {
+            const char *target = (nargs > 1) ? args[1] : getenv("HOME");
+            if (!target) target = "/";
+            if (chdir(target) != 0) {
+                perror("cd");
+            }
+            continue;
+        }
+
+        const SmallclueApplet *applet = smallclueFindApplet(args[0]);
+        if (applet) {
+            smallclueDispatchApplet(applet, nargs, args);
+        } else {
+            printf("%s: command not found\n", args[0]);
+        }
+    }
     return 0;
 }
 EOF
@@ -170,6 +224,19 @@ echo "Done."
 EOF
 chmod +x "$ROOTFS/etc/rc"
 
+echo "Creating enter_chroot.sh..."
+cat > enter_chroot.sh <<EOF
+#!/bin/sh
+# Check for root privileges
+if [ "\$(id -u)" -ne 0 ]; then
+    echo "Please run as root (use sudo)."
+    exit 1
+fi
+# Execute chroot with explicit shell to override user's SHELL env var
+exec chroot $ROOTFS /bin/sh -l
+EOF
+chmod +x enter_chroot.sh
+
 echo "Setup complete."
 echo ""
 if [ "$(uname -s)" = "Darwin" ]; then
@@ -182,7 +249,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
     echo "  For a true chroot-style environment, use Linux."
 else
     echo "To enter the environment (requires sudo):"
-    echo "  sudo chroot $ROOTFS /bin/sh"
+    echo "  ./enter_chroot.sh"
     echo ""
     echo "Or run specific commands:"
     echo "  sudo chroot $ROOTFS /bin/ls -la"
