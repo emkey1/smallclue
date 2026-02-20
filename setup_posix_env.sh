@@ -75,7 +75,13 @@ EOF
 
 # 3. Compile smallclue
 echo "Compiling smallclue..."
-gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE \
+EXTRA_C_DEFS=""
+if [ "$(uname -s)" = "Darwin" ]; then
+    # Keep BSD typedefs (u_int/u_char/u_short) visible in macOS SDK networking headers.
+    EXTRA_C_DEFS="-D_DARWIN_C_SOURCE"
+fi
+
+gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${EXTRA_C_DEFS} \
     -I. -Isrc -lpthread \
     src/main.c \
     src/core.c \
@@ -94,6 +100,11 @@ if [ ! -f smallclue ]; then
     exit 1
 fi
 
+if [ "$(uname -s)" = "Darwin" ] && [ -n "${SMALLCLUE_CODESIGN_IDENTITY:-}" ]; then
+    echo "Signing smallclue with identity: ${SMALLCLUE_CODESIGN_IDENTITY}"
+    codesign --force --timestamp=none --sign "${SMALLCLUE_CODESIGN_IDENTITY}" smallclue
+fi
+
 # 4. Setup rootfs
 ROOTFS="rootfs"
 echo "Setting up $ROOTFS..."
@@ -102,6 +113,9 @@ mkdir -p "$ROOTFS"/{bin,usr/bin,etc,tmp,var,home,dev,proc,sys}
 
 # 5. Install smallclue
 cp smallclue "$ROOTFS/bin/"
+if [ "$(uname -s)" = "Darwin" ] && [ -n "${SMALLCLUE_CODESIGN_IDENTITY:-}" ]; then
+    codesign --force --timestamp=none --sign "${SMALLCLUE_CODESIGN_IDENTITY}" "$ROOTFS/bin/smallclue"
+fi
 
 # 6. Create symlinks
 echo "Creating symlinks..."
@@ -137,8 +151,18 @@ chmod +x "$ROOTFS/etc/rc"
 
 echo "Setup complete."
 echo ""
-echo "To enter the environment (requires sudo):"
-echo "  sudo chroot $ROOTFS /bin/sh"
-echo ""
-echo "Or run specific commands:"
-echo "  sudo chroot $ROOTFS /bin/ls -la"
+if [ "$(uname -s)" = "Darwin" ]; then
+    echo "macOS note:"
+    echo "  chroot may SIGKILL unsigned binaries (AMFI/AppleSystemPolicy)."
+    echo "  If chroot is killed, sign with a real cert and rerun:"
+    echo "    SMALLCLUE_CODESIGN_IDENTITY=\"Apple Development: Your Name (TEAMID)\" ./setup_posix_env.sh"
+    echo "  Otherwise run applets directly without chroot:"
+    echo "    ./smallclue ls -la"
+    echo "  For a true chroot-style environment, use Linux."
+else
+    echo "To enter the environment (requires sudo):"
+    echo "  sudo chroot $ROOTFS /bin/sh"
+    echo ""
+    echo "Or run specific commands:"
+    echo "  sudo chroot $ROOTFS /bin/ls -la"
+fi
