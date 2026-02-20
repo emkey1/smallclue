@@ -83,9 +83,13 @@ EOF
 # 3. Compile smallclue
 echo "Compiling smallclue..."
 EXTRA_C_DEFS=""
+EXTRA_LD_FLAGS=""
 if [ "$(uname -s)" = "Darwin" ]; then
     # Keep BSD typedefs (u_int/u_char/u_short) visible in macOS SDK networking headers.
     EXTRA_C_DEFS="-D_DARWIN_C_SOURCE"
+fi
+if [ "$(uname -s)" = "Linux" ]; then
+    EXTRA_LD_FLAGS="-static"
 fi
 
 NEXTVI_SRC="src/nextvi_stubs.c"
@@ -99,7 +103,7 @@ OPENSSH_SRC="src/openssh_stubs.c"
 # For now, we default to stubs unless explicitly overridden.
 
 gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -DSMALLCLUE_WITH_EXSH ${EXTRA_C_DEFS} \
-    -I. -Isrc -lpthread \
+    -I. -Isrc ${EXTRA_LD_FLAGS} -lpthread \
     src/main.c \
     src/core.c \
     src/runtime_support.c \
