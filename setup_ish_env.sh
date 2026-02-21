@@ -136,8 +136,64 @@ OPENSSH_SRC="src/openssh_stubs.c"
 OPENSSH_OBJS=""
 OPENSSH_LIBS=""
 OPENSSH_SHIM="src/openssh_shim.c"
+TARGET_IS_CROSS=0
+if [ "${CC_CMD[0]}" = "i686-linux-gnu-gcc" ]; then
+    TARGET_IS_CROSS=1
+fi
+OPENSSH_CPPFLAGS=""
+OPENSSH_LDFLAGS=""
+if [ "$TARGET_IS_CROSS" -eq 1 ]; then
+    if [ -d /usr/include/i386-linux-gnu ]; then
+        OPENSSH_CPPFLAGS="$OPENSSH_CPPFLAGS -I/usr/include/i386-linux-gnu"
+    fi
+    if [ -d /usr/lib/i386-linux-gnu ]; then
+        OPENSSH_LDFLAGS="$OPENSSH_LDFLAGS -L/usr/lib/i386-linux-gnu"
+    fi
+fi
 
 if [ -d "$OPENSSH_DIR" ]; then
+    echo "Checking i686 zlib/crypto for OpenSSH..."
+    HAVE_TARGET_ZLIB=1
+    HAVE_TARGET_CRYPTO=1
+
+    if ! "${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" "${TARGET_LDFLAGS[@]}" ${OPENSSH_CPPFLAGS} ${OPENSSH_LDFLAGS} \
+        -static -x c - -o /dev/null -lz >/dev/null 2>&1 <<'EOF'
+#include <zlib.h>
+int main(void) { return zlibVersion() ? 0 : 1; }
+EOF
+    then
+        HAVE_TARGET_ZLIB=0
+    fi
+
+    if ! "${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" "${TARGET_LDFLAGS[@]}" ${OPENSSH_CPPFLAGS} ${OPENSSH_LDFLAGS} \
+        -static -x c - -o /dev/null -lcrypto >/dev/null 2>&1 <<'EOF'
+#include <openssl/crypto.h>
+int main(void) { return OpenSSL_version_num() ? 0 : 1; }
+EOF
+    then
+        HAVE_TARGET_CRYPTO=0
+    fi
+
+    if [ "$HAVE_TARGET_ZLIB" -ne 1 ] || [ "$HAVE_TARGET_CRYPTO" -ne 1 ]; then
+        echo "Warning: missing i686 OpenSSH deps; building with OpenSSH stubs only."
+        if [ "$HAVE_TARGET_ZLIB" -ne 1 ]; then
+            echo "  Missing target zlib (-lz)."
+        fi
+        if [ "$HAVE_TARGET_CRYPTO" -ne 1 ]; then
+            echo "  Missing target OpenSSL crypto (-lcrypto)."
+        fi
+        if [ "$TARGET_IS_CROSS" -eq 1 ]; then
+            echo "Install i386 target libs on Debian:"
+            echo "  sudo dpkg --add-architecture i386"
+            echo "  sudo apt-get update"
+            echo "  sudo apt-get install zlib1g-dev:i386 libssl-dev:i386"
+        else
+            echo "Install 32-bit target libs on Debian:"
+            echo "  sudo dpkg --add-architecture i386"
+            echo "  sudo apt-get update"
+            echo "  sudo apt-get install zlib1g-dev:i386 libssl-dev:i386"
+        fi
+    else
     echo "Configuring OpenSSH for i686..."
     
     # Check if we need to reconfigure (simplistic check: if Makefile exists but we want to be safe)
@@ -153,7 +209,7 @@ if [ -d "$OPENSSH_DIR" ]; then
     fi
 
     echo "Running configure for OpenSSH..."
-    (cd "$OPENSSH_DIR" && ./configure --host="$TARGET_HOST" --without-openssl-header-check CC="$CC_PRINT")
+    (cd "$OPENSSH_DIR" && CPPFLAGS="$OPENSSH_CPPFLAGS" LDFLAGS="$OPENSSH_LDFLAGS ${TARGET_LDFLAGS[*]}" ./configure --host="$TARGET_HOST" --without-openssl-header-check CC="$CC_PRINT")
 
     echo "Patching OpenSSH (setup_posix_env.sh logic)..."
     # setup_posix_env.sh patching logic
@@ -215,6 +271,7 @@ $OPENSSH_DIR/ssh-keygen.o $OPENSSH_DIR/sshsig.o"
     OPENSSH_LIBS="$OPENSSH_DIR/libssh.a $OPENSSH_DIR/openbsd-compat/libopenbsd-compat.a -lcrypto -lz"
     OPENSSH_SRC="src/openssh_stubs.c src/openssh_globals.c"
     OPENSSH_SHIM=""
+    fi
 fi
 
 # Dash
