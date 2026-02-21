@@ -85,20 +85,9 @@ if [ -d "$OPENSSH_DIR" ] && [ ! -f "$OPENSSH_DIR/Makefile" ]; then
 fi
 
 # --- Dash ---
-echo "Fetching dash..."
-DASH_VER="0.5.12"
-DASH_URL="http://gondor.apana.org.au/~herbert/dash/files/dash-${DASH_VER}.tar.gz"
-# Fallback mirror or alternate method if needed, but curl/wget usually works.
-if [ ! -d "$THIRD_PARTY_DIR/dash-${DASH_VER}" ]; then
-    if command -v curl >/dev/null 2>&1; then
-        curl -L -o "$THIRD_PARTY_DIR/dash.tar.gz" "$DASH_URL"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -O "$THIRD_PARTY_DIR/dash.tar.gz" "$DASH_URL"
-    else
-        echo "Error: curl or wget required to fetch dash."
-        exit 1
-    fi
-    (cd "$THIRD_PARTY_DIR" && tar -xzf dash.tar.gz && rm dash.tar.gz)
+if [ ! -d "$THIRD_PARTY_DIR/dash" ]; then
+    echo "Cloning dash..."
+    git clone git://git.kernel.org/pub/scm/utils/dash/dash.git "$THIRD_PARTY_DIR/dash"
 fi
 
 echo "Dependencies fetched and patched."

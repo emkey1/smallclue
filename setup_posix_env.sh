@@ -18,7 +18,7 @@ if [ ! -d "third-party/openssh/.git" ]; then
     echo "OpenSSH repository missing or incomplete."
     MISSING_DEPS=1
 fi
-if [ ! -d "third-party/dash-0.5.12" ]; then
+if [ ! -d "third-party/dash" ]; then
     echo "Dash missing."
     MISSING_DEPS=1
 fi
@@ -247,9 +247,14 @@ $OPENSSH_DIR/ssh-keygen.o $OPENSSH_DIR/sshsig.o"
 fi
 
 # Build dash if present
-DASH_DIR="third-party/dash-0.5.12"
+DASH_DIR="third-party/dash"
 if [ -d "$DASH_DIR" ] && [ ! -f "$DASH_DIR/src/dash" ]; then
     echo "Building dash..."
+    # Git checkout needs autogen
+    if [ ! -f "$DASH_DIR/configure" ]; then
+        echo "Generating dash configure script..."
+        (cd "$DASH_DIR" && ./autogen.sh)
+    fi
     (cd "$DASH_DIR" && ./configure --enable-static && make -j4)
 fi
 
@@ -364,11 +369,11 @@ if [ "$(uname -s)" = "Darwin" ] && [ -n "${SMALLCLUE_CODESIGN_IDENTITY:-}" ]; th
     codesign --force --timestamp=none --sign "${SMALLCLUE_CODESIGN_IDENTITY}" "$ROOTFS/bin/smallclue"
 fi
 
-if [ -f "third-party/dash-0.5.12/src/dash" ]; then
+if [ -f "third-party/dash/src/dash" ]; then
     echo "Installing dash..."
-    cp "third-party/dash-0.5.12/src/dash" "$ROOTFS/bin/dash"
+    cp "third-party/dash/src/dash" "$ROOTFS/bin/dash"
     mkdir -p "$ROOTFS/usr/share/doc/dash"
-    cp "third-party/dash-0.5.12/COPYING" "$ROOTFS/usr/share/doc/dash/"
+    cp "third-party/dash/COPYING" "$ROOTFS/usr/share/doc/dash/"
     # Symlink /bin/sh to dash
     ln -sf dash "$ROOTFS/bin/sh"
 fi
