@@ -109,83 +109,7 @@ bool pathTruncateStrip(const char *path, char *buffer, size_t buflen) {
     return false; /* Did not modify */
 }
 
-void exsh_process_line(char *line) {
-    size_t len = strlen(line);
-    if (len > 0 && line[len-1] == '\n') {
-        line[len-1] = '\0';
-        len--;
-    }
-    if (len == 0) return;
-
-    char *args[64];
-    int nargs = 0;
-    char *token = strtok(line, " \t");
-    while (token && nargs < 63) {
-        args[nargs++] = token;
-        token = strtok(NULL, " \t");
-    }
-    args[nargs] = NULL;
-
-    if (nargs == 0) return;
-
-    // Ignore comments
-    if (args[0][0] == '#') return;
-
-    if (strcmp(args[0], "exit") == 0) {
-        exit(0);
-    }
-    if (strcmp(args[0], "cd") == 0) {
-        const char *target = (nargs > 1) ? args[1] : getenv("HOME");
-        if (!target) target = "/";
-        if (chdir(target) != 0) {
-            perror("cd");
-        }
-        return;
-    }
-
-    const SmallclueApplet *applet = smallclueFindApplet(args[0]);
-    if (applet) {
-        smallclueDispatchApplet(applet, nargs, args);
-    } else {
-        printf("%s: command not found\n", args[0]);
-    }
-}
-
-int exsh_main(int argc, char **argv) {
-    printf("SmallClue Shell (minimal)\n");
-
-    // Try to source .exshrc
-    const char *home = getenv("HOME");
-    if (home) {
-        char rcpath[1024];
-        snprintf(rcpath, sizeof(rcpath), "%s/.exshrc", home);
-        FILE *fp = fopen(rcpath, "r");
-        if (fp) {
-            char line[1024];
-            while (fgets(line, sizeof(line), fp)) {
-                 exsh_process_line(line);
-            }
-            fclose(fp);
-        }
-    }
-
-    char line[1024];
-    while (1) {
-        char cwd[1024];
-        if (getcwd(cwd, sizeof(cwd))) {
-            printf("%s %% ", cwd);
-        } else {
-            printf("? %% ");
-        }
-        fflush(stdout);
-
-        if (!fgets(line, sizeof(line), stdin)) {
-            break;
-        }
-        exsh_process_line(line);
-    }
-    return 0;
-}
+/* exsh stubs removed as dash is used for sh */
 EOF
 
 # 3. Compile smallclue
@@ -318,7 +242,14 @@ $OPENSSH_DIR/ssh-keygen.o $OPENSSH_DIR/sshsig.o"
     OPENSSH_SHIM=""
 fi
 
-gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -DSMALLCLUE_WITH_EXSH ${EXTRA_C_DEFS} \
+# Build dash if present
+DASH_DIR="third-party/dash-0.5.12"
+if [ -d "$DASH_DIR" ] && [ ! -f "$DASH_DIR/src/dash" ]; then
+    echo "Building dash..."
+    (cd "$DASH_DIR" && ./configure --enable-static && make -j4)
+fi
+
+gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${EXTRA_C_DEFS} \
     -I. -Isrc ${EXTRA_LD_FLAGS} -lpthread \
     src/main.c \
     src/core.c \
@@ -423,10 +354,19 @@ elif [ "$(uname -s)" = "Darwin" ]; then
     mknod -m 666 "$ROOTFS/dev/urandom" c 14 1 || echo "Failed to create /dev/urandom"
 fi
 
-# 5. Install smallclue
+# 5. Install smallclue and dash
 cp smallclue "$ROOTFS/bin/"
 if [ "$(uname -s)" = "Darwin" ] && [ -n "${SMALLCLUE_CODESIGN_IDENTITY:-}" ]; then
     codesign --force --timestamp=none --sign "${SMALLCLUE_CODESIGN_IDENTITY}" "$ROOTFS/bin/smallclue"
+fi
+
+if [ -f "third-party/dash-0.5.12/src/dash" ]; then
+    echo "Installing dash..."
+    cp "third-party/dash-0.5.12/src/dash" "$ROOTFS/bin/dash"
+    mkdir -p "$ROOTFS/usr/share/doc/dash"
+    cp "third-party/dash-0.5.12/COPYING" "$ROOTFS/usr/share/doc/dash/"
+    # Symlink /bin/sh to dash
+    ln -sf dash "$ROOTFS/bin/sh"
 fi
 
 # 6. Create symlinks
@@ -438,6 +378,10 @@ APPLETS=$(./smallclue 2>&1 | grep "^  " | awk '{print $1}' | grep -v "smallclue"
 for applet in $APPLETS; do
     # Skip if it is smallclue itself (already handled)
     if [ "$applet" == "smallclue" ]; then
+        continue
+    fi
+    # If dash is present, do not overwrite sh
+    if [ "$applet" == "sh" ] && [ -f "$ROOTFS/bin/dash" ]; then
         continue
     fi
     ln -sf smallclue "$ROOTFS/bin/$applet"
