@@ -109,8 +109,66 @@ bool pathTruncateStrip(const char *path, char *buffer, size_t buflen) {
     return false; /* Did not modify */
 }
 
+void exsh_process_line(char *line) {
+    size_t len = strlen(line);
+    if (len > 0 && line[len-1] == '\n') {
+        line[len-1] = '\0';
+        len--;
+    }
+    if (len == 0) return;
+
+    char *args[64];
+    int nargs = 0;
+    char *token = strtok(line, " \t");
+    while (token && nargs < 63) {
+        args[nargs++] = token;
+        token = strtok(NULL, " \t");
+    }
+    args[nargs] = NULL;
+
+    if (nargs == 0) return;
+
+    // Ignore comments
+    if (args[0][0] == '#') return;
+
+    if (strcmp(args[0], "exit") == 0) {
+        exit(0);
+    }
+    if (strcmp(args[0], "cd") == 0) {
+        const char *target = (nargs > 1) ? args[1] : getenv("HOME");
+        if (!target) target = "/";
+        if (chdir(target) != 0) {
+            perror("cd");
+        }
+        return;
+    }
+
+    const SmallclueApplet *applet = smallclueFindApplet(args[0]);
+    if (applet) {
+        smallclueDispatchApplet(applet, nargs, args);
+    } else {
+        printf("%s: command not found\n", args[0]);
+    }
+}
+
 int exsh_main(int argc, char **argv) {
     printf("SmallClue Shell (minimal)\n");
+
+    // Try to source .exshrc
+    const char *home = getenv("HOME");
+    if (home) {
+        char rcpath[1024];
+        snprintf(rcpath, sizeof(rcpath), "%s/.exshrc", home);
+        FILE *fp = fopen(rcpath, "r");
+        if (fp) {
+            char line[1024];
+            while (fgets(line, sizeof(line), fp)) {
+                 exsh_process_line(line);
+            }
+            fclose(fp);
+        }
+    }
+
     char line[1024];
     while (1) {
         char cwd[1024];
@@ -124,43 +182,7 @@ int exsh_main(int argc, char **argv) {
         if (!fgets(line, sizeof(line), stdin)) {
             break;
         }
-
-        size_t len = strlen(line);
-        if (len > 0 && line[len-1] == '\n') {
-            line[len-1] = '\0';
-            len--;
-        }
-        if (len == 0) continue;
-
-        char *args[64];
-        int nargs = 0;
-        char *token = strtok(line, " \t");
-        while (token && nargs < 63) {
-            args[nargs++] = token;
-            token = strtok(NULL, " \t");
-        }
-        args[nargs] = NULL;
-
-        if (nargs == 0) continue;
-
-        if (strcmp(args[0], "exit") == 0) {
-            break;
-        }
-        if (strcmp(args[0], "cd") == 0) {
-            const char *target = (nargs > 1) ? args[1] : getenv("HOME");
-            if (!target) target = "/";
-            if (chdir(target) != 0) {
-                perror("cd");
-            }
-            continue;
-        }
-
-        const SmallclueApplet *applet = smallclueFindApplet(args[0]);
-        if (applet) {
-            smallclueDispatchApplet(applet, nargs, args);
-        } else {
-            printf("%s: command not found\n", args[0]);
-        }
+        exsh_process_line(line);
     }
     return 0;
 }
@@ -440,6 +462,13 @@ nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
 sshd:x:104:65534::/run/sshd:/usr/sbin/nologin
 username:x:1000:1000:User Name,,,:/home/username:/bin/sh
 EOF
+
+echo "Creating .exshrc..."
+cat > "$ROOTFS/home/username/.exshrc" <<EOF
+# Minimal .exshrc
+echo "Loading .exshrc..."
+EOF
+chown 1000:1000 "$ROOTFS/home/username/.exshrc"
 
 cat > "$ROOTFS/etc/group" <<EOF
 root:x:0:
