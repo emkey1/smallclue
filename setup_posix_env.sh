@@ -436,7 +436,7 @@ cat > "$ROOTFS/home/username/.dashrc" <<EOF
 
 # Get username if not set
 if [ -z "\$USER" ]; then
-    USER=\$(id | cut -d\( -f2 | cut -d\) -f1)
+    USER=\$(id | cut -d \( -f2 | cut -d \) -f1)
 fi
 
 # Get hostname
@@ -447,7 +447,7 @@ else
 fi
 
 # Check for root
-MY_UID=\$(id | cut -d= -f2 | cut -d\( -f1)
+MY_UID=\$(id | cut -d = -f2 | cut -d \( -f1)
 if [ "\$MY_UID" = "0" ]; then
     PS1='\${USER}@\${HOSTNAME}:\${PWD}# '
 else
@@ -474,7 +474,7 @@ cat > "$ROOTFS/root/.dashrc" <<EOF
 
 # Get username if not set
 if [ -z "\$USER" ]; then
-    USER=\$(id | cut -d\( -f2 | cut -d\) -f1)
+    USER=\$(id | cut -d \( -f2 | cut -d \) -f1)
 fi
 
 # Get hostname
@@ -485,7 +485,7 @@ else
 fi
 
 # Check for root
-MY_UID=\$(id | cut -d= -f2 | cut -d\( -f1)
+MY_UID=\$(id | cut -d = -f2 | cut -d \( -f1)
 if [ "\$MY_UID" = "0" ]; then
     PS1='\${USER}@\${HOSTNAME}:\${PWD}# '
 else
