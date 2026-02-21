@@ -25,11 +25,11 @@ fi
 
 if [ "$MISSING_DEPS" -eq 1 ]; then
     echo "Fetching dependencies..."
-    chmod +x fetch_dependencies.sh
-    ./fetch_dependencies.sh
 else
-    echo "Dependencies verified."
+    echo "Dependencies present, checking for updates/patches..."
 fi
+chmod +x fetch_dependencies.sh
+./fetch_dependencies.sh
 
 # 1. Create dummy headers
 echo "Creating dummy headers..."
