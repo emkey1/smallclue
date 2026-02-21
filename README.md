@@ -1,8 +1,8 @@
-# smallclue
+# SmallCLUE
 
-**smallclue** is a lightweight, multicall binary that provides a suite of standard Unix-like utilities. It is designed specifically for constrained or sandboxed environments where standard GNU/BSD core utilities are unavailable, such as custom terminal emulators on iOS and iPadOS (e.g., PSCAL).
+**SmallCLUE** is a lightweight, multicall binary that provides a suite of standard Unix-like utilities. It is designed specifically for constrained or sandboxed environments where standard GNU/BSD core utilities are unavailable, such as custom terminal emulators on iOS and iPadOS (e.g., PSCAL).
 
-Functionally similar to BusyBox, `smallclue` combines many common tools (like `ls`, `cp`, `grep`, `ssh`) into a single executable to reduce overhead and simplify integration.
+Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `ls`, `cp`, `grep`, `ssh`) into a single executable to reduce overhead and simplify integration.
 
 ## Overview
 
@@ -13,7 +13,7 @@ Functionally similar to BusyBox, `smallclue` combines many common tools (like `l
 
 ## Available Applets
 
-`smallclue` currently implements the following commands:
+`SmallCLUE` currently implements the following commands:
 
 ### File Management
 * **ls**: List directory contents (supports colors, `-l`, `-h`, `-a`, `-t`).
