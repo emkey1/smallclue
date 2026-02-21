@@ -1,4 +1,4 @@
-# SmallCLUE
+# SmallCLUE (Small Command Line Unix Environment)
 
 **SmallCLUE** is a lightweight, multicall binary that provides a suite of standard Unix-like utilities. It is designed specifically for constrained or sandboxed environments where standard GNU/BSD core utilities are unavailable, such as custom terminal emulators on iOS and iPadOS (e.g., PSCAL).
 
