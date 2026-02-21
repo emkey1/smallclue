@@ -8,23 +8,39 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# 0. Check for 32-bit support
-if ! command -v gcc >/dev/null 2>&1; then
-    echo "Error: gcc not found."
+# 0. Determine 32-bit i686 toolchain support
+TARGET_HOST="i686-linux-gnu"
+TARGET_DESC=""
+declare -a CC_CMD
+declare -a TARGET_CFLAGS
+declare -a TARGET_LDFLAGS
+declare -a SMALLCLUE_RUNNER_CMD
+
+if command -v gcc >/dev/null 2>&1 && gcc -m32 -static -o /dev/null -x c - <<< "int main(){return 0;}" 2>/dev/null; then
+    CC_CMD=(gcc -m32)
+    TARGET_CFLAGS=(-m32)
+    TARGET_LDFLAGS=(-m32)
+    TARGET_DESC="native gcc -m32"
+elif command -v i686-linux-gnu-gcc >/dev/null 2>&1 && i686-linux-gnu-gcc -static -o /dev/null -x c - <<< "int main(){return 0;}" 2>/dev/null; then
+    CC_CMD=(i686-linux-gnu-gcc)
+    TARGET_DESC="cross i686-linux-gnu-gcc"
+else
+    HOST_ARCH="$(uname -m)"
+    echo "Error: no usable 32-bit i686 compiler found."
+    if [ "$HOST_ARCH" = "aarch64" ] || [ "$HOST_ARCH" = "arm64" ] || [ "$HOST_ARCH" = "armv7l" ]; then
+        echo "On ARM hosts (Raspberry Pi), install the i686 cross toolchain:"
+        echo "  sudo apt-get update"
+        echo "  sudo apt-get install gcc-i686-linux-gnu libc6-dev-i386-cross binutils-i686-linux-gnu qemu-user-static"
+    else
+        echo "Install multilib support:"
+        echo "  sudo apt-get update"
+        echo "  sudo apt-get install gcc-multilib libc6-dev-i386"
+    fi
     exit 1
 fi
 
-if ! gcc -m32 -o /dev/null -x c - <<< "int main(){return 0;}" 2>/dev/null; then
-    echo "Error: gcc cannot compile 32-bit binaries."
-    echo "Please install gcc-multilib and libc6-dev-i386."
-    echo "  sudo apt-get install gcc-multilib libc6-dev-i386"
-    exit 1
-fi
-
-echo "Setting up iSH (32-bit x86) build environment..."
-export CC="gcc -m32"
-export CFLAGS="-m32"
-export LDFLAGS="-m32"
+CC_PRINT="${CC_CMD[*]}"
+echo "Setting up iSH (32-bit x86) build environment using ${TARGET_DESC}..."
 
 # 1. Fetch dependencies
 echo "Fetching dependencies..."
@@ -122,7 +138,7 @@ OPENSSH_LIBS=""
 OPENSSH_SHIM="src/openssh_shim.c"
 
 if [ -d "$OPENSSH_DIR" ]; then
-    echo "Configuring OpenSSH for 32-bit..."
+    echo "Configuring OpenSSH for i686..."
     
     # Check if we need to reconfigure (simplistic check: if Makefile exists but we want to be safe)
     # We always force reconfigure to ensure -m32 is picked up
@@ -137,7 +153,7 @@ if [ -d "$OPENSSH_DIR" ]; then
     fi
 
     echo "Running configure for OpenSSH..."
-    (cd "$OPENSSH_DIR" && ./configure --host=i686-linux-gnu --without-openssl-header-check CC="gcc -m32")
+    (cd "$OPENSSH_DIR" && ./configure --host="$TARGET_HOST" --without-openssl-header-check CC="$CC_PRINT")
 
     echo "Patching OpenSSH (setup_posix_env.sh logic)..."
     # setup_posix_env.sh patching logic
@@ -204,14 +220,14 @@ fi
 # Dash
 DASH_DIR="third-party/dash"
 if [ -d "$DASH_DIR" ]; then
-    echo "Configuring Dash for 32-bit..."
+    echo "Configuring Dash for i686..."
     if [ -f "$DASH_DIR/Makefile" ]; then
         (cd "$DASH_DIR" && make distclean >/dev/null 2>&1 || true)
     fi
     if [ ! -f "$DASH_DIR/configure" ]; then
         (cd "$DASH_DIR" && ./autogen.sh)
     fi
-    (cd "$DASH_DIR" && ./configure --enable-static --host=i686-linux-gnu CC="gcc -m32")
+    (cd "$DASH_DIR" && ./configure --enable-static --host="$TARGET_HOST" CC="$CC_PRINT")
     echo "Building Dash..."
     (cd "$DASH_DIR" && make -j4)
 fi
@@ -223,7 +239,7 @@ fi
 
 # 4. Compile smallclue
 echo "Compiling smallclue (iSH/32-bit static)..."
-gcc -m32 -static -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE \
+"${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" "${TARGET_LDFLAGS[@]}" -static -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE \
     -I. -Isrc -lpthread \
     src/main.c \
     src/core.c \
@@ -245,7 +261,7 @@ if [ ! -f smallclue ]; then
 fi
 
 echo "Verifying 32-bit binary..."
-file smallclue | grep "32-bit" || { echo "Error: smallclue is not 32-bit"; exit 1; }
+file smallclue | grep -E "ELF 32-bit|Intel 80386|i386" || { echo "Error: smallclue is not a 32-bit i686 binary"; exit 1; }
 
 # 5. Setup rootfs
 ROOTFS="rootfs_ish"
@@ -287,7 +303,35 @@ else
 fi
 
 # Create symlinks
-APPLETS=$(./smallclue 2>&1 | grep "^  " | awk '{print $1}' | grep -v "smallclue")
+if ./smallclue >/dev/null 2>&1; then
+    SMALLCLUE_RUNNER_CMD=(./smallclue)
+elif command -v qemu-i386-static >/dev/null 2>&1; then
+    SMALLCLUE_RUNNER_CMD=(qemu-i386-static ./smallclue)
+elif command -v qemu-i386 >/dev/null 2>&1; then
+    SMALLCLUE_RUNNER_CMD=(qemu-i386 ./smallclue)
+else
+    SMALLCLUE_RUNNER_CMD=()
+fi
+
+if [ "${#SMALLCLUE_RUNNER_CMD[@]}" -gt 0 ]; then
+    APPLETS=$("${SMALLCLUE_RUNNER_CMD[@]}" 2>&1 | grep "^  " | awk '{print $1}' | grep -v "^smallclue$" || true)
+else
+    echo "Warning: unable to execute i686 smallclue binary on this host."
+    echo "Falling back to parsing applet names from src/core.c."
+    APPLETS=$(awk '
+        /static const SmallclueApplet kSmallclueApplets\[] = {/ { in_table = 1; next }
+        in_table && /^\};/ { exit }
+        in_table && match($0, /^[[:space:]]*\{"[^"]+"/) {
+            line = $0
+            sub(/^[[:space:]]*\{"/, "", line)
+            sub(/".*$/, "", line)
+            if (line != "smallclue") {
+                print line
+            }
+        }
+    ' src/core.c | sort -u)
+fi
+
 for applet in $APPLETS; do
     if [ "$applet" == "smallclue" ]; then continue; fi
     if [ "$applet" == "sh" ] && [ -f "$ROOTFS/bin/dash" ]; then continue; fi
