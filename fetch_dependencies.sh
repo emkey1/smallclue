@@ -63,6 +63,20 @@ if [ -f "$LED_C" ]; then
     fi
 fi
 
+# Patch term.c to enable ICRNL (map CR to NL on input)
+TERM_C="$THIRD_PARTY_DIR/nextvi/term.c"
+if [ -f "$TERM_C" ]; then
+    if ! grep -q "ICRNL" "$TERM_C"; then
+        echo "Patching nextvi term.c to enable ICRNL..."
+        # Find the line disabling ICANON | ISIG | ECHO and add ICRNL to c_iflag
+        sed -i.bak '/newtermios.c_lflag &= ~(ICANON | ISIG | ECHO);/a \
+	newtermios.c_iflag |= ICRNL;' "$TERM_C"
+        rm -f "${TERM_C}.bak"
+    else
+        echo "nextvi term.c already patched for ICRNL."
+    fi
+fi
+
 # --- OpenSSH ---
 if [ ! -d "$THIRD_PARTY_DIR/openssh" ]; then
     echo "Cloning OpenSSH Portable..."
