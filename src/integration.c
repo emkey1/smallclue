@@ -285,6 +285,7 @@ smallclue_dispatch_done:
     }
 
 DEFINE_SMALLCLUE_WRAPPER("cat", cat)
+DEFINE_SMALLCLUE_WRAPPER("echo", echo)
 DEFINE_SMALLCLUE_WRAPPER("clear", clear)
 DEFINE_SMALLCLUE_WRAPPER("cls", cls)
 DEFINE_SMALLCLUE_WRAPPER("date", date)
@@ -315,6 +316,7 @@ DEFINE_SMALLCLUE_WRAPPER("pbpaste", pbpaste)
 DEFINE_SMALLCLUE_WRAPPER("init", init)
 DEFINE_SMALLCLUE_WRAPPER("runit", runit)
 DEFINE_SMALLCLUE_WRAPPER("mdev", mdev)
+DEFINE_SMALLCLUE_WRAPPER("mknod", mknod)
 DEFINE_SMALLCLUE_WRAPPER("halt", halt)
 
 #if SMALLCLUE_HAS_IFADDRS
@@ -340,11 +342,15 @@ DEFINE_SMALLCLUE_WRAPPER("xargs", xargs)
 DEFINE_SMALLCLUE_WRAPPER("ps", ps)
 DEFINE_SMALLCLUE_WRAPPER("kill", kill)
 #if defined(SMALLCLUE_WITH_EXSH)
+DEFINE_SMALLCLUE_WRAPPER("exsh", exsh)
 DEFINE_SMALLCLUE_WRAPPER("sh", sh)
 #endif
 DEFINE_SMALLCLUE_WRAPPER("uptime", uptime)
 DEFINE_SMALLCLUE_WRAPPER("uname", uname)
+DEFINE_SMALLCLUE_WRAPPER("type", type)
 DEFINE_SMALLCLUE_WRAPPER("file", file)
+DEFINE_SMALLCLUE_WRAPPER("su", su)
+DEFINE_SMALLCLUE_WRAPPER("sudo", sudo)
 DEFINE_SMALLCLUE_WRAPPER("scp", scp)
 DEFINE_SMALLCLUE_WRAPPER("sftp", sftp)
 DEFINE_SMALLCLUE_WRAPPER("script", script)
@@ -425,6 +431,7 @@ static void registerSmallclueBuiltin(const char *name,
 
 static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("cat", vmBuiltinSmallclue_cat, "cat");
+    registerSmallclueBuiltin("echo", vmBuiltinSmallclue_echo, "echo");
     registerSmallclueBuiltin("ls", vmBuiltinSmallclue_ls, "ls");
     registerSmallclueBuiltin("md", vmBuiltinSmallclue_md, "md");
     registerSmallclueBuiltin("less", vmBuiltinSmallclue_less, "less");
@@ -459,6 +466,7 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("init", vmBuiltinSmallclue_init, "init");
     registerSmallclueBuiltin("runit", vmBuiltinSmallclue_runit, "runit");
     registerSmallclueBuiltin("mdev", vmBuiltinSmallclue_mdev, "mdev");
+    registerSmallclueBuiltin("mknod", vmBuiltinSmallclue_mknod, "mknod");
     registerSmallclueBuiltin("halt", vmBuiltinSmallclue_halt, "halt");
     registerSmallclueBuiltin("poweroff", vmBuiltinSmallclue_halt, "poweroff");
     registerSmallclueBuiltin("reboot", vmBuiltinSmallclue_halt, "reboot");
@@ -484,12 +492,16 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("ps", vmBuiltinSmallclue_ps, "ps");
     registerSmallclueBuiltin("kill", vmBuiltinSmallclue_kill, "kill");
 #if defined(SMALLCLUE_WITH_EXSH)
+    registerSmallclueBuiltin("exsh", vmBuiltinSmallclue_exsh, "exsh");
     registerSmallclueBuiltin("sh", vmBuiltinSmallclue_sh, "sh");
 #endif
     registerSmallclueBuiltin("uptime", vmBuiltinSmallclue_uptime, "uptime");
     registerSmallclueBuiltin("uname", vmBuiltinSmallclue_uname, "uname");
+    registerSmallclueBuiltin("type", vmBuiltinSmallclue_type, "type");
     registerSmallclueBuiltin("scp", vmBuiltinSmallclue_scp, "scp");
     registerSmallclueBuiltin("sftp", vmBuiltinSmallclue_sftp, "sftp");
+    registerSmallclueBuiltin("su", vmBuiltinSmallclue_su, "su");
+    registerSmallclueBuiltin("sudo", vmBuiltinSmallclue_sudo, "sudo");
     registerSmallclueBuiltin("ssh", vmBuiltinSmallclue_ssh, "ssh");
     registerSmallclueBuiltin("ssh-keygen", vmBuiltinSmallclue_sshkeygen, "ssh-keygen");
     registerSmallclueBuiltin("ssh-copy-id", vmBuiltinSmallclue_sshcopyid, "ssh-copy-id");

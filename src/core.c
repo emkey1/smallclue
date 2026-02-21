@@ -127,6 +127,118 @@ static const char *smallclueResolvePath(const char *path, char *buffer, size_t b
     return path;
 }
 
+static bool smallclueCopyPath(char *out, size_t outSize, const char *value) {
+    if (!out || outSize == 0 || !value) {
+        return false;
+    }
+    int written = snprintf(out, outSize, "%s", value);
+    return written > 0 && (size_t)written < outSize;
+}
+
+static bool smallclueJoinPath2(char *out,
+                               size_t outSize,
+                               const char *left,
+                               const char *right) {
+    if (!out || outSize == 0 || !left || !right) {
+        return false;
+    }
+    int written = snprintf(out, outSize, "%s/%s", left, right);
+    return written > 0 && (size_t)written < outSize;
+}
+
+static bool smallclueResolveEtcEntry(const char *entryName,
+                                     int accessMode,
+                                     char *outPath,
+                                     size_t outPathSize) {
+    if (!entryName || entryName[0] == '\0' || !outPath || outPathSize == 0) {
+        return false;
+    }
+    outPath[0] = '\0';
+
+    char candidate[PATH_MAX];
+    const char *etcRoot = getenv("PSCALI_ETC_ROOT");
+    if (etcRoot && etcRoot[0] == '/') {
+        if (smallclueJoinPath2(candidate, sizeof(candidate), etcRoot, entryName) &&
+            access(candidate, accessMode) == 0 &&
+            smallclueCopyPath(outPath, outPathSize, candidate)) {
+            return true;
+        }
+    }
+
+    const char *containerRoot = getenv("PSCALI_CONTAINER_ROOT");
+    if (containerRoot && containerRoot[0] == '/') {
+        int written = snprintf(candidate,
+                               sizeof(candidate),
+                               "%s/Documents/etc/%s",
+                               containerRoot,
+                               entryName);
+        if (written > 0 &&
+            (size_t)written < sizeof(candidate) &&
+            access(candidate, accessMode) == 0 &&
+            smallclueCopyPath(outPath, outPathSize, candidate)) {
+            return true;
+        }
+    }
+
+    if (smallclueJoinPath2(candidate, sizeof(candidate), "/etc", entryName) &&
+        access(candidate, accessMode) == 0 &&
+        smallclueCopyPath(outPath, outPathSize, candidate)) {
+        return true;
+    }
+    return false;
+}
+
+static bool smallclueResolveExshPath(char *outPath, size_t outPathSize) {
+    if (!outPath || outPathSize == 0) {
+        return false;
+    }
+    outPath[0] = '\0';
+
+    char candidate[PATH_MAX];
+    const char *workspaceRoot = getenv("PSCALI_WORKSPACE_ROOT");
+    if (workspaceRoot && workspaceRoot[0] == '/') {
+        int written = snprintf(candidate,
+                               sizeof(candidate),
+                               "%s/bin/exsh",
+                               workspaceRoot);
+        if (written > 0 &&
+            (size_t)written < sizeof(candidate) &&
+            access(candidate, X_OK) == 0 &&
+            smallclueCopyPath(outPath, outPathSize, candidate)) {
+            return true;
+        }
+    }
+
+    const char *containerRoot = getenv("PSCALI_CONTAINER_ROOT");
+    if (containerRoot && containerRoot[0] == '/') {
+        int written = snprintf(candidate,
+                               sizeof(candidate),
+                               "%s/Documents/bin/exsh",
+                               containerRoot);
+        if (written > 0 &&
+            (size_t)written < sizeof(candidate) &&
+            access(candidate, X_OK) == 0 &&
+            smallclueCopyPath(outPath, outPathSize, candidate)) {
+            return true;
+        }
+    }
+
+    char resolved[PATH_MAX];
+    const char *expanded = smallclueResolvePath("/bin/exsh", resolved, sizeof(resolved));
+    if (expanded &&
+        access(expanded, X_OK) == 0 &&
+        smallclueCopyPath(outPath, outPathSize, expanded)) {
+        return true;
+    }
+
+    if (smallclueJoinPath2(candidate, sizeof(candidate), "/bin", "exsh") &&
+        access(candidate, X_OK) == 0 &&
+        smallclueCopyPath(outPath, outPathSize, candidate)) {
+        return true;
+    }
+    return false;
+}
+
 static const char *smallclueDisplayPath(const char *path, char *buffer, size_t buflen) {
     if (!path) {
         return "";
@@ -954,8 +1066,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Default N=10"},
     {"id", "id\n"
            "  Show uid/gid info"},
-    {"init", "init\n"
-             "  System initialization (PID 1)"},
+    {"init", "init [--service-mode|-S|--allow-non-pid1]\n"
+             "  System initialization (PID 1 by default)\n"
+             "  --service-mode allows compatibility startup when PID != 1"},
 #if SMALLCLUE_HAS_IFADDRS
     {"ipaddr", "ipaddr\n"
                "  Show interface IP addresses"},
@@ -1439,6 +1552,46 @@ static bool smallclueReadTokensFromStdin(SmallclueLineVector *vec) {
 static int smallcluePsCommand(int argc, char **argv) {
     (void)argc;
     (void)argv;
+#if defined(PSCAL_TARGET_IOS)
+    size_t cap = vprocSnapshot(NULL, 0);
+    VProcSnapshot *snaps = (cap > 0) ? (VProcSnapshot *)calloc(cap, sizeof(VProcSnapshot)) : NULL;
+    size_t count = snaps ? vprocSnapshot(snaps, cap) : 0;
+    if (!snaps || count == 0) {
+        free(snaps);
+        puts(" PID   PPID  PGID   SID STATE      COMMAND");
+        puts(" <no virtual tasks>");
+        return 0;
+    }
+
+    puts(" PID   PPID  PGID   SID STATE      COMMAND");
+    for (size_t i = 0; i < count; ++i) {
+        const VProcSnapshot *s = &snaps[i];
+        const char *state = "running";
+        if (s->zombie) {
+            state = "zombie";
+        } else if (s->stopped) {
+            state = "stopped";
+        } else if (s->continued) {
+            state = "continued";
+        } else if (s->exited) {
+            state = "exited";
+        } else if (s->sigchld_pending) {
+            state = "sigchld";
+        }
+        const char *cmd = (s->command[0] != '\0')
+            ? s->command
+            : ((s->comm[0] != '\0') ? s->comm : "?");
+        printf("%4d %6d %5d %5d %-10s %s\n",
+               s->pid,
+               s->parent_pid,
+               s->pgid,
+               s->sid,
+               state,
+               cmd);
+    }
+    free(snaps);
+    return 0;
+#else
     pid_t pid = getpid();
     pid_t ppid = getppid();
     uid_t uid = getuid();
@@ -1446,6 +1599,7 @@ static int smallcluePsCommand(int argc, char **argv) {
     printf(" PID   PPID   UID COMMAND\n");
     printf("%4d %6d %5d %s\n", (int)pid, (int)ppid, (int)uid, cmd);
     return 0;
+#endif
 }
 
 #if defined(PSCAL_TARGET_IOS)
@@ -13538,11 +13692,33 @@ static int smallcluePbpasteCommand(int argc, char **argv) {
 }
 
 static int smallclueInitCommand(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
-    if (getpid() != 1) {
-        fprintf(stderr, "init: must be run as PID 1\n");
+    bool allowNonPid1 = false;
+    for (int i = 1; i < argc; ++i) {
+        const char *arg = argv[i] ? argv[i] : "";
+        if (strcmp(arg, "--service-mode") == 0 ||
+            strcmp(arg, "--allow-non-pid1") == 0 ||
+            strcmp(arg, "-S") == 0) {
+            allowNonPid1 = true;
+            continue;
+        }
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+            printf("usage: init [--service-mode|-S|--allow-non-pid1]\n");
+            printf("  --service-mode        allow init compatibility mode when PID != 1\n");
+            printf("  --allow-non-pid1      same as --service-mode\n");
+            return 0;
+        }
+        fprintf(stderr, "init: unknown option '%s'\n", arg);
+        fprintf(stderr, "usage: init [--service-mode|-S|--allow-non-pid1]\n");
         return 1;
+    }
+    pid_t selfPid = getpid();
+    if (selfPid != 1 && !allowNonPid1) {
+        fprintf(stderr, "init: must be run as PID 1\n");
+        fprintf(stderr, "init: use --service-mode to run in compatibility mode on iOS/iPadOS\n");
+        return 1;
+    }
+    if (selfPid != 1) {
+        printf("init: compatibility mode enabled (pid=%d)\n", (int)selfPid);
     }
 
     /* Basic init implementation:
@@ -13553,17 +13729,45 @@ static int smallclueInitCommand(int argc, char **argv) {
 
     printf("smallclue init: starting...\n");
 
-    if (access("/etc/rc", X_OK) == 0) {
-        printf("smallclue init: running /etc/rc\n");
+    char rcPath[PATH_MAX];
+    if (smallclueResolveEtcEntry("rc", F_OK, rcPath, sizeof(rcPath))) {
+        printf("smallclue init: running %s\n", rcPath);
         pid_t pid = fork();
         if (pid == 0) {
-            execl("/etc/rc", "/etc/rc", NULL);
-            exit(127);
+            execl(rcPath, rcPath, NULL);
+            int execErr = errno;
+            char exshPath[PATH_MAX];
+            if ((execErr == EACCES || execErr == ENOEXEC || execErr == ENOTSUP || execErr == EPERM) &&
+                smallclueResolveExshPath(exshPath, sizeof(exshPath))) {
+                execl(exshPath, exshPath, rcPath, NULL);
+                execErr = errno;
+            }
+            fprintf(stderr, "init: failed to exec '%s': %s\n", rcPath, strerror(execErr));
+            _exit(127);
         } else if (pid > 0) {
-            waitpid(pid, NULL, 0);
+            int rcStatus = 0;
+            if (waitpid(pid, &rcStatus, 0) < 0) {
+                fprintf(stderr, "init: waitpid(%s) failed: %s\n", rcPath, strerror(errno));
+            } else if (!WIFEXITED(rcStatus) || WEXITSTATUS(rcStatus) != 0) {
+                if (WIFEXITED(rcStatus)) {
+                    fprintf(stderr, "init: %s exited with status %d\n",
+                            rcPath, WEXITSTATUS(rcStatus));
+                } else if (WIFSIGNALED(rcStatus)) {
+                    fprintf(stderr, "init: %s terminated by signal %d\n",
+                            rcPath, WTERMSIG(rcStatus));
+                }
+            }
+        } else {
+            fprintf(stderr, "init: fork failed for %s: %s\n", rcPath, strerror(errno));
         }
     } else {
-        printf("smallclue init: /etc/rc not found or not executable\n");
+        const char *etcRoot = getenv("PSCALI_ETC_ROOT");
+        if (etcRoot && etcRoot[0] == '/') {
+            printf("smallclue init: rc not found (checked %s/rc and /etc/rc)\n",
+                   etcRoot);
+        } else {
+            printf("smallclue init: /etc/rc not found\n");
+        }
     }
 
     /* Ignore signals that might terminate us */
@@ -13631,9 +13835,14 @@ static int smallclueRunitCommand(int argc, char **argv) {
     // Scans /etc/service (or arg) and spawns 'run' scripts.
     // Does not implement full supervision (restart, control).
 
+    char default_service_dir[PATH_MAX];
     const char *service_dir = "/etc/service";
     if (argc > 1) {
         service_dir = argv[1];
+    } else if (smallclueResolveEtcEntry("service", R_OK,
+                                        default_service_dir,
+                                        sizeof(default_service_dir))) {
+        service_dir = default_service_dir;
     }
 
     DIR *dir = opendir(service_dir);
