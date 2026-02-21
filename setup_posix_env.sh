@@ -423,6 +423,82 @@ echo "Loading .exshrc..."
 EOF
 chown 1000:1000 "$ROOTFS/home/username/.exshrc"
 
+echo "Creating .profile..."
+cat > "$ROOTFS/home/username/.profile" <<EOF
+export ENV=\$HOME/.dashrc
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+EOF
+chown 1000:1000 "$ROOTFS/home/username/.profile"
+
+echo "Creating .dashrc..."
+cat > "$ROOTFS/home/username/.dashrc" <<EOF
+# Basic dash configuration
+
+# Get username if not set
+if [ -z "\$USER" ]; then
+    USER=\$(id | cut -d\( -f2 | cut -d\) -f1)
+fi
+
+# Get hostname
+if [ -f /etc/hostname ]; then
+    HOSTNAME=\$(cat /etc/hostname)
+else
+    HOSTNAME=\$(uname -n)
+fi
+
+# Check for root
+MY_UID=\$(id | cut -d= -f2 | cut -d\( -f1)
+if [ "\$MY_UID" = "0" ]; then
+    PS1='\${USER}@\${HOSTNAME}:\${PWD}# '
+else
+    PS1='\${USER}@\${HOSTNAME}:\${PWD}\$ '
+fi
+
+# Aliases
+alias ll='ls -al'
+alias la='ls -A'
+alias l='ls -CF'
+alias ls='ls --color=auto'
+EOF
+chown 1000:1000 "$ROOTFS/home/username/.dashrc"
+
+echo "Creating root .profile..."
+cat > "$ROOTFS/root/.profile" <<EOF
+export ENV=\$HOME/.dashrc
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+EOF
+
+echo "Creating root .dashrc..."
+cat > "$ROOTFS/root/.dashrc" <<EOF
+# Basic dash configuration
+
+# Get username if not set
+if [ -z "\$USER" ]; then
+    USER=\$(id | cut -d\( -f2 | cut -d\) -f1)
+fi
+
+# Get hostname
+if [ -f /etc/hostname ]; then
+    HOSTNAME=\$(cat /etc/hostname)
+else
+    HOSTNAME=\$(uname -n)
+fi
+
+# Check for root
+MY_UID=\$(id | cut -d= -f2 | cut -d\( -f1)
+if [ "\$MY_UID" = "0" ]; then
+    PS1='\${USER}@\${HOSTNAME}:\${PWD}# '
+else
+    PS1='\${USER}@\${HOSTNAME}:\${PWD}\$ '
+fi
+
+# Aliases
+alias ll='ls -al'
+alias la='ls -A'
+alias l='ls -CF'
+alias ls='ls --color=auto'
+EOF
+
 cat > "$ROOTFS/etc/group" <<EOF
 root:x:0:
 daemon:x:1:
@@ -464,6 +540,9 @@ cat > "$ROOTFS/etc/hosts" <<EOF
 ff02::1     ip6-allnodes
 ff02::2     ip6-allrouters
 EOF
+
+echo "Creating /etc/hostname..."
+echo "smallclue" > "$ROOTFS/etc/hostname"
 
 echo "Creating /etc/rc..."
 cat > "$ROOTFS/etc/rc" <<EOF
