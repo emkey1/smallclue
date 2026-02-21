@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <ctype.h>
 #include <sys/stat.h>
+#include <termios.h>
 #include "common/path_truncate.h"
 #include "pscal_openssh_hooks.h"
 #if defined(PSCAL_TARGET_IOS)
@@ -702,6 +703,58 @@ static void smallcluePopDisableSoftSignalingScope(smallclueSoftSignalScope *scop
     memset(scope, 0, sizeof(*scope));
 }
 
+typedef struct {
+    struct sigaction sa_int;
+    struct sigaction sa_term;
+    struct sigaction sa_quit;
+    struct sigaction sa_pipe;
+    struct sigaction sa_winch;
+    struct sigaction sa_tstp;
+    struct sigaction sa_ttin;
+    struct sigaction sa_ttou;
+    struct sigaction sa_chld;
+    struct sigaction sa_hup;
+    struct termios t;
+    bool t_valid;
+} smallclue_saved_state;
+
+static void smallclueSaveState(smallclue_saved_state *state) {
+    if (!state) return;
+    memset(state, 0, sizeof(*state));
+    sigaction(SIGINT, NULL, &state->sa_int);
+    sigaction(SIGTERM, NULL, &state->sa_term);
+    sigaction(SIGQUIT, NULL, &state->sa_quit);
+    sigaction(SIGPIPE, NULL, &state->sa_pipe);
+    sigaction(SIGWINCH, NULL, &state->sa_winch);
+    sigaction(SIGTSTP, NULL, &state->sa_tstp);
+    sigaction(SIGTTIN, NULL, &state->sa_ttin);
+    sigaction(SIGTTOU, NULL, &state->sa_ttou);
+    sigaction(SIGCHLD, NULL, &state->sa_chld);
+    sigaction(SIGHUP, NULL, &state->sa_hup);
+
+    if (tcgetattr(STDIN_FILENO, &state->t) == 0) {
+        state->t_valid = true;
+    }
+}
+
+static void smallclueRestoreState(const smallclue_saved_state *state) {
+    if (!state) return;
+    sigaction(SIGINT, &state->sa_int, NULL);
+    sigaction(SIGTERM, &state->sa_term, NULL);
+    sigaction(SIGQUIT, &state->sa_quit, NULL);
+    sigaction(SIGPIPE, &state->sa_pipe, NULL);
+    sigaction(SIGWINCH, &state->sa_winch, NULL);
+    sigaction(SIGTSTP, &state->sa_tstp, NULL);
+    sigaction(SIGTTIN, &state->sa_ttin, NULL);
+    sigaction(SIGTTOU, &state->sa_ttou, NULL);
+    sigaction(SIGCHLD, &state->sa_chld, NULL);
+    sigaction(SIGHUP, &state->sa_hup, NULL);
+
+    if (state->t_valid) {
+        tcsetattr(STDIN_FILENO, TCSADRAIN, &state->t);
+    }
+}
+
 static int smallclueInvokeOpensshEntry(const char *label, int (*entry)(int, char **),
                                        int argc, char **argv) {
     g_smallclue_openssh_exit_requested = 0;
@@ -747,12 +800,14 @@ static int smallclueRunOpensshEntryOnce(const char *label, int (*entry)(int, cha
         fprintf(stderr, "%s: command unavailable\n", label ? label : "ssh");
         return 127;
     }
-    struct sigaction old_pipe;
+    smallclue_saved_state saved_state;
+    smallclueSaveState(&saved_state);
+
     struct sigaction ignore_action;
     memset(&ignore_action, 0, sizeof(ignore_action));
     ignore_action.sa_handler = SIG_IGN;
     sigemptyset(&ignore_action.sa_mask);
-    sigaction(SIGPIPE, &ignore_action, &old_pipe);
+    sigaction(SIGPIPE, &ignore_action, NULL);
     int status = 255;
     int invoke_argc = argc;
     char **invoke_argv = argv;
@@ -821,7 +876,7 @@ smallclue_openssh_done:
         smallcluePopDisableSoftSignalingScope(&soft_signal_scope);
     }
     free(augmented_argv);
-    sigaction(SIGPIPE, &old_pipe, NULL);
+    smallclueRestoreState(&saved_state);
     return status;
 }
 
