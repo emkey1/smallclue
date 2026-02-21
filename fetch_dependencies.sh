@@ -26,30 +26,40 @@ if [ ! -d "$THIRD_PARTY_DIR/nextvi" ]; then
             echo "void nextvi_reset_state(void) {}" >> "$NEXTVI_MAIN"
         fi
 
-        # Patch CR handling
-        VI_C="$THIRD_PARTY_DIR/nextvi/vi.c"
-        if [ -f "$VI_C" ]; then
-            echo "Patching nextvi CR handling in vi.c..."
-            # Handle CR in command mode
-            # Use single quotes for sed command to handle backslashes correctly
-            sed -i.bak 's/case '\''\\n'\'':/case '\''\\n'\'': case '\''\\r'\'':/g' "$VI_C"
-            rm -f "${VI_C}.bak"
-        fi
-
-        LED_C="$THIRD_PARTY_DIR/nextvi/led.c"
-        if [ -f "$LED_C" ]; then
-            echo "Patching nextvi CR handling in led.c..."
-            # Handle CR in insert mode (treat as newline)
-            sed -i.bak '/if (c == '\''\\n'\'' || TK_INT(c))/{
-                N
-                s/return c;/return c == '\''\\r'\'' ? '\''\\n'\'' : c;/
-                s/if (c == '\''\\n'\'' || TK_INT(c))/if (c == '\''\\n'\'' || c == '\''\\r'\'' || TK_INT(c))/
-            }' "$LED_C"
-            rm -f "${LED_C}.bak"
-        fi
-
     else
         echo "Could not find nextvi main file."
+    fi
+fi
+
+# Patch CR handling for nextvi (idempotent)
+VI_C="$THIRD_PARTY_DIR/nextvi/vi.c"
+if [ -f "$VI_C" ]; then
+    # Check if patch is already applied
+    if ! grep -q "case '\\\r':" "$VI_C"; then
+        echo "Patching nextvi CR handling in vi.c..."
+        # Handle CR in command mode
+        # Use single quotes for sed command to handle backslashes correctly
+        sed -i.bak 's/case '\''\\n'\'':/case '\''\\n'\'': case '\''\\r'\'':/g' "$VI_C"
+        rm -f "${VI_C}.bak"
+    else
+        echo "nextvi vi.c already patched for CR handling."
+    fi
+fi
+
+LED_C="$THIRD_PARTY_DIR/nextvi/led.c"
+if [ -f "$LED_C" ]; then
+    # Check if patch is already applied (checking one of the changes)
+    if ! grep -q "return c == '\\\r' ? '\\\n' : c;" "$LED_C"; then
+        echo "Patching nextvi CR handling in led.c..."
+        # Handle CR in insert mode (treat as newline)
+        sed -i.bak '/if (c == '\''\\n'\'' || TK_INT(c))/{
+            N
+            s/return c;/return c == '\''\\r'\'' ? '\''\\n'\'' : c;/
+            s/if (c == '\''\\n'\'' || TK_INT(c))/if (c == '\''\\n'\'' || c == '\''\\r'\'' || TK_INT(c))/
+        }' "$LED_C"
+        rm -f "${LED_C}.bak"
+    else
+        echo "nextvi led.c already patched for CR handling."
     fi
 fi
 
