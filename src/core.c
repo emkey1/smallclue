@@ -11958,7 +11958,12 @@ static int smallclueCutCommand(int argc, char **argv) {
             index++;
             break;
         }
-        if (strcmp(arg, "-d") == 0) {
+        if (strncmp(arg, "-d", 2) == 0) {
+            if (arg[2] != '\0') {
+                delimiter = arg[2];
+                index++;
+                continue;
+            }
             if (index + 1 >= argc || !argv[index + 1][0]) {
                 fprintf(stderr, "cut: missing delimiter\n");
                 return 1;
@@ -11967,17 +11972,24 @@ static int smallclueCutCommand(int argc, char **argv) {
             index += 2;
             continue;
         }
-        if (strcmp(arg, "-f") == 0) {
-            if (index + 1 >= argc) {
-                fprintf(stderr, "cut: missing field number\n");
-                return 1;
+        if (strncmp(arg, "-f", 2) == 0) {
+            const char *val_str = NULL;
+            if (arg[2] != '\0') {
+                val_str = arg + 2;
+                index++;
+            } else {
+                if (index + 1 >= argc) {
+                    fprintf(stderr, "cut: missing field number\n");
+                    return 1;
+                }
+                val_str = argv[index + 1];
+                index += 2;
             }
-            field = (int)smallclueParseLong(argv[index + 1]);
+            field = (int)smallclueParseLong(val_str);
             if (field <= 0) {
-                fprintf(stderr, "cut: invalid field '%s'\n", argv[index + 1]);
+                fprintf(stderr, "cut: invalid field '%s'\n", val_str);
                 return 1;
             }
-            index += 2;
             continue;
         }
         fprintf(stderr, "cut: unsupported option '%s'\n", arg);
