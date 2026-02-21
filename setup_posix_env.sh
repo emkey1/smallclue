@@ -18,6 +18,10 @@ if [ ! -d "third-party/openssh/.git" ]; then
     echo "OpenSSH repository missing or incomplete."
     MISSING_DEPS=1
 fi
+if [ ! -d "third-party/dash-0.5.12" ]; then
+    echo "Dash missing."
+    MISSING_DEPS=1
+fi
 
 if [ "$MISSING_DEPS" -eq 1 ]; then
     echo "Fetching dependencies..."
