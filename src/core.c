@@ -655,6 +655,7 @@ static int smallclueTelnetCommand(int argc, char **argv);
 static int smallclueTracerouteCommand(int argc, char **argv);
 static int smallclueNslookupCommand(int argc, char **argv);
 static int smallclueHostCommand(int argc, char **argv);
+static int smallclueHostnameCommand(int argc, char **argv);
 #if SMALLCLUE_HAS_IFADDRS
 static int smallclueIpAddrCommand(int argc, char **argv);
 #endif
@@ -788,6 +789,35 @@ static int smallclueHostCommand(int argc, char **argv) {
         fprintf(stderr, "No records found for %s\n", host);
         return 1;
     }
+    return 0;
+}
+
+static int smallclueHostnameCommand(int argc, char **argv) {
+    if (argc > 1) {
+        fprintf(stderr, "hostname: setting hostname not supported\n");
+        return 1;
+    }
+
+    char path[PATH_MAX];
+    if (smallclueResolveEtcEntry("hostname", R_OK, path, sizeof(path))) {
+        FILE *fp = fopen(path, "r");
+        if (fp) {
+            char buf[256];
+            if (fgets(buf, sizeof(buf), fp)) {
+                size_t len = strlen(buf);
+                if (len > 0 && buf[len - 1] == '\n') {
+                    buf[len - 1] = '\0';
+                }
+                puts(buf);
+                fclose(fp);
+                return 0;
+            }
+            fclose(fp);
+        }
+    }
+
+    puts("unknown");
+    fprintf(stderr, "hostname: host name not found; create /etc/hostname to set it\n");
     return 0;
 }
 
@@ -936,6 +966,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
 #endif
     {"halt", smallclueHaltCommand, "Halt the system"},
     {"host", smallclueHostCommand, "DNS lookup utility"},
+    {"hostname", smallclueHostnameCommand, "Show system hostname"},
     {"init", smallclueInitCommand, "System initialization"},
     {"kill", smallclueKillCommand, "Send signals to processes"},
     {"less", smallcluePagerCommand, "Paginate file contents"},
@@ -1111,6 +1142,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -t A|AAAA select record type\n"
              "  -v verbose (hosts debug)\n"
              "Server override is ignored."},
+    {"hostname", "hostname\n"
+                 "  Show system hostname"},
     {"pbcopy", "pbcopy\n"
                "  Copy stdin to system clipboard"},
     {"pbpaste", "pbpaste\n"
