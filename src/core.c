@@ -1591,6 +1591,19 @@ static bool smallclueReadTokensFromStdin(SmallclueLineVector *vec) {
     return true;
 }
 
+typedef struct {
+    int pid;
+    int ppid;
+    uid_t uid;
+    char *command;
+} SmallcluePsEntry;
+
+static int smallcluePsCompare(const void *a, const void *b) {
+    const SmallcluePsEntry *pa = (const SmallcluePsEntry *)a;
+    const SmallcluePsEntry *pb = (const SmallcluePsEntry *)b;
+    return pa->pid - pb->pid;
+}
+
 static int smallcluePsCommand(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -1634,12 +1647,116 @@ static int smallcluePsCommand(int argc, char **argv) {
     free(snaps);
     return 0;
 #else
-    pid_t pid = getpid();
-    pid_t ppid = getppid();
-    uid_t uid = getuid();
-    const char *cmd = argv && argv[0] ? argv[0] : "ps";
-    printf(" PID   PPID   UID COMMAND\n");
-    printf("%4d %6d %5d %s\n", (int)pid, (int)ppid, (int)uid, cmd);
+    DIR *dir = opendir("/proc");
+    if (dir) {
+        SmallcluePsEntry *entries = NULL;
+        size_t count = 0;
+        size_t capacity = 0;
+        struct dirent *ent;
+
+        while ((ent = readdir(dir)) != NULL) {
+            if (!isdigit(ent->d_name[0])) continue;
+
+            int pid = atoi(ent->d_name);
+            char path[PATH_MAX];
+
+            snprintf(path, sizeof(path), "/proc/%s/stat", ent->d_name);
+            FILE *fp = fopen(path, "r");
+            if (!fp) continue;
+
+            char buf[1024];
+            if (!fgets(buf, sizeof(buf), fp)) {
+                fclose(fp);
+                continue;
+            }
+            fclose(fp);
+
+            char *open_paren = strchr(buf, '(');
+            char *close_paren = strrchr(buf, ')');
+            if (!open_paren || !close_paren || close_paren <= open_paren) {
+                continue;
+            }
+
+            *close_paren = '\0';
+            char *comm_short = open_paren + 1;
+            char *rest = close_paren + 1;
+
+            int ppid = 0;
+            char state_char;
+            if (sscanf(rest, " %c %d", &state_char, &ppid) != 2) {
+                ppid = 0;
+            }
+
+            struct stat st;
+            uid_t uid = 0;
+            snprintf(path, sizeof(path), "/proc/%s", ent->d_name);
+            if (stat(path, &st) == 0) {
+                uid = st.st_uid;
+            }
+
+            char *command = NULL;
+            snprintf(path, sizeof(path), "/proc/%s/cmdline", ent->d_name);
+            fp = fopen(path, "r");
+            if (fp) {
+                char cmdline[1024];
+                size_t len = fread(cmdline, 1, sizeof(cmdline) - 1, fp);
+                fclose(fp);
+                if (len > 0) {
+                    cmdline[len] = '\0';
+                    for (size_t i = 0; i < len; ++i) {
+                        if (cmdline[i] == '\0') cmdline[i] = ' ';
+                    }
+                    if (len > 0 && cmdline[len - 1] == ' ') {
+                        cmdline[len - 1] = '\0';
+                    }
+                    if (cmdline[0] != '\0') {
+                        command = strdup(cmdline);
+                    }
+                }
+            }
+
+            if (!command) {
+                command = strdup(comm_short);
+            }
+
+            if (command) {
+                if (count == capacity) {
+                    size_t new_cap = capacity ? capacity * 2 : 16;
+                    SmallcluePsEntry *new_entries = (SmallcluePsEntry *)realloc(entries, new_cap * sizeof(SmallcluePsEntry));
+                    if (!new_entries) {
+                        free(command);
+                        break;
+                    }
+                    entries = new_entries;
+                    capacity = new_cap;
+                }
+                entries[count].pid = pid;
+                entries[count].ppid = ppid;
+                entries[count].uid = uid;
+                entries[count].command = command;
+                count++;
+            }
+        }
+        closedir(dir);
+
+        if (entries && count > 1) {
+            qsort(entries, count, sizeof(SmallcluePsEntry), smallcluePsCompare);
+        }
+
+        printf(" PID   PPID   UID COMMAND\n");
+        for (size_t i = 0; i < count; ++i) {
+            printf("%4d %6d %5d %s\n", entries[i].pid, entries[i].ppid, (int)entries[i].uid, entries[i].command);
+            free(entries[i].command);
+        }
+        free(entries);
+    } else {
+        pid_t pid = getpid();
+        pid_t ppid = getppid();
+        uid_t uid = getuid();
+        const char *cmd = argv && argv[0] ? argv[0] : "ps";
+        printf(" PID   PPID   UID COMMAND\n");
+        printf("%4d %6d %5d %s\n", (int)pid, (int)ppid, (int)uid, cmd);
+    }
     return 0;
 #endif
 }
