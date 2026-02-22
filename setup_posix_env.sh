@@ -141,7 +141,20 @@ OPENSSH_SHIM="src/openssh_shim.c"
 
 OPENSSH_DIR="third-party/openssh"
 if [ -d "$OPENSSH_DIR" ]; then
+    # Revert sshd.c patching if present (from previous failed runs)
+    if grep -q "pscal_openssh_sshd_main" "$OPENSSH_DIR/sshd.c"; then
+        echo "Reverting sshd.c changes..."
+        (cd "$OPENSSH_DIR" && git checkout sshd.c)
+    fi
+
     echo "Configuring OpenSSH..."
+    if [ -f "$OPENSSH_DIR/Makefile" ]; then
+        if [ "$(uname -s)" = "Linux" ] && ! grep -q "\-static" "$OPENSSH_DIR/Makefile"; then
+             echo "Reconfiguring OpenSSH for static build..."
+             (cd "$OPENSSH_DIR" && make distclean)
+        fi
+    fi
+
     if [ ! -f "$OPENSSH_DIR/Makefile" ]; then
         if [ ! -f "$OPENSSH_DIR/configure" ]; then
             echo "configure script missing. Attempting to generate with autoreconf (this may take a moment)..."
@@ -166,7 +179,11 @@ if [ -d "$OPENSSH_DIR" ]; then
         fi
 
         if [ -f "$OPENSSH_DIR/configure" ]; then
-            (cd "$OPENSSH_DIR" && ./configure)
+            OPENSSH_CONFIG_FLAGS=""
+            if [ "$(uname -s)" = "Linux" ]; then
+                OPENSSH_CONFIG_FLAGS="LDFLAGS=-static"
+            fi
+            (cd "$OPENSSH_DIR" && ./configure $OPENSSH_CONFIG_FLAGS)
         else
             echo "Error: configure script not found and could not be generated."
             exit 1
@@ -228,6 +245,9 @@ if [ -d "$OPENSSH_DIR" ]; then
         scp.o progressmeter.o sftp-common.o sftp-client.o sftp-glob.o \
         sftp.o sftp-usergroup.o \
         ssh-keygen.o sshsig.o)
+
+    echo "Building OpenSSH sshd..."
+    (cd "$OPENSSH_DIR" && make -j4 sshd)
 
     OPENSSH_OBJS="$OPENSSH_DIR/ssh.o $OPENSSH_DIR/readconf.o $OPENSSH_DIR/clientloop.o $OPENSSH_DIR/sshtty.o \
 $OPENSSH_DIR/sshconnect.o $OPENSSH_DIR/sshconnect2.o $OPENSSH_DIR/mux.o $OPENSSH_DIR/ssh-sk-client.o \
@@ -365,6 +385,10 @@ fi
 
 # 5. Install smallclue and dash
 cp smallclue "$ROOTFS/bin/"
+if [ -f "third-party/openssh/sshd" ]; then
+    echo "Installing sshd..."
+    cp "third-party/openssh/sshd" "$ROOTFS/bin/sshd"
+fi
 if [ "$(uname -s)" = "Darwin" ] && [ -n "${SMALLCLUE_CODESIGN_IDENTITY:-}" ]; then
     codesign --force --timestamp=none --sign "${SMALLCLUE_CODESIGN_IDENTITY}" "$ROOTFS/bin/smallclue"
 fi
@@ -559,6 +583,30 @@ EOF
 echo "Creating /etc/hostname..."
 echo "smallclue" > "$ROOTFS/etc/hostname"
 
+echo "Setting up SSH..."
+mkdir -p "$ROOTFS/var/empty"
+mkdir -p "$ROOTFS/run/sshd"
+mkdir -p "$ROOTFS/etc/ssh"
+
+if [ ! -f "$ROOTFS/etc/ssh/ssh_host_rsa_key" ]; then
+    echo "Generating SSH host keys..."
+    ssh-keygen -t rsa -f "$ROOTFS/etc/ssh/ssh_host_rsa_key" -N "" -q
+    ssh-keygen -t ecdsa -f "$ROOTFS/etc/ssh/ssh_host_ecdsa_key" -N "" -q
+    ssh-keygen -t ed25519 -f "$ROOTFS/etc/ssh/ssh_host_ed25519_key" -N "" -q
+fi
+
+cat > "$ROOTFS/etc/ssh/sshd_config" <<EOF
+Port 22
+PermitRootLogin yes
+PasswordAuthentication yes
+PermitEmptyPasswords yes
+HostKey /etc/ssh/ssh_host_rsa_key
+HostKey /etc/ssh/ssh_host_ecdsa_key
+HostKey /etc/ssh/ssh_host_ed25519_key
+AuthorizedKeysFile .ssh/authorized_keys
+Subsystem sftp internal-sftp
+EOF
+
 echo "Creating /etc/rc..."
 cat > "$ROOTFS/etc/rc" <<EOF
 #!/bin/sh
@@ -569,6 +617,7 @@ echo "Mounting filesystems..."
 # mount -t sysfs sys /sys
 # mount -t devtmpfs dev /dev
 echo "Starting services..."
+/bin/sshd
 echo "Done."
 exec /bin/sh -l
 EOF
