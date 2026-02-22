@@ -36,6 +36,10 @@
 #include <limits.h>
 #include <libgen.h>
 #include <pwd.h>
+#if defined(__linux__) || defined(linux) || defined(__linux)
+#include <shadow.h>
+#include <crypt.h>
+#endif
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <stdbool.h>
@@ -944,6 +948,213 @@ static int smallclueSudoCommand(int argc, char **argv) {
     return (errno == ENOENT) ? 127 : 126;
 }
 
+#if defined(__linux__) || defined(linux) || defined(__linux)
+static char *smallclueGetPass(const char *prompt) {
+    static char buf[128];
+    struct termios old, new;
+    int fd = fileno(stdin);
+
+    if (tcgetattr(fd, &old) != 0) {
+        return NULL;
+    }
+    new = old;
+    new.c_lflag &= ~ECHO;
+    if (tcsetattr(fd, TCSAFLUSH, &new) != 0) {
+        return NULL;
+    }
+
+    fprintf(stderr, "%s", prompt);
+    if (fgets(buf, sizeof(buf), stdin) == NULL) {
+        tcsetattr(fd, TCSAFLUSH, &old);
+        return NULL;
+    }
+    tcsetattr(fd, TCSAFLUSH, &old);
+    fprintf(stderr, "\n");
+
+    size_t len = strlen(buf);
+    if (len > 0 && buf[len - 1] == '\n') {
+        buf[len - 1] = '\0';
+    }
+    return buf;
+}
+#endif
+
+static int smallcluePasswdCommand(int argc, char **argv) {
+#if defined(__linux__) || defined(linux) || defined(__linux)
+    const char *username = NULL;
+    if (argc > 1) {
+        username = argv[1];
+    } else {
+        struct passwd *pw = getpwuid(getuid());
+        if (pw) {
+            username = pw->pw_name;
+        }
+    }
+
+    if (!username) {
+        fprintf(stderr, "passwd: cannot determine username\n");
+        return 1;
+    }
+
+    uid_t uid = getuid();
+    if (uid != 0 && argc > 1) {
+        struct passwd *pw = getpwnam(username);
+        if (!pw || pw->pw_uid != uid) {
+            fprintf(stderr, "passwd: permission denied\n");
+            return 1;
+        }
+    }
+
+    // Lock shadow file
+    if (lckpwdf() != 0) {
+        fprintf(stderr, "passwd: password file busy\n");
+        return 1;
+    }
+
+    struct spwd *sp = getspnam(username);
+    if (!sp) {
+        fprintf(stderr, "passwd: user '%s' not found in shadow file\n", username);
+        ulckpwdf();
+        return 1;
+    }
+
+    // If not root, ask for old password
+    if (uid != 0 && sp->sp_pwdp && strcmp(sp->sp_pwdp, "*") != 0 && strcmp(sp->sp_pwdp, "!") != 0 && sp->sp_pwdp[0] != '\0') {
+        char *pass = smallclueGetPass("Old password: ");
+        if (!pass) {
+            ulckpwdf();
+            return 1;
+        }
+        char *encrypted = crypt(pass, sp->sp_pwdp);
+        if (!encrypted || strcmp(encrypted, sp->sp_pwdp) != 0) {
+            fprintf(stderr, "passwd: authentication failure\n");
+            ulckpwdf();
+            return 1;
+        }
+    }
+
+    char *new_pass = smallclueGetPass("New password: ");
+    if (!new_pass || !*new_pass) {
+        fprintf(stderr, "passwd: password unchanged\n");
+        ulckpwdf();
+        return 1;
+    }
+    char *new_pass_copy = strdup(new_pass);
+    if (!new_pass_copy) {
+        fprintf(stderr, "passwd: out of memory\n");
+        ulckpwdf();
+        return 1;
+    }
+
+    char *confirm_pass = smallclueGetPass("Retype new password: ");
+    if (!confirm_pass || strcmp(new_pass_copy, confirm_pass) != 0) {
+        fprintf(stderr, "passwd: passwords do not match\n");
+        free(new_pass_copy);
+        ulckpwdf();
+        return 1;
+    }
+
+    // Generate salt
+    char salt[64];
+    const char *salt_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789./";
+    unsigned char random_bytes[16];
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f) {
+        size_t n = fread(random_bytes, 1, sizeof(random_bytes), f);
+        fclose(f);
+        if (n != sizeof(random_bytes)) {
+            fprintf(stderr, "passwd: failed to read random source\n");
+            ulckpwdf();
+            return 1;
+        }
+    } else {
+        fprintf(stderr, "passwd: cannot open /dev/urandom\n");
+        ulckpwdf();
+        return 1;
+    }
+
+    // SHA-512 salt format: $6$salt$
+    strcpy(salt, "$6$");
+    int salt_idx = 3;
+    for (int i = 0; i < 16 && salt_idx < 19; ++i) {
+        salt[salt_idx++] = salt_chars[random_bytes[i] % 64];
+    }
+    salt[salt_idx] = '\0';
+
+    char *hashed = crypt(new_pass_copy, salt);
+    free(new_pass_copy);
+
+    if (!hashed) {
+        fprintf(stderr, "passwd: encryption failed\n");
+        ulckpwdf();
+        return 1;
+    }
+
+    // Update shadow file
+    FILE *fp = fopen("/etc/shadow", "r");
+    if (!fp) {
+        perror("passwd: /etc/shadow");
+        ulckpwdf();
+        return 1;
+    }
+
+    FILE *out_fp = fopen("/etc/shadow.tmp", "w");
+    if (!out_fp) {
+        perror("passwd: /etc/shadow.tmp");
+        fclose(fp);
+        ulckpwdf();
+        return 1;
+    }
+
+    // Set permission of tmp file
+    chmod("/etc/shadow.tmp", 0600);
+
+    struct spwd *entry;
+    int found = 0;
+    while ((entry = fgetspent(fp)) != NULL) {
+        if (strcmp(entry->sp_namp, username) == 0) {
+            entry->sp_pwdp = hashed;
+            entry->sp_lstchg = time(NULL) / (24 * 3600);
+            found = 1;
+        }
+        if (putspent(entry, out_fp) != 0) {
+            fprintf(stderr, "passwd: error writing to temporary file\n");
+            fclose(fp);
+            fclose(out_fp);
+            unlink("/etc/shadow.tmp");
+            ulckpwdf();
+            return 1;
+        }
+    }
+
+    fclose(fp);
+    fclose(out_fp);
+
+    if (!found) {
+        fprintf(stderr, "passwd: user '%s' not found during update\n", username);
+        unlink("/etc/shadow.tmp");
+        ulckpwdf();
+        return 1;
+    }
+
+    if (rename("/etc/shadow.tmp", "/etc/shadow") != 0) {
+        perror("passwd: rename");
+        unlink("/etc/shadow.tmp");
+        ulckpwdf();
+        return 1;
+    }
+
+    ulckpwdf();
+    printf("passwd: password updated successfully\n");
+    return 0;
+#else
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "passwd: not supported on this platform\n");
+    return 1;
+#endif
+}
+
 static const SmallclueApplet kSmallclueApplets[] = {
     {"[", smallclueBracketCommand, "Evaluate expressions"},
     {"basename", smallclueBasenameCommand, "Strip directory prefix"},
@@ -987,6 +1198,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"mv", smallclueMvCommand, "Move or rename files"},
     {"nslookup", smallclueNslookupCommand, "DNS lookup utility"},
     {"no", smallclueNoCommand, "Repeatedly print strings (exit 1)"},
+    {"passwd", smallcluePasswdCommand, "Change user password"},
     {"pbcopy", smallcluePbcopyCommand, "Copy stdin to the system clipboard"},
     {"pbpaste", smallcluePbpasteCommand, "Paste the system clipboard to stdout"},
     {"ping", smallcluePingCommand, "TCP ping utility"},
@@ -1147,6 +1359,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                  "  -v prints hosts lookup debugging."},
     {"nextvi", "nextvi [FILE]\n"
                "  Full-screen text editor"},
+    {"passwd", "passwd [username]\n"
+               "  Change user password"},
     {"host", "host [-4|-6] [-v] [-t TYPE] host [server]\n"
              "  -4 IPv4 only\n"
              "  -6 IPv6 only\n"
