@@ -7337,6 +7337,9 @@ static void smallclueCurlApplyCommonOptions(CURL *curl, const char *url) {
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    /* Restrict protocols to HTTP/HTTPS to prevent SSRF via redirects to file:// etc. */
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
 }
 
 static size_t smallclueCurlWriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
