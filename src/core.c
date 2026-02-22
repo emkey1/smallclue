@@ -92,6 +92,10 @@ __attribute__((weak)) char *pscalRuntimeCopyMarketingVersion(void) { return NULL
 #include "termios_shim.h"
 #include <time.h>
 #include <unistd.h>
+#if defined(__linux__) || defined(linux) || defined(__linux)
+#include <sys/mount.h>
+#endif
+
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
 #include <sys/param.h>
 #include <sys/mount.h>
@@ -609,6 +613,7 @@ static int smallcluePsCommand(int argc, char **argv);
 static int smallclueKillCommand(int argc, char **argv);
 static int smallclueMkdirCommand(int argc, char **argv);
 static int smallclueMknodCommand(int argc, char **argv);
+static int smallclueMountCommand(int argc, char **argv);
 static void smallclueEmitTerminalSane(void);
 #if defined(PSCAL_TARGET_IOS)
 static bool smallclueSessionPtyName(char *buf, size_t buf_len);
@@ -976,6 +981,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"mdev", smallclueMdevCommand, "Device manager"},
     {"mkdir", smallclueMkdirCommand, "Create directories"},
     {"mknod", smallclueMknodCommand, "Create special files"},
+    {"mount", smallclueMountCommand, "Mount filesystems"},
     {"more", smallcluePagerCommand, "Paginate file contents"},
     {"mv", smallclueMvCommand, "Move or rename files"},
     {"nslookup", smallclueNslookupCommand, "DNS lookup utility"},
@@ -1127,6 +1133,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  -p create parents as needed"},
     {"mknod", "mknod [-m mode] NAME TYPE [MAJOR MINOR]\n"
               "  Create special files (b=block, c/u=char, p=fifo)"},
+    {"mount", "mount [-t type] [-o options] device dir\n"
+              "  Mount filesystems (use -t type)"},
     {"more", "more [FILE...]\n"
              "  Pager (alias of less)"},
     {"mv", "mv SRC... DEST\n"
@@ -13151,6 +13159,124 @@ static int smallclueMknodCommand(int argc, char **argv) {
     }
 
     return 0;
+}
+
+static int smallclueMountCommand(int argc, char **argv) {
+#if defined(__linux__) || defined(linux) || defined(__linux)
+    const char *usage = "usage: mount [-t type] [-o options] device dir\n";
+    const char *type = NULL;
+    char *options = NULL;
+    unsigned long flags = 0;
+
+    smallclueResetGetopt();
+    int opt;
+    while ((opt = getopt(argc, argv, "t:o:")) != -1) {
+        switch (opt) {
+            case 't':
+                type = optarg;
+                break;
+            case 'o':
+                if (options) {
+                    size_t old_len = strlen(options);
+                    size_t new_len = old_len + 1 + strlen(optarg) + 1;
+                    char *new_opts = (char *)realloc(options, new_len);
+                    if (new_opts) {
+                        options = new_opts;
+                        strcat(options, ",");
+                        strcat(options, optarg);
+                    }
+                } else {
+                    options = strdup(optarg);
+                }
+                break;
+            default:
+                if (options) free(options);
+                fputs(usage, stderr);
+                return 1;
+        }
+    }
+
+    if (optind >= argc) {
+        if (options) free(options);
+        FILE *fp = fopen("/proc/mounts", "r");
+        if (!fp) fp = fopen("/etc/mtab", "r");
+        if (!fp) {
+             perror("mount: cannot read mounts");
+             return 1;
+        }
+        char buf[1024];
+        while (fgets(buf, sizeof(buf), fp)) {
+            fputs(buf, stdout);
+        }
+        fclose(fp);
+        return 0;
+    }
+
+    if (optind + 1 >= argc) {
+        if (options) free(options);
+        fputs(usage, stderr);
+        return 1;
+    }
+
+    const char *source = argv[optind];
+    const char *target = argv[optind + 1];
+
+    char *data = NULL;
+    if (options) {
+        char *opts = strdup(options);
+        char *token = strtok(opts, ",");
+        while (token) {
+            bool is_flag = true;
+            if (strcmp(token, "ro") == 0) flags |= MS_RDONLY;
+            else if (strcmp(token, "rw") == 0) flags &= ~MS_RDONLY;
+            else if (strcmp(token, "nosuid") == 0) flags |= MS_NOSUID;
+            else if (strcmp(token, "suid") == 0) flags &= ~MS_NOSUID;
+            else if (strcmp(token, "nodev") == 0) flags |= MS_NODEV;
+            else if (strcmp(token, "dev") == 0) flags &= ~MS_NODEV;
+            else if (strcmp(token, "noexec") == 0) flags |= MS_NOEXEC;
+            else if (strcmp(token, "exec") == 0) flags &= ~MS_NOEXEC;
+#ifdef MS_REMOUNT
+            else if (strcmp(token, "remount") == 0) flags |= MS_REMOUNT;
+#endif
+#ifdef MS_BIND
+            else if (strcmp(token, "bind") == 0) flags |= MS_BIND;
+#endif
+            else is_flag = false;
+
+            if (!is_flag) {
+                 if (!data) {
+                     data = strdup(token);
+                 } else {
+                     size_t old_len = strlen(data);
+                     size_t new_len = old_len + 1 + strlen(token) + 1;
+                     char *new_data = (char *)realloc(data, new_len);
+                     if (new_data) {
+                         data = new_data;
+                         strcat(data, ",");
+                         strcat(data, token);
+                     }
+                 }
+            }
+            token = strtok(NULL, ",");
+        }
+        free(opts);
+        free(options);
+    }
+
+    int rc = mount(source, target, type ? type : "auto", flags, data);
+    if (data) free(data);
+
+    if (rc != 0) {
+        perror("mount");
+        return 1;
+    }
+    return 0;
+#else
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "mount: not supported on this platform\n");
+    return 1;
+#endif
 }
 
 static int smallclueFileCommand(int argc, char **argv) {
