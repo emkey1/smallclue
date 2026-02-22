@@ -9517,15 +9517,13 @@ static int smallclueTimeCommand(int argc, char **argv) {
     return status;
 }
 
+#if defined(PSCAL_TARGET_IOS)
 static int smallclueWatchRunApplet(const SmallclueApplet *applet, int argc, char **argv) {
     if (!applet) {
         fprintf(stderr, "watch: %s: command not found\n", argv[0]);
         return 127;
     }
     const char *dbg = getenv("SMALLCLUE_DEBUG");
-#if !defined(PSCAL_TARGET_IOS)
-    return smallclueDispatchApplet(applet, argc, argv);
-#else
     char label[96] = {0};
     size_t used = 0;
     for (int i = 0; i < argc && used + 1 < sizeof(label); ++i) {
@@ -9558,8 +9556,8 @@ static int smallclueWatchRunApplet(const SmallclueApplet *applet, int argc, char
         }
     }
     return status;
-#endif
 }
+#endif
 
 static int smallclueWatchCommand(int argc, char **argv) {
     smallclueResetGetopt();
@@ -9636,7 +9634,9 @@ static int smallclueWatchCommand(int argc, char **argv) {
      * synthetic tasks. */
 #endif
 
+#if defined(PSCAL_TARGET_IOS)
     const SmallclueApplet *applet = smallclueFindApplet(argv[idx]);
+#endif
 
     int status = 0;
     int iterations = 0;
@@ -9651,7 +9651,20 @@ static int smallclueWatchCommand(int argc, char **argv) {
         fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
         printf("Every %.2fs: %s\n\n", interval, cmdline ? cmdline : argv[idx]);
         fflush(stdout);
+#if defined(PSCAL_TARGET_IOS)
         status = smallclueWatchRunApplet(applet, cmd_argc, &argv[idx]);
+#else
+        int sys_rc = system(cmdline ? cmdline : argv[idx]);
+        if (sys_rc == -1) {
+            status = 127;
+        } else if (WIFEXITED(sys_rc)) {
+            status = WEXITSTATUS(sys_rc);
+        } else if (WIFSIGNALED(sys_rc)) {
+            status = 128 + WTERMSIG(sys_rc);
+        } else {
+            status = 1;
+        }
+#endif
         fflush(stdout);
         if (status >= 128 && status < 128 + NSIG) {
             int sig = status - 128;
