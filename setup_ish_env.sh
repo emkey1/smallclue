@@ -9,13 +9,18 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 AUTO_INSTALL_DEPS="${AUTO_INSTALL_DEPS:-1}"
+OPENSSH_VENDOR_FALLBACK="${OPENSSH_VENDOR_FALLBACK:-1}"
 IS_DEBIAN_APT=0
 if [ -f /etc/debian_version ] && command -v apt-get >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1; then
     IS_DEBIAN_APT=1
 fi
 HOST_DEB_ARCH=""
+DPKG_HAS_BROKEN=0
 if [ "$IS_DEBIAN_APT" -eq 1 ]; then
     HOST_DEB_ARCH="$(dpkg --print-architecture 2>/dev/null || true)"
+    if dpkg --audit 2>/dev/null | grep -q .; then
+        DPKG_HAS_BROKEN=1
+    fi
 fi
 APT_UPDATED=0
 
@@ -71,27 +76,103 @@ ensureDebianI386OpenSshDeps() {
     fi
     ensureI386ArchDebian
 
-    # First pass: straightforward i386 installs.
-    aptInstallNoRecommends libc6:i386 libc6-dev:i386 || true
-    if aptInstallNoRecommends zlib1g:i386 zlib1g-dev:i386 libssl3:i386 libssl-dev:i386; then
-        return 0
+    # Try straightforward i386 installs only; do not force host package changes.
+    if ! aptInstallNoRecommends libc6:i386 libc6-dev:i386 zlib1g:i386 zlib1g-dev:i386 libssl3:i386 libssl-dev:i386; then
+        return 1
+    fi
+    return 0
+}
+
+downloadTarball() {
+    local url="$1"
+    local out="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -L --fail -o "$out" "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -O "$out" "$url"
+    else
+        echo "Error: need curl or wget to download $url"
+        return 1
+    fi
+}
+
+buildVendoredOpenSshDeps() {
+    local vendor_root="third-party/ish-i686-deps"
+    local src_root="$vendor_root/src"
+    local install_root="$vendor_root/install"
+    local zlib_ver="1.3.1"
+    local zlib_src="$src_root/zlib-$zlib_ver"
+    local zlib_tar="$src_root/zlib-$zlib_ver.tar.gz"
+    local zlib_url="https://zlib.net/zlib-$zlib_ver.tar.gz"
+    local openssl_ver="3.6.0"
+    local openssl_src="$src_root/openssl-$openssl_ver"
+    local openssl_tar="$src_root/openssl-$openssl_ver.tar.gz"
+    local openssl_url="https://www.openssl.org/source/openssl-$openssl_ver.tar.gz"
+    local target_ar="ar"
+    local target_ranlib="ranlib"
+    local cc_prefix=""
+
+    mkdir -p "$src_root" "$install_root"
+
+    if [ "$TARGET_IS_CROSS" -eq 1 ]; then
+        cc_prefix="i686-linux-gnu-"
+        if command -v i686-linux-gnu-ar >/dev/null 2>&1; then
+            target_ar="i686-linux-gnu-ar"
+        fi
+        if command -v i686-linux-gnu-ranlib >/dev/null 2>&1; then
+            target_ranlib="i686-linux-gnu-ranlib"
+        fi
     fi
 
-    # Second pass: force host+i386 package versions to resolve together.
-    echo "Retrying i386 dependency install with host+i386 package alignment..."
-    apt-get -y --fix-broken install || true
-    aptMaybeUpdate
-    if [ -n "$HOST_DEB_ARCH" ]; then
-        apt-get install -y --no-install-recommends \
-            "libssl3:${HOST_DEB_ARCH}" libssl3:i386 \
-            "libssl-dev:${HOST_DEB_ARCH}" libssl-dev:i386 \
-            "zlib1g:${HOST_DEB_ARCH}" zlib1g:i386 zlib1g-dev:i386 \
-            libc6:i386 libc6-dev:i386
-    else
-        apt-get install -y --no-install-recommends \
-            libssl3:i386 libssl-dev:i386 zlib1g:i386 zlib1g-dev:i386 \
-            libc6:i386 libc6-dev:i386
+    if [ ! -d "$zlib_src" ]; then
+        echo "Fetching zlib $zlib_ver..."
+        [ -f "$zlib_tar" ] || downloadTarball "$zlib_url" "$zlib_tar"
+        tar -xf "$zlib_tar" -C "$src_root"
     fi
+
+    echo "Building vendored zlib for i686..."
+    (cd "$zlib_src" && \
+        make distclean >/dev/null 2>&1 || true && \
+        CC="$CC_PRINT" AR="$target_ar" RANLIB="$target_ranlib" \
+        ./configure --static --prefix="$(cd "$install_root" && pwd)" && \
+        make -j4 && make install)
+
+    if [ ! -d "$openssl_src" ]; then
+        if [ -d ../../third-party/openssl-3.6.0 ]; then
+            echo "Using bundled OpenSSL source from ../../third-party/openssl-3.6.0"
+            cp -a ../../third-party/openssl-3.6.0 "$openssl_src"
+        elif [ -d ../third-party/openssl-3.6.0 ]; then
+            echo "Using bundled OpenSSL source from ../third-party/openssl-3.6.0"
+            cp -a ../third-party/openssl-3.6.0 "$openssl_src"
+        else
+            echo "Fetching OpenSSL $openssl_ver..."
+            [ -f "$openssl_tar" ] || downloadTarball "$openssl_url" "$openssl_tar"
+            tar -xf "$openssl_tar" -C "$src_root"
+        fi
+    fi
+
+    echo "Building vendored OpenSSL for i686..."
+    if [ -n "$cc_prefix" ]; then
+        (cd "$openssl_src" && \
+            make clean >/dev/null 2>&1 || true && \
+            perl Configure linux-generic32 no-shared no-tests no-module \
+                --prefix="$(cd "$install_root" && pwd)" \
+                --openssldir="$(cd "$install_root" && pwd)/ssl" \
+                --cross-compile-prefix="$cc_prefix" && \
+            make -j4 CC="$CC_PRINT" AR="$target_ar" RANLIB="$target_ranlib" && \
+            make install_sw)
+    else
+        (cd "$openssl_src" && \
+            make clean >/dev/null 2>&1 || true && \
+            perl Configure linux-generic32 no-shared no-tests no-module \
+                --prefix="$(cd "$install_root" && pwd)" \
+                --openssldir="$(cd "$install_root" && pwd)/ssl" && \
+            make -j4 CC="$CC_PRINT" AR="$target_ar" RANLIB="$target_ranlib" && \
+            make install_sw)
+    fi
+
+    OPENSSH_CPPFLAGS="$OPENSSH_CPPFLAGS -I$(cd "$install_root" && pwd)/include"
+    OPENSSH_LDFLAGS="$OPENSSH_LDFLAGS -L$(cd "$install_root" && pwd)/lib"
 }
 
 selectI686Toolchain() {
@@ -122,7 +203,7 @@ declare -a SMALLCLUE_RUNNER_CMD
 
 if ! selectI686Toolchain; then
     HOST_ARCH="$(uname -m)"
-    if [ "$AUTO_INSTALL_DEPS" = "1" ] && [ "$IS_DEBIAN_APT" -eq 1 ]; then
+    if [ "$AUTO_INSTALL_DEPS" = "1" ] && [ "$IS_DEBIAN_APT" -eq 1 ] && [ "$DPKG_HAS_BROKEN" -eq 0 ]; then
         echo "Installing missing toolchain/build dependencies..."
         ensureDebianPackages make file autoconf automake libtool pkg-config
         if [ "$HOST_ARCH" = "aarch64" ] || [ "$HOST_ARCH" = "arm64" ] || [ "$HOST_ARCH" = "armv7l" ]; then
@@ -132,6 +213,9 @@ if ! selectI686Toolchain; then
             ensureDebianPackages gcc-multilib libc6-dev-i386
         fi
         selectI686Toolchain || true
+    elif [ "$AUTO_INSTALL_DEPS" = "1" ] && [ "$IS_DEBIAN_APT" -eq 1 ] && [ "$DPKG_HAS_BROKEN" -eq 1 ]; then
+        echo "Warning: dpkg has unconfigured/broken packages; skipping apt auto-install."
+        echo "  (Script will continue and use non-apt fallback paths when possible.)"
     fi
 fi
 
@@ -304,9 +388,19 @@ if [ -d "$OPENSSH_DIR" ]; then
     probeOpenSshTargetLibs
 
     if ([ "$HAVE_TARGET_ZLIB" -ne 1 ] || [ "$HAVE_TARGET_CRYPTO" -ne 1 ]) && \
-       [ "$AUTO_INSTALL_DEPS" = "1" ] && [ "$IS_DEBIAN_APT" -eq 1 ]; then
+       [ "$AUTO_INSTALL_DEPS" = "1" ] && [ "$IS_DEBIAN_APT" -eq 1 ] && [ "$DPKG_HAS_BROKEN" -eq 0 ]; then
         echo "Installing missing i386 OpenSSH dependency packages..."
         ensureDebianI386OpenSshDeps || true
+        probeOpenSshTargetLibs
+    elif ([ "$HAVE_TARGET_ZLIB" -ne 1 ] || [ "$HAVE_TARGET_CRYPTO" -ne 1 ]) && \
+         [ "$AUTO_INSTALL_DEPS" = "1" ] && [ "$IS_DEBIAN_APT" -eq 1 ] && [ "$DPKG_HAS_BROKEN" -eq 1 ]; then
+        echo "Warning: dpkg currently broken; skipping apt OpenSSH dependency install."
+    fi
+
+    if ([ "$HAVE_TARGET_ZLIB" -ne 1 ] || [ "$HAVE_TARGET_CRYPTO" -ne 1 ]) && \
+       [ "$OPENSSH_VENDOR_FALLBACK" = "1" ]; then
+        echo "System i386 OpenSSH deps unavailable; trying vendored OpenSSL+zlib build..."
+        buildVendoredOpenSshDeps || true
         probeOpenSshTargetLibs
     fi
 
@@ -322,22 +416,15 @@ if [ -d "$OPENSSH_DIR" ]; then
             echo "Install i386 target libs on Debian:"
             echo "  sudo dpkg --add-architecture i386"
             echo "  sudo apt-get update"
-            echo "  sudo apt-get -y --fix-broken install"
-            if [ -n "$HOST_DEB_ARCH" ]; then
-                echo "  sudo apt-get install libc6:i386 libc6-dev:i386 zlib1g:i386 zlib1g-dev:i386 libssl3:${HOST_DEB_ARCH} libssl3:i386 libssl-dev:${HOST_DEB_ARCH} libssl-dev:i386"
-            else
-                echo "  sudo apt-get install libc6:i386 libc6-dev:i386 zlib1g:i386 zlib1g-dev:i386 libssl3:i386 libssl-dev:i386"
-            fi
+            echo "  sudo apt-get install libc6:i386 libc6-dev:i386 zlib1g:i386 zlib1g-dev:i386 libssl3:i386 libssl-dev:i386"
+            echo "If Raspberry Pi repo version suffixes prevent multiarch installs:"
+            echo "  rerun with OPENSSH_VENDOR_FALLBACK=1 (default) to build vendored OpenSSL+zlib"
         else
             echo "Install 32-bit target libs on Debian:"
             echo "  sudo dpkg --add-architecture i386"
             echo "  sudo apt-get update"
-            echo "  sudo apt-get -y --fix-broken install"
-            if [ -n "$HOST_DEB_ARCH" ]; then
-                echo "  sudo apt-get install libc6:i386 libc6-dev:i386 zlib1g:i386 zlib1g-dev:i386 libssl3:${HOST_DEB_ARCH} libssl3:i386 libssl-dev:${HOST_DEB_ARCH} libssl-dev:i386"
-            else
-                echo "  sudo apt-get install libc6:i386 libc6-dev:i386 zlib1g:i386 zlib1g-dev:i386 libssl3:i386 libssl-dev:i386"
-            fi
+            echo "  sudo apt-get install libc6:i386 libc6-dev:i386 zlib1g:i386 zlib1g-dev:i386 libssl3:i386 libssl-dev:i386"
+            echo "If multiarch versioning blocks this, rerun with OPENSSH_VENDOR_FALLBACK=1."
         fi
         if [ "$ALLOW_OPENSSH_STUBS" != "1" ]; then
             echo "Error: refusing to continue with OpenSSH stubs."
@@ -505,7 +592,7 @@ fi
 
 echo "Compiling smallclue (iSH/32-bit static)..."
 "${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" "${TARGET_LDFLAGS[@]}" -static -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${NEXTVI_DEFS} \
-    -I. -Isrc -lpthread \
+    -I. -Isrc ${OPENSSH_LDFLAGS} -lpthread \
     src/main.c \
     src/core.c \
     src/runtime_support.c \
