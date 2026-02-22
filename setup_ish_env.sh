@@ -341,7 +341,7 @@ fi
 
 # 4. Compile smallclue
 echo "Compiling smallclue (iSH/32-bit static)..."
-"${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" "${TARGET_LDFLAGS[@]}" -static -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -DSMALLCLUE_WITH_EXSH \
+"${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" "${TARGET_LDFLAGS[@]}" -static -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE \
     -I. -Isrc -lpthread \
     src/main.c \
     src/core.c \
