@@ -121,6 +121,8 @@ int PSCALRuntimeScriptCaptureActive(void) { return 0; }
 
 int smallclueVprocTestCommand(int argc, char **argv);
 
+static ssize_t smallclueGetlineStream(char **line, size_t *cap, FILE *stream, int *out_errno);
+
 static const char *smallclueResolvePath(const char *path, char *buffer, size_t buflen) {
     if (!path) {
         return NULL;
@@ -580,6 +582,7 @@ static int smallclueChmodCommand(int argc, char **argv);
 static int smallclueDateCommand(int argc, char **argv);
 static int smallclueCalCommand(int argc, char **argv);
 static int smallclueHeadCommand(int argc, char **argv);
+static int smallclueHistoryCommand(int argc, char **argv);
 static int smallclueGrepCommand(int argc, char **argv);
 static int smallclueWcCommand(int argc, char **argv);
 static int smallclueDuCommand(int argc, char **argv);
@@ -1179,6 +1182,43 @@ static int smallcluePasswdCommand(int argc, char **argv) {
 #endif
 }
 
+static int smallclueHistoryCommand(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    const char *home = getenv("HOME");
+    if (!home) {
+        fprintf(stderr, "history: HOME not set\n");
+        return 1;
+    }
+    char path[PATH_MAX];
+    int w = snprintf(path, sizeof(path), "%s/.sh_history", home);
+    if (w < 0 || (size_t)w >= sizeof(path)) {
+        fprintf(stderr, "history: path too long\n");
+        return 1;
+    }
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        return 0;
+    }
+    char *line = NULL;
+    size_t cap = 0;
+    int index = 1;
+    while (true) {
+        int read_err = 0;
+        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
+        if (len < 0) {
+            break;
+        }
+        printf("%5d  %s", index++, line);
+        if (len > 0 && line[len-1] != '\n') {
+            putchar('\n');
+        }
+    }
+    free(line);
+    fclose(fp);
+    return 0;
+}
+
 static const SmallclueApplet kSmallclueApplets[] = {
     {"[", smallclueBracketCommand, "Evaluate expressions"},
     {"basename", smallclueBasenameCommand, "Strip directory prefix"},
@@ -1201,6 +1241,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"find", smallclueFindCommand, "Search for files"},
     {"grep", smallclueGrepCommand, "Search for patterns"},
     {"head", smallclueHeadCommand, "Print the first lines of files"},
+    {"history", smallclueHistoryCommand, "Show command history"},
     {"id", smallclueIdCommand, "Print user identity information"},
 #if SMALLCLUE_HAS_IFADDRS
     {"ipaddr", smallclueIpAddrCommand, "Show interface IP addresses"},
@@ -1339,6 +1380,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Halt the system"},
     {"head", "head [-n N] [FILE...]\n"
              "  Default N=10"},
+    {"history", "history\n"
+                "  Show command history"},
     {"id", "id\n"
            "  Show uid/gid info"},
     {"init", "init [--service-mode|-S|--allow-non-pid1]\n"
