@@ -1398,11 +1398,13 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Pager; navigation: j/k, /, n, g/G, q"},
     {"ln", "ln [-s] TARGET LINK\n"
            "  -s symbolic link"},
-    {"ls", "ls [-a] [-A] [-l] [-n] [-t] [-h] [-d] [--color[=auto|always|never]] [path ...]\n"
+    {"ls", "ls [-a] [-A] [-l] [-n] [-1] [-C] [-t] [-h] [-d] [--color[=auto|always|never]] [path ...]\n"
            "  -a show entries starting with '.' (including . and ..)\n"
            "  -A show entries starting with '.' (excluding . and ..)\n"
            "  -l long format with permissions, ownership, size, time\n"
            "  -n numeric uid/gid (implies -l)\n"
+           "  -1 list one file per line\n"
+           "  -C list entries by columns\n"
            "  -t sort by modification time\n"
            "  -h human-readable sizes (with -l)\n"
            "  -d list directories themselves, not their contents"},
@@ -8155,6 +8157,11 @@ static int compare_ls_entries_group_dirs_mtime(const void *lhs, const void *rhs)
     return strcmp(a->name, b->name);
 }
 
+#define LS_FORMAT_AUTO 0
+#define LS_FORMAT_LONG 1
+#define LS_FORMAT_COLUMNS 2
+#define LS_FORMAT_SINGLE 3
+
 static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int color_mode, int classify) {
     if (count == 0) {
         return;
@@ -8228,7 +8235,7 @@ static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int 
 static int list_directory(const char *path,
                           bool show_all,
                           bool show_almost_all,
-                          bool long_format,
+                          int format_mode,
                           bool sort_by_time,
                           bool group_directories_first,
                           bool human,
@@ -8319,18 +8326,29 @@ static int list_directory(const char *path,
         qsort(entries, count, sizeof(entries[0]), comparator);
     }
 
-        if (long_format) {
-            for (size_t i = 0; i < count; ++i) {
-                status |= print_path_entry_with_stat(entries[i].full_path,
-                                                     entries[i].name,
-                                                     true,
-                                                     human,
-                                                     numeric_ids,
-                                                     &entries[i].stat_buf,
-                                                     color_mode,
-                                                     classify);
-            }
-        } else {
+    if (format_mode == LS_FORMAT_LONG) {
+        for (size_t i = 0; i < count; ++i) {
+            status |= print_path_entry_with_stat(entries[i].full_path,
+                                                 entries[i].name,
+                                                 true,
+                                                 human,
+                                                 numeric_ids,
+                                                 &entries[i].stat_buf,
+                                                 color_mode,
+                                                 classify);
+        }
+    } else if (format_mode == LS_FORMAT_SINGLE) {
+        for (size_t i = 0; i < count; ++i) {
+            status |= print_path_entry_with_stat(entries[i].full_path,
+                                                 entries[i].name,
+                                                 false,
+                                                 human,
+                                                 numeric_ids,
+                                                 &entries[i].stat_buf,
+                                                 color_mode,
+                                                 classify);
+        }
+    } else {
         print_ls_columns(entries, count, color_mode, classify);
     }
 
@@ -8390,7 +8408,7 @@ static int smallclueEchoCommand(int argc, char **argv) {
 static bool smallclueLsValidateShortOptions(const char *arg,
                                             int *show_all,
                                             int *show_almost_all,
-                                            int *long_format,
+                                            int *format,
                                             int *sort_by_time,
                                             int *list_dirs_only,
                                             int *human_sizes,
@@ -8411,7 +8429,13 @@ static bool smallclueLsValidateShortOptions(const char *arg,
                 }
                 break;
             case 'l':
-                *long_format = 1;
+                *format = LS_FORMAT_LONG;
+                break;
+            case '1':
+                *format = LS_FORMAT_SINGLE;
+                break;
+            case 'C':
+                *format = LS_FORMAT_COLUMNS;
                 break;
             case 't':
                 *sort_by_time = 1;
@@ -8427,7 +8451,7 @@ static bool smallclueLsValidateShortOptions(const char *arg,
                 break;
             case 'n':
                 *numeric_ids = 1;
-                *long_format = 1;
+                *format = LS_FORMAT_LONG;
                 break;
             default:
                 fprintf(stderr, "ls: invalid option -- '%c'\n", *cursor);
@@ -8481,7 +8505,7 @@ static bool smallclueLsHandleLongOption(const char *arg) {
 static int smallclueLsCommand(int argc, char **argv) {
     int show_all = 0;
     int show_almost_all = 0;
-    int long_format = 0;
+    int format = LS_FORMAT_AUTO;
     int sort_by_time = 0;
     int group_directories_first = 0;
     int list_dirs_only = 0;
@@ -8526,7 +8550,7 @@ static int smallclueLsCommand(int argc, char **argv) {
         if (!smallclueLsValidateShortOptions(arg + 1,
                                              &show_all,
                                              &show_almost_all,
-                                             &long_format,
+                                             &format,
                                              &sort_by_time,
                                              &list_dirs_only,
                                              &human_sizes,
@@ -8541,13 +8565,21 @@ static int smallclueLsCommand(int argc, char **argv) {
         color_mode = pscalRuntimeStdoutIsInteractive() ? 1 : -1;
     }
 
+    if (format == LS_FORMAT_AUTO) {
+        if (pscalRuntimeStdoutIsInteractive()) {
+            format = LS_FORMAT_COLUMNS;
+        } else {
+            format = LS_FORMAT_SINGLE;
+        }
+    }
+
     int status = 0;
     int paths_start = idx;
     if (paths_start >= argc) {
         if (list_dirs_only) {
-            return print_path_entry_with_stat(".", ".", long_format, human_sizes, numeric_ids, NULL, color_mode, classify) ? 1 : 0;
+            return print_path_entry_with_stat(".", ".", format == LS_FORMAT_LONG, human_sizes, numeric_ids, NULL, color_mode, classify) ? 1 : 0;
         }
-        return list_directory(".", show_all, show_almost_all, long_format,
+        return list_directory(".", show_all, show_almost_all, format,
                               sort_by_time, group_directories_first, human_sizes, numeric_ids, color_mode, classify);
     }
 
@@ -8568,10 +8600,10 @@ static int smallclueLsCommand(int argc, char **argv) {
                 }
                 printf("%s:\n", path);
             }
-            status |= list_directory(path, show_all, show_almost_all, long_format,
+            status |= list_directory(path, show_all, show_almost_all, format,
                                      sort_by_time, group_directories_first, human_sizes, numeric_ids, color_mode, classify);
         } else {
-            status |= print_path_entry_with_stat(path, path, long_format, human_sizes, numeric_ids, &stat_buf, color_mode, classify);
+            status |= print_path_entry_with_stat(path, path, format == LS_FORMAT_LONG, human_sizes, numeric_ids, &stat_buf, color_mode, classify);
         }
     }
     return status ? 1 : 0;
