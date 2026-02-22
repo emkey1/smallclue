@@ -14601,17 +14601,11 @@ static int smallclueInitCommand(int argc, char **argv) {
     signal(SIGTSTP, SIG_IGN);
     signal(SIGQUIT, SIG_IGN);
 
-    printf("smallclue init: entering main loop\n");
-    while (1) {
-        int status;
-        pid_t pid = wait(&status);
-        if (pid < 0) {
-            if (errno == ECHILD) {
-                /* No children left; system is idle, so exit. */
-                return 0;
-            }
-            continue;
-        }
+    if (getpid() == 1) {
+        printf("smallclue init: rc exited, shutting down...\n");
+        kill(-1, SIGTERM);
+        sleep(1);
+        kill(-1, SIGKILL);
     }
     return 0;
 }
