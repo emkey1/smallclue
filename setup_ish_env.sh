@@ -99,7 +99,8 @@ downloadTarball() {
 buildVendoredOpenSshDeps() {
     local vendor_root="third-party/ish-i686-deps"
     local src_root="$vendor_root/src"
-    local install_root="$vendor_root/install"
+    local stage_root="$vendor_root/stage"
+    local stage_abs=""
     local zlib_ver="1.3.1"
     local zlib_src="$src_root/zlib-$zlib_ver"
     local zlib_tar="$src_root/zlib-$zlib_ver.tar.gz"
@@ -111,8 +112,15 @@ buildVendoredOpenSshDeps() {
     local target_ar="ar"
     local target_ranlib="ranlib"
     local cc_prefix=""
+    local zlib_header=""
+    local zlib_lib=""
+    local openssl_header=""
+    local openssl_lib=""
 
-    mkdir -p "$src_root" "$install_root"
+    mkdir -p "$src_root" "$stage_root"
+    rm -rf "$stage_root"
+    mkdir -p "$stage_root"
+    stage_abs="$(cd "$stage_root" && pwd)"
 
     if [ "$TARGET_IS_CROSS" -eq 1 ]; then
         cc_prefix="i686-linux-gnu-"
@@ -134,8 +142,8 @@ buildVendoredOpenSshDeps() {
     (cd "$zlib_src" && \
         make distclean >/dev/null 2>&1 || true && \
         CC="$CC_PRINT" AR="$target_ar" RANLIB="$target_ranlib" \
-        ./configure --static --prefix="$(cd "$install_root" && pwd)" && \
-        make -j4 && make install)
+        ./configure --static --prefix=/usr && \
+        make -j4 && make install DESTDIR="$stage_abs")
 
     if [ ! -d "$openssl_src" ]; then
         if [ -d ../../third-party/openssl-3.6.0 ]; then
@@ -156,23 +164,37 @@ buildVendoredOpenSshDeps() {
         (cd "$openssl_src" && \
             make clean >/dev/null 2>&1 || true && \
             perl Configure linux-generic32 no-shared no-tests no-module \
-                --prefix="$(cd "$install_root" && pwd)" \
-                --openssldir="$(cd "$install_root" && pwd)/ssl" \
+                --prefix=/usr \
+                --openssldir=/etc/ssl \
                 --cross-compile-prefix="$cc_prefix" && \
             make -j4 CC="$CC_PRINT" AR="$target_ar" RANLIB="$target_ranlib" && \
-            make install_sw)
+            make install_sw DESTDIR="$stage_abs")
     else
         (cd "$openssl_src" && \
             make clean >/dev/null 2>&1 || true && \
             perl Configure linux-generic32 no-shared no-tests no-module \
-                --prefix="$(cd "$install_root" && pwd)" \
-                --openssldir="$(cd "$install_root" && pwd)/ssl" && \
+                --prefix=/usr \
+                --openssldir=/etc/ssl && \
             make -j4 CC="$CC_PRINT" AR="$target_ar" RANLIB="$target_ranlib" && \
-            make install_sw)
+            make install_sw DESTDIR="$stage_abs")
     fi
 
-    OPENSSH_CPPFLAGS="$OPENSSH_CPPFLAGS -I$(cd "$install_root" && pwd)/include"
-    OPENSSH_LDFLAGS="$OPENSSH_LDFLAGS -L$(cd "$install_root" && pwd)/lib"
+    zlib_header="$(find "$stage_abs" -type f -path '*/include/zlib.h' | head -n 1 || true)"
+    zlib_lib="$(find "$stage_abs" -type f -name 'libz.a' | head -n 1 || true)"
+    openssl_header="$(find "$stage_abs" -type f -path '*/include/openssl/ssl.h' | head -n 1 || true)"
+    openssl_lib="$(find "$stage_abs" -type f -name 'libcrypto.a' | head -n 1 || true)"
+
+    if [ -z "$zlib_header" ] || [ -z "$zlib_lib" ] || [ -z "$openssl_header" ] || [ -z "$openssl_lib" ]; then
+        echo "Error: vendored OpenSSH deps were built but required artifacts were not found."
+        echo "  zlib header:    ${zlib_header:-missing}"
+        echo "  zlib lib:       ${zlib_lib:-missing}"
+        echo "  openssl header: ${openssl_header:-missing}"
+        echo "  openssl lib:    ${openssl_lib:-missing}"
+        return 1
+    fi
+
+    OPENSSH_CPPFLAGS="$OPENSSH_CPPFLAGS -I$(dirname "$zlib_header") -I$(dirname "$(dirname "$openssl_header")")"
+    OPENSSH_LDFLAGS="$OPENSSH_LDFLAGS -L$(dirname "$zlib_lib") -L$(dirname "$openssl_lib")"
 }
 
 selectI686Toolchain() {
@@ -374,7 +396,7 @@ EOF
     fi
 
     if ! "${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" "${TARGET_LDFLAGS[@]}" ${OPENSSH_CPPFLAGS} ${OPENSSH_LDFLAGS} \
-        -static -x c - -o /dev/null -lcrypto -ldl -pthread >/dev/null 2>&1 <<'EOF'
+        -static -x c - -o /dev/null -lcrypto -lz -ldl -pthread >/dev/null 2>&1 <<'EOF'
 #include <openssl/crypto.h>
 int main(void) { return OpenSSL_version_num() ? 0 : 1; }
 EOF
