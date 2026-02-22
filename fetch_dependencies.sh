@@ -218,6 +218,17 @@ EOF
 
         rm -f "$INPUT_C.bak" "$DASH_SRC/linenoise_patch.c"
     fi
+
+    # Patch parser.c to suppress prompt when using linenoise (which handles prompt itself)
+    PARSER_C="$DASH_SRC/parser.c"
+    if [ -f "$PARSER_C" ]; then
+        if grep -q "show = 1;" "$PARSER_C"; then
+            echo "Patching dash parser.c..."
+            sed -i.bak 's/show = 1;/show = !stdin_istty;/g' "$PARSER_C"
+            sed -i.bak 's/show = !el;/show = !el \&\& !stdin_istty;/g' "$PARSER_C"
+            rm -f "$PARSER_C.bak"
+        fi
+    fi
 fi
 
 echo "Dependencies fetched and patched."
