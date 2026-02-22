@@ -7992,16 +7992,24 @@ static int list_directory(const char *path,
     return status ? 1 : 0;
 }
 
-static void smallcluePrintAppletList(FILE *out, const char *heading) {
+static void smallcluePrintAppletList(FILE *out, const char *heading, bool color) {
     if (!out) {
         return;
     }
     if (heading && *heading) {
-        fprintf(out, "%s\n", heading);
+        if (color) {
+            fprintf(out, "\033[1m%s\033[0m\n", heading);
+        } else {
+            fprintf(out, "%s\n", heading);
+        }
     }
     for (size_t i = 0; i < kSmallclueAppletCount; ++i) {
         const SmallclueApplet *applet = &kSmallclueApplets[i];
-        fprintf(out, "  %-14s %s\n", applet->name, applet->description ? applet->description : "");
+        if (color) {
+            fprintf(out, "  \033[36m%-16s\033[0m %s\n", applet->name, applet->description ? applet->description : "");
+        } else {
+            fprintf(out, "  %-16s %s\n", applet->name, applet->description ? applet->description : "");
+        }
     }
 }
 
@@ -8010,7 +8018,7 @@ static void print_usage(void) {
     fprintf(stderr, "This is smallclue. Usage:\n");
     fprintf(stderr, "  smallclue <applet> [arguments...]\n\n");
     fprintf(stderr, "Available applets:\n");
-    smallcluePrintAppletList(stderr, NULL);
+    smallcluePrintAppletList(stderr, NULL, isatty(STDERR_FILENO));
     fprintf(stderr, "\nYou can symlink applets to 'smallclue' or invoke them directly.\n");
 }
 
@@ -8801,6 +8809,8 @@ static int smallclueHelpCommand(int argc, char **argv) {
     int status = 0;
     char *buffer = NULL;
     size_t buflen = 0;
+    bool interactive_out = pscalRuntimeStdoutIsInteractive();
+
     FILE *mem = open_memstream(&buffer, &buflen);
     if (!mem) {
         fprintf(stderr, "smallclue-help: unable to allocate buffer\n");
@@ -8808,7 +8818,7 @@ static int smallclueHelpCommand(int argc, char **argv) {
     }
 
     if (argc <= 1) {
-        smallcluePrintAppletList(mem, "Available smallclue applets:");
+        smallcluePrintAppletList(mem, "Available smallclue applets:", interactive_out);
     } else {
         for (int i = 1; i < argc; ++i) {
             const char *target = argv[i];
@@ -8834,7 +8844,6 @@ static int smallclueHelpCommand(int argc, char **argv) {
         return status;
     }
 
-    bool interactive_out = pscalRuntimeStdoutIsInteractive();
     if (interactive_out) {
         FILE *r = fmemopen(buffer, buflen, "r");
         if (!r) {
