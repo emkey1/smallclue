@@ -153,6 +153,10 @@ if [ -d "$OPENSSH_DIR" ]; then
              echo "Reconfiguring OpenSSH for static build..."
              (cd "$OPENSSH_DIR" && make distclean)
         fi
+        if ! grep -q "sysconfdir = /etc/ssh" "$OPENSSH_DIR/Makefile"; then
+             echo "Reconfiguring OpenSSH for sysconfdir..."
+             (cd "$OPENSSH_DIR" && make distclean)
+        fi
     fi
 
     if [ ! -f "$OPENSSH_DIR/Makefile" ]; then
@@ -179,9 +183,9 @@ if [ -d "$OPENSSH_DIR" ]; then
         fi
 
         if [ -f "$OPENSSH_DIR/configure" ]; then
-            OPENSSH_CONFIG_FLAGS=""
+            OPENSSH_CONFIG_FLAGS="--sysconfdir=/etc/ssh"
             if [ "$(uname -s)" = "Linux" ]; then
-                OPENSSH_CONFIG_FLAGS="LDFLAGS=-static"
+                OPENSSH_CONFIG_FLAGS="$OPENSSH_CONFIG_FLAGS LDFLAGS=-static"
             fi
             (cd "$OPENSSH_DIR" && ./configure $OPENSSH_CONFIG_FLAGS)
         else
@@ -617,7 +621,7 @@ echo "Mounting filesystems..."
 # mount -t sysfs sys /sys
 # mount -t devtmpfs dev /dev
 echo "Starting services..."
-/bin/sshd
+/bin/sshd -f /etc/ssh/sshd_config
 echo "Done."
 exec /bin/sh -l
 EOF
