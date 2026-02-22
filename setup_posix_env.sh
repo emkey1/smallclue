@@ -299,7 +299,7 @@ if [ "$(uname -s)" = "Linux" ] && [ -d "$ROOTFS" ]; then
 fi
 
 rm -rf "$ROOTFS"
-mkdir -p "$ROOTFS"/{bin,usr/bin,etc,tmp,var,home/username,dev,proc,sys,root}
+mkdir -p "$ROOTFS"/{bin,sbin,usr/bin,usr/sbin,etc,tmp,var,home/username,dev,proc,sys,root}
 chown -R 1000:1000 "$ROOTFS/home/username"
 chmod 1777 "$ROOTFS/tmp"
 
@@ -395,6 +395,9 @@ for applet in $APPLETS; do
     fi
     ln -sf smallclue "$ROOTFS/bin/$applet"
 done
+
+# Init symlink
+ln -sf /bin/smallclue "$ROOTFS/sbin/init"
 
 # 7. Create dummy files
 echo "Creating dummy /etc files..."
@@ -567,6 +570,7 @@ echo "Mounting filesystems..."
 # mount -t devtmpfs dev /dev
 echo "Starting services..."
 echo "Done."
+exec /bin/sh -l
 EOF
 chmod +x "$ROOTFS/etc/rc"
 

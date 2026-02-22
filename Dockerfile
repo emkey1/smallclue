@@ -32,5 +32,4 @@ FROM scratch
 COPY --from=builder /app/rootfs /
 
 # Set shell entrypoint
-ENTRYPOINT ["/bin/sh"]
-CMD ["-l"]
+ENTRYPOINT ["/sbin/init"]
