@@ -427,7 +427,6 @@ export PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
 # Run /etc/rc if present and not already run
 if [ -x /etc/rc ] && [ ! -f /tmp/rc_ran ]; then
     /etc/rc
-    touch /tmp/rc_ran
 fi
 EOF
 chmod 644 "$ROOTFS/etc/profile"
@@ -563,6 +562,7 @@ echo "smallclue" > "$ROOTFS/etc/hostname"
 echo "Creating /etc/rc..."
 cat > "$ROOTFS/etc/rc" <<EOF
 #!/bin/sh
+touch /tmp/rc_ran
 echo "Welcome to SmallClue POSIX Environment!"
 echo "Mounting filesystems..."
 # mount -t proc proc /proc
