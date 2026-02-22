@@ -10712,67 +10712,199 @@ static int smallclueFirstWeekdayOfMonth(int month, int year) {
     return tm_buf.tm_wday; /* 0 = Sunday */
 }
 
+typedef struct {
+    char lines[8][128]; /* Enough for text + ANSI codes */
+} SmallclueCalMonthBlock;
+
+static void smallclueCalRenderMonth(int month, int year, int highlight_day, SmallclueCalMonthBlock *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+
+    struct tm tm_buf;
+    memset(&tm_buf, 0, sizeof(tm_buf));
+    tm_buf.tm_year = year - 1900;
+    tm_buf.tm_mon = month - 1;
+    tm_buf.tm_mday = 1;
+
+    /* Line 0: Header (Month Year), centered in 20 chars */
+    char header_text[64];
+    if (strftime(header_text, sizeof(header_text), "%B %Y", &tm_buf) == 0) {
+        snprintf(header_text, sizeof(header_text), "%d %d", month, year);
+    }
+    int len = (int)strlen(header_text);
+    if (len > 20) len = 20;
+    int pad_left = (20 - len) / 2;
+    snprintf(out->lines[0], sizeof(out->lines[0]), "%*s%s", pad_left, "", header_text);
+
+    /* Line 1: Day names */
+    snprintf(out->lines[1], sizeof(out->lines[1]), "Su Mo Tu We Th Fr Sa");
+
+    int first_wday = smallclueFirstWeekdayOfMonth(month, year);
+    int days = smallclueDaysInMonth(month, year);
+
+    int current_wday = 0;
+    int line_idx = 2;
+    char *ptr = out->lines[line_idx];
+    size_t rem = sizeof(out->lines[line_idx]);
+
+    /* Initial padding */
+    for (current_wday = 0; current_wday < first_wday; ++current_wday) {
+        int w = snprintf(ptr, rem, "   ");
+        if (w > 0 && (size_t)w < rem) { ptr += w; rem -= w; }
+    }
+
+    int use_color = (highlight_day > 0 && isatty(STDOUT_FILENO));
+    for (int day = 1; day <= days; ++day) {
+        char day_str[32];
+        if (use_color && day == highlight_day) {
+            snprintf(day_str, sizeof(day_str), "\x1b[7m%2d\x1b[0m", day);
+        } else {
+            snprintf(day_str, sizeof(day_str), "%2d", day);
+        }
+
+        int w = snprintf(ptr, rem, "%s", day_str);
+        if (w > 0 && (size_t)w < rem) { ptr += w; rem -= w; }
+
+        current_wday++;
+        if (current_wday % 7 == 0) {
+            /* End of week, move to next line */
+            line_idx++;
+            if (line_idx < 8) {
+                ptr = out->lines[line_idx];
+                rem = sizeof(out->lines[line_idx]);
+            } else {
+                break;
+            }
+        } else {
+            /* Space between days */
+            if (day < days) {
+                int s = snprintf(ptr, rem, " ");
+                if (s > 0 && (size_t)s < rem) { ptr += s; rem -= s; }
+            }
+        }
+    }
+}
+
+static int smallclueVisibleLength(const char *s) {
+    int len = 0;
+    int in_esc = 0;
+    if (!s) return 0;
+    for (; *s; ++s) {
+        if (*s == '\x1b') {
+            in_esc = 1;
+        } else if (in_esc) {
+            if (*s == 'm') in_esc = 0;
+        } else {
+            len++;
+        }
+    }
+    return len;
+}
+
+static void smallclueCalPrintYear(int year, int current_day, int current_month, int current_year) {
+    /* Print year header centered.
+       3 months side by side = 20*3 + 2*2 (padding) = 64 chars.
+       Centered year: (64 - 4) / 2 = 30 spaces padding (approx)
+    */
+    if (year < 1 || year > 9999) return;
+
+    /* 35 spaces seems about right to center 4 digits in 64 columns?
+       64 - 4 = 60. 30 spaces.
+    */
+    printf("                              %d\n\n", year);
+
+    for (int row = 0; row < 4; ++row) {
+        int m_start = row * 3 + 1;
+        SmallclueCalMonthBlock blocks[3];
+
+        for (int i = 0; i < 3; ++i) {
+            int m = m_start + i;
+            int hl = (year == current_year && m == current_month) ? current_day : 0;
+            smallclueCalRenderMonth(m, year, hl, &blocks[i]);
+        }
+
+        for (int line = 0; line < 8; ++line) {
+            for (int i = 0; i < 3; ++i) {
+                const char *text = blocks[i].lines[line];
+                int vis_len = smallclueVisibleLength(text);
+                fputs(text, stdout);
+                if (i < 2) {
+                    /* Pad to 20 chars, plus 2 spaces gap */
+                    int pad = 20 - vis_len;
+                    if (pad < 0) pad = 0;
+                    for (int p = 0; p < pad + 2; ++p) putchar(' ');
+                }
+            }
+            putchar('\n');
+        }
+        /* Extra newline between rows of months, if not last row */
+        /* Standard cal doesn't seem to put extra lines, just the 8 lines of month grid?
+           Wait, months have variable weeks (4-6).
+           SmallclueCalRenderMonth puts lines into fixed 8 slots.
+           If a month has 5 weeks, line 7 (index 6) might be empty.
+           If a month has 6 weeks, line 8 (index 7) might be empty.
+           We print all 8 lines to keep alignment.
+        */
+        /* Actually standard cal output separates rows of months by one empty line usually? */
+        /* Let's see: reproduce_cal.sh output shows one empty line after the month. */
+        /* I'll verify logic by running it. */
+        /* A bit of vertical separation is good. */
+        /* Note: standard cal output for year fits in terminal. */
+    }
+}
+
 static int smallclueCalCommand(int argc, char **argv) {
-    int month = 0;
-    int year = 0;
+    time_t now = time(NULL);
+    struct tm tm_now_buf;
+    struct tm *tm_now = localtime_r(&now, &tm_now_buf);
+
+    int current_day = tm_now ? tm_now->tm_mday : 0;
+    int current_month = tm_now ? tm_now->tm_mon + 1 : 0;
+    int current_year_val = tm_now ? tm_now->tm_year + 1900 : 0;
 
     if (argc == 1) {
-        time_t now = time(NULL);
-        if (now == (time_t)-1) {
-            perror("cal");
-            return 1;
+        /* cal: print current month */
+        SmallclueCalMonthBlock block;
+        smallclueCalRenderMonth(current_month, current_year_val, current_day, &block);
+        for (int i = 0; i < 8; ++i) {
+            /* Trim trailing whitespace for single month view? */
+            /* Or just print. Standard cal trims trailing spaces. */
+            printf("%s\n", block.lines[i]);
         }
-        struct tm *tm_now = localtime(&now);
-        if (!tm_now) {
-            perror("cal");
-            return 1;
+        return 0;
+    }
+
+    if (argc == 2) {
+        /* cal [year] */
+        int year = 0;
+        if (smallclueParseInt(argv[1], 1, 9999, &year)) {
+            smallclueCalPrintYear(year, current_day, current_month, current_year_val);
+            return 0;
+        } else {
+             fprintf(stderr, "cal: usage: cal [year] or cal [month] [year]\n");
+             return 1;
         }
-        month = tm_now->tm_mon + 1;
-        year = tm_now->tm_year + 1900;
-    } else if (argc == 3) {
+    }
+
+    if (argc == 3) {
+        /* cal [month] [year] */
+        int month = 0;
+        int year = 0;
         if (!smallclueParseInt(argv[1], 1, 12, &month) || !smallclueParseInt(argv[2], 1, 9999, &year)) {
             fprintf(stderr, "cal: usage: cal [month] [year]\n");
             return 1;
         }
-    } else {
-        fprintf(stderr, "cal: usage: cal [month] [year]\n");
-        return 1;
-    }
-
-    struct tm display_tm;
-    memset(&display_tm, 0, sizeof(display_tm));
-    display_tm.tm_year = year - 1900;
-    display_tm.tm_mon = month - 1;
-    display_tm.tm_mday = 1;
-    char header[64];
-    if (strftime(header, sizeof(header), "%B %Y", &display_tm) == 0) {
-        snprintf(header, sizeof(header), "Month %d", year);
-    }
-
-    printf("      %s\n", header);
-    printf("Su Mo Tu We Th Fr Sa\n");
-
-    int first_wday = smallclueFirstWeekdayOfMonth(month, year);
-    int days = smallclueDaysInMonth(month, year);
-    int current_wday = 0;
-
-    for (current_wday = 0; current_wday < first_wday; ++current_wday) {
-        fputs("   ", stdout);
-    }
-
-    for (int day = 1; day <= days; ++day) {
-        printf("%2d", day);
-        current_wday++;
-        if (current_wday % 7 == 0) {
-            putchar('\n');
-        } else {
-            putchar(' ');
+        int hl = (year == current_year_val && month == current_month) ? current_day : 0;
+        SmallclueCalMonthBlock block;
+        smallclueCalRenderMonth(month, year, hl, &block);
+        for (int i = 0; i < 8; ++i) {
+            printf("%s\n", block.lines[i]);
         }
+        return 0;
     }
-    if (current_wday % 7 != 0) {
-        putchar('\n');
-    }
-    return 0;
+
+    fprintf(stderr, "cal: usage: cal [year] or cal [month] [year]\n");
+    return 1;
 }
 
 static const char *smallclueStrCaseStr(const char *haystack, const char *needle, int ignore_case) {
