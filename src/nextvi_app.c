@@ -372,6 +372,13 @@ static void *smallclueRunEditorThread(void *opaque) {
 }
 
 int smallclueRunEditor(int argc, char **argv) {
+#if defined(SMALLCLUE_NEXTVI_DIRECT)
+    /*
+     * iSH kernels can expose partial futex behavior for some pthread paths.
+     * Run nextvi directly in the caller thread to avoid pthread_create/join.
+     */
+    return smallclueRunEditorChild(argc, argv);
+#else
     const char *tool_name = (argc > 0 && argv && argv[0]) ? argv[0] : "nextvi";
 
     NextviThreadArgs *args = calloc(1, sizeof(*args));
@@ -447,4 +454,5 @@ int smallclueRunEditor(int argc, char **argv) {
     /* Block until the editor thread finishes so the caller's TTY is not reused prematurely. */
     (void)pthread_join(tid, NULL);
     return 0;
+#endif
 }

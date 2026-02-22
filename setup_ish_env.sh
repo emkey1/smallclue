@@ -8,6 +8,72 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+AUTO_INSTALL_DEPS="${AUTO_INSTALL_DEPS:-1}"
+IS_DEBIAN_APT=0
+if [ -f /etc/debian_version ] && command -v apt-get >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1; then
+    IS_DEBIAN_APT=1
+fi
+APT_UPDATED=0
+
+aptMaybeUpdate() {
+    if [ "$APT_UPDATED" -eq 0 ]; then
+        apt-get update
+        APT_UPDATED=1
+    fi
+}
+
+debianPkgInstalled() {
+    local pkg="$1"
+    dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q "install ok installed"
+}
+
+ensureDebianPackages() {
+    if [ "$IS_DEBIAN_APT" -ne 1 ]; then
+        return 1
+    fi
+    local missing=()
+    local pkg=""
+    for pkg in "$@"; do
+        if ! debianPkgInstalled "$pkg"; then
+            missing+=("$pkg")
+        fi
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        aptMaybeUpdate
+        apt-get install -y --no-install-recommends "${missing[@]}"
+    fi
+    return 0
+}
+
+ensureI386ArchDebian() {
+    if [ "$IS_DEBIAN_APT" -ne 1 ]; then
+        return 1
+    fi
+    if ! dpkg --print-foreign-architectures | grep -qx "i386"; then
+        dpkg --add-architecture i386
+        APT_UPDATED=0
+    fi
+    return 0
+}
+
+selectI686Toolchain() {
+    if command -v gcc >/dev/null 2>&1 && gcc -m32 -static -o /dev/null -x c - <<< "int main(){return 0;}" 2>/dev/null; then
+        CC_CMD=(gcc -m32)
+        TARGET_CFLAGS=(-m32)
+        TARGET_LDFLAGS=(-m32)
+        TARGET_DESC="native gcc -m32"
+        return 0
+    fi
+    if command -v i686-linux-gnu-gcc >/dev/null 2>&1 && i686-linux-gnu-gcc -static -o /dev/null -x c - <<< "int main(){return 0;}" 2>/dev/null; then
+        CC_CMD=(i686-linux-gnu-gcc)
+        TARGET_CFLAGS=()
+        TARGET_LDFLAGS=()
+        TARGET_DESC="cross i686-linux-gnu-gcc"
+        return 0
+    fi
+    return 1
+}
+
 # 0. Determine 32-bit i686 toolchain support
 TARGET_HOST="i686-linux-gnu"
 TARGET_DESC=""
@@ -16,15 +82,22 @@ declare -a TARGET_CFLAGS
 declare -a TARGET_LDFLAGS
 declare -a SMALLCLUE_RUNNER_CMD
 
-if command -v gcc >/dev/null 2>&1 && gcc -m32 -static -o /dev/null -x c - <<< "int main(){return 0;}" 2>/dev/null; then
-    CC_CMD=(gcc -m32)
-    TARGET_CFLAGS=(-m32)
-    TARGET_LDFLAGS=(-m32)
-    TARGET_DESC="native gcc -m32"
-elif command -v i686-linux-gnu-gcc >/dev/null 2>&1 && i686-linux-gnu-gcc -static -o /dev/null -x c - <<< "int main(){return 0;}" 2>/dev/null; then
-    CC_CMD=(i686-linux-gnu-gcc)
-    TARGET_DESC="cross i686-linux-gnu-gcc"
-else
+if ! selectI686Toolchain; then
+    HOST_ARCH="$(uname -m)"
+    if [ "$AUTO_INSTALL_DEPS" = "1" ] && [ "$IS_DEBIAN_APT" -eq 1 ]; then
+        echo "Installing missing toolchain/build dependencies..."
+        ensureDebianPackages make file autoconf automake libtool pkg-config
+        if [ "$HOST_ARCH" = "aarch64" ] || [ "$HOST_ARCH" = "arm64" ] || [ "$HOST_ARCH" = "armv7l" ]; then
+            ensureDebianPackages gcc-i686-linux-gnu libc6-dev-i386-cross binutils-i686-linux-gnu qemu-user-static
+        else
+            ensureI386ArchDebian
+            ensureDebianPackages gcc-multilib libc6-dev-i386
+        fi
+        selectI686Toolchain || true
+    fi
+fi
+
+if ! selectI686Toolchain; then
     HOST_ARCH="$(uname -m)"
     echo "Error: no usable 32-bit i686 compiler found."
     if [ "$HOST_ARCH" = "aarch64" ] || [ "$HOST_ARCH" = "arm64" ] || [ "$HOST_ARCH" = "armv7l" ]; then
@@ -33,6 +106,7 @@ else
         echo "  sudo apt-get install gcc-i686-linux-gnu libc6-dev-i386-cross binutils-i686-linux-gnu qemu-user-static"
     else
         echo "Install multilib support:"
+        echo "  sudo dpkg --add-architecture i386"
         echo "  sudo apt-get update"
         echo "  sudo apt-get install gcc-multilib libc6-dev-i386"
     fi
@@ -147,6 +221,8 @@ OPENSSH_SRC="src/openssh_stubs.c"
 OPENSSH_OBJS=""
 OPENSSH_LIBS=""
 OPENSSH_SHIM="src/openssh_shim.c"
+OPENSSH_ENABLED=0
+ALLOW_OPENSSH_STUBS="${ALLOW_OPENSSH_STUBS:-0}"
 TARGET_IS_CROSS=0
 if [ "${CC_CMD[0]}" = "i686-linux-gnu-gcc" ]; then
     TARGET_IS_CROSS=1
@@ -162,8 +238,7 @@ if [ "$TARGET_IS_CROSS" -eq 1 ]; then
     fi
 fi
 
-if [ -d "$OPENSSH_DIR" ]; then
-    echo "Checking i686 zlib/crypto for OpenSSH..."
+probeOpenSshTargetLibs() {
     HAVE_TARGET_ZLIB=1
     HAVE_TARGET_CRYPTO=1
 
@@ -177,16 +252,29 @@ EOF
     fi
 
     if ! "${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" "${TARGET_LDFLAGS[@]}" ${OPENSSH_CPPFLAGS} ${OPENSSH_LDFLAGS} \
-        -static -x c - -o /dev/null -lcrypto >/dev/null 2>&1 <<'EOF'
+        -static -x c - -o /dev/null -lcrypto -ldl -pthread >/dev/null 2>&1 <<'EOF'
 #include <openssl/crypto.h>
 int main(void) { return OpenSSL_version_num() ? 0 : 1; }
 EOF
     then
         HAVE_TARGET_CRYPTO=0
     fi
+}
+
+if [ -d "$OPENSSH_DIR" ]; then
+    echo "Checking i686 zlib/crypto for OpenSSH..."
+    probeOpenSshTargetLibs
+
+    if ([ "$HAVE_TARGET_ZLIB" -ne 1 ] || [ "$HAVE_TARGET_CRYPTO" -ne 1 ]) && \
+       [ "$AUTO_INSTALL_DEPS" = "1" ] && [ "$IS_DEBIAN_APT" -eq 1 ]; then
+        echo "Installing missing i386 OpenSSH dependency packages..."
+        ensureI386ArchDebian
+        ensureDebianPackages zlib1g-dev:i386 libssl-dev:i386
+        probeOpenSshTargetLibs
+    fi
 
     if [ "$HAVE_TARGET_ZLIB" -ne 1 ] || [ "$HAVE_TARGET_CRYPTO" -ne 1 ]; then
-        echo "Warning: missing i686 OpenSSH deps; building with OpenSSH stubs only."
+        echo "Warning: missing i686 OpenSSH deps."
         if [ "$HAVE_TARGET_ZLIB" -ne 1 ]; then
             echo "  Missing target zlib (-lz)."
         fi
@@ -204,6 +292,12 @@ EOF
             echo "  sudo apt-get update"
             echo "  sudo apt-get install zlib1g-dev:i386 libssl-dev:i386"
         fi
+        if [ "$ALLOW_OPENSSH_STUBS" != "1" ]; then
+            echo "Error: refusing to continue with OpenSSH stubs."
+            echo "Set ALLOW_OPENSSH_STUBS=1 to build without real ssh/scp/sftp support."
+            exit 1
+        fi
+        echo "Continuing with OpenSSH stubs because ALLOW_OPENSSH_STUBS=1."
     else
     echo "Configuring OpenSSH for i686..."
     
@@ -220,7 +314,18 @@ EOF
     fi
 
     echo "Running configure for OpenSSH..."
-    (cd "$OPENSSH_DIR" && CPPFLAGS="$OPENSSH_CPPFLAGS" LDFLAGS="$OPENSSH_LDFLAGS ${TARGET_LDFLAGS[*]}" ./configure --host="$TARGET_HOST" --without-openssl-header-check CC="$CC_PRINT")
+    # Force-disable syscalls known to be missing/stubbed on iSH kernels so
+    # OpenSSH prefers portable fallbacks instead of ENOSYS paths at runtime.
+    (cd "$OPENSSH_DIR" && \
+        ac_cv_func_accept4=no \
+        ac_cv_func_inotify_init=no \
+        ac_cv_func_inotify_init1=no \
+        ac_cv_func_faccessat2=no \
+        ac_cv_func_sched_getattr=no \
+        ac_cv_func_membarrier=no \
+        CPPFLAGS="$OPENSSH_CPPFLAGS" \
+        LDFLAGS="$OPENSSH_LDFLAGS ${TARGET_LDFLAGS[*]}" \
+        ./configure --host="$TARGET_HOST" --without-openssl-header-check CC="$CC_PRINT")
 
     echo "Patching OpenSSH (setup_posix_env.sh logic)..."
     # setup_posix_env.sh patching logic
@@ -279,9 +384,10 @@ $OPENSSH_DIR/scp.o $OPENSSH_DIR/progressmeter.o $OPENSSH_DIR/sftp-common.o $OPEN
 $OPENSSH_DIR/sftp.o $OPENSSH_DIR/sftp-usergroup.o \
 $OPENSSH_DIR/ssh-keygen.o $OPENSSH_DIR/sshsig.o"
 
-    OPENSSH_LIBS="$OPENSSH_DIR/libssh.a $OPENSSH_DIR/openbsd-compat/libopenbsd-compat.a -lcrypto -lz"
+    OPENSSH_LIBS="$OPENSSH_DIR/libssh.a $OPENSSH_DIR/openbsd-compat/libopenbsd-compat.a -lcrypto -lz -ldl"
     OPENSSH_SRC="src/openssh_stubs.c src/openssh_globals.c"
     OPENSSH_SHIM=""
+    OPENSSH_ENABLED=1
     fi
 fi
 
@@ -327,8 +433,12 @@ if [ -d "$DASH_DIR" ]; then
     }
 fi
 
+DISABLE_NEXTVI="${DISABLE_NEXTVI:-0}"
+NEXTVI_DIRECT_MODE="${NEXTVI_DIRECT_MODE:-1}"
 NEXTVI_SRC="src/nextvi_stubs.c"
-if [ -f third-party/nextvi/vi.c ]; then
+if [ "$DISABLE_NEXTVI" = "1" ]; then
+    echo "nextvi disabled via DISABLE_NEXTVI=1; using stubs."
+elif [ -f third-party/nextvi/vi.c ]; then
     echo "Verifying nextvi can be compiled for i686 target..."
     NEXTVI_CHECK_OBJ="third-party/nextvi/.nextvi_target_check.o"
     "${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -I. -Isrc -c third-party/nextvi/vi.c -o "$NEXTVI_CHECK_OBJ"
@@ -340,8 +450,14 @@ else
 fi
 
 # 4. Compile smallclue
+NEXTVI_DEFS=""
+if [ "$NEXTVI_DIRECT_MODE" = "1" ]; then
+    NEXTVI_DEFS="-DSMALLCLUE_NEXTVI_DIRECT=1"
+    echo "nextvi direct mode enabled (no pthread editor worker thread)."
+fi
+
 echo "Compiling smallclue (iSH/32-bit static)..."
-"${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" "${TARGET_LDFLAGS[@]}" -static -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE \
+"${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" "${TARGET_LDFLAGS[@]}" -static -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${NEXTVI_DEFS} \
     -I. -Isrc -lpthread \
     src/main.c \
     src/core.c \
@@ -476,6 +592,12 @@ fi
 if [ ! -e "$ROOTFS/bin/sh" ]; then
     echo "Error: /bin/sh is missing in rootfs."
     exit 1
+fi
+
+if [ "$OPENSSH_ENABLED" -eq 1 ]; then
+    echo "OpenSSH integration: enabled (ssh/scp/sftp/ssh-keygen available)."
+else
+    echo "OpenSSH integration: stubs only."
 fi
 
 # Init symlink for iSH
