@@ -40,6 +40,13 @@ else
 fi
 
 CC_PRINT="${CC_CMD[*]}"
+BUILD_TRIPLET="$("${CC_CMD[0]}" -dumpmachine 2>/dev/null || true)"
+if [ -z "$BUILD_TRIPLET" ]; then
+    BUILD_TRIPLET="$(gcc -dumpmachine 2>/dev/null || true)"
+fi
+if [ -z "$BUILD_TRIPLET" ]; then
+    BUILD_TRIPLET="$(uname -m)-unknown-linux-gnu"
+fi
 echo "Setting up iSH (32-bit x86) build environment using ${TARGET_DESC}..."
 
 # 1. Fetch dependencies
@@ -278,25 +285,58 @@ fi
 DASH_DIR="third-party/dash"
 if [ -d "$DASH_DIR" ]; then
     echo "Configuring Dash for i686..."
+    DASH_AR="ar"
+    DASH_RANLIB="ranlib"
+    if [ "$TARGET_IS_CROSS" -eq 1 ]; then
+        if command -v i686-linux-gnu-ar >/dev/null 2>&1; then
+            DASH_AR="i686-linux-gnu-ar"
+        fi
+        if command -v i686-linux-gnu-ranlib >/dev/null 2>&1; then
+            DASH_RANLIB="i686-linux-gnu-ranlib"
+        fi
+    fi
     if [ -f "$DASH_DIR/Makefile" ]; then
         (cd "$DASH_DIR" && make distclean >/dev/null 2>&1 || true)
     fi
     if [ ! -f "$DASH_DIR/configure" ]; then
         (cd "$DASH_DIR" && ./autogen.sh)
     fi
-    (cd "$DASH_DIR" && ./configure --enable-static --host="$TARGET_HOST" CC="$CC_PRINT")
+    (cd "$DASH_DIR" && AR="$DASH_AR" RANLIB="$DASH_RANLIB" ./configure --build="$BUILD_TRIPLET" --host="$TARGET_HOST" --enable-static CC="$CC_PRINT" CFLAGS="${TARGET_CFLAGS[*]}" LDFLAGS="${TARGET_LDFLAGS[*]} -static")
     echo "Building Dash..."
-    (cd "$DASH_DIR" && make -j4)
+    (cd "$DASH_DIR" && make -j4 CC="$CC_PRINT" AR="$DASH_AR" RANLIB="$DASH_RANLIB" CFLAGS="${TARGET_CFLAGS[*]}" LDFLAGS="${TARGET_LDFLAGS[*]} -static")
+
+    if [ ! -f "$DASH_DIR/src/dash" ]; then
+        echo "Error: dash build did not produce $DASH_DIR/src/dash"
+        exit 1
+    fi
+    DASH_BUILD_FILE_INFO="$(file "$DASH_DIR/src/dash" || true)"
+    echo "$DASH_BUILD_FILE_INFO" | grep -Eq "ELF 32-bit|Intel 80386|i386" || {
+        echo "Error: dash is not an i686 binary."
+        echo "  file: $DASH_BUILD_FILE_INFO"
+        exit 1
+    }
+    echo "$DASH_BUILD_FILE_INFO" | grep -q "statically linked" || {
+        echo "Error: dash is not statically linked."
+        echo "  file: $DASH_BUILD_FILE_INFO"
+        exit 1
+    }
 fi
 
 NEXTVI_SRC="src/nextvi_stubs.c"
 if [ -f third-party/nextvi/vi.c ]; then
+    echo "Verifying nextvi can be compiled for i686 target..."
+    NEXTVI_CHECK_OBJ="third-party/nextvi/.nextvi_target_check.o"
+    "${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -I. -Isrc -c third-party/nextvi/vi.c -o "$NEXTVI_CHECK_OBJ"
+    rm -f "$NEXTVI_CHECK_OBJ"
+    echo "Using target-compiled nextvi source."
     NEXTVI_SRC="third-party/nextvi/vi.c"
+else
+    echo "nextvi source not found; using stubs."
 fi
 
 # 4. Compile smallclue
 echo "Compiling smallclue (iSH/32-bit static)..."
-"${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" "${TARGET_LDFLAGS[@]}" -static -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE \
+"${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" "${TARGET_LDFLAGS[@]}" -static -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -DSMALLCLUE_WITH_EXSH \
     -I. -Isrc -lpthread \
     src/main.c \
     src/core.c \
@@ -351,12 +391,17 @@ mkdir -p "$ROOTFS/dev/pts"
 # Install binaries
 cp smallclue "$ROOTFS/bin/"
 
+DASH_USABLE=0
 if [ -f "third-party/dash/src/dash" ]; then
-    echo "Installing dash..."
-    cp "third-party/dash/src/dash" "$ROOTFS/bin/dash"
-    ln -sf dash "$ROOTFS/bin/sh"
-else
-    ln -sf smallclue "$ROOTFS/bin/sh"
+    DASH_FILE_INFO="$(file "third-party/dash/src/dash" || true)"
+    if echo "$DASH_FILE_INFO" | grep -Eq "ELF 32-bit|Intel 80386|i386" && echo "$DASH_FILE_INFO" | grep -q "statically linked"; then
+        echo "Installing dash..."
+        cp "third-party/dash/src/dash" "$ROOTFS/bin/dash"
+        ln -sf dash "$ROOTFS/bin/sh"
+        DASH_USABLE=1
+    else
+        echo "Warning: dash exists but is not a static i686 binary; skipping /bin/sh -> dash."
+    fi
 fi
 
 # Create symlinks
@@ -395,6 +440,39 @@ for applet in $APPLETS; do
     ln -sf smallclue "$ROOTFS/bin/$applet"
 done
 
+if [ "$DASH_USABLE" -eq 0 ]; then
+    if printf '%s\n' "$APPLETS" | grep -qx "sh"; then
+        ln -sf smallclue "$ROOTFS/bin/sh"
+    else
+        echo "Error: no runnable /bin/sh candidate found."
+        echo "Need either:"
+        echo "  1) static i686 dash at third-party/dash/src/dash, or"
+        echo "  2) smallclue built with 'sh' applet."
+        exit 1
+    fi
+fi
+
+# iSH default launch command is /bin/login -f root; provide a simple wrapper.
+cat > "$ROOTFS/bin/login" <<EOF
+#!/bin/sh
+if [ "\$1" = "-f" ] && [ -n "\$2" ]; then
+    export USER="\$2"
+    export LOGNAME="\$2"
+fi
+exec /bin/sh -l
+EOF
+chmod +x "$ROOTFS/bin/login"
+ln -sf /bin/login "$ROOTFS/usr/bin/login"
+
+if [ ! -x "$ROOTFS/bin/login" ]; then
+    echo "Error: /bin/login is not executable in rootfs."
+    exit 1
+fi
+if [ ! -e "$ROOTFS/bin/sh" ]; then
+    echo "Error: /bin/sh is missing in rootfs."
+    exit 1
+fi
+
 # Init symlink for iSH
 ln -sf /bin/smallclue "$ROOTFS/sbin/init"
 ln -sf /bin/smallclue "$ROOTFS/init" # Just in case
@@ -415,6 +493,10 @@ cat > "$ROOTFS/etc/hosts" <<EOF
 127.0.0.1   localhost
 127.0.1.1   smallclue
 ::1         localhost ip6-localhost ip6-loopback
+EOF
+
+cat > "$ROOTFS/etc/profile" <<EOF
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EOF
 
 echo "Creating /etc/rc..."
