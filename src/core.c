@@ -39,6 +39,7 @@
 #if defined(__linux__) || defined(linux) || defined(__linux)
 #include <shadow.h>
 #include <crypt.h>
+#include <sys/klog.h>
 #endif
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -675,10 +676,10 @@ static int smallclueIpAddrCommand(int argc, char **argv);
 static int smallclueDfCommand(int argc, char **argv);
 #if defined(PSCAL_TARGET_IOS)
 static int smallclueTopCommand(int argc, char **argv);
-static int smallclueDmesgCommand(int argc, char **argv);
 static int smallclueHelpCommand(int argc, char **argv);
 static int smallclueAddTabCommand(int argc, char **argv);
 #endif
+static int smallclueDmesgCommand(int argc, char **argv);
 
 
 static int smallclueNslookupCommand(int argc, char **argv) {
@@ -1294,6 +1295,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"yes", smallclueYesCommand, "Repeatedly print strings"},
     {"xargs", smallclueXargsCommand, "Build command lines from stdin"},
     {"df", smallclueDfCommand, "Report filesystem usage"},
+    {"dmesg", smallclueDmesgCommand, "Print the kernel ring buffer"},
 
 #if defined(PSCAL_TARGET_IOS)
     {"addt", smallclueAddTabCommand, "Open an additional shell tab"},
@@ -1301,7 +1303,6 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"tadd", smallclueAddTabCommand, "Alias for addt: open an additional shell tab"},
     {"smallclue-help", smallclueHelpCommand, "List available smallclue applets"},
     {"licenses", smallclueLicensesCommand, "View third-party licenses"},
-    {"dmesg", smallclueDmesgCommand, "Show PSCAL runtime log for this session"},
     {"top", smallclueTopCommand, "Show PSCAL virtual processes"},
 #endif
 };
@@ -1545,6 +1546,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  Build command lines from stdin"},
     {"df", "df [-h]\n"
            "  -h human-readable sizes"},
+    {"dmesg", "dmesg [-T]\n"
+              "  Print or control the kernel ring buffer\n"
+              "  -T  show human-readable timestamps (iOS only)"},
     {"nslookup", "nslookup [-v] host [port]\n"
                  "  DNS lookup utility (UDP port defaults to 53). -v prints hosts lookup debugging."},
 #if defined(PSCAL_TARGET_IOS)
@@ -1555,9 +1559,6 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                        "  With a command: show usage if available"},
     {"licenses", "licenses\n"
                  "  Browse PSCAL and third-party licenses; use arrows/enter to view"},
-    {"dmesg", "dmesg [-T]\n"
-              "  Show PSCAL runtime log for this session\n"
-              "  -T  show human-readable timestamps"},
     {"top", "top\n"
             "  Show PSCAL virtual processes and CPU ticks"},
 #endif
@@ -10673,6 +10674,7 @@ static void smallclueDmesgPrintLineHuman(const char *line) {
         fprintf(stdout, "[%s.%03d]\n", time_buf, millis);
     }
 }
+#endif
 
 static int smallclueDmesgCommand(int argc, char **argv) {
     smallclueResetGetopt();
@@ -10692,6 +10694,8 @@ static int smallclueDmesgCommand(int argc, char **argv) {
         fprintf(stderr, "usage: dmesg [-T]\n");
         return 1;
     }
+
+#if defined(PSCAL_TARGET_IOS)
     if (pscalRuntimeCopySessionLog) {
         char *snapshot = pscalRuntimeCopySessionLog();
         if (snapshot) {
@@ -10724,8 +10728,35 @@ static int smallclueDmesgCommand(int argc, char **argv) {
     }
     fprintf(stderr, "dmesg: session log unavailable\n");
     return 1;
-}
+#elif defined(__linux__) || defined(linux) || defined(__linux)
+    int len = klogctl(10, NULL, 0); // SYSLOG_ACTION_SIZE_BUFFER
+    if (len < 0) {
+        perror("dmesg: klogctl size");
+        return 1;
+    }
+    char *buf = (char *)malloc((size_t)len + 1);
+    if (!buf) {
+        fprintf(stderr, "dmesg: out of memory\n");
+        return 1;
+    }
+    int n = klogctl(3, buf, len); // SYSLOG_ACTION_READ_ALL
+    if (n < 0) {
+        perror("dmesg: klogctl read");
+        free(buf);
+        return 1;
+    }
+    buf[n] = 0;
+    fputs(buf, stdout);
+    if (n > 0 && buf[n-1] != '\n') {
+        putchar('\n');
+    }
+    free(buf);
+    return 0;
+#else
+    fprintf(stderr, "dmesg: not supported on this platform\n");
+    return 1;
 #endif
+}
 
 static int smallclueCatCommand(int argc, char **argv) {
     int status = 0;
