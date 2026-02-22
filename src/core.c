@@ -654,6 +654,7 @@ static int smallcluePingCommand(int argc, char **argv);
 static int smallclueMarkdownCommand(int argc, char **argv);
 static int smallclueCurlCommand(int argc, char **argv);
 static int smallclueWgetCommand(int argc, char **argv);
+static int smallclueWhichCommand(int argc, char **argv);
 static int smallclueHttpFetch(const char *cmd_name, const char *url, const char *destinationPath);
 static int smallclueHttpFetchToMemory(const char *cmd_name, const char *url, char **data_out, size_t *len_out);
 static int smallclueTelnetCommand(int argc, char **argv);
@@ -1036,6 +1037,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"vi", smallclueEditorCommand, "Alias for Nextvi text editor"},
     {"wc", smallclueWcCommand, "Count lines/words/bytes"},
     {"wget", smallclueWgetCommand, "Download files via HTTP(S)"},
+    {"which", smallclueWhichCommand, "Locate a command"},
     {"yes", smallclueYesCommand, "Repeatedly print strings"},
     {"xargs", smallclueXargsCommand, "Build command lines from stdin"},
     {"df", smallclueDfCommand, "Report filesystem usage"},
@@ -1276,6 +1278,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  --post-data\n"
              "  -q\n"
              "  -nv"},
+    {"which", "which [-a] program ...\n"
+              "  Locate a command"},
     {"yes", "yes [STRING...]\n"
             "  Repeatedly print STRING (default: y)"},
     {"no", "no [STRING...]\n"
@@ -13849,6 +13853,68 @@ static char *smallclueSearchPath(const char *name) {
     }
     free(copy);
     return NULL;
+}
+
+static int smallclueWhichCommand(int argc, char **argv) {
+    bool all = false;
+    smallclueResetGetopt();
+    int opt;
+    while ((opt = getopt(argc, argv, "a")) != -1) {
+        switch (opt) {
+            case 'a':
+                all = true;
+                break;
+            default:
+                fprintf(stderr, "usage: which [-a] program ...\n");
+                return 1;
+        }
+    }
+
+    if (optind >= argc) {
+        return 1;
+    }
+
+    int status = 0;
+    const char *env = getenv("PATH");
+
+    for (int i = optind; i < argc; ++i) {
+        const char *name = argv[i];
+        if (strchr(name, '/')) {
+            if (access(name, X_OK) == 0) {
+                puts(name);
+            } else {
+                status = 1;
+            }
+            continue;
+        }
+
+        bool found = false;
+        if (env && *env) {
+            char *path_copy = strdup(env);
+            if (path_copy) {
+                char *token = strtok(path_copy, ":");
+                while (token) {
+                    char candidate[PATH_MAX];
+                    int w = snprintf(candidate, sizeof(candidate), "%s/%s", token, name);
+                    if (w > 0 && (size_t)w < sizeof(candidate) && access(candidate, X_OK) == 0) {
+                        puts(candidate);
+                        found = true;
+                        if (!all) {
+                            break;
+                        }
+                    }
+                    token = strtok(NULL, ":");
+                }
+                free(path_copy);
+            }
+        }
+
+        if (!found) {
+            status = 1;
+        }
+    }
+
+    return status;
 }
 
 static int smallclueTypeCommand(int argc, char **argv) {
