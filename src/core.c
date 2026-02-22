@@ -1961,9 +1961,16 @@ static int smallcluePsCommand(int argc, char **argv) {
             qsort(entries, count, sizeof(SmallcluePsEntry), smallcluePsCompare);
         }
 
-        printf(" PID   PPID   UID COMMAND\n");
+        printf(" PID   PPID USER     COMMAND\n");
         for (size_t i = 0; i < count; ++i) {
-            printf("%4d %6d %5d %s\n", entries[i].pid, entries[i].ppid, (int)entries[i].uid, entries[i].command);
+            struct passwd *pw = getpwuid(entries[i].uid);
+            char user_buf[32];
+            if (pw) {
+                snprintf(user_buf, sizeof(user_buf), "%s", pw->pw_name);
+            } else {
+                snprintf(user_buf, sizeof(user_buf), "%d", (int)entries[i].uid);
+            }
+            printf("%4d %6d %-8s %s\n", entries[i].pid, entries[i].ppid, user_buf, entries[i].command);
             free(entries[i].command);
         }
         free(entries);
@@ -1972,8 +1979,15 @@ static int smallcluePsCommand(int argc, char **argv) {
         pid_t ppid = getppid();
         uid_t uid = getuid();
         const char *cmd = argv && argv[0] ? argv[0] : "ps";
-        printf(" PID   PPID   UID COMMAND\n");
-        printf("%4d %6d %5d %s\n", (int)pid, (int)ppid, (int)uid, cmd);
+        printf(" PID   PPID USER     COMMAND\n");
+        struct passwd *pw = getpwuid(uid);
+        char user_buf[32];
+        if (pw) {
+            snprintf(user_buf, sizeof(user_buf), "%s", pw->pw_name);
+        } else {
+            snprintf(user_buf, sizeof(user_buf), "%d", (int)uid);
+        }
+        printf("%4d %6d %-8s %s\n", (int)pid, (int)ppid, user_buf, cmd);
     }
     return 0;
 #endif
