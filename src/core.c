@@ -7820,6 +7820,40 @@ static int compare_ls_entries_by_mtime(const void *lhs, const void *rhs) {
     return strcmp(a->name, b->name);
 }
 
+static int compare_ls_entries_by_name(const void *lhs, const void *rhs) {
+    const SmallclueLsEntry *a = (const SmallclueLsEntry *)lhs;
+    const SmallclueLsEntry *b = (const SmallclueLsEntry *)rhs;
+    return strcmp(a->name, b->name);
+}
+
+static int compare_ls_entries_group_dirs_name(const void *lhs, const void *rhs) {
+    const SmallclueLsEntry *a = (const SmallclueLsEntry *)lhs;
+    const SmallclueLsEntry *b = (const SmallclueLsEntry *)rhs;
+    bool a_is_dir = S_ISDIR(a->stat_buf.st_mode);
+    bool b_is_dir = S_ISDIR(b->stat_buf.st_mode);
+    if (a_is_dir != b_is_dir) {
+        return a_is_dir ? -1 : 1;
+    }
+    return strcmp(a->name, b->name);
+}
+
+static int compare_ls_entries_group_dirs_mtime(const void *lhs, const void *rhs) {
+    const SmallclueLsEntry *a = (const SmallclueLsEntry *)lhs;
+    const SmallclueLsEntry *b = (const SmallclueLsEntry *)rhs;
+    bool a_is_dir = S_ISDIR(a->stat_buf.st_mode);
+    bool b_is_dir = S_ISDIR(b->stat_buf.st_mode);
+    if (a_is_dir != b_is_dir) {
+        return a_is_dir ? -1 : 1;
+    }
+    if (a->stat_buf.st_mtime > b->stat_buf.st_mtime) {
+        return -1;
+    }
+    if (a->stat_buf.st_mtime < b->stat_buf.st_mtime) {
+        return 1;
+    }
+    return strcmp(a->name, b->name);
+}
+
 static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int color_mode, int classify) {
     if (count == 0) {
         return;
@@ -7895,6 +7929,7 @@ static int list_directory(const char *path,
                           bool show_almost_all,
                           bool long_format,
                           bool sort_by_time,
+                          bool group_directories_first,
                           bool human,
                           bool numeric_ids,
                           int color_mode,
@@ -7969,8 +8004,18 @@ static int list_directory(const char *path,
     }
     closedir(d);
 
-    if (sort_by_time && count > 1) {
-        qsort(entries, count, sizeof(entries[0]), compare_ls_entries_by_mtime);
+    if (count > 1) {
+        int (*comparator)(const void *, const void *) = compare_ls_entries_by_name;
+        if (group_directories_first) {
+            if (sort_by_time) {
+                comparator = compare_ls_entries_group_dirs_mtime;
+            } else {
+                comparator = compare_ls_entries_group_dirs_name;
+            }
+        } else if (sort_by_time) {
+            comparator = compare_ls_entries_by_mtime;
+        }
+        qsort(entries, count, sizeof(entries[0]), comparator);
     }
 
         if (long_format) {
@@ -8113,6 +8158,9 @@ static bool smallclueLsHandleLongOption(const char *arg) {
     if (!arg) {
         return true;
     }
+    if (strcmp(arg, "--group-directories-first") == 0) {
+        return true;
+    }
     if (strcmp(arg, "--color") == 0) {
         return smallclueLsAcceptColorValue("--color", NULL);
     }
@@ -8134,6 +8182,7 @@ static int smallclueLsCommand(int argc, char **argv) {
     int show_almost_all = 0;
     int long_format = 0;
     int sort_by_time = 0;
+    int group_directories_first = 0;
     int list_dirs_only = 0;
     int human_sizes = 0;
     int classify = 0;
@@ -8155,7 +8204,9 @@ static int smallclueLsCommand(int argc, char **argv) {
             if (!smallclueLsHandleLongOption(arg)) {
                 return 1;
             }
-            if (strcmp(arg, "--color") == 0 || strcmp(arg, "--colour") == 0) {
+            if (strcmp(arg, "--group-directories-first") == 0) {
+                group_directories_first = 1;
+            } else if (strcmp(arg, "--color") == 0 || strcmp(arg, "--colour") == 0) {
                 color_mode = 1;
             } else if (strncmp(arg, "--color=", 8) == 0) {
                 const char *val = arg + 8;
@@ -8196,7 +8247,7 @@ static int smallclueLsCommand(int argc, char **argv) {
             return print_path_entry_with_stat(".", ".", long_format, human_sizes, numeric_ids, NULL, color_mode, classify) ? 1 : 0;
         }
         return list_directory(".", show_all, show_almost_all, long_format,
-                              sort_by_time, human_sizes, numeric_ids, color_mode, classify);
+                              sort_by_time, group_directories_first, human_sizes, numeric_ids, color_mode, classify);
     }
 
     int remaining = argc - paths_start;
@@ -8217,7 +8268,7 @@ static int smallclueLsCommand(int argc, char **argv) {
                 printf("%s:\n", path);
             }
             status |= list_directory(path, show_all, show_almost_all, long_format,
-                                     sort_by_time, human_sizes, numeric_ids, color_mode, classify);
+                                     sort_by_time, group_directories_first, human_sizes, numeric_ids, color_mode, classify);
         } else {
             status |= print_path_entry_with_stat(path, path, long_format, human_sizes, numeric_ids, &stat_buf, color_mode, classify);
         }
