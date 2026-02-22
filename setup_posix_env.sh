@@ -149,12 +149,18 @@ if [ -d "$OPENSSH_DIR" ]; then
 
     echo "Configuring OpenSSH..."
     if [ -f "$OPENSSH_DIR/Makefile" ]; then
+        NEED_RECONF=0
         if [ "$(uname -s)" = "Linux" ] && ! grep -q "\-static" "$OPENSSH_DIR/Makefile"; then
              echo "Reconfiguring OpenSSH for static build..."
-             (cd "$OPENSSH_DIR" && make distclean)
+             NEED_RECONF=1
         fi
         if ! grep -q "sysconfdir = /etc/ssh" "$OPENSSH_DIR/Makefile"; then
              echo "Reconfiguring OpenSSH for sysconfdir..."
+             NEED_RECONF=1
+        fi
+
+        if [ "$NEED_RECONF" -eq 1 ]; then
+             echo "Cleaning OpenSSH build to reconfigure..."
              (cd "$OPENSSH_DIR" && make distclean)
         fi
     fi
