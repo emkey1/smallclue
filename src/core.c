@@ -12216,11 +12216,55 @@ static int smallclueEnvCommand(int argc, char **argv) {
     return 126;
 }
 
+static void smallclueGrepPrintMatch(const char *line, size_t len, const char *pattern, int ignore_case, int color_enabled, const char *prefix_path, long line_number) {
+    if (prefix_path) {
+        printf("%s:", prefix_path);
+    }
+    if (line_number > 0) {
+        printf("%ld:", line_number);
+    }
+
+    if (!color_enabled || !pattern || !*pattern) {
+        fwrite(line, 1, len, stdout);
+        return;
+    }
+
+    const char *cursor = line;
+    const char *end = line + len;
+    while (cursor < end) {
+        /* Note: smallclueStrCaseStr stops at null terminator, so matches after embedded nulls in binary files are ignored (matching existing behavior). */
+        const char *match = smallclueStrCaseStr(cursor, pattern, ignore_case);
+        if (!match || match >= end) {
+            fwrite(cursor, 1, (size_t)(end - cursor), stdout);
+            break;
+        }
+
+        /* Print prefix */
+        if (match > cursor) {
+            fwrite(cursor, 1, (size_t)(match - cursor), stdout);
+        }
+
+        /* Print match in color */
+        size_t pat_len = strlen(pattern);
+        if (match + pat_len > end) {
+            pat_len = (size_t)(end - match);
+        }
+
+        fputs("\033[1;31m", stdout); /* Bold Red */
+        fwrite(match, 1, pat_len, stdout);
+        fputs("\033[0m", stdout); /* Reset */
+
+        cursor = match + pat_len;
+    }
+}
+
 static int smallclueGrepCommand(int argc, char **argv) {
     int index = 1;
     int number_lines = 0;
     int ignore_case = 0;
     int invert_match = 0;
+    int color_mode = 0; /* 0=auto, 1=always, -1=never */
+
     while (index < argc) {
         const char *arg = argv[index];
         if (!arg || arg[0] != '-') {
@@ -12248,7 +12292,15 @@ static int smallclueGrepCommand(int argc, char **argv) {
                 continue;
             }
             if (strncmp(arg, "--color", 7) == 0 || strncmp(arg, "--colour", 8) == 0) {
-                /* Accept --color[=auto|never|always] without changing behaviour. */
+                const char *val = NULL;
+                if (strncmp(arg, "--color=", 8) == 0) val = arg + 8;
+                else if (strncmp(arg, "--colour=", 9) == 0) val = arg + 9;
+                else val = "auto"; /* implicit argument for --color */
+
+                if (strcasecmp(val, "always") == 0) color_mode = 1;
+                else if (strcasecmp(val, "never") == 0 || strcasecmp(val, "none") == 0) color_mode = -1;
+                else color_mode = 0;
+
                 index++;
                 continue;
             }
@@ -12274,6 +12326,12 @@ static int smallclueGrepCommand(int argc, char **argv) {
         return 1;
     }
     const char *pattern = argv[index++];
+
+    if (color_mode == 0) {
+        color_mode = pscalRuntimeStdoutIsInteractive() ? 1 : -1;
+    }
+    int use_color = (color_mode == 1) && !invert_match;
+
     int paths = argc - index;
     int status = 1;
     char *line = NULL;
@@ -12293,10 +12351,7 @@ static int smallclueGrepCommand(int argc, char **argv) {
             line_no++;
             int found = smallclueStrCaseStr(line, pattern, ignore_case) != NULL;
             if (invert_match ? !found : found) {
-                if (number_lines) {
-                    printf("%ld:", line_no);
-                }
-                fwrite(line, 1, (size_t)len, stdout);
+                smallclueGrepPrintMatch(line, (size_t)len, pattern, ignore_case, use_color, NULL, number_lines ? line_no : 0);
                 status = 0;
             }
         }
@@ -12322,13 +12377,7 @@ static int smallclueGrepCommand(int argc, char **argv) {
                 line_no++;
                 int found = smallclueStrCaseStr(line, pattern, ignore_case) != NULL;
                 if (invert_match ? !found : found) {
-                    if (paths > 1) {
-                        printf("%s:", path);
-                    }
-                    if (number_lines) {
-                        printf("%ld:", line_no);
-                    }
-                    fwrite(line, 1, (size_t)len, stdout);
+                    smallclueGrepPrintMatch(line, (size_t)len, pattern, ignore_case, use_color, (paths > 1) ? path : NULL, number_lines ? line_no : 0);
                     status = 0;
                 }
             }
