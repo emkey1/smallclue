@@ -630,7 +630,7 @@ static void smallclueTrimTrailingSlashes(char *path);
 static bool smallclueChopParentDirectory(char *path);
 static int smallclueRemovePathWithLabel(const char *label, const char *path, bool recursive, bool force);
 static int smallclueCopyFile(const char *label, const char *src, const char *dst);
-static int smallclueMkdirParents(const char *path, mode_t mode);
+static int smallclueMkdirParents(const char *path, mode_t mode, bool verbose);
 static void smallclueGetTerminalSize(int *rows, int *cols);
 static int smallclueEditorCommand(int argc, char **argv);
 static int smallclueSshCommand(int argc, char **argv);
@@ -1129,8 +1129,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  -i interactive mode.  Makes ~/Docs browsable"},
     {"mdev", "mdev [-s]\n"
              "  Device manager (scan only)"},
-    {"mkdir", "mkdir [-p] DIR...\n"
-              "  -p create parents as needed"},
+    {"mkdir", "mkdir [-p] [-v] DIR...\n"
+              "  -p create parents as needed\n"
+              "  -v verbose"},
     {"mknod", "mknod [-m mode] NAME TYPE [MAJOR MINOR]\n"
               "  Create special files (b=block, c/u=char, p=fifo)"},
     {"mount", "mount [-t type] [-o options] device dir\n"
@@ -12885,7 +12886,7 @@ static int smallclueCopyFile(const char *label, const char *src, const char *dst
     return status;
 }
 
-static int smallclueMkdirParents(const char *path, mode_t mode) {
+static int smallclueMkdirParents(const char *path, mode_t mode, bool verbose) {
     if (!path || !*path) {
         errno = EINVAL;
         return -1;
@@ -12909,7 +12910,11 @@ static int smallclueMkdirParents(const char *path, mode_t mode) {
         if (*cursor == '/') {
             *cursor = '\0';
             if (mutable_path[0] != '\0') {
-                if (mkdir(mutable_path, mode) != 0 && errno != EEXIST) {
+                if (mkdir(mutable_path, mode) == 0) {
+                    if (verbose) {
+                        printf("mkdir: created directory '%s'\n", mutable_path);
+                    }
+                } else if (errno != EEXIST) {
                     int err = errno;
                     free(mutable_path);
                     errno = err;
@@ -12934,6 +12939,8 @@ static int smallclueMkdirParents(const char *path, mode_t mode) {
         free(mutable_path);
         errno = err;
         return -1;
+    } else if (verbose) {
+        printf("mkdir: created directory '%s'\n", path);
     }
     free(mutable_path);
     return 0;
@@ -13059,12 +13066,16 @@ static int smallclueRmdirCommand(int argc, char **argv) {
 
 static int smallclueMkdirCommand(int argc, char **argv) {
     int parents = 0;
+    int verbose = 0;
     int opt;
     smallclueResetGetopt();
-    while ((opt = getopt(argc, argv, "p")) != -1) {
+    while ((opt = getopt(argc, argv, "pv")) != -1) {
         switch (opt) {
             case 'p':
                 parents = 1;
+                break;
+            case 'v':
+                verbose = 1;
                 break;
             default:
                 fprintf(stderr, "mkdir: invalid option -- %c\n", optopt);
@@ -13079,7 +13090,7 @@ static int smallclueMkdirCommand(int argc, char **argv) {
     for (int i = optind; i < argc; ++i) {
         const char *target = argv[i];
         if (parents) {
-            if (smallclueMkdirParents(target, 0777) != 0) {
+            if (smallclueMkdirParents(target, 0777, verbose) != 0) {
                 fprintf(stderr, "mkdir: %s: %s\n", target, strerror(errno));
                 status = 1;
             }
@@ -13087,6 +13098,8 @@ static int smallclueMkdirCommand(int argc, char **argv) {
             if (mkdir(target, 0777) != 0) {
                 fprintf(stderr, "mkdir: %s: %s\n", target, strerror(errno));
                 status = 1;
+            } else if (verbose) {
+                printf("mkdir: created directory '%s'\n", target);
             }
         }
     }
