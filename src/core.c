@@ -14144,8 +14144,8 @@ static int smallclueInitCommand(int argc, char **argv) {
         pid_t pid = wait(&status);
         if (pid < 0) {
             if (errno == ECHILD) {
-                /* No children left, sleep to avoid busy loop */
-                sleep(1);
+                /* No children left; system is idle, so exit. */
+                return 0;
             }
             continue;
         }
