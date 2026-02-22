@@ -13,6 +13,10 @@ IS_DEBIAN_APT=0
 if [ -f /etc/debian_version ] && command -v apt-get >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1; then
     IS_DEBIAN_APT=1
 fi
+HOST_DEB_ARCH=""
+if [ "$IS_DEBIAN_APT" -eq 1 ]; then
+    HOST_DEB_ARCH="$(dpkg --print-architecture 2>/dev/null || true)"
+fi
 APT_UPDATED=0
 
 aptMaybeUpdate() {
@@ -45,6 +49,11 @@ ensureDebianPackages() {
     return 0
 }
 
+aptInstallNoRecommends() {
+    aptMaybeUpdate
+    apt-get install -y --no-install-recommends "$@"
+}
+
 ensureI386ArchDebian() {
     if [ "$IS_DEBIAN_APT" -ne 1 ]; then
         return 1
@@ -54,6 +63,35 @@ ensureI386ArchDebian() {
         APT_UPDATED=0
     fi
     return 0
+}
+
+ensureDebianI386OpenSshDeps() {
+    if [ "$IS_DEBIAN_APT" -ne 1 ]; then
+        return 1
+    fi
+    ensureI386ArchDebian
+
+    # First pass: straightforward i386 installs.
+    aptInstallNoRecommends libc6:i386 libc6-dev:i386 || true
+    if aptInstallNoRecommends zlib1g:i386 zlib1g-dev:i386 libssl3:i386 libssl-dev:i386; then
+        return 0
+    fi
+
+    # Second pass: force host+i386 package versions to resolve together.
+    echo "Retrying i386 dependency install with host+i386 package alignment..."
+    apt-get -y --fix-broken install || true
+    aptMaybeUpdate
+    if [ -n "$HOST_DEB_ARCH" ]; then
+        apt-get install -y --no-install-recommends \
+            "libssl3:${HOST_DEB_ARCH}" libssl3:i386 \
+            "libssl-dev:${HOST_DEB_ARCH}" libssl-dev:i386 \
+            "zlib1g:${HOST_DEB_ARCH}" zlib1g:i386 zlib1g-dev:i386 \
+            libc6:i386 libc6-dev:i386
+    else
+        apt-get install -y --no-install-recommends \
+            libssl3:i386 libssl-dev:i386 zlib1g:i386 zlib1g-dev:i386 \
+            libc6:i386 libc6-dev:i386
+    fi
 }
 
 selectI686Toolchain() {
@@ -268,8 +306,7 @@ if [ -d "$OPENSSH_DIR" ]; then
     if ([ "$HAVE_TARGET_ZLIB" -ne 1 ] || [ "$HAVE_TARGET_CRYPTO" -ne 1 ]) && \
        [ "$AUTO_INSTALL_DEPS" = "1" ] && [ "$IS_DEBIAN_APT" -eq 1 ]; then
         echo "Installing missing i386 OpenSSH dependency packages..."
-        ensureI386ArchDebian
-        ensureDebianPackages zlib1g-dev:i386 libssl-dev:i386
+        ensureDebianI386OpenSshDeps || true
         probeOpenSshTargetLibs
     fi
 
@@ -285,12 +322,22 @@ if [ -d "$OPENSSH_DIR" ]; then
             echo "Install i386 target libs on Debian:"
             echo "  sudo dpkg --add-architecture i386"
             echo "  sudo apt-get update"
-            echo "  sudo apt-get install zlib1g-dev:i386 libssl-dev:i386"
+            echo "  sudo apt-get -y --fix-broken install"
+            if [ -n "$HOST_DEB_ARCH" ]; then
+                echo "  sudo apt-get install libc6:i386 libc6-dev:i386 zlib1g:i386 zlib1g-dev:i386 libssl3:${HOST_DEB_ARCH} libssl3:i386 libssl-dev:${HOST_DEB_ARCH} libssl-dev:i386"
+            else
+                echo "  sudo apt-get install libc6:i386 libc6-dev:i386 zlib1g:i386 zlib1g-dev:i386 libssl3:i386 libssl-dev:i386"
+            fi
         else
             echo "Install 32-bit target libs on Debian:"
             echo "  sudo dpkg --add-architecture i386"
             echo "  sudo apt-get update"
-            echo "  sudo apt-get install zlib1g-dev:i386 libssl-dev:i386"
+            echo "  sudo apt-get -y --fix-broken install"
+            if [ -n "$HOST_DEB_ARCH" ]; then
+                echo "  sudo apt-get install libc6:i386 libc6-dev:i386 zlib1g:i386 zlib1g-dev:i386 libssl3:${HOST_DEB_ARCH} libssl3:i386 libssl-dev:${HOST_DEB_ARCH} libssl-dev:i386"
+            else
+                echo "  sudo apt-get install libc6:i386 libc6-dev:i386 zlib1g:i386 zlib1g-dev:i386 libssl3:i386 libssl-dev:i386"
+            fi
         fi
         if [ "$ALLOW_OPENSSH_STUBS" != "1" ]; then
             echo "Error: refusing to continue with OpenSSH stubs."
