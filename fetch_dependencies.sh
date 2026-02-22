@@ -131,10 +131,95 @@ if [ -d "$OPENSSH_DIR" ] && [ ! -f "$OPENSSH_DIR/Makefile" ]; then
     fi
 fi
 
+# --- Linenoise ---
+if [ ! -d "$THIRD_PARTY_DIR/linenoise" ]; then
+    echo "Cloning linenoise..."
+    git clone https://github.com/antirez/linenoise "$THIRD_PARTY_DIR/linenoise"
+fi
+
 # --- Dash ---
 if [ ! -d "$THIRD_PARTY_DIR/dash" ]; then
     echo "Cloning dash..."
     git clone git://git.kernel.org/pub/scm/utils/dash/dash.git "$THIRD_PARTY_DIR/dash"
+fi
+
+# --- Dash Integration (Linenoise) ---
+DASH_SRC="$THIRD_PARTY_DIR/dash/src"
+if [ -d "$DASH_SRC" ]; then
+    echo "Integrating linenoise into dash..."
+    cp "$THIRD_PARTY_DIR/linenoise/linenoise.c" "$DASH_SRC/"
+    cp "$THIRD_PARTY_DIR/linenoise/linenoise.h" "$DASH_SRC/"
+
+    # Patch Makefile.am to include linenoise.c
+    if ! grep -q "linenoise.c" "$DASH_SRC/Makefile.am"; then
+        echo "Patching dash Makefile.am..."
+        sed -i.bak 's/input.c/input.c linenoise.c/g' "$DASH_SRC/Makefile.am"
+        rm -f "$DASH_SRC/Makefile.am.bak"
+    fi
+
+    # Patch input.c
+    INPUT_C="$DASH_SRC/input.c"
+    if ! grep -q "linenoise.h" "$INPUT_C"; then
+        echo "Patching dash input.c..."
+        sed -i.bak '/#include "trap.h"/a #include "linenoise.h"' "$INPUT_C"
+
+        # Create patch content for linenoise integration
+        cat > "$DASH_SRC/linenoise_patch.c" <<'EOF'
+#ifndef SMALL
+	if (fd == 0 && isatty(0)) {
+		static char *ln_buf = NULL;
+		static int ln_len = 0;
+		static int ln_pos = 0;
+
+		if (ln_buf == NULL) {
+			char *line = linenoise(getprompt(NULL));
+			if (line) {
+				linenoiseHistoryAdd(line);
+				int len = strlen(line);
+				ln_buf = malloc(len + 2);
+				if (ln_buf) {
+					strcpy(ln_buf, line);
+					ln_buf[len] = '\n';
+					ln_buf[len+1] = '\0';
+					ln_len = len + 1;
+					ln_pos = 0;
+				}
+				free(line);
+			} else {
+				return 0;
+			}
+		}
+
+		if (ln_buf) {
+			int to_copy = ln_len - ln_pos;
+			if (to_copy > nr) to_copy = nr;
+			memcpy(buf, ln_buf + ln_pos, to_copy);
+			ln_pos += to_copy;
+			if (ln_pos >= ln_len) {
+				free(ln_buf);
+				ln_buf = NULL;
+				ln_len = 0;
+				ln_pos = 0;
+			}
+			return to_copy;
+		}
+	}
+#endif
+EOF
+        # Replace the libedit block with a marker
+        sed -i.bak 's/if (fd == 0 && el) {/if (0) { \/* replaced by linenoise *\//' "$INPUT_C"
+
+        # Insert new block before the marker
+        LINE_NUM=$(grep -n "if (0) { /\* replaced by linenoise \*/" "$INPUT_C" | cut -d: -f1)
+        if [ ! -z "$LINE_NUM" ]; then
+             head -n $(($LINE_NUM - 2)) "$INPUT_C" > "$INPUT_C.tmp"
+             cat "$DASH_SRC/linenoise_patch.c" >> "$INPUT_C.tmp"
+             tail -n +$(($LINE_NUM - 1)) "$INPUT_C" >> "$INPUT_C.tmp"
+             mv "$INPUT_C.tmp" "$INPUT_C"
+        fi
+
+        rm -f "$INPUT_C.bak" "$DASH_SRC/linenoise_patch.c"
+    fi
 fi
 
 echo "Dependencies fetched and patched."
