@@ -84,16 +84,26 @@ ensureDebianI386OpenSshDeps() {
 }
 
 downloadTarball() {
-    local url="$1"
-    local out="$2"
-    if command -v curl >/dev/null 2>&1; then
-        curl -L --fail -o "$out" "$url"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -O "$out" "$url"
-    else
-        echo "Error: need curl or wget to download $url"
-        return 1
-    fi
+    local out="$1"
+    shift
+    local url=""
+    for url in "$@"; do
+        [ -z "$url" ] && continue
+        echo "Trying download: $url"
+        if command -v curl >/dev/null 2>&1; then
+            if curl -L --fail -o "$out" "$url"; then
+                return 0
+            fi
+        elif command -v wget >/dev/null 2>&1; then
+            if wget -O "$out" "$url"; then
+                return 0
+            fi
+        else
+            echo "Error: need curl or wget to download sources."
+            return 1
+        fi
+    done
+    return 1
 }
 
 buildVendoredOpenSshDeps() {
@@ -104,11 +114,14 @@ buildVendoredOpenSshDeps() {
     local zlib_ver="1.3.1"
     local zlib_src="$src_root/zlib-$zlib_ver"
     local zlib_tar="$src_root/zlib-$zlib_ver.tar.gz"
-    local zlib_url="https://zlib.net/zlib-$zlib_ver.tar.gz"
+    local zlib_url_1="https://zlib.net/zlib-$zlib_ver.tar.gz"
+    local zlib_url_2="https://zlib.net/fossils/zlib-$zlib_ver.tar.gz"
+    local zlib_url_3="https://www.zlib.net/fossils/zlib-$zlib_ver.tar.gz"
     local openssl_ver="3.6.0"
     local openssl_src="$src_root/openssl-$openssl_ver"
     local openssl_tar="$src_root/openssl-$openssl_ver.tar.gz"
-    local openssl_url="https://www.openssl.org/source/openssl-$openssl_ver.tar.gz"
+    local openssl_url_1="https://www.openssl.org/source/openssl-$openssl_ver.tar.gz"
+    local openssl_url_2="https://www.openssl.org/source/old/3.6/openssl-$openssl_ver.tar.gz"
     local target_ar="ar"
     local target_ranlib="ranlib"
     local cc_prefix=""
@@ -134,8 +147,20 @@ buildVendoredOpenSshDeps() {
 
     if [ ! -d "$zlib_src" ]; then
         echo "Fetching zlib $zlib_ver..."
-        [ -f "$zlib_tar" ] || downloadTarball "$zlib_url" "$zlib_tar"
-        tar -xf "$zlib_tar" -C "$src_root"
+        if [ ! -f "$zlib_tar" ]; then
+            downloadTarball "$zlib_tar" "$zlib_url_1" "$zlib_url_2" "$zlib_url_3" || {
+                echo "Error: unable to download zlib source tarball."
+                return 1
+            }
+        fi
+        tar -xf "$zlib_tar" -C "$src_root" || {
+            echo "Error: unable to extract $zlib_tar"
+            return 1
+        }
+        if [ ! -d "$zlib_src" ]; then
+            echo "Error: expected zlib source dir not found after extract: $zlib_src"
+            return 1
+        fi
     fi
 
     echo "Building vendored zlib for i686..."
@@ -154,8 +179,20 @@ buildVendoredOpenSshDeps() {
             cp -a ../third-party/openssl-3.6.0 "$openssl_src"
         else
             echo "Fetching OpenSSL $openssl_ver..."
-            [ -f "$openssl_tar" ] || downloadTarball "$openssl_url" "$openssl_tar"
-            tar -xf "$openssl_tar" -C "$src_root"
+            if [ ! -f "$openssl_tar" ]; then
+                downloadTarball "$openssl_tar" "$openssl_url_1" "$openssl_url_2" || {
+                    echo "Error: unable to download OpenSSL source tarball."
+                    return 1
+                }
+            fi
+            tar -xf "$openssl_tar" -C "$src_root" || {
+                echo "Error: unable to extract $openssl_tar"
+                return 1
+            }
+        fi
+        if [ ! -d "$openssl_src" ]; then
+            echo "Error: expected OpenSSL source dir not found after extract: $openssl_src"
+            return 1
         fi
     fi
 
@@ -422,7 +459,13 @@ if [ -d "$OPENSSH_DIR" ]; then
     if ([ "$HAVE_TARGET_ZLIB" -ne 1 ] || [ "$HAVE_TARGET_CRYPTO" -ne 1 ]) && \
        [ "$OPENSSH_VENDOR_FALLBACK" = "1" ]; then
         echo "System i386 OpenSSH deps unavailable; trying vendored OpenSSL+zlib build..."
-        buildVendoredOpenSshDeps || true
+        if ! buildVendoredOpenSshDeps; then
+            echo "Warning: vendored OpenSSH dependency build failed."
+            if [ "$ALLOW_OPENSSH_STUBS" != "1" ]; then
+                echo "Error: cannot continue without OpenSSH deps (or ALLOW_OPENSSH_STUBS=1)."
+                exit 1
+            fi
+        fi
         probeOpenSshTargetLibs
     fi
 
