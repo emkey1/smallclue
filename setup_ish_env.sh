@@ -40,10 +40,14 @@ else
 fi
 
 CC_PRINT="${CC_CMD[*]}"
-BUILD_TRIPLET="$("${CC_CMD[0]}" -dumpmachine 2>/dev/null || true)"
-if [ -z "$BUILD_TRIPLET" ]; then
-    BUILD_TRIPLET="$(gcc -dumpmachine 2>/dev/null || true)"
+BUILD_CC="cc"
+if command -v gcc >/dev/null 2>&1; then
+    BUILD_CC="gcc"
+elif command -v cc >/dev/null 2>&1; then
+    BUILD_CC="cc"
 fi
+
+BUILD_TRIPLET="$($BUILD_CC -dumpmachine 2>/dev/null || true)"
 if [ -z "$BUILD_TRIPLET" ]; then
     BUILD_TRIPLET="$(uname -m)-unknown-linux-gnu"
 fi
@@ -301,9 +305,10 @@ if [ -d "$DASH_DIR" ]; then
     if [ ! -f "$DASH_DIR/configure" ]; then
         (cd "$DASH_DIR" && ./autogen.sh)
     fi
-    (cd "$DASH_DIR" && AR="$DASH_AR" RANLIB="$DASH_RANLIB" ./configure --build="$BUILD_TRIPLET" --host="$TARGET_HOST" --enable-static CC="$CC_PRINT" CFLAGS="${TARGET_CFLAGS[*]}" LDFLAGS="${TARGET_LDFLAGS[*]} -static")
+    DASH_CC_FOR_BUILD="$BUILD_CC"
+    (cd "$DASH_DIR" && AR="$DASH_AR" RANLIB="$DASH_RANLIB" CC_FOR_BUILD="$DASH_CC_FOR_BUILD" ./configure --build="$BUILD_TRIPLET" --host="$TARGET_HOST" --enable-static CC="$CC_PRINT" CFLAGS="${TARGET_CFLAGS[*]}" LDFLAGS="${TARGET_LDFLAGS[*]} -static")
     echo "Building Dash..."
-    (cd "$DASH_DIR" && make -j4 CC="$CC_PRINT" AR="$DASH_AR" RANLIB="$DASH_RANLIB" CFLAGS="${TARGET_CFLAGS[*]}" LDFLAGS="${TARGET_LDFLAGS[*]} -static")
+    (cd "$DASH_DIR" && make -j4 CC="$CC_PRINT" CC_FOR_BUILD="$DASH_CC_FOR_BUILD" AR="$DASH_AR" RANLIB="$DASH_RANLIB" CFLAGS="${TARGET_CFLAGS[*]}" LDFLAGS="${TARGET_LDFLAGS[*]} -static")
 
     if [ ! -f "$DASH_DIR/src/dash" ]; then
         echo "Error: dash build did not produce $DASH_DIR/src/dash"
