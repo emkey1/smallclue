@@ -268,6 +268,9 @@ $OPENSSH_DIR/ssh-keygen.o $OPENSSH_DIR/sshsig.o"
     # Link against built static libs and system libs (zlib, crypto)
     # On Linux with -static, -lcrypto -lz will use static versions if available.
     OPENSSH_LIBS="$OPENSSH_DIR/libssh.a $OPENSSH_DIR/openbsd-compat/libopenbsd-compat.a -lcrypto -lz"
+    if [ "$(uname -s)" = "Linux" ]; then
+        OPENSSH_LIBS="$OPENSSH_LIBS -lcrypt"
+    fi
 
     # Include globals and stubs
     OPENSSH_SRC="src/openssh_stubs.c src/openssh_globals.c"
@@ -452,6 +455,26 @@ nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
 sshd:x:104:65534::/run/sshd:/usr/sbin/nologin
 username:x:1000:1000:User Name,,,:/home/username:/bin/sh
 EOF
+
+echo "Creating /etc/shadow..."
+cat > "$ROOTFS/etc/shadow" <<EOF
+root:*:19700:0:99999:7:::
+daemon:*:19700:0:99999:7:::
+bin:*:19700:0:99999:7:::
+sys:*:19700:0:99999:7:::
+sync:*:19700:0:99999:7:::
+games:*:19700:0:99999:7:::
+man:*:19700:0:99999:7:::
+lp:*:19700:0:99999:7:::
+proxy:*:19700:0:99999:7:::
+www-data:*:19700:0:99999:7:::
+backup:*:19700:0:99999:7:::
+list:*:19700:0:99999:7:::
+nobody:*:19700:0:99999:7:::
+sshd:*:19700:0:99999:7:::
+username::19700:0:99999:7:::
+EOF
+chmod 600 "$ROOTFS/etc/shadow"
 
 echo "Creating /etc/profile..."
 cat > "$ROOTFS/etc/profile" <<EOF
