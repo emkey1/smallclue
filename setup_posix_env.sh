@@ -416,6 +416,19 @@ sshd:x:104:65534::/run/sshd:/usr/sbin/nologin
 username:x:1000:1000:User Name,,,:/home/username:/bin/sh
 EOF
 
+echo "Creating /etc/profile..."
+cat > "$ROOTFS/etc/profile" <<EOF
+# System-wide profile
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+
+# Run /etc/rc if present and not already run
+if [ -x /etc/rc ] && [ ! -f /tmp/rc_ran ]; then
+    /etc/rc
+    touch /tmp/rc_ran
+fi
+EOF
+chmod 644 "$ROOTFS/etc/profile"
+
 echo "Creating .exshrc..."
 cat > "$ROOTFS/home/username/.exshrc" <<EOF
 # Minimal .exshrc
