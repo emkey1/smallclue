@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zlib1g-dev \
     ca-certificates \
     curl \
+    openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy source
