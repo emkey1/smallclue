@@ -165,7 +165,6 @@ if [ -d "$DASH_SRC" ]; then
 
         # Create patch content for linenoise integration
         cat > "$DASH_SRC/linenoise_patch.c" <<'EOF'
-#ifndef SMALL
 	if (fd == 0 && isatty(0)) {
 		static char *ln_buf = NULL;
 		static int ln_len = 0;
@@ -204,7 +203,6 @@ if [ -d "$DASH_SRC" ]; then
 			return to_copy;
 		}
 	}
-#endif
 EOF
         # Replace the libedit block with a marker
         sed -i.bak 's/if (fd == 0 && el) {/if (0) { \/* replaced by linenoise *\//' "$INPUT_C"
