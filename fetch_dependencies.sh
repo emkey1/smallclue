@@ -140,7 +140,9 @@ fi
 # --- Dash ---
 if [ ! -d "$THIRD_PARTY_DIR/dash" ]; then
     echo "Cloning dash..."
-    git clone git://git.kernel.org/pub/scm/utils/dash/dash.git "$THIRD_PARTY_DIR/dash"
+    git clone https://git.kernel.org/pub/scm/utils/dash/dash.git "$THIRD_PARTY_DIR/dash"
+    # Pin to a stable release (v0.5.13.1)
+    (cd "$THIRD_PARTY_DIR/dash" && git checkout v0.5.13.1)
 fi
 
 # --- Dash Integration (Linenoise) ---
@@ -161,7 +163,9 @@ if [ -d "$DASH_SRC" ]; then
     INPUT_C="$DASH_SRC/input.c"
     if ! grep -q "linenoise.h" "$INPUT_C"; then
         echo "Patching dash input.c..."
-        sed -i.bak '/#include "trap.h"/a #include "linenoise.h"' "$INPUT_C"
+        sed -i.bak '/#include "trap.h"/a #include "linenoise.h"\
+#include <stdlib.h>\
+#include <stdio.h>' "$INPUT_C"
 
         # Create patch content for linenoise integration
         cat > "$DASH_SRC/linenoise_patch.c" <<'EOF'
@@ -169,11 +173,30 @@ if [ -d "$DASH_SRC" ]; then
 		static char *ln_buf = NULL;
 		static int ln_len = 0;
 		static int ln_pos = 0;
+		static int history_loaded = 0;
+
+		if (!history_loaded) {
+			const char *home = getenv("HOME");
+			if (home) {
+				char path[1024];
+				snprintf(path, sizeof(path), "%s/.sh_history", home);
+				linenoiseHistoryLoad(path);
+			}
+			history_loaded = 1;
+		}
 
 		if (ln_buf == NULL) {
 			char *line = linenoise(getprompt(NULL));
 			if (line) {
-				linenoiseHistoryAdd(line);
+				if (*line) {
+					linenoiseHistoryAdd(line);
+					const char *home = getenv("HOME");
+					if (home) {
+						char path[1024];
+						snprintf(path, sizeof(path), "%s/.sh_history", home);
+						linenoiseHistorySave(path);
+					}
+				}
 				int len = strlen(line);
 				ln_buf = malloc(len + 2);
 				if (ln_buf) {

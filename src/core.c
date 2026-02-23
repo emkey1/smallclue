@@ -39,6 +39,7 @@
 #if defined(__linux__) || defined(linux) || defined(__linux)
 #include <shadow.h>
 #include <crypt.h>
+#include <sys/klog.h>
 #endif
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -120,6 +121,8 @@ int PSCALRuntimeScriptCaptureActive(void) { return 0; }
 #endif
 
 int smallclueVprocTestCommand(int argc, char **argv);
+
+static ssize_t smallclueGetlineStream(char **line, size_t *cap, FILE *stream, int *out_errno);
 
 static const char *smallclueResolvePath(const char *path, char *buffer, size_t buflen) {
     if (!path) {
@@ -580,6 +583,7 @@ static int smallclueChmodCommand(int argc, char **argv);
 static int smallclueDateCommand(int argc, char **argv);
 static int smallclueCalCommand(int argc, char **argv);
 static int smallclueHeadCommand(int argc, char **argv);
+static int smallclueHistoryCommand(int argc, char **argv);
 static int smallclueGrepCommand(int argc, char **argv);
 static int smallclueWcCommand(int argc, char **argv);
 static int smallclueDuCommand(int argc, char **argv);
@@ -618,6 +622,7 @@ static int smallclueKillCommand(int argc, char **argv);
 static int smallclueMkdirCommand(int argc, char **argv);
 static int smallclueMknodCommand(int argc, char **argv);
 static int smallclueMountCommand(int argc, char **argv);
+static int smallclueWhoamiCommand(int argc, char **argv);
 static void smallclueEmitTerminalSane(void);
 #if defined(PSCAL_TARGET_IOS)
 static bool smallclueSessionPtyName(char *buf, size_t buf_len);
@@ -672,10 +677,10 @@ static int smallclueIpAddrCommand(int argc, char **argv);
 static int smallclueDfCommand(int argc, char **argv);
 #if defined(PSCAL_TARGET_IOS)
 static int smallclueTopCommand(int argc, char **argv);
-static int smallclueDmesgCommand(int argc, char **argv);
 static int smallclueHelpCommand(int argc, char **argv);
 static int smallclueAddTabCommand(int argc, char **argv);
 #endif
+static int smallclueDmesgCommand(int argc, char **argv);
 
 
 static int smallclueNslookupCommand(int argc, char **argv) {
@@ -1179,6 +1184,43 @@ static int smallcluePasswdCommand(int argc, char **argv) {
 #endif
 }
 
+static int smallclueHistoryCommand(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    const char *home = getenv("HOME");
+    if (!home) {
+        fprintf(stderr, "history: HOME not set\n");
+        return 1;
+    }
+    char path[PATH_MAX];
+    int w = snprintf(path, sizeof(path), "%s/.sh_history", home);
+    if (w < 0 || (size_t)w >= sizeof(path)) {
+        fprintf(stderr, "history: path too long\n");
+        return 1;
+    }
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        return 0;
+    }
+    char *line = NULL;
+    size_t cap = 0;
+    int index = 1;
+    while (true) {
+        int read_err = 0;
+        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
+        if (len < 0) {
+            break;
+        }
+        printf("%5d  %s", index++, line);
+        if (len > 0 && line[len-1] != '\n') {
+            putchar('\n');
+        }
+    }
+    free(line);
+    fclose(fp);
+    return 0;
+}
+
 static const SmallclueApplet kSmallclueApplets[] = {
     {"[", smallclueBracketCommand, "Evaluate expressions"},
     {"basename", smallclueBasenameCommand, "Strip directory prefix"},
@@ -1201,6 +1243,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"find", smallclueFindCommand, "Search for files"},
     {"grep", smallclueGrepCommand, "Search for patterns"},
     {"head", smallclueHeadCommand, "Print the first lines of files"},
+    {"history", smallclueHistoryCommand, "Show command history"},
     {"id", smallclueIdCommand, "Print user identity information"},
 #if SMALLCLUE_HAS_IFADDRS
     {"ipaddr", smallclueIpAddrCommand, "Show interface IP addresses"},
@@ -1274,9 +1317,11 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"wc", smallclueWcCommand, "Count lines/words/bytes"},
     {"wget", smallclueWgetCommand, "Download files via HTTP(S)"},
     {"which", smallclueWhichCommand, "Locate a command"},
+    {"whoami", smallclueWhoamiCommand, "Print effective user name"},
     {"yes", smallclueYesCommand, "Repeatedly print strings"},
     {"xargs", smallclueXargsCommand, "Build command lines from stdin"},
     {"df", smallclueDfCommand, "Report filesystem usage"},
+    {"dmesg", smallclueDmesgCommand, "Print the kernel ring buffer"},
 
 #if defined(PSCAL_TARGET_IOS)
     {"addt", smallclueAddTabCommand, "Open an additional shell tab"},
@@ -1284,7 +1329,6 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"tadd", smallclueAddTabCommand, "Alias for addt: open an additional shell tab"},
     {"smallclue-help", smallclueHelpCommand, "List available smallclue applets"},
     {"licenses", smallclueLicensesCommand, "View third-party licenses"},
-    {"dmesg", smallclueDmesgCommand, "Show PSCAL runtime log for this session"},
     {"top", smallclueTopCommand, "Show PSCAL virtual processes"},
 #endif
 };
@@ -1339,6 +1383,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Halt the system"},
     {"head", "head [-n N] [FILE...]\n"
              "  Default N=10"},
+    {"history", "history\n"
+                "  Show command history"},
     {"id", "id\n"
            "  Show uid/gid info"},
     {"init", "init [--service-mode|-S|--allow-non-pid1]\n"
@@ -1354,17 +1400,20 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Pager; navigation: j/k, /, n, g/G, q"},
     {"ln", "ln [-s] TARGET LINK\n"
            "  -s symbolic link"},
-    {"ls", "ls [-a] [-A] [-l] [-n] [-t] [-h] [-d] [--color[=auto|always|never]] [path ...]\n"
+    {"ls", "ls [-a] [-A] [-l] [-n] [-1] [-C] [-t] [-h] [-d] [--color[=auto|always|never]] [path ...]\n"
            "  -a show entries starting with '.' (including . and ..)\n"
            "  -A show entries starting with '.' (excluding . and ..)\n"
            "  -l long format with permissions, ownership, size, time\n"
            "  -n numeric uid/gid (implies -l)\n"
+           "  -1 list one file per line\n"
+           "  -C list entries by columns\n"
            "  -t sort by modification time\n"
            "  -h human-readable sizes (with -l)\n"
            "  -d list directories themselves, not their contents"},
-    {"md", "md [-i] [FILE|URL]\n"
+    {"md", "md [-i] [-c] [FILE|URL]\n"
            "  View Markdown/HTML document; press 'o' to open links in-page\n"
-           "  -i interactive mode.  Makes ~/Docs browsable"},
+           "  -i interactive mode.  Makes ~/Docs browsable\n"
+           "  -c output raw markdown (convert if HTML)"},
     {"mdev", "mdev [-s]\n"
              "  Device manager (scan only)"},
     {"mkdir", "mkdir [-p] [-v] DIR...\n"
@@ -1519,6 +1568,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -nv"},
     {"which", "which [-a] program ...\n"
               "  Locate a command"},
+    {"whoami", "whoami\n"
+               "  Print effective user name"},
     {"yes", "yes [STRING...]\n"
             "  Repeatedly print STRING (default: y)"},
     {"no", "no [STRING...]\n"
@@ -1527,6 +1578,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  Build command lines from stdin"},
     {"df", "df [-h]\n"
            "  -h human-readable sizes"},
+    {"dmesg", "dmesg [-T]\n"
+              "  Print or control the kernel ring buffer\n"
+              "  -T  show human-readable timestamps (iOS only)"},
     {"nslookup", "nslookup [-v] host [port]\n"
                  "  DNS lookup utility (UDP port defaults to 53). -v prints hosts lookup debugging."},
 #if defined(PSCAL_TARGET_IOS)
@@ -1537,9 +1591,6 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                        "  With a command: show usage if available"},
     {"licenses", "licenses\n"
                  "  Browse PSCAL and third-party licenses; use arrows/enter to view"},
-    {"dmesg", "dmesg [-T]\n"
-              "  Show PSCAL runtime log for this session\n"
-              "  -T  show human-readable timestamps"},
     {"top", "top\n"
             "  Show PSCAL virtual processes and CPU ticks"},
 #endif
@@ -1673,9 +1724,12 @@ static ssize_t smallclueReadStream(FILE *stream, void *buf, size_t count, int *o
     if (!stream || !buf || count == 0) {
         return 0;
     }
+
+#if defined(PSCAL_TARGET_IOS)
     if (stream == stdin) {
         return smallclueReadStdin(buf, count, out_errno);
     }
+#endif
     size_t read_bytes = fread(buf, 1, count, stream);
     if (read_bytes < count && ferror(stream)) {
         if (out_errno) {
@@ -1696,25 +1750,29 @@ static int smallclueGetcStream(FILE *stream, int *out_errno) {
         errno = EBADF;
         return EOF;
     }
-    if (stream != stdin) {
-        int ch = fgetc(stream);
-        if (ch == EOF && ferror(stream)) {
-            if (out_errno) {
-                *out_errno = errno ? errno : EIO;
+
+#if defined(PSCAL_TARGET_IOS)
+    if (stream == stdin) {
+        unsigned char ch = 0;
+        int read_err = 0;
+        ssize_t res = smallclueReadStdin(&ch, 1, &read_err);
+        if (res <= 0) {
+            if (read_err && out_errno) {
+                *out_errno = read_err;
             }
+            return EOF;
         }
-        return ch;
+        return (int)ch;
     }
-    unsigned char ch = 0;
-    int read_err = 0;
-    ssize_t res = smallclueReadStdin(&ch, 1, &read_err);
-    if (res <= 0) {
-        if (read_err && out_errno) {
-            *out_errno = read_err;
+#endif
+
+    int ch = fgetc(stream);
+    if (ch == EOF && ferror(stream)) {
+        if (out_errno) {
+            *out_errno = errno ? errno : EIO;
         }
-        return EOF;
     }
-    return (int)ch;
+    return ch;
 }
 
 static ssize_t smallclueGetlineStream(char **line, size_t *cap, FILE *stream, int *out_errno) {
@@ -1728,68 +1786,72 @@ static ssize_t smallclueGetlineStream(char **line, size_t *cap, FILE *stream, in
         errno = EINVAL;
         return -1;
     }
-    if (stream != stdin) {
-        ssize_t len = getline(line, cap, stream);
-        if (len < 0 && ferror(stream)) {
-            if (out_errno) {
-                *out_errno = errno ? errno : EIO;
-            }
-        }
-        return len;
-    }
-    if (!*line || *cap == 0) {
-        size_t newcap = 128;
-        char *buf = (char *)malloc(newcap);
-        if (!buf) {
-            if (out_errno) {
-                *out_errno = ENOMEM;
-            }
-            errno = ENOMEM;
-            return -1;
-        }
-        *line = buf;
-        *cap = newcap;
-    }
-    size_t len = 0;
-    while (true) {
-        unsigned char ch = 0;
-        int read_err = 0;
-        ssize_t res = smallclueReadStdin(&ch, 1, &read_err);
-        if (res < 0) {
-            if (out_errno) {
-                *out_errno = read_err ? read_err : (errno ? errno : EIO);
-            }
-            return -1;
-        }
-        if (res == 0) {
-            if (len == 0) {
-                return -1;
-            }
-            break;
-        }
-        if (len + 1 >= *cap) {
-            size_t newcap = (*cap) * 2;
-            if (newcap < *cap + 2) {
-                newcap = *cap + 2;
-            }
-            char *resized = (char *)realloc(*line, newcap);
-            if (!resized) {
+
+#if defined(PSCAL_TARGET_IOS)
+    if (stream == stdin) {
+        if (!*line || *cap == 0) {
+            size_t newcap = 128;
+            char *buf = (char *)malloc(newcap);
+            if (!buf) {
                 if (out_errno) {
                     *out_errno = ENOMEM;
                 }
                 errno = ENOMEM;
                 return -1;
             }
-            *line = resized;
+            *line = buf;
             *cap = newcap;
         }
-        (*line)[len++] = (char)ch;
-        if (ch == '\n') {
-            break;
+        size_t len = 0;
+        while (true) {
+            unsigned char ch = 0;
+            int read_err = 0;
+            ssize_t res = smallclueReadStdin(&ch, 1, &read_err);
+            if (res < 0) {
+                if (out_errno) {
+                    *out_errno = read_err ? read_err : (errno ? errno : EIO);
+                }
+                return -1;
+            }
+            if (res == 0) {
+                if (len == 0) {
+                    return -1;
+                }
+                break;
+            }
+            if (len + 1 >= *cap) {
+                size_t newcap = (*cap) * 2;
+                if (newcap < *cap + 2) {
+                    newcap = *cap + 2;
+                }
+                char *resized = (char *)realloc(*line, newcap);
+                if (!resized) {
+                    if (out_errno) {
+                        *out_errno = ENOMEM;
+                    }
+                    errno = ENOMEM;
+                    return -1;
+                }
+                *line = resized;
+                *cap = newcap;
+            }
+            (*line)[len++] = (char)ch;
+            if (ch == '\n') {
+                break;
+            }
+        }
+        (*line)[len] = '\0';
+        return (ssize_t)len;
+    }
+#endif
+
+    ssize_t len = getline(line, cap, stream);
+    if (len < 0 && ferror(stream)) {
+        if (out_errno) {
+            *out_errno = errno ? errno : EIO;
         }
     }
-    (*line)[len] = '\0';
-    return (ssize_t)len;
+    return len;
 }
 
 static bool smallclueReadTokensFromStdin(SmallclueLineVector *vec) {
@@ -1986,9 +2048,16 @@ static int smallcluePsCommand(int argc, char **argv) {
             qsort(entries, count, sizeof(SmallcluePsEntry), smallcluePsCompare);
         }
 
-        printf(" PID   PPID   UID COMMAND\n");
+        printf(" PID   PPID USER     COMMAND\n");
         for (size_t i = 0; i < count; ++i) {
-            printf("%4d %6d %5d %s\n", entries[i].pid, entries[i].ppid, (int)entries[i].uid, entries[i].command);
+            struct passwd *pw = getpwuid(entries[i].uid);
+            char user_buf[32];
+            if (pw) {
+                snprintf(user_buf, sizeof(user_buf), "%s", pw->pw_name);
+            } else {
+                snprintf(user_buf, sizeof(user_buf), "%d", (int)entries[i].uid);
+            }
+            printf("%4d %6d %-8s %s\n", entries[i].pid, entries[i].ppid, user_buf, entries[i].command);
             free(entries[i].command);
         }
         free(entries);
@@ -1997,8 +2066,15 @@ static int smallcluePsCommand(int argc, char **argv) {
         pid_t ppid = getppid();
         uid_t uid = getuid();
         const char *cmd = argv && argv[0] ? argv[0] : "ps";
-        printf(" PID   PPID   UID COMMAND\n");
-        printf("%4d %6d %5d %s\n", (int)pid, (int)ppid, (int)uid, cmd);
+        printf(" PID   PPID USER     COMMAND\n");
+        struct passwd *pw = getpwuid(uid);
+        char user_buf[32];
+        if (pw) {
+            snprintf(user_buf, sizeof(user_buf), "%s", pw->pw_name);
+        } else {
+            snprintf(user_buf, sizeof(user_buf), "%d", (int)uid);
+        }
+        printf("%4d %6d %-8s %s\n", (int)pid, (int)ppid, user_buf, cmd);
     }
     return 0;
 #endif
@@ -6900,7 +6976,8 @@ static int smallclueMarkdownDisplayDataEx(const char *label,
                                           MarkdownInputMode input_mode,
                                           MarkdownLinkList *links_out,
                                           int *exit_key_out,
-                                          int *selected_link_index_out) {
+                                          int *selected_link_index_out,
+                                          bool output_raw) {
     if (exit_key_out) {
         *exit_key_out = 'q';
     }
@@ -6918,6 +6995,17 @@ static int smallclueMarkdownDisplayDataEx(const char *label,
         if (converted_html) {
             render_source = converted_html;
         }
+    }
+
+    if (output_raw) {
+        if (*render_source) {
+            fputs(render_source, stdout);
+        }
+        free(converted_html);
+        if (exit_key_out) {
+            *exit_key_out = 'q';
+        }
+        return 0;
     }
 
     FILE *source = tmpfile();
@@ -6984,7 +7072,8 @@ static int smallclueMarkdownDisplayStreamEx(const char *label,
                                             MarkdownInputMode input_mode,
                                             MarkdownLinkList *links_out,
                                             int *exit_key_out,
-                                            int *selected_link_index_out) {
+                                            int *selected_link_index_out,
+                                            bool output_raw) {
     if (exit_key_out) {
         *exit_key_out = 'q';
     }
@@ -7006,7 +7095,8 @@ static int smallclueMarkdownDisplayStreamEx(const char *label,
                                                 input_mode,
                                                 links_out,
                                                 exit_key_out,
-                                                selected_link_index_out);
+                                                selected_link_index_out,
+                                                output_raw);
     free(raw_data);
     return status;
 }
@@ -7249,7 +7339,7 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
     return -1;
 }
 
-static int smallclueMarkdownBrowseTarget(const char *initial_target) {
+static int smallclueMarkdownBrowseTarget(const char *initial_target, bool output_raw) {
     if (!initial_target || !*initial_target) {
         return 1;
     }
@@ -7290,9 +7380,18 @@ static int smallclueMarkdownBrowseTarget(const char *initial_target) {
                                                         MARKDOWN_INPUT_MODE_AUTO,
                                                         &links,
                                                         &exit_key,
-                                                        &selected_link_index);
+                                                        &selected_link_index,
+                                                        output_raw);
                 free(remote_data);
             }
+        } else if (strcmp(current, "-") == 0) {
+            status = smallclueMarkdownDisplayStreamEx("(stdin)",
+                                                      stdin,
+                                                      MARKDOWN_INPUT_MODE_MARKDOWN,
+                                                      &links,
+                                                      &exit_key,
+                                                      &selected_link_index,
+                                                      output_raw);
         } else {
             char resolved[PATH_MAX];
             if (markdownResolvePath(current, resolved, sizeof(resolved)) != 0) {
@@ -7309,7 +7408,8 @@ static int smallclueMarkdownBrowseTarget(const char *initial_target) {
                                                               markdownInputModeForFilePath(resolved),
                                                               &links,
                                                               &exit_key,
-                                                              &selected_link_index);
+                                                              &selected_link_index,
+                                                              output_raw);
                     fclose(fp);
                 }
             }
@@ -7318,6 +7418,12 @@ static int smallclueMarkdownBrowseTarget(const char *initial_target) {
         if (status != 0) {
             markdownLinkListFree(&links);
             overall_status = 1;
+            break;
+        }
+
+        if (output_raw) {
+            markdownLinkListFree(&links);
+            overall_status = 0;
             break;
         }
 
@@ -7397,7 +7503,7 @@ static int smallclueMarkdownBrowseTarget(const char *initial_target) {
 }
 
 static int smallclueMarkdownDisplayPath(const char *path) {
-    return smallclueMarkdownBrowseTarget(path);
+    return smallclueMarkdownBrowseTarget(path, false);
 }
 
 static char *markdownExtractTitle(const char *path) {
@@ -7671,7 +7777,7 @@ static int markdownInteractiveSelectDocument(void) {
     if (!has_selection) {
         return 0;
     }
-    int status = smallclueMarkdownBrowseTarget(selected);
+    int status = smallclueMarkdownBrowseTarget(selected, false);
     if (status == 0) {
         // After viewing a document, return to the list.
         return markdownInteractiveSelectDocument();
@@ -8097,6 +8203,11 @@ static int compare_ls_entries_group_dirs_mtime(const void *lhs, const void *rhs)
     return strcmp(a->name, b->name);
 }
 
+#define LS_FORMAT_AUTO 0
+#define LS_FORMAT_LONG 1
+#define LS_FORMAT_COLUMNS 2
+#define LS_FORMAT_SINGLE 3
+
 static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int color_mode, int classify) {
     if (count == 0) {
         return;
@@ -8170,7 +8281,7 @@ static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int 
 static int list_directory(const char *path,
                           bool show_all,
                           bool show_almost_all,
-                          bool long_format,
+                          int format_mode,
                           bool sort_by_time,
                           bool group_directories_first,
                           bool human,
@@ -8261,18 +8372,29 @@ static int list_directory(const char *path,
         qsort(entries, count, sizeof(entries[0]), comparator);
     }
 
-        if (long_format) {
-            for (size_t i = 0; i < count; ++i) {
-                status |= print_path_entry_with_stat(entries[i].full_path,
-                                                     entries[i].name,
-                                                     true,
-                                                     human,
-                                                     numeric_ids,
-                                                     &entries[i].stat_buf,
-                                                     color_mode,
-                                                     classify);
-            }
-        } else {
+    if (format_mode == LS_FORMAT_LONG) {
+        for (size_t i = 0; i < count; ++i) {
+            status |= print_path_entry_with_stat(entries[i].full_path,
+                                                 entries[i].name,
+                                                 true,
+                                                 human,
+                                                 numeric_ids,
+                                                 &entries[i].stat_buf,
+                                                 color_mode,
+                                                 classify);
+        }
+    } else if (format_mode == LS_FORMAT_SINGLE) {
+        for (size_t i = 0; i < count; ++i) {
+            status |= print_path_entry_with_stat(entries[i].full_path,
+                                                 entries[i].name,
+                                                 false,
+                                                 human,
+                                                 numeric_ids,
+                                                 &entries[i].stat_buf,
+                                                 color_mode,
+                                                 classify);
+        }
+    } else {
         print_ls_columns(entries, count, color_mode, classify);
     }
 
@@ -8332,7 +8454,7 @@ static int smallclueEchoCommand(int argc, char **argv) {
 static bool smallclueLsValidateShortOptions(const char *arg,
                                             int *show_all,
                                             int *show_almost_all,
-                                            int *long_format,
+                                            int *format,
                                             int *sort_by_time,
                                             int *list_dirs_only,
                                             int *human_sizes,
@@ -8353,7 +8475,13 @@ static bool smallclueLsValidateShortOptions(const char *arg,
                 }
                 break;
             case 'l':
-                *long_format = 1;
+                *format = LS_FORMAT_LONG;
+                break;
+            case '1':
+                *format = LS_FORMAT_SINGLE;
+                break;
+            case 'C':
+                *format = LS_FORMAT_COLUMNS;
                 break;
             case 't':
                 *sort_by_time = 1;
@@ -8369,7 +8497,7 @@ static bool smallclueLsValidateShortOptions(const char *arg,
                 break;
             case 'n':
                 *numeric_ids = 1;
-                *long_format = 1;
+                *format = LS_FORMAT_LONG;
                 break;
             default:
                 fprintf(stderr, "ls: invalid option -- '%c'\n", *cursor);
@@ -8423,7 +8551,7 @@ static bool smallclueLsHandleLongOption(const char *arg) {
 static int smallclueLsCommand(int argc, char **argv) {
     int show_all = 0;
     int show_almost_all = 0;
-    int long_format = 0;
+    int format = LS_FORMAT_AUTO;
     int sort_by_time = 0;
     int group_directories_first = 0;
     int list_dirs_only = 0;
@@ -8468,7 +8596,7 @@ static int smallclueLsCommand(int argc, char **argv) {
         if (!smallclueLsValidateShortOptions(arg + 1,
                                              &show_all,
                                              &show_almost_all,
-                                             &long_format,
+                                             &format,
                                              &sort_by_time,
                                              &list_dirs_only,
                                              &human_sizes,
@@ -8483,13 +8611,21 @@ static int smallclueLsCommand(int argc, char **argv) {
         color_mode = pscalRuntimeStdoutIsInteractive() ? 1 : -1;
     }
 
+    if (format == LS_FORMAT_AUTO) {
+        if (pscalRuntimeStdoutIsInteractive()) {
+            format = LS_FORMAT_COLUMNS;
+        } else {
+            format = LS_FORMAT_SINGLE;
+        }
+    }
+
     int status = 0;
     int paths_start = idx;
     if (paths_start >= argc) {
         if (list_dirs_only) {
-            return print_path_entry_with_stat(".", ".", long_format, human_sizes, numeric_ids, NULL, color_mode, classify) ? 1 : 0;
+            return print_path_entry_with_stat(".", ".", format == LS_FORMAT_LONG, human_sizes, numeric_ids, NULL, color_mode, classify) ? 1 : 0;
         }
-        return list_directory(".", show_all, show_almost_all, long_format,
+        return list_directory(".", show_all, show_almost_all, format,
                               sort_by_time, group_directories_first, human_sizes, numeric_ids, color_mode, classify);
     }
 
@@ -8510,10 +8646,10 @@ static int smallclueLsCommand(int argc, char **argv) {
                 }
                 printf("%s:\n", path);
             }
-            status |= list_directory(path, show_all, show_almost_all, long_format,
+            status |= list_directory(path, show_all, show_almost_all, format,
                                      sort_by_time, group_directories_first, human_sizes, numeric_ids, color_mode, classify);
         } else {
-            status |= print_path_entry_with_stat(path, path, long_format, human_sizes, numeric_ids, &stat_buf, color_mode, classify);
+            status |= print_path_entry_with_stat(path, path, format == LS_FORMAT_LONG, human_sizes, numeric_ids, &stat_buf, color_mode, classify);
         }
     }
     return status ? 1 : 0;
@@ -9460,15 +9596,13 @@ static int smallclueTimeCommand(int argc, char **argv) {
     return status;
 }
 
+#if defined(PSCAL_TARGET_IOS)
 static int smallclueWatchRunApplet(const SmallclueApplet *applet, int argc, char **argv) {
     if (!applet) {
         fprintf(stderr, "watch: %s: command not found\n", argv[0]);
         return 127;
     }
     const char *dbg = getenv("SMALLCLUE_DEBUG");
-#if !defined(PSCAL_TARGET_IOS)
-    return smallclueDispatchApplet(applet, argc, argv);
-#else
     char label[96] = {0};
     size_t used = 0;
     for (int i = 0; i < argc && used + 1 < sizeof(label); ++i) {
@@ -9501,8 +9635,8 @@ static int smallclueWatchRunApplet(const SmallclueApplet *applet, int argc, char
         }
     }
     return status;
-#endif
 }
+#endif
 
 static int smallclueWatchCommand(int argc, char **argv) {
     smallclueResetGetopt();
@@ -9579,7 +9713,9 @@ static int smallclueWatchCommand(int argc, char **argv) {
      * synthetic tasks. */
 #endif
 
+#if defined(PSCAL_TARGET_IOS)
     const SmallclueApplet *applet = smallclueFindApplet(argv[idx]);
+#endif
 
     int status = 0;
     int iterations = 0;
@@ -9594,7 +9730,20 @@ static int smallclueWatchCommand(int argc, char **argv) {
         fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
         printf("Every %.2fs: %s\n\n", interval, cmdline ? cmdline : argv[idx]);
         fflush(stdout);
+#if defined(PSCAL_TARGET_IOS)
         status = smallclueWatchRunApplet(applet, cmd_argc, &argv[idx]);
+#else
+        int sys_rc = system(cmdline ? cmdline : argv[idx]);
+        if (sys_rc == -1) {
+            status = 127;
+        } else if (WIFEXITED(sys_rc)) {
+            status = WEXITSTATUS(sys_rc);
+        } else if (WIFSIGNALED(sys_rc)) {
+            status = 128 + WTERMSIG(sys_rc);
+        } else {
+            status = 1;
+        }
+#endif
         fflush(stdout);
         if (status >= 128 && status < 128 + NSIG) {
             int sig = status - 128;
@@ -10628,6 +10777,7 @@ static void smallclueDmesgPrintLineHuman(const char *line) {
         fprintf(stdout, "[%s.%03d]\n", time_buf, millis);
     }
 }
+#endif
 
 static int smallclueDmesgCommand(int argc, char **argv) {
     smallclueResetGetopt();
@@ -10647,6 +10797,8 @@ static int smallclueDmesgCommand(int argc, char **argv) {
         fprintf(stderr, "usage: dmesg [-T]\n");
         return 1;
     }
+
+#if defined(PSCAL_TARGET_IOS)
     if (pscalRuntimeCopySessionLog) {
         char *snapshot = pscalRuntimeCopySessionLog();
         if (snapshot) {
@@ -10679,8 +10831,35 @@ static int smallclueDmesgCommand(int argc, char **argv) {
     }
     fprintf(stderr, "dmesg: session log unavailable\n");
     return 1;
-}
+#elif defined(__linux__) || defined(linux) || defined(__linux)
+    int len = klogctl(10, NULL, 0); // SYSLOG_ACTION_SIZE_BUFFER
+    if (len < 0) {
+        perror("dmesg: klogctl size");
+        return 1;
+    }
+    char *buf = (char *)malloc((size_t)len + 1);
+    if (!buf) {
+        fprintf(stderr, "dmesg: out of memory\n");
+        return 1;
+    }
+    int n = klogctl(3, buf, len); // SYSLOG_ACTION_READ_ALL
+    if (n < 0) {
+        perror("dmesg: klogctl read");
+        free(buf);
+        return 1;
+    }
+    buf[n] = 0;
+    fputs(buf, stdout);
+    if (n > 0 && buf[n-1] != '\n') {
+        putchar('\n');
+    }
+    free(buf);
+    return 0;
+#else
+    fprintf(stderr, "dmesg: not supported on this platform\n");
+    return 1;
 #endif
+}
 
 static int smallclueCatCommand(int argc, char **argv) {
     int status = 0;
@@ -10725,8 +10904,9 @@ static int smallclueMarkdownCommand(int argc, char **argv) {
     smallclueResetGetopt();
     int list_only = 0;
     int interactive = 0;
+    bool output_raw = false;
     int opt;
-    while ((opt = getopt(argc, argv, "il")) != -1) {
+    while ((opt = getopt(argc, argv, "ilc")) != -1) {
         switch (opt) {
             case 'i':
                 interactive = 1;
@@ -10734,8 +10914,11 @@ static int smallclueMarkdownCommand(int argc, char **argv) {
             case 'l':
                 list_only = 1;
                 break;
+            case 'c':
+                output_raw = true;
+                break;
             default:
-                fprintf(stderr, "usage: md [-i | -l] [file|url ...]\n");
+                fprintf(stderr, "usage: md [-i | -l | -c] [file|url ...]\n");
                 return 1;
         }
     }
@@ -10746,12 +10929,18 @@ static int smallclueMarkdownCommand(int argc, char **argv) {
         }
         return markdownInteractiveSelectDocument();
     }
-    if (list_only || optind >= argc) {
+    if (list_only) {
+        return smallclueMarkdownListDocuments();
+    }
+    if (optind >= argc) {
+        if (!isatty(STDIN_FILENO)) {
+            return smallclueMarkdownBrowseTarget("-", output_raw);
+        }
         return smallclueMarkdownListDocuments();
     }
     int status = 0;
     for (int i = optind; i < argc; ++i) {
-        status |= smallclueMarkdownBrowseTarget(argv[i]);
+        status |= smallclueMarkdownBrowseTarget(argv[i], output_raw);
     }
     return status ? 1 : 0;
 }
@@ -12720,6 +12909,19 @@ static int smallclueIdCommand(int argc, char **argv) {
     return 0;
 }
 
+static int smallclueWhoamiCommand(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    uid_t uid = geteuid();
+    struct passwd *pw = getpwuid(uid);
+    if (pw && pw->pw_name) {
+        puts(pw->pw_name);
+    } else {
+        printf("%u\n", (unsigned)uid);
+    }
+    return 0;
+}
+
 static int smallclueEnvCommand(int argc, char **argv) {
     smallclueResetGetopt();
     int clear_env = 0;
@@ -13313,7 +13515,7 @@ static bool smallclueConfirmDelete(const char *label, const char *path) {
                 label, path);
         return false;
     }
-    fprintf(stderr, "%s: remove '%s'? [y/N] ", label, path);
+    fprintf(stderr, "%s: remove '\033[1;31m%s\033[0m'? [y/N] ", label, path);
     fflush(stderr);
     int c = getchar();
     /* consume the rest of the line */
@@ -13337,6 +13539,14 @@ static int smallclueRemovePathWithLabel(const char *label, const char *path, boo
         }
         return force ? 0 : -1;
     }
+
+    /* Interactive mode check: prompt for all files */
+    if (interactive && !force) {
+        if (!smallclueConfirmDelete(label, target)) {
+            return 0;
+        }
+    }
+
     if (S_ISDIR(st.st_mode)) {
         if (!recursive) {
             fprintf(stderr, "%s: %s: is a directory\n", label, target);
@@ -13529,6 +13739,9 @@ static int smallclueRmCommand(int argc, char **argv) {
             case 'i':
                 interactive = 1;
                 force = 0;
+                break;
+            case 'i':
+                interactive = true;
                 break;
             default:
                 fprintf(stderr, "rm: invalid option -- %c\n", optopt);
