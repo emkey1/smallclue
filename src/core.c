@@ -7343,6 +7343,13 @@ static int smallclueMarkdownBrowseTarget(const char *initial_target) {
                                                         &selected_link_index);
                 free(remote_data);
             }
+        } else if (strcmp(current, "-") == 0) {
+            status = smallclueMarkdownDisplayStreamEx("(stdin)",
+                                                      stdin,
+                                                      MARKDOWN_INPUT_MODE_MARKDOWN,
+                                                      &links,
+                                                      &exit_key,
+                                                      &selected_link_index);
         } else {
             char resolved[PATH_MAX];
             if (markdownResolvePath(current, resolved, sizeof(resolved)) != 0) {
@@ -10869,7 +10876,13 @@ static int smallclueMarkdownCommand(int argc, char **argv) {
         }
         return markdownInteractiveSelectDocument();
     }
-    if (list_only || optind >= argc) {
+    if (list_only) {
+        return smallclueMarkdownListDocuments();
+    }
+    if (optind >= argc) {
+        if (!isatty(STDIN_FILENO)) {
+            return smallclueMarkdownBrowseTarget("-");
+        }
         return smallclueMarkdownListDocuments();
     }
     int status = 0;
