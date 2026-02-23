@@ -12969,22 +12969,29 @@ static int smallclueWcProcessFile(const char *path, SmallclueWcCounts *counts) {
     } else {
         fp = stdin;
     }
-    int c;
-    int in_word = 0;
+
     counts->lines = counts->words = counts->bytes = 0;
+    int in_word = 0;
     int read_err = 0;
-    while ((c = smallclueGetcStream(fp, &read_err)) != EOF) {
-        counts->bytes++;
-        if (c == '\n') {
-            counts->lines++;
-        }
-        if (isspace(c)) {
-            in_word = 0;
-        } else if (!in_word) {
-            counts->words++;
-            in_word = 1;
+    char buf[16384];
+    ssize_t n;
+
+    while ((n = smallclueReadStream(fp, buf, sizeof(buf), &read_err)) > 0) {
+        counts->bytes += (uint64_t)n;
+        for (ssize_t i = 0; i < n; ++i) {
+            unsigned char c = (unsigned char)buf[i];
+            if (c == '\n') {
+                counts->lines++;
+            }
+            if (isspace(c)) {
+                in_word = 0;
+            } else if (!in_word) {
+                counts->words++;
+                in_word = 1;
+            }
         }
     }
+
     if (fp != stdin) {
         fclose(fp);
     }
