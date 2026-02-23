@@ -140,7 +140,9 @@ fi
 # --- Dash ---
 if [ ! -d "$THIRD_PARTY_DIR/dash" ]; then
     echo "Cloning dash..."
-    git clone git://git.kernel.org/pub/scm/utils/dash/dash.git "$THIRD_PARTY_DIR/dash"
+    git clone https://git.kernel.org/pub/scm/utils/dash/dash.git "$THIRD_PARTY_DIR/dash"
+    # Pin to a stable release (v0.5.13.1)
+    (cd "$THIRD_PARTY_DIR/dash" && git checkout v0.5.13.1)
 fi
 
 # --- Dash Integration (Linenoise) ---
