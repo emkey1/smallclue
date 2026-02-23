@@ -13515,7 +13515,7 @@ static bool smallclueConfirmDelete(const char *label, const char *path) {
                 label, path);
         return false;
     }
-    fprintf(stderr, "%s: remove '%s'? [y/N] ", label, path);
+    fprintf(stderr, "%s: remove '\033[1;31m%s\033[0m'? [y/N] ", label, path);
     fflush(stderr);
     int c = getchar();
     /* consume the rest of the line */
@@ -13539,6 +13539,14 @@ static int smallclueRemovePathWithLabel(const char *label, const char *path, boo
         }
         return force ? 0 : -1;
     }
+
+    /* Interactive mode check: prompt for all files */
+    if (interactive && !force) {
+        if (!smallclueConfirmDelete(label, target)) {
+            return 0;
+        }
+    }
+
     if (S_ISDIR(st.st_mode)) {
         if (!recursive) {
             fprintf(stderr, "%s: %s: is a directory\n", label, target);
@@ -13731,6 +13739,9 @@ static int smallclueRmCommand(int argc, char **argv) {
             case 'i':
                 interactive = 1;
                 force = 0;
+                break;
+            case 'i':
+                interactive = true;
                 break;
             default:
                 fprintf(stderr, "rm: invalid option -- %c\n", optopt);
