@@ -935,6 +935,10 @@ static int smallclueSuCommand(int argc, char **argv) {
     }
 }
 
+#if defined(__linux__) || defined(linux) || defined(__linux)
+static char *smallclueGetPass(const char *prompt);
+#endif
+
 static int smallclueSudoCommand(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: sudo command [args...]\n");
@@ -942,6 +946,26 @@ static int smallclueSudoCommand(int argc, char **argv) {
     }
 
     if (getuid() != 0) {
+        if (geteuid() == 0) {
+#if defined(__linux__) || defined(linux) || defined(__linux)
+            struct spwd *sp = getspnam("root");
+            if (!sp || !sp->sp_pwdp || strcmp(sp->sp_pwdp, "*") == 0 || strcmp(sp->sp_pwdp, "!") == 0) {
+                fprintf(stderr, "sudo: root account locked or cannot read shadow\n");
+                return 1;
+            }
+            char *pass = smallclueGetPass("[sudo] password for root: ");
+            if (!pass) return 1;
+            char *encrypted = crypt(pass, sp->sp_pwdp);
+            if (!encrypted || strcmp(encrypted, sp->sp_pwdp) != 0) {
+                fprintf(stderr, "sudo: authentication failure\n");
+                return 1;
+            }
+#else
+            fprintf(stderr, "sudo: authentication not supported on this platform\n");
+            return 1;
+#endif
+        }
+
         if (setuid(0) != 0 || setgid(0) != 0) {
              fprintf(stderr, "sudo: permission denied (must be setuid root)\n");
              return 1;
@@ -1434,9 +1458,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Reboot the system"},
     {"resize", "resize [COLUMNS ROWS]\n"
                "  Report or set terminal size"},
-    {"rm", "rm [-r] [-f] FILE...\n"
+    {"rm", "rm [-r] [-f] [-i] FILE...\n"
            "  -r recursive\n"
-           "  -f force"},
+           "  -f force\n"
+           "  -i interactive"},
     {"rmdir", "rmdir DIR...\n"
               "  Remove empty directories"},
     {"runit", "runit\n"
@@ -13146,22 +13171,29 @@ static int smallclueWcProcessFile(const char *path, SmallclueWcCounts *counts) {
     } else {
         fp = stdin;
     }
-    int c;
-    int in_word = 0;
+
     counts->lines = counts->words = counts->bytes = 0;
+    int in_word = 0;
     int read_err = 0;
-    while ((c = smallclueGetcStream(fp, &read_err)) != EOF) {
-        counts->bytes++;
-        if (c == '\n') {
-            counts->lines++;
-        }
-        if (isspace(c)) {
-            in_word = 0;
-        } else if (!in_word) {
-            counts->words++;
-            in_word = 1;
+    char buf[16384];
+    ssize_t n;
+
+    while ((n = smallclueReadStream(fp, buf, sizeof(buf), &read_err)) > 0) {
+        counts->bytes += (uint64_t)n;
+        for (ssize_t i = 0; i < n; ++i) {
+            unsigned char c = (unsigned char)buf[i];
+            if (c == '\n') {
+                counts->lines++;
+            }
+            if (isspace(c)) {
+                in_word = 0;
+            } else if (!in_word) {
+                counts->words++;
+                in_word = 1;
+            }
         }
     }
+
     if (fp != stdin) {
         fclose(fp);
     }
@@ -13520,9 +13552,8 @@ static int smallclueRemovePathWithLabel(const char *label, const char *path, boo
             fprintf(stderr, "%s: %s: is a directory\n", label, target);
             return -1;
         }
-        /* Fallback: if not interactive (already prompted), prompt for directory if not forced */
-        if (!interactive && !force && !smallclueConfirmDelete(label, target)) {
-            return 1;
+        if ((interactive || !force) && !smallclueConfirmDelete(label, target)) {
+            return interactive ? 0 : 1;
         }
         DIR *dir = opendir(target);
         if (!dir) {
@@ -13553,6 +13584,9 @@ static int smallclueRemovePathWithLabel(const char *label, const char *path, boo
             fprintf(stderr, "%s: %s: %s\n", label, target, strerror(errno));
             return -1;
         }
+        return 0;
+    }
+    if (interactive && !smallclueConfirmDelete(label, target)) {
         return 0;
     }
     if (unlink(target) != 0) {
@@ -13690,7 +13724,7 @@ static int smallclueMkdirParents(const char *path, mode_t mode, bool verbose) {
 static int smallclueRmCommand(int argc, char **argv) {
     int recursive = 0;
     int force = 0;
-    bool interactive = false;
+    int interactive = 0;
     int opt;
     smallclueResetGetopt();
     while ((opt = getopt(argc, argv, "rfi")) != -1) {
@@ -13700,6 +13734,11 @@ static int smallclueRmCommand(int argc, char **argv) {
                 break;
             case 'f':
                 force = 1;
+                interactive = 0;
+                break;
+            case 'i':
+                interactive = 1;
+                force = 0;
                 break;
             case 'i':
                 interactive = true;
@@ -13738,7 +13777,7 @@ static int smallclueRmCommand(int argc, char **argv) {
                 continue;
             }
             for (size_t m = 0; m < matches.gl_pathc; ++m) {
-                if (smallclueRemovePathWithLabel("rm", matches.gl_pathv[m], recursive != 0, force != 0, interactive) != 0) {
+                if (smallclueRemovePathWithLabel("rm", matches.gl_pathv[m], recursive != 0, force != 0, interactive != 0) != 0) {
                     if (!force) {
                         status = 1;
                     }
@@ -13746,7 +13785,7 @@ static int smallclueRmCommand(int argc, char **argv) {
             }
             globfree(&matches);
         } else {
-            if (smallclueRemovePathWithLabel("rm", expanded, recursive != 0, force != 0, interactive) != 0) {
+            if (smallclueRemovePathWithLabel("rm", expanded, recursive != 0, force != 0, interactive != 0) != 0) {
                 if (!force) {
                     status = 1;
                 }
