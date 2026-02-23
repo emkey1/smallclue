@@ -622,6 +622,7 @@ static int smallclueKillCommand(int argc, char **argv);
 static int smallclueMkdirCommand(int argc, char **argv);
 static int smallclueMknodCommand(int argc, char **argv);
 static int smallclueMountCommand(int argc, char **argv);
+static int smallclueWhoamiCommand(int argc, char **argv);
 static void smallclueEmitTerminalSane(void);
 #if defined(PSCAL_TARGET_IOS)
 static bool smallclueSessionPtyName(char *buf, size_t buf_len);
@@ -1292,6 +1293,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"wc", smallclueWcCommand, "Count lines/words/bytes"},
     {"wget", smallclueWgetCommand, "Download files via HTTP(S)"},
     {"which", smallclueWhichCommand, "Locate a command"},
+    {"whoami", smallclueWhoamiCommand, "Print effective user name"},
     {"yes", smallclueYesCommand, "Repeatedly print strings"},
     {"xargs", smallclueXargsCommand, "Build command lines from stdin"},
     {"df", smallclueDfCommand, "Report filesystem usage"},
@@ -1540,6 +1542,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -nv"},
     {"which", "which [-a] program ...\n"
               "  Locate a command"},
+    {"whoami", "whoami\n"
+               "  Print effective user name"},
     {"yes", "yes [STRING...]\n"
             "  Repeatedly print STRING (default: y)"},
     {"no", "no [STRING...]\n"
@@ -12836,6 +12840,19 @@ static int smallclueIdCommand(int argc, char **argv) {
         free(groups);
     }
     putchar('\n');
+    return 0;
+}
+
+static int smallclueWhoamiCommand(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    uid_t uid = geteuid();
+    struct passwd *pw = getpwuid(uid);
+    if (pw && pw->pw_name) {
+        puts(pw->pw_name);
+    } else {
+        printf("%u\n", (unsigned)uid);
+    }
     return 0;
 }
 
