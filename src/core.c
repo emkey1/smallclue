@@ -1386,9 +1386,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  -t sort by modification time\n"
            "  -h human-readable sizes (with -l)\n"
            "  -d list directories themselves, not their contents"},
-    {"md", "md [-i] [FILE|URL]\n"
+    {"md", "md [-i] [-c] [FILE|URL]\n"
            "  View Markdown/HTML document; press 'o' to open links in-page\n"
-           "  -i interactive mode.  Makes ~/Docs browsable"},
+           "  -i interactive mode.  Makes ~/Docs browsable\n"
+           "  -c output raw markdown (convert if HTML)"},
     {"mdev", "mdev [-s]\n"
              "  Device manager (scan only)"},
     {"mkdir", "mkdir [-p] [-v] DIR...\n"
@@ -6950,7 +6951,8 @@ static int smallclueMarkdownDisplayDataEx(const char *label,
                                           MarkdownInputMode input_mode,
                                           MarkdownLinkList *links_out,
                                           int *exit_key_out,
-                                          int *selected_link_index_out) {
+                                          int *selected_link_index_out,
+                                          bool output_raw) {
     if (exit_key_out) {
         *exit_key_out = 'q';
     }
@@ -6968,6 +6970,17 @@ static int smallclueMarkdownDisplayDataEx(const char *label,
         if (converted_html) {
             render_source = converted_html;
         }
+    }
+
+    if (output_raw) {
+        if (*render_source) {
+            fputs(render_source, stdout);
+        }
+        free(converted_html);
+        if (exit_key_out) {
+            *exit_key_out = 'q';
+        }
+        return 0;
     }
 
     FILE *source = tmpfile();
@@ -7034,7 +7047,8 @@ static int smallclueMarkdownDisplayStreamEx(const char *label,
                                             MarkdownInputMode input_mode,
                                             MarkdownLinkList *links_out,
                                             int *exit_key_out,
-                                            int *selected_link_index_out) {
+                                            int *selected_link_index_out,
+                                            bool output_raw) {
     if (exit_key_out) {
         *exit_key_out = 'q';
     }
@@ -7056,7 +7070,8 @@ static int smallclueMarkdownDisplayStreamEx(const char *label,
                                                 input_mode,
                                                 links_out,
                                                 exit_key_out,
-                                                selected_link_index_out);
+                                                selected_link_index_out,
+                                                output_raw);
     free(raw_data);
     return status;
 }
@@ -7299,7 +7314,7 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
     return -1;
 }
 
-static int smallclueMarkdownBrowseTarget(const char *initial_target) {
+static int smallclueMarkdownBrowseTarget(const char *initial_target, bool output_raw) {
     if (!initial_target || !*initial_target) {
         return 1;
     }
@@ -7340,7 +7355,8 @@ static int smallclueMarkdownBrowseTarget(const char *initial_target) {
                                                         MARKDOWN_INPUT_MODE_AUTO,
                                                         &links,
                                                         &exit_key,
-                                                        &selected_link_index);
+                                                        &selected_link_index,
+                                                        output_raw);
                 free(remote_data);
             }
         } else if (strcmp(current, "-") == 0) {
@@ -7349,7 +7365,8 @@ static int smallclueMarkdownBrowseTarget(const char *initial_target) {
                                                       MARKDOWN_INPUT_MODE_MARKDOWN,
                                                       &links,
                                                       &exit_key,
-                                                      &selected_link_index);
+                                                      &selected_link_index,
+                                                      output_raw);
         } else {
             char resolved[PATH_MAX];
             if (markdownResolvePath(current, resolved, sizeof(resolved)) != 0) {
@@ -7366,7 +7383,8 @@ static int smallclueMarkdownBrowseTarget(const char *initial_target) {
                                                               markdownInputModeForFilePath(resolved),
                                                               &links,
                                                               &exit_key,
-                                                              &selected_link_index);
+                                                              &selected_link_index,
+                                                              output_raw);
                     fclose(fp);
                 }
             }
@@ -7375,6 +7393,12 @@ static int smallclueMarkdownBrowseTarget(const char *initial_target) {
         if (status != 0) {
             markdownLinkListFree(&links);
             overall_status = 1;
+            break;
+        }
+
+        if (output_raw) {
+            markdownLinkListFree(&links);
+            overall_status = 0;
             break;
         }
 
@@ -7454,7 +7478,7 @@ static int smallclueMarkdownBrowseTarget(const char *initial_target) {
 }
 
 static int smallclueMarkdownDisplayPath(const char *path) {
-    return smallclueMarkdownBrowseTarget(path);
+    return smallclueMarkdownBrowseTarget(path, false);
 }
 
 static char *markdownExtractTitle(const char *path) {
@@ -7728,7 +7752,7 @@ static int markdownInteractiveSelectDocument(void) {
     if (!has_selection) {
         return 0;
     }
-    int status = smallclueMarkdownBrowseTarget(selected);
+    int status = smallclueMarkdownBrowseTarget(selected, false);
     if (status == 0) {
         // After viewing a document, return to the list.
         return markdownInteractiveSelectDocument();
@@ -10855,8 +10879,9 @@ static int smallclueMarkdownCommand(int argc, char **argv) {
     smallclueResetGetopt();
     int list_only = 0;
     int interactive = 0;
+    bool output_raw = false;
     int opt;
-    while ((opt = getopt(argc, argv, "il")) != -1) {
+    while ((opt = getopt(argc, argv, "ilc")) != -1) {
         switch (opt) {
             case 'i':
                 interactive = 1;
@@ -10864,8 +10889,11 @@ static int smallclueMarkdownCommand(int argc, char **argv) {
             case 'l':
                 list_only = 1;
                 break;
+            case 'c':
+                output_raw = true;
+                break;
             default:
-                fprintf(stderr, "usage: md [-i | -l] [file|url ...]\n");
+                fprintf(stderr, "usage: md [-i | -l | -c] [file|url ...]\n");
                 return 1;
         }
     }
@@ -10881,13 +10909,13 @@ static int smallclueMarkdownCommand(int argc, char **argv) {
     }
     if (optind >= argc) {
         if (!isatty(STDIN_FILENO)) {
-            return smallclueMarkdownBrowseTarget("-");
+            return smallclueMarkdownBrowseTarget("-", output_raw);
         }
         return smallclueMarkdownListDocuments();
     }
     int status = 0;
     for (int i = optind; i < argc; ++i) {
-        status |= smallclueMarkdownBrowseTarget(argv[i]);
+        status |= smallclueMarkdownBrowseTarget(argv[i], output_raw);
     }
     return status ? 1 : 0;
 }
