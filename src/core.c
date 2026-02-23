@@ -935,6 +935,10 @@ static int smallclueSuCommand(int argc, char **argv) {
     }
 }
 
+#if defined(__linux__) || defined(linux) || defined(__linux)
+static char *smallclueGetPass(const char *prompt);
+#endif
+
 static int smallclueSudoCommand(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: sudo command [args...]\n");
@@ -942,6 +946,26 @@ static int smallclueSudoCommand(int argc, char **argv) {
     }
 
     if (getuid() != 0) {
+        if (geteuid() == 0) {
+#if defined(__linux__) || defined(linux) || defined(__linux)
+            struct spwd *sp = getspnam("root");
+            if (!sp || !sp->sp_pwdp || strcmp(sp->sp_pwdp, "*") == 0 || strcmp(sp->sp_pwdp, "!") == 0) {
+                fprintf(stderr, "sudo: root account locked or cannot read shadow\n");
+                return 1;
+            }
+            char *pass = smallclueGetPass("[sudo] password for root: ");
+            if (!pass) return 1;
+            char *encrypted = crypt(pass, sp->sp_pwdp);
+            if (!encrypted || strcmp(encrypted, sp->sp_pwdp) != 0) {
+                fprintf(stderr, "sudo: authentication failure\n");
+                return 1;
+            }
+#else
+            fprintf(stderr, "sudo: authentication not supported on this platform\n");
+            return 1;
+#endif
+        }
+
         if (setuid(0) != 0 || setgid(0) != 0) {
              fprintf(stderr, "sudo: permission denied (must be setuid root)\n");
              return 1;
