@@ -637,7 +637,7 @@ static const char *smallclueLeafName(const char *path);
 static int smallclueBuildPath(char *buf, size_t buf_size, const char *dir, const char *leaf);
 static void smallclueTrimTrailingSlashes(char *path);
 static bool smallclueChopParentDirectory(char *path);
-static int smallclueRemovePathWithLabel(const char *label, const char *path, bool recursive, bool force);
+static int smallclueRemovePathWithLabel(const char *label, const char *path, bool recursive, bool force, bool interactive);
 static int smallclueCopyFile(const char *label, const char *src, const char *dst);
 static int smallclueMkdirParents(const char *path, mode_t mode, bool verbose);
 static void smallclueGetTerminalSize(int *rows, int *cols);
@@ -1458,9 +1458,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Reboot the system"},
     {"resize", "resize [COLUMNS ROWS]\n"
                "  Report or set terminal size"},
-    {"rm", "rm [-r] [-f] FILE...\n"
+    {"rm", "rm [-r] [-f] [-i] FILE...\n"
            "  -r recursive\n"
-           "  -f force"},
+           "  -f force\n"
+           "  -i interactive"},
     {"rmdir", "rmdir DIR...\n"
               "  Remove empty directories"},
     {"runit", "runit\n"
@@ -13516,7 +13517,7 @@ static bool smallclueConfirmDelete(const char *label, const char *path) {
     return c == 'y' || c == 'Y';
 }
 
-static int smallclueRemovePathWithLabel(const char *label, const char *path, bool recursive, bool force) {
+static int smallclueRemovePathWithLabel(const char *label, const char *path, bool recursive, bool force, bool interactive) {
     const char *target = path;
 #if defined(PSCAL_TARGET_IOS)
     char expanded[PATH_MAX];
@@ -13536,8 +13537,8 @@ static int smallclueRemovePathWithLabel(const char *label, const char *path, boo
             fprintf(stderr, "%s: %s: is a directory\n", label, target);
             return -1;
         }
-        if (!force && !smallclueConfirmDelete(label, target)) {
-            return 1;
+        if ((interactive || !force) && !smallclueConfirmDelete(label, target)) {
+            return interactive ? 0 : 1;
         }
         DIR *dir = opendir(target);
         if (!dir) {
@@ -13556,7 +13557,7 @@ static int smallclueRemovePathWithLabel(const char *label, const char *path, boo
                 status = -1;
                 break;
             }
-            if (smallclueRemovePathWithLabel(label, child_path, true, force) != 0) {
+            if (smallclueRemovePathWithLabel(label, child_path, true, force, interactive) != 0) {
                 status = -1;
             }
         }
@@ -13568,6 +13569,9 @@ static int smallclueRemovePathWithLabel(const char *label, const char *path, boo
             fprintf(stderr, "%s: %s: %s\n", label, target, strerror(errno));
             return -1;
         }
+        return 0;
+    }
+    if (interactive && !smallclueConfirmDelete(label, target)) {
         return 0;
     }
     if (unlink(target) != 0) {
@@ -13705,15 +13709,21 @@ static int smallclueMkdirParents(const char *path, mode_t mode, bool verbose) {
 static int smallclueRmCommand(int argc, char **argv) {
     int recursive = 0;
     int force = 0;
+    int interactive = 0;
     int opt;
     smallclueResetGetopt();
-    while ((opt = getopt(argc, argv, "rf")) != -1) {
+    while ((opt = getopt(argc, argv, "rfi")) != -1) {
         switch (opt) {
             case 'r':
                 recursive = 1;
                 break;
             case 'f':
                 force = 1;
+                interactive = 0;
+                break;
+            case 'i':
+                interactive = 1;
+                force = 0;
                 break;
             default:
                 fprintf(stderr, "rm: invalid option -- %c\n", optopt);
@@ -13749,7 +13759,7 @@ static int smallclueRmCommand(int argc, char **argv) {
                 continue;
             }
             for (size_t m = 0; m < matches.gl_pathc; ++m) {
-                if (smallclueRemovePathWithLabel("rm", matches.gl_pathv[m], recursive != 0, force != 0) != 0) {
+                if (smallclueRemovePathWithLabel("rm", matches.gl_pathv[m], recursive != 0, force != 0, interactive != 0) != 0) {
                     if (!force) {
                         status = 1;
                     }
@@ -13757,7 +13767,7 @@ static int smallclueRmCommand(int argc, char **argv) {
             }
             globfree(&matches);
         } else {
-            if (smallclueRemovePathWithLabel("rm", expanded, recursive != 0, force != 0) != 0) {
+            if (smallclueRemovePathWithLabel("rm", expanded, recursive != 0, force != 0, interactive != 0) != 0) {
                 if (!force) {
                     status = 1;
                 }
@@ -14483,7 +14493,7 @@ static int smallclueMvCommand(int argc, char **argv) {
                 status = 1;
                 continue;
             }
-            if (smallclueRemovePathWithLabel("mv", src, false, true) != 0) {
+            if (smallclueRemovePathWithLabel("mv", src, false, true, false) != 0) {
                 fprintf(stderr, "mv: %s: unable to remove after copy\n", src);
                 status = 1;
             }
