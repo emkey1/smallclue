@@ -1694,9 +1694,12 @@ static ssize_t smallclueReadStream(FILE *stream, void *buf, size_t count, int *o
     if (!stream || !buf || count == 0) {
         return 0;
     }
+
+#if defined(PSCAL_TARGET_IOS)
     if (stream == stdin) {
         return smallclueReadStdin(buf, count, out_errno);
     }
+#endif
     size_t read_bytes = fread(buf, 1, count, stream);
     if (read_bytes < count && ferror(stream)) {
         if (out_errno) {
@@ -1717,25 +1720,29 @@ static int smallclueGetcStream(FILE *stream, int *out_errno) {
         errno = EBADF;
         return EOF;
     }
-    if (stream != stdin) {
-        int ch = fgetc(stream);
-        if (ch == EOF && ferror(stream)) {
-            if (out_errno) {
-                *out_errno = errno ? errno : EIO;
+
+#if defined(PSCAL_TARGET_IOS)
+    if (stream == stdin) {
+        unsigned char ch = 0;
+        int read_err = 0;
+        ssize_t res = smallclueReadStdin(&ch, 1, &read_err);
+        if (res <= 0) {
+            if (read_err && out_errno) {
+                *out_errno = read_err;
             }
+            return EOF;
         }
-        return ch;
+        return (int)ch;
     }
-    unsigned char ch = 0;
-    int read_err = 0;
-    ssize_t res = smallclueReadStdin(&ch, 1, &read_err);
-    if (res <= 0) {
-        if (read_err && out_errno) {
-            *out_errno = read_err;
+#endif
+
+    int ch = fgetc(stream);
+    if (ch == EOF && ferror(stream)) {
+        if (out_errno) {
+            *out_errno = errno ? errno : EIO;
         }
-        return EOF;
     }
-    return (int)ch;
+    return ch;
 }
 
 static ssize_t smallclueGetlineStream(char **line, size_t *cap, FILE *stream, int *out_errno) {
@@ -1749,68 +1756,72 @@ static ssize_t smallclueGetlineStream(char **line, size_t *cap, FILE *stream, in
         errno = EINVAL;
         return -1;
     }
-    if (stream != stdin) {
-        ssize_t len = getline(line, cap, stream);
-        if (len < 0 && ferror(stream)) {
-            if (out_errno) {
-                *out_errno = errno ? errno : EIO;
-            }
-        }
-        return len;
-    }
-    if (!*line || *cap == 0) {
-        size_t newcap = 128;
-        char *buf = (char *)malloc(newcap);
-        if (!buf) {
-            if (out_errno) {
-                *out_errno = ENOMEM;
-            }
-            errno = ENOMEM;
-            return -1;
-        }
-        *line = buf;
-        *cap = newcap;
-    }
-    size_t len = 0;
-    while (true) {
-        unsigned char ch = 0;
-        int read_err = 0;
-        ssize_t res = smallclueReadStdin(&ch, 1, &read_err);
-        if (res < 0) {
-            if (out_errno) {
-                *out_errno = read_err ? read_err : (errno ? errno : EIO);
-            }
-            return -1;
-        }
-        if (res == 0) {
-            if (len == 0) {
-                return -1;
-            }
-            break;
-        }
-        if (len + 1 >= *cap) {
-            size_t newcap = (*cap) * 2;
-            if (newcap < *cap + 2) {
-                newcap = *cap + 2;
-            }
-            char *resized = (char *)realloc(*line, newcap);
-            if (!resized) {
+
+#if defined(PSCAL_TARGET_IOS)
+    if (stream == stdin) {
+        if (!*line || *cap == 0) {
+            size_t newcap = 128;
+            char *buf = (char *)malloc(newcap);
+            if (!buf) {
                 if (out_errno) {
                     *out_errno = ENOMEM;
                 }
                 errno = ENOMEM;
                 return -1;
             }
-            *line = resized;
+            *line = buf;
             *cap = newcap;
         }
-        (*line)[len++] = (char)ch;
-        if (ch == '\n') {
-            break;
+        size_t len = 0;
+        while (true) {
+            unsigned char ch = 0;
+            int read_err = 0;
+            ssize_t res = smallclueReadStdin(&ch, 1, &read_err);
+            if (res < 0) {
+                if (out_errno) {
+                    *out_errno = read_err ? read_err : (errno ? errno : EIO);
+                }
+                return -1;
+            }
+            if (res == 0) {
+                if (len == 0) {
+                    return -1;
+                }
+                break;
+            }
+            if (len + 1 >= *cap) {
+                size_t newcap = (*cap) * 2;
+                if (newcap < *cap + 2) {
+                    newcap = *cap + 2;
+                }
+                char *resized = (char *)realloc(*line, newcap);
+                if (!resized) {
+                    if (out_errno) {
+                        *out_errno = ENOMEM;
+                    }
+                    errno = ENOMEM;
+                    return -1;
+                }
+                *line = resized;
+                *cap = newcap;
+            }
+            (*line)[len++] = (char)ch;
+            if (ch == '\n') {
+                break;
+            }
+        }
+        (*line)[len] = '\0';
+        return (ssize_t)len;
+    }
+#endif
+
+    ssize_t len = getline(line, cap, stream);
+    if (len < 0 && ferror(stream)) {
+        if (out_errno) {
+            *out_errno = errno ? errno : EIO;
         }
     }
-    (*line)[len] = '\0';
-    return (ssize_t)len;
+    return len;
 }
 
 static bool smallclueReadTokensFromStdin(SmallclueLineVector *vec) {
