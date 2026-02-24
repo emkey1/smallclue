@@ -1127,16 +1127,25 @@ static int smallcluePasswdCommand(int argc, char **argv) {
         return 1;
     }
 
-    FILE *out_fp = fopen("/etc/shadow.tmp", "w");
-    if (!out_fp) {
+    /* Sentinel: Fix TOCTOU race condition by using O_EXCL and 0600 at creation. */
+    unlink("/etc/shadow.tmp");
+    int fd = open("/etc/shadow.tmp", O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
         perror("passwd: /etc/shadow.tmp");
         fclose(fp);
         ulckpwdf();
         return 1;
     }
 
-    // Set permission of tmp file
-    chmod("/etc/shadow.tmp", 0600);
+    FILE *out_fp = fdopen(fd, "w");
+    if (!out_fp) {
+        perror("passwd: fdopen");
+        close(fd);
+        fclose(fp);
+        unlink("/etc/shadow.tmp");
+        ulckpwdf();
+        return 1;
+    }
 
     struct spwd *entry;
     int found = 0;
@@ -13755,9 +13764,6 @@ static int smallclueRmCommand(int argc, char **argv) {
             case 'i':
                 interactive = 1;
                 force = 0;
-                break;
-            case 'i':
-                interactive = true;
                 break;
             default:
                 fprintf(stderr, "rm: invalid option -- %c\n", optopt);
