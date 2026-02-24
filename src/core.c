@@ -1918,12 +1918,20 @@ static int smallcluePsCommand(int argc, char **argv) {
     size_t count = snaps ? vprocSnapshot(snaps, cap) : 0;
     if (!snaps || count == 0) {
         free(snaps);
-        puts(" PID   PPID  PGID   SID STATE      COMMAND");
+        if (isatty(STDOUT_FILENO)) {
+            printf("\033[1m PID   PPID  PGID   SID STATE      COMMAND\033[0m\n");
+        } else {
+            puts(" PID   PPID  PGID   SID STATE      COMMAND");
+        }
         puts(" <no virtual tasks>");
         return 0;
     }
 
-    puts(" PID   PPID  PGID   SID STATE      COMMAND");
+    if (isatty(STDOUT_FILENO)) {
+        printf("\033[1m PID   PPID  PGID   SID STATE      COMMAND\033[0m\n");
+    } else {
+        puts(" PID   PPID  PGID   SID STATE      COMMAND");
+    }
     for (size_t i = 0; i < count; ++i) {
         const VProcSnapshot *s = &snaps[i];
         const char *state = "running";
@@ -2048,7 +2056,11 @@ static int smallcluePsCommand(int argc, char **argv) {
             qsort(entries, count, sizeof(SmallcluePsEntry), smallcluePsCompare);
         }
 
-        printf(" PID   PPID USER     COMMAND\n");
+        if (isatty(STDOUT_FILENO)) {
+            printf("\033[1m PID   PPID USER     COMMAND\033[0m\n");
+        } else {
+            printf(" PID   PPID USER     COMMAND\n");
+        }
         for (size_t i = 0; i < count; ++i) {
             struct passwd *pw = getpwuid(entries[i].uid);
             char user_buf[32];
@@ -2066,7 +2078,11 @@ static int smallcluePsCommand(int argc, char **argv) {
         pid_t ppid = getppid();
         uid_t uid = getuid();
         const char *cmd = argv && argv[0] ? argv[0] : "ps";
-        printf(" PID   PPID USER     COMMAND\n");
+        if (isatty(STDOUT_FILENO)) {
+            printf("\033[1m PID   PPID USER     COMMAND\033[0m\n");
+        } else {
+            printf(" PID   PPID USER     COMMAND\n");
+        }
         struct passwd *pw = getpwuid(uid);
         char user_buf[32];
         if (pw) {
