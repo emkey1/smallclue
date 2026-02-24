@@ -11131,17 +11131,18 @@ static int smallclueDaysInMonth(int month, int year) {
     return days_per_month[month - 1];
 }
 
+/* Sakamoto's algorithm to determine the day of the week.
+ * Returns 0 = Sunday, 1 = Monday, etc.
+ * Replaces mktime() to avoid libc overhead and time zone dependencies.
+ * Assumes m is 1-12. */
+static int smallclueDayOfWeek(int d, int m, int y) {
+    static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    y -= m < 3;
+    return (y + y/4 - y/100 + y/400 + t[m-1] + d) % 7;
+}
+
 static int smallclueFirstWeekdayOfMonth(int month, int year) {
-    struct tm tm_buf;
-    memset(&tm_buf, 0, sizeof(tm_buf));
-    tm_buf.tm_year = year - 1900;
-    tm_buf.tm_mon = month - 1;
-    tm_buf.tm_mday = 1;
-    tm_buf.tm_isdst = -1;
-    if (mktime(&tm_buf) == (time_t)-1) {
-        return 0;
-    }
-    return tm_buf.tm_wday; /* 0 = Sunday */
+    return smallclueDayOfWeek(1, month, year);
 }
 
 typedef struct {
@@ -13739,9 +13740,6 @@ static int smallclueRmCommand(int argc, char **argv) {
             case 'i':
                 interactive = 1;
                 force = 0;
-                break;
-            case 'i':
-                interactive = true;
                 break;
             default:
                 fprintf(stderr, "rm: invalid option -- %c\n", optopt);
