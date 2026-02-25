@@ -550,6 +550,7 @@ typedef struct {
     size_t offset_count;
     size_t line_count;
     size_t length;
+    bool raw_mode;
 } PagerBuffer;
 
 typedef struct {
@@ -2789,6 +2790,23 @@ static int pagerCollectLines(const char *cmd_name, const char *path, FILE *strea
     return 0;
 }
 
+static void smallclueSanitizeAndPrint(const char *data, size_t len, FILE *out) {
+    if (!data) return;
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = (unsigned char)data[i];
+        if (c == '\0') break;
+        if (c == 0x7F) {
+            fputc('^', out);
+            fputc('?', out);
+        } else if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') {
+            fputc('^', out);
+            fputc(c + 0x40, out);
+        } else {
+            fputc(c, out);
+        }
+    }
+}
+
 static void pagerRenderPage(const PagerBuffer *buffer, size_t start, int page_rows, const char *highlight_target) {
     if (!buffer || !buffer->file || !buffer->offsets) {
         return;
@@ -2811,16 +2829,36 @@ static void pagerRenderPage(const PagerBuffer *buffer, size_t start, int page_ro
             char *hit = strstr(line, highlight_target);
             if (hit) {
                 size_t prefix_len = (size_t)(hit - line);
-                fwrite(line, 1, prefix_len, stdout);
+                if (buffer->raw_mode) {
+                    fwrite(line, 1, prefix_len, stdout);
+                } else {
+                    smallclueSanitizeAndPrint(line, prefix_len, stdout);
+                }
                 fputs("\x1b[7m", stdout);
-                fwrite(hit, 1, strlen(highlight_target), stdout);
+                if (buffer->raw_mode) {
+                    fwrite(hit, 1, strlen(highlight_target), stdout);
+                } else {
+                    smallclueSanitizeAndPrint(hit, strlen(highlight_target), stdout);
+                }
                 fputs("\x1b[0m", stdout);
-                fputs(hit + strlen(highlight_target), stdout);
+                if (buffer->raw_mode) {
+                    fputs(hit + strlen(highlight_target), stdout);
+                } else {
+                    smallclueSanitizeAndPrint(hit + strlen(highlight_target), SIZE_MAX, stdout);
+                }
             } else {
-                fputs(line, stdout);
+                if (buffer->raw_mode) {
+                    fputs(line, stdout);
+                } else {
+                    smallclueSanitizeAndPrint(line, SIZE_MAX, stdout);
+                }
             }
         } else {
-            fputs(line, stdout);
+            if (buffer->raw_mode) {
+                fputs(line, stdout);
+            } else {
+                smallclueSanitizeAndPrint(line, SIZE_MAX, stdout);
+            }
         }
         fputc('\n', stdout);
         free(line);
@@ -3827,7 +3865,7 @@ static bool pagerStreamIsInteractive(FILE *stream) {
     return isatty(fd) != 0;
 }
 
-static int pager_file(const char *cmd_name, const char *path, FILE *stream) {
+static int pager_file(const char *cmd_name, const char *path, FILE *stream, bool raw_mode) {
     pager_control_fd_reset();
     pager_last_exit_key = 'q';
     pager_last_md_link_index = -1;
@@ -3860,6 +3898,7 @@ static int pager_file(const char *cmd_name, const char *path, FILE *stream) {
     }
 #endif
     PagerBuffer buffer = {0};
+    buffer.raw_mode = raw_mode;
     if (pagerCollectLines(cmd_name, path, stream, &buffer) != 0) {
         return 1;
     }
@@ -7080,7 +7119,7 @@ static int smallclueMarkdownDisplayDataEx(const char *label,
     rewind(buffer);
     const MarkdownLinkList *prev_active_links = pager_active_md_links;
     pagerSetActiveMarkdownLinks(links_out);
-    int status = pager_file("md", label ? label : "(stdin)", buffer);
+    int status = pager_file("md", label ? label : "(stdin)", buffer, false);
     pagerSetActiveMarkdownLinks(prev_active_links);
     if (exit_key_out) {
         *exit_key_out = pagerLastExitKey();
@@ -9319,7 +9358,7 @@ static int smallclueHelpCommand(int argc, char **argv) {
                 if (*p == '\n') line_count++;
             }
             if (line_count >= rows) {
-                pager_file("smallclue-help", "(internal)", r);
+                pager_file("smallclue-help", "(internal)", r, false);
             } else {
                 // Print directly if it fits on one screen
                 fwrite(buffer, 1, buflen, stdout);
@@ -10903,18 +10942,33 @@ static int smallclueCatCommand(int argc, char **argv) {
 
 static int smallcluePagerCommand(int argc, char **argv) {
     const char *cmd_name = pager_command_name(argv && argc > 0 ? argv[0] : NULL);
+    smallclueResetGetopt();
+    int opt;
+    bool raw_mode = false;
+    while ((opt = getopt(argc, argv, "rR")) != -1) {
+        switch (opt) {
+            case 'r':
+            case 'R':
+                raw_mode = true;
+                break;
+            default:
+                /* Ignore unknown options or treat as error? */
+                break;
+        }
+    }
+
     int status = 0;
-    if (argc <= 1) {
+    if (optind >= argc) {
         if (pscalRuntimeStdinIsInteractive()) {
             fprintf(stderr, "%s: missing filename\n", cmd_name);
             return 1;
         }
-        return pager_file(cmd_name, "(stdin)", stdin);
+        return pager_file(cmd_name, "(stdin)", stdin, raw_mode);
     }
-    for (int i = 1; i < argc; ++i) {
+    for (int i = optind; i < argc; ++i) {
         const char *path = argv[i];
         if (!path || strcmp(path, "-") == 0) {
-            status |= pager_file(cmd_name, "(stdin)", stdin);
+            status |= pager_file(cmd_name, "(stdin)", stdin, raw_mode);
             continue;
         }
         FILE *fp = fopen(path, "r");
@@ -10923,7 +10977,7 @@ static int smallcluePagerCommand(int argc, char **argv) {
             status = 1;
             continue;
         }
-        status |= pager_file(cmd_name, path, fp);
+        status |= pager_file(cmd_name, path, fp, raw_mode);
         fclose(fp);
     }
     return status ? 1 : 0;
