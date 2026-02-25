@@ -8085,6 +8085,16 @@ static void print_long_listing(const char *filename, const struct stat *s, bool 
     putchar('\n');
 }
 
+static const char *smallclueLsGetColor(mode_t mode) {
+    if (S_ISDIR(mode)) return "1;34";       /* bold blue */
+    if (S_ISLNK(mode)) return "1;36";       /* bold cyan */
+    if (S_ISCHR(mode) || S_ISBLK(mode)) return "1;33"; /* bold yellow */
+    if (S_ISSOCK(mode)) return "35";        /* magenta */
+    if (S_ISFIFO(mode)) return "33";        /* yellow */
+    if (mode & S_IXUSR) return "1;32";      /* bold green */
+    return NULL;
+}
+
 static int print_path_entry_with_stat(const char *path,
                                       const char *label,
                                       bool long_format,
@@ -8103,12 +8113,9 @@ static int print_path_entry_with_stat(const char *path,
         st = &local_stat;
     }
 
-    int color = 0;
+    const char *color = NULL;
     if (color_mode > 0 && st) {
-        if (S_ISDIR(st->st_mode)) color = 34;       /* blue */
-        else if (S_ISLNK(st->st_mode)) color = 36;  /* cyan */
-        else if (S_ISCHR(st->st_mode) || S_ISBLK(st->st_mode)) color = 33; /* yellow */
-        else if (st->st_mode & S_IXUSR) color = 32; /* green executables */
+        color = smallclueLsGetColor(st->st_mode);
     }
 
     char decorated[PATH_MAX];
@@ -8129,13 +8136,13 @@ static int print_path_entry_with_stat(const char *path,
     }
     if (long_format) {
         if (color)
-            printf("\033[%dm", color);
+            printf("\033[%sm", color);
         print_long_listing(out, st, human, numeric_ids);
         if (color)
             printf("\033[0m");
     } else {
         if (color)
-            printf("\033[%dm%s\033[0m\n", color, out);
+            printf("\033[%sm%s\033[0m\n", color, out);
         else
             printf("%s\n", out);
     }
@@ -8285,17 +8292,14 @@ static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int 
                     out = decorated;
                 }
             }
-            int color = 0;
+            const char *color = NULL;
             if (color_mode > 0) {
-                if (S_ISDIR(st->st_mode)) color = 34;
-                else if (S_ISLNK(st->st_mode)) color = 36;
-                else if (S_ISCHR(st->st_mode) || S_ISBLK(st->st_mode)) color = 33;
-                else if (st->st_mode & S_IXUSR) color = 32;
+                color = smallclueLsGetColor(st->st_mode);
             }
             if (c == cols - 1 || (size_t)((c + 1) * rows + r) >= count) {
-                if (color) printf("\033[%dm%s\033[0m", color, out); else printf("%s", out);
+                if (color) printf("\033[%sm%s\033[0m", color, out); else printf("%s", out);
             } else {
-                if (color) printf("\033[%dm%-*s\033[0m", color, (int)col_width, out);
+                if (color) printf("\033[%sm%-*s\033[0m", color, (int)col_width, out);
                 else printf("%-*s", (int)col_width, out);
             }
         }
