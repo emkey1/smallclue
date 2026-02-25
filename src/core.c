@@ -1471,8 +1471,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  -r recursive\n"
            "  -f force\n"
            "  -i interactive"},
-    {"rmdir", "rmdir DIR...\n"
-              "  Remove empty directories"},
+    {"rmdir", "rmdir [-p] [-v] DIR...\n"
+              "  Remove empty directories\n"
+              "  -p remove parents\n"
+              "  -v verbose"},
     {"runit", "runit\n"
              "  Service supervisor"},
     {"sed", "sed 's/old/new/g' [FILE...]\n"
@@ -13821,10 +13823,13 @@ static int smallclueRmCommand(int argc, char **argv) {
     return status;
 }
 
-static int smallclueRmdirPath(const char *path, bool parents) {
+static int smallclueRmdirPath(const char *path, bool parents, bool verbose) {
     if (rmdir(path) != 0) {
         fprintf(stderr, "rmdir: %s: %s\n", path, strerror(errno));
         return -1;
+    }
+    if (verbose) {
+        printf("rmdir: removing directory, '%s'\n", path);
     }
     if (!parents) {
         return 0;
@@ -13844,6 +13849,9 @@ static int smallclueRmdirPath(const char *path, bool parents) {
             free(mutable_path);
             return -1;
         }
+        if (verbose) {
+            printf("rmdir: removing directory, '%s'\n", mutable_path);
+        }
     }
     free(mutable_path);
     return 0;
@@ -13851,14 +13859,20 @@ static int smallclueRmdirPath(const char *path, bool parents) {
 
 static int smallclueRmdirCommand(int argc, char **argv) {
     int parents = 0;
+    int verbose = 0;
     int opt;
     smallclueResetGetopt();
-    while ((opt = getopt(argc, argv, "p")) != -1) {
-        if (opt == 'p') {
-            parents = 1;
-        } else {
-            fprintf(stderr, "usage: rmdir [-p] dir...\n");
-            return 1;
+    while ((opt = getopt(argc, argv, "pv")) != -1) {
+        switch (opt) {
+            case 'p':
+                parents = 1;
+                break;
+            case 'v':
+                verbose = 1;
+                break;
+            default:
+                fprintf(stderr, "usage: rmdir [-p] [-v] dir...\n");
+                return 1;
         }
     }
     if (optind >= argc) {
@@ -13867,7 +13881,7 @@ static int smallclueRmdirCommand(int argc, char **argv) {
     }
     int status = 0;
     for (int i = optind; i < argc; ++i) {
-        if (smallclueRmdirPath(argv[i], parents != 0) != 0) {
+        if (smallclueRmdirPath(argv[i], parents != 0, verbose != 0) != 0) {
             status = 1;
         }
     }
