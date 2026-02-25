@@ -11344,6 +11344,10 @@ static const char *smallclueStrCaseStr(const char *haystack, const char *needle,
     if (!haystack || !needle || !*needle) {
         return haystack;
     }
+    /* Optimization: Use optimized libc strstr for case-sensitive search */
+    if (!ignore_case) {
+        return strstr(haystack, needle);
+    }
     size_t needle_len = strlen(needle);
     for (const char *p = haystack; *p; ++p) {
         size_t i = 0;
