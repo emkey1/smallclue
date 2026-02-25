@@ -1455,19 +1455,8 @@ static int smallclueRunOpensshEntry(const char *label, int (*entry)(int, char **
 
 int smallclueRunSsh(int argc, char **argv) {
     smallclueEnsureWritableHomeSsh();
-    char *saved_home = NULL;
-    char *saved_pscali_home = NULL;
-    bool restore_home = smallclueApplyVirtualHome(&saved_home, &saved_pscali_home);
-    smallclueSshAskpassEnv askpass_env = {0};
-    bool restore_askpass = smallclueApplySshPromptEnv(&askpass_env);
     if (argc < 2) {
         fprintf(stderr, "usage: ssh [options] host [command]\n");
-        if (restore_home) {
-            smallclueRestoreEnv("HOME", saved_home);
-            smallclueRestoreEnv("PSCALI_HOME", saved_pscali_home);
-        }
-        free(saved_home);
-        free(saved_pscali_home);
         return 255;
     }
     /* Preserve user args; only ensure -tt for interactive sessions. */
@@ -1486,15 +1475,17 @@ int smallclueRunSsh(int argc, char **argv) {
     int extra = has_tty_flag ? 0 : 1;
     int new_argc = argc + extra;
     char **augmented = (char **)calloc((size_t)new_argc, sizeof(char *));
+    int status = 255;
+    bool restore_home = false;
+    bool restore_askpass = false;
+    char *saved_home = NULL;
+    char *saved_pscali_home = NULL;
+    smallclueSshAskpassEnv askpass_env = {0};
     if (!augmented) {
-        int status = smallclueRunOpensshEntry("ssh", pscal_openssh_ssh_main, argc, argv);
-        if (restore_home) {
-            smallclueRestoreEnv("HOME", saved_home);
-            smallclueRestoreEnv("PSCALI_HOME", saved_pscali_home);
-        }
-        free(saved_home);
-        free(saved_pscali_home);
-        return status;
+        restore_home = smallclueApplyVirtualHome(&saved_home, &saved_pscali_home);
+        restore_askpass = smallclueApplySshPromptEnv(&askpass_env);
+        status = smallclueRunOpensshEntry("ssh", pscal_openssh_ssh_main, argc, argv);
+        goto smallclue_run_ssh_cleanup;
     }
     int count = 0;
     if (argc > 0 && argv && argv[0]) {
@@ -1511,14 +1502,36 @@ int smallclueRunSsh(int argc, char **argv) {
 
     int expanded_count = 0;
     char **expanded = smallclueExpandSshArgs(count, augmented, &expanded_count);
-    int status = 255;
-    status = smallclueRunOpensshEntry("ssh", pscal_openssh_ssh_main,
-                                      expanded ? expanded_count : count,
-                                      expanded ? expanded : augmented);
+    bool opened_runtime_session = false;
+#if defined(PSCAL_TARGET_IOS)
+    if (pscalRuntimeOpenSshSession) {
+        int open_status = pscalRuntimeOpenSshSession(expanded ? expanded_count : count,
+                                                     expanded ? expanded : augmented);
+        if (open_status == 0) {
+            status = 0;
+            opened_runtime_session = true;
+        }
+        if (!opened_runtime_session && smallclueSshDebugEnabled()) {
+            char logbuf[160];
+            snprintf(logbuf, sizeof(logbuf),
+                     "[ssh-session] runtime open failed rc=%d; fallback inline",
+                     open_status);
+            smallclueSshDebugLog(logbuf);
+        }
+    }
+#endif
+    if (!opened_runtime_session) {
+        restore_home = smallclueApplyVirtualHome(&saved_home, &saved_pscali_home);
+        restore_askpass = smallclueApplySshPromptEnv(&askpass_env);
+        status = smallclueRunOpensshEntry("ssh", pscal_openssh_ssh_main,
+                                          expanded ? expanded_count : count,
+                                          expanded ? expanded : augmented);
+    }
     if (expanded) {
         smallclueFreeArgv(expanded, expanded_count);
     }
     smallclueFreeArgv(augmented, count);
+smallclue_run_ssh_cleanup:
     if (restore_askpass) {
         smallclueRestoreSshPromptEnv(&askpass_env);
     }
