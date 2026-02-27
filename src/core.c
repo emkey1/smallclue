@@ -6,6 +6,7 @@
 #include "smallclue.h"
 
 #include "common/runtime_tty.h"
+#include "micro_app.h"
 #include "nextvi_app.h"
 #include "openssh_app.h"
 #include "common/runtime_clipboard.h"
@@ -648,6 +649,7 @@ static int smallclueCopyFile(const char *label, const char *src, const char *dst
 static int smallclueMkdirParents(const char *path, mode_t mode, bool verbose);
 static void smallclueGetTerminalSize(int *rows, int *cols);
 static int smallclueEditorCommand(int argc, char **argv);
+static int smallclueMicroCommand(int argc, char **argv);
 static int smallclueSshCommand(int argc, char **argv);
 static int smallclueScpCommand(int argc, char **argv);
 static int smallclueSftpCommand(int argc, char **argv);
@@ -1258,6 +1260,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"dirname", smallclueDirnameCommand, "Strip last path component"},
     {"du", smallclueDuCommand, "Summarize disk usage"},
     {"echo", smallclueEchoCommand, "Print arguments"},
+    {"micro", smallclueMicroCommand, "Micro text editor"},
     {"nextvi", smallclueEditorCommand, "Nextvi text editor"},
     {"env", smallclueEnvCommand, "Display or update environment"},
     {"false", smallclueFalseCommand, "Do nothing, unsuccessfully"},
@@ -1445,6 +1448,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  Create special files (b=block, c/u=char, p=fifo)"},
     {"mount", "mount [-t type] [-o options] device dir\n"
               "  Mount filesystems (use -t type)"},
+    {"micro", "micro [FILE]\n"
+              "  Micro editor (set PSCALI_MICRO_COMPAT_NEXTVI=1 for compatibility mode)"},
     {"more", "more [FILE...]\n"
              "  Pager (alias of less)"},
     {"mv", "mv SRC... DEST\n"
@@ -9261,6 +9266,7 @@ static const SmallclueLicense kSmallclueLicenses[] = {
     {"curl", "curl_LICENSE.txt"},
     {"OpenSSL", "openssl_LICENSE.txt"},
     {"SDL2", "sdl_LICENSE.txt"},
+    {"Micro", "micro_LICENSE.txt"},
     {"Nextvi", "nextvi_LICENSE.txt"},
     {"yyjson", "yyjson_LICENSE.txt"},
     {"hterm", "hterm_LICENSE.txt"},
@@ -10142,6 +10148,9 @@ static int smallclueScriptCommand(int argc, char **argv) {
 
 static int smallclueEditorCommand(int argc, char **argv) {
     return smallclueRunEditor(argc, argv);
+}
+static int smallclueMicroCommand(int argc, char **argv) {
+    return smallclueRunMicro(argc, argv);
 }
 static int smallclueSshCommand(int argc, char **argv) {
     return smallclueRunSsh(argc, argv);

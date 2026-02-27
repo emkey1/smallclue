@@ -385,6 +385,7 @@ DEFINE_SMALLCLUE_WRAPPER("top", top)
 #endif
 #if defined(PSCAL_TARGET_IOS)
 DEFINE_SMALLCLUE_WRAPPER("nextvi", nextvi)
+DEFINE_SMALLCLUE_WRAPPER("micro", micro)
 #endif
 DEFINE_SMALLCLUE_WRAPPER("less", less)
 DEFINE_SMALLCLUE_WRAPPER("ls", ls)
@@ -528,6 +529,7 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("script", vmBuiltinSmallclue_script, "script");
     registerSmallclueBuiltin("nextvi", vmBuiltinSmallclue_nextvi, "nextvi");
     registerSmallclueBuiltin("vi", vmBuiltinSmallclue_nextvi, "vi");
+    registerSmallclueBuiltin("micro", vmBuiltinSmallclue_micro, "micro");
     registerSmallclueBuiltin("addt", vmBuiltinSmallclue_addt, "addt");
     registerSmallclueBuiltin("tabadd", vmBuiltinSmallclue_tabadd, "tabadd");
     registerSmallclueBuiltin("tadd", vmBuiltinSmallclue_tadd, "tadd");

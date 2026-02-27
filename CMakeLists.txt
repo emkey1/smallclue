@@ -95,6 +95,7 @@ list(APPEND OPENSSH_SOURCES
 set(SOURCES
     src/main.c
     src/core.c
+    src/micro_app.c
     src/nextvi_app.c
     src/openssh_app.c
     src/vproc_test_app.c
