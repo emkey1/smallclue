@@ -8149,7 +8149,7 @@ static void print_permissions(mode_t mode) {
     putchar(mode & S_IXOTH ? 'x' : '-');
 }
 
-static void print_long_listing(const char *filename, const struct stat *s, bool human, bool numeric_ids) {
+static void print_long_listing(const char *filename, const struct stat *s, bool human, bool numeric_ids, const char *color) {
     print_permissions(s->st_mode);
     printf(" %2llu", (unsigned long long)s->st_nlink);
 
@@ -8173,7 +8173,10 @@ static void print_long_listing(const char *filename, const struct stat *s, bool 
     }
     char time_buf[64];
     strftime(time_buf, sizeof(time_buf), "%b %d %H:%M", localtime(&s->st_mtime));
-    printf(" %s %s", time_buf, filename);
+    printf(" %s ", time_buf);
+    if (color) printf("\033[%sm", color);
+    printf("%s", filename);
+    if (color) printf("\033[0m");
 
     if (S_ISLNK(s->st_mode)) {
         char link_target[1024];
@@ -8236,11 +8239,7 @@ static int print_path_entry_with_stat(const char *path,
         }
     }
     if (long_format) {
-        if (color)
-            printf("\033[%sm", color);
-        print_long_listing(out, st, human, numeric_ids);
-        if (color)
-            printf("\033[0m");
+        print_long_listing(out, st, human, numeric_ids, color);
     } else {
         if (color)
             printf("\033[%sm%s\033[0m\n", color, out);
