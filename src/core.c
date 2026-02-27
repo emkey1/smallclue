@@ -13088,10 +13088,16 @@ static int smallclueEnvCommand(int argc, char **argv) {
 
 static void smallclueGrepPrintMatch(const char *line, size_t len, const char *pattern, int ignore_case, int color_enabled, const char *prefix_path, long line_number) {
     if (prefix_path) {
-        printf("%s:", prefix_path);
+        if (color_enabled) fputs("\033[35m", stdout);
+        printf("%s", prefix_path);
+        if (color_enabled) fputs("\033[36m:\033[0m", stdout);
+        else putchar(':');
     }
     if (line_number > 0) {
-        printf("%ld:", line_number);
+        if (color_enabled) fputs("\033[32m", stdout);
+        printf("%ld", line_number);
+        if (color_enabled) fputs("\033[36m:\033[0m", stdout);
+        else putchar(':');
     }
 
     if (!color_enabled || !pattern || !*pattern) {
