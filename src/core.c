@@ -14687,6 +14687,64 @@ static void smallclueRedirectFromEnv(void) {
     }
 }
 
+static int levenshtein_distance(const char *s1, const char *s2) {
+    size_t len1 = strlen(s1);
+    size_t len2 = strlen(s2);
+    if (len1 == 0) return (int)len2;
+    if (len2 == 0) return (int)len1;
+
+    int *matrix = (int *)malloc((len1 + 1) * (len2 + 1) * sizeof(int));
+    if (!matrix) return -1;
+
+    for (size_t i = 0; i <= len1; i++) matrix[i * (len2 + 1)] = (int)i;
+    for (size_t j = 0; j <= len2; j++) matrix[j] = (int)j;
+
+    for (size_t i = 1; i <= len1; i++) {
+        for (size_t j = 1; j <= len2; j++) {
+            int cost = (s1[i - 1] == s2[j - 1]) ? 0 : 1;
+            int delete_op = matrix[(i - 1) * (len2 + 1) + j] + 1;
+            int insert_op = matrix[i * (len2 + 1) + (j - 1)] + 1;
+            int substitute_op = matrix[(i - 1) * (len2 + 1) + (j - 1)] + cost;
+            int min = delete_op;
+            if (insert_op < min) min = insert_op;
+            if (substitute_op < min) min = substitute_op;
+            matrix[i * (len2 + 1) + j] = min;
+        }
+    }
+
+    int result = matrix[len1 * (len2 + 1) + len2];
+    free(matrix);
+    return result;
+}
+
+static const char *smallclueSuggestCommand(const char *typo) {
+    if (!typo || !*typo) return NULL;
+
+    const char *best_match = NULL;
+    int best_dist = -1;
+    size_t typo_len = strlen(typo);
+
+    for (size_t i = 0; i < kSmallclueAppletCount; ++i) {
+        const char *name = kSmallclueApplets[i].name;
+        if (!name) continue;
+
+        int dist = levenshtein_distance(typo, name);
+        if (dist < 0) continue;
+
+        if (best_dist == -1 || dist < best_dist) {
+            best_dist = dist;
+            best_match = name;
+        }
+    }
+
+    if (best_match && best_dist != -1) {
+        if (best_dist <= 2 && best_dist < (int)typo_len) {
+            return best_match;
+        }
+    }
+    return NULL;
+}
+
 int smallclueMain(int argc, char **argv) {
     smallclueRedirectFromEnv();
     const SmallclueApplet *applet = NULL;
@@ -14720,7 +14778,12 @@ int smallclueMain(int argc, char **argv) {
         }
     }
     if (!applet) {
-        fprintf(stderr, "smallclue: '%s' applet not found.\n\n", call_name);
+        fprintf(stderr, "smallclue: '%s' applet not found.\n", call_name);
+        const char *suggestion = smallclueSuggestCommand(call_name);
+        if (suggestion) {
+            fprintf(stderr, "Did you mean '%s'?\n", suggestion);
+        }
+        fprintf(stderr, "\n");
         print_usage();
         return 127;
     }
