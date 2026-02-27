@@ -8903,30 +8903,54 @@ static int smallclueYesNoLoop(const char *text, int initial_status) {
         return initial_status;
     }
     size_t len = strlen(text);
-    char *line = (char *)malloc(len + 2);
-    if (!line) {
+    size_t buf_size = 16 * 1024;
+    char *buffer = (char *)malloc(buf_size);
+    if (!buffer) {
         return 1;
     }
-    memcpy(line, text, len);
-    line[len] = '\n';
-    line[len + 1] = '\0';
-    size_t line_len = len + 1;
+
+    size_t filled = 0;
+    while (filled + len + 1 <= buf_size) {
+        memcpy(buffer + filled, text, len);
+        buffer[filled + len] = '\n';
+        filled += len + 1;
+    }
+
+    if (filled == 0) {
+        /* Pattern too large for buffer, fall back to single line. */
+        free(buffer);
+        size_t line_len = len + 1;
+        char *line = (char *)malloc(line_len + 1);
+        if (!line) return 1;
+        memcpy(line, text, len);
+        line[len] = '\n';
+        line[len + 1] = '\0';
+        int status = initial_status;
+        while (true) {
+            if (smallclueShouldAbort(&status)) break;
+            if (fwrite(line, 1, line_len, stdout) != line_len) {
+                status = errno ? errno : status;
+                break;
+            }
+        }
+        free(line);
+        return status;
+    }
+
     int status = initial_status;
+    size_t iteration = 0;
     while (true) {
-        if (smallclueShouldAbort(&status)) {
-            break;
+        if ((iteration++ & 127) == 0) {
+            if (smallclueShouldAbort(&status)) {
+                break;
+            }
         }
-        size_t written = fwrite(line, 1, line_len, stdout);
-        if (written != line_len) {
-            status = errno ? errno : status;
-            break;
-        }
-        if (fflush(stdout) != 0) {
+        if (fwrite(buffer, 1, filled, stdout) != filled) {
             status = errno ? errno : status;
             break;
         }
     }
-    free(line);
+    free(buffer);
     return status;
 }
 
