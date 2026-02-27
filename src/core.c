@@ -8903,7 +8903,7 @@ static int smallclueYesNoLoop(const char *text, int initial_status) {
         return initial_status;
     }
     size_t len = strlen(text);
-    size_t buf_size = 16 * 1024;
+    size_t buf_size = 64 * 1024;
     char *buffer = (char *)malloc(buf_size);
     if (!buffer) {
         return 1;
@@ -8945,9 +8945,16 @@ static int smallclueYesNoLoop(const char *text, int initial_status) {
                 break;
             }
         }
-        if (fwrite(buffer, 1, filled, stdout) != filled) {
-            status = errno ? errno : status;
-            break;
+        size_t total_written = 0;
+        while (total_written < filled) {
+            ssize_t n = write(STDOUT_FILENO, buffer + total_written, filled - total_written);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                status = errno ? errno : status;
+                free(buffer);
+                return status;
+            }
+            total_written += (size_t)n;
         }
     }
     free(buffer);
