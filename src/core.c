@@ -7643,10 +7643,22 @@ static int smallclueMarkdownListDocuments(void) {
         return 1;
     }
     qsort(entries, count, sizeof(MarkdownDocEntry), markdownDocEntryCompare);
-    printf("Markdown documents in %s:\n\n", visible_docs_dir);
+
+    bool use_color = isatty(STDOUT_FILENO);
+    if (use_color) {
+        printf("Markdown documents in \033[1;34m%s\033[0m:\n\n", visible_docs_dir);
+    } else {
+        printf("Markdown documents in %s:\n\n", visible_docs_dir);
+    }
+
     for (size_t i = 0; i < count; ++i) {
         const char *title = entries[i].title ? entries[i].title : "";
-        printf("  %-24s %s\n", entries[i].name ? entries[i].name : "(unknown)", title);
+        const char *name = entries[i].name ? entries[i].name : "(unknown)";
+        if (use_color) {
+            printf("  \033[1m%-24s\033[0m %s\n", name, title);
+        } else {
+            printf("  %-24s %s\n", name, title);
+        }
         markdownDocEntryFree(&entries[i]);
     }
     free(entries);
