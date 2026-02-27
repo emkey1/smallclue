@@ -946,6 +946,13 @@ static int smallclueSudoCommand(int argc, char **argv) {
         return 1;
     }
 
+    /* Sentinel: Sanitize environment to prevent privilege escalation via LD_PRELOAD/PATH injection */
+    unsetenv("LD_PRELOAD");
+    unsetenv("LD_LIBRARY_PATH");
+    unsetenv("LD_DEBUG");
+    unsetenv("IFS");
+    setenv("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", 1);
+
     if (getuid() != 0) {
         if (geteuid() == 0) {
 #if defined(__linux__) || defined(linux) || defined(__linux)
