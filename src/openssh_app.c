@@ -34,6 +34,9 @@ extern void PSCALRuntimePopExitOverrideWithStatus(void) __attribute__((weak_impo
 extern void PSCALRuntimeInterposeBootstrap(void) __attribute__((weak_import));
 extern void PSCALRuntimeRegisterSessionContext(uint64_t session_id) __attribute__((weak_import));
 extern void PSCALRuntimeUnregisterSessionContext(uint64_t session_id) __attribute__((weak_import));
+extern void *PSCALRuntimeGetCurrentRuntimeContext(void) __attribute__((weak_import));
+extern void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) __attribute__((weak_import));
+extern void PSCALRuntimeSetCurrentRuntimeStdio(VProcSessionStdio *stdio_ctx) __attribute__((weak_import));
 #  endif
 #elif defined(__APPLE__)
 extern jmp_buf *PSCALRuntimeSwapExitJumpBuffer(jmp_buf *buffer) __attribute__((weak_import));
@@ -44,6 +47,9 @@ extern void PSCALRuntimePopExitOverrideWithStatus(void) __attribute__((weak_impo
 extern void PSCALRuntimeInterposeBootstrap(void) __attribute__((weak_import));
 extern void PSCALRuntimeRegisterSessionContext(uint64_t session_id) __attribute__((weak_import));
 extern void PSCALRuntimeUnregisterSessionContext(uint64_t session_id) __attribute__((weak_import));
+extern void *PSCALRuntimeGetCurrentRuntimeContext(void) __attribute__((weak_import));
+extern void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) __attribute__((weak_import));
+extern void PSCALRuntimeSetCurrentRuntimeStdio(VProcSessionStdio *stdio_ctx) __attribute__((weak_import));
 #else
 extern jmp_buf *PSCALRuntimeSwapExitJumpBuffer(jmp_buf *buffer) __attribute__((weak));
 extern int PSCALRuntimePushExitOverride(jmp_buf *buffer) __attribute__((weak));
@@ -53,6 +59,9 @@ extern void PSCALRuntimePopExitOverrideWithStatus(void) __attribute__((weak));
 extern void PSCALRuntimeInterposeBootstrap(void) __attribute__((weak));
 extern void PSCALRuntimeRegisterSessionContext(uint64_t session_id) __attribute__((weak));
 extern void PSCALRuntimeUnregisterSessionContext(uint64_t session_id) __attribute__((weak));
+extern void *PSCALRuntimeGetCurrentRuntimeContext(void) __attribute__((weak));
+extern void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) __attribute__((weak));
+extern void PSCALRuntimeSetCurrentRuntimeStdio(VProcSessionStdio *stdio_ctx) __attribute__((weak));
 #endif
 extern void pscalRuntimeDebugLog(const char *message) __attribute__((weak));
 extern void pscalRuntimeRegisterShellThread(uint64_t session_id, pthread_t tid) __attribute__((weak));
@@ -95,6 +104,21 @@ void PSCALRuntimeRegisterSessionContext(uint64_t session_id) {
 __attribute__((weak))
 void PSCALRuntimeUnregisterSessionContext(uint64_t session_id) {
     (void)session_id;
+}
+
+__attribute__((weak))
+void *PSCALRuntimeGetCurrentRuntimeContext(void) {
+    return NULL;
+}
+
+__attribute__((weak))
+void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) {
+    (void)ctx;
+}
+
+__attribute__((weak))
+void PSCALRuntimeSetCurrentRuntimeStdio(VProcSessionStdio *stdio_ctx) {
+    (void)stdio_ctx;
 }
 
 __attribute__((weak))
@@ -1129,6 +1153,7 @@ typedef struct {
     struct pscal_fd *pty_master;
     struct pscal_fd *pty_slave;
     uint64_t session_id;
+    void *runtime_ctx;
 } smallclueSshSessionContext;
 
 static void smallclueSshSessionNotifyExit(uint64_t session_id, int status) {
@@ -1193,6 +1218,13 @@ static void *smallclueRunSshSessionThread(void *arg) {
     if (!ctx) {
         return NULL;
     }
+    void *prev_runtime_ctx = NULL;
+    if (PSCALRuntimeGetCurrentRuntimeContext) {
+        prev_runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext();
+    }
+    if (PSCALRuntimeSetCurrentRuntimeContext && ctx->runtime_ctx) {
+        PSCALRuntimeSetCurrentRuntimeContext(ctx->runtime_ctx);
+    }
     if (smallclueSshDebugEnabled()) {
         char logbuf[192];
         snprintf(logbuf, sizeof(logbuf),
@@ -1208,6 +1240,9 @@ static void *smallclueRunSshSessionThread(void *arg) {
         smallclueSshSessionNotifyExit(ctx->session_id, status);
         smallclueFreeArgv(ctx->argv, ctx->argc);
         free(ctx);
+        if (PSCALRuntimeSetCurrentRuntimeContext && prev_runtime_ctx) {
+            PSCALRuntimeSetCurrentRuntimeContext(prev_runtime_ctx);
+        }
         return NULL;
     }
     if (vprocSessionStdioInitWithPty(session_stdio,
@@ -1220,6 +1255,9 @@ static void *smallclueRunSshSessionThread(void *arg) {
         smallclueSshSessionNotifyExit(ctx->session_id, status);
         smallclueFreeArgv(ctx->argv, ctx->argc);
         free(ctx);
+        if (PSCALRuntimeSetCurrentRuntimeContext && prev_runtime_ctx) {
+            PSCALRuntimeSetCurrentRuntimeContext(prev_runtime_ctx);
+        }
         return NULL;
     }
     /* Dedicated SSH sessions must preserve literal ^C/^Z bytes so the remote
@@ -1255,6 +1293,9 @@ static void *smallclueRunSshSessionThread(void *arg) {
         (void)vprocSetSid(pid, pid);
         (void)vprocSetPgid(pid, pid);
         vprocSessionStdioActivate(session_stdio);
+        if (PSCALRuntimeSetCurrentRuntimeStdio) {
+            PSCALRuntimeSetCurrentRuntimeStdio(session_stdio);
+        }
         smallclueSshAttachControllingTty(session_stdio, pid, pid);
         (void)vprocSetForegroundPgid(pid, pid);
         if (pscalRuntimeRegisterShellThread) {
@@ -1294,6 +1335,9 @@ static void *smallclueRunSshSessionThread(void *arg) {
     }
 
     if (session_stdio) {
+        if (PSCALRuntimeSetCurrentRuntimeStdio) {
+            PSCALRuntimeSetCurrentRuntimeStdio(NULL);
+        }
         vprocSessionStdioActivate(NULL);
         vprocSessionStdioDestroy(session_stdio);
     }
@@ -1309,6 +1353,9 @@ static void *smallclueRunSshSessionThread(void *arg) {
     smallclueSshSessionNotifyExit(ctx->session_id, status);
     smallclueFreeArgv(ctx->argv, ctx->argc);
     free(ctx);
+    if (PSCALRuntimeSetCurrentRuntimeContext && prev_runtime_ctx) {
+        PSCALRuntimeSetCurrentRuntimeContext(prev_runtime_ctx);
+    }
     return NULL;
 }
 
@@ -1395,6 +1442,9 @@ int PSCALRuntimeCreateSshSession(int argc,
     ctx->pty_master = pty_master;
     ctx->pty_slave = pty_slave;
     ctx->session_id = session_id;
+    if (PSCALRuntimeGetCurrentRuntimeContext) {
+        ctx->runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext();
+    }
     ctx->argv = (char **)calloc((size_t)argc, sizeof(char *));
     if (!ctx->argv) {
         smallclueCloseSessionFds(ctx);

@@ -170,6 +170,12 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
         int shell_pid = vprocGetShellSelfPid();
         int owner_pid = (active_vp && vprocPid(active_vp) > 0) ? vprocPid(active_vp) : shell_pid;
         bool force_new_vproc = !(active_vp && vprocPid(active_vp) > 0 && vprocPid(active_vp) != shell_pid);
+        bool is_watch_applet = (applet && applet->name && strcmp(applet->name, "watch") == 0);
+        if (is_watch_applet) {
+            /* Keep watch in its own command scope so Ctrl-Z/bg/fg target a
+             * stable synthetic job even when invoked from a stage vproc. */
+            force_new_vproc = true;
+        }
         smallclueFormatLabel(argc, argv, label, sizeof(label));
         if (label[0]) {
             vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, label, force_new_vproc, false);
@@ -209,7 +215,7 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
                                vprocPid(active_vp) != shell_pid);
         if (execution_pid > 0 && execution_pid != shell_pid &&
             vprocIsShellSelfThread() &&
-            !in_stage_vproc &&
+            (!in_stage_vproc || is_watch_applet) &&
             !vprocGetStopUnsupported(execution_pid)) {
             /* Builtins can execute inside an already-scoped stage vproc (no new
              * command scope created). Keep Ctrl-Z cooperative in that case too. */

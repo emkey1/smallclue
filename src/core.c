@@ -365,16 +365,21 @@ static void smallclueClearPendingSignals(void) {
 static bool smallclueShouldAbort(int *out_status) {
     const char *dbg = getenv("SMALLCLUE_DEBUG");
     bool allow_cooperative_sigtstp = true;
+    bool cooperative_stop_entry = false;
     int cur_pid = 0;
 #if defined(PSCAL_TARGET_IOS)
     VProc *vp = vprocCurrent();
     if (vp) {
         int shell_pid = vprocGetShellSelfPid();
         cur_pid = vprocPid(vp);
-        if (cur_pid > 0 && !vprocGetStopUnsupported(cur_pid)) {
+        if (cur_pid > 0) {
+            cooperative_stop_entry = vprocGetStopUnsupported(cur_pid);
+        }
+        if (cur_pid > 0 && !cooperative_stop_entry) {
             allow_cooperative_sigtstp = false;
         }
-        if (shell_pid <= 0 || vprocPid(vp) != shell_pid) {
+        if (!cooperative_stop_entry &&
+            (shell_pid <= 0 || vprocPid(vp) != shell_pid)) {
             (void)vprocWaitIfStopped(vp);
         }
         if (dbg && *dbg) {
@@ -382,7 +387,7 @@ static bool smallclueShouldAbort(int *out_status) {
                     "[smallclue] shouldAbort pid=%d shell_pid=%d stop_unsupported=%d allow_coop=%d\n",
                     cur_pid,
                     shell_pid,
-                    (int)vprocGetStopUnsupported(cur_pid),
+                    (int)cooperative_stop_entry,
                     (int)allow_cooperative_sigtstp);
         }
     }
@@ -1630,6 +1635,7 @@ static const char * __attribute__((unused)) smallclueLookupHelp(const char *name
 static const char *pager_command_name(const char *name);
 static int pager_read_key(void);
 static char *pagerReadLogicalLine(const PagerBuffer *buffer, size_t line_index, bool *had_newline);
+static void smallclueMenuStartFrame(bool *first_frame);
 
 static void pagerBell(void) {
     fputc('\a', stdout);
@@ -3471,12 +3477,10 @@ static int pager_control_fd(void) {
 }
 
 static void pager_control_fd_reset(void) {
-    if (pager_control_fd_value >= 0) {
-        if (pager_control_fd_value > STDERR_FILENO) {
-            close(pager_control_fd_value);
-        }
-        pager_control_fd_value = -2;
+    if (pager_control_fd_value > STDERR_FILENO) {
+        close(pager_control_fd_value);
     }
+    pager_control_fd_value = -2;
 }
 
 #if defined(PSCAL_TARGET_IOS)
@@ -3634,8 +3638,11 @@ static int pager_read_key(void) {
         return 'q';
     }
     int fd = pager_control_fd();
+    int fd_is_tty = (fd >= 0 && pscalRuntimeFdIsInteractive(fd)) ? 1 : 0;
 #if defined(PSCAL_TARGET_IOS)
-    bool use_session_queue = pager_session_queue_enabled && pagerUseSessionInputQueue();
+    bool have_session_queue = pagerUseSessionInputQueue();
+    bool use_session_queue = have_session_queue &&
+                             (pager_session_queue_enabled || fd < 0 || !fd_is_tty);
 #else
     bool use_session_queue = false;
 #endif
@@ -3644,7 +3651,6 @@ static int pager_read_key(void) {
             return 'q';
         }
     }
-    int fd_is_tty = (fd >= 0 && pscalRuntimeFdIsInteractive(fd)) ? 1 : 0;
     if (pagerDebugEnabled()) {
         pagerDebugLogf("[pager] read key fd=%d isatty=%d use_session=%d",
                        fd, fd_is_tty, use_session_queue ? 1 : 0);
@@ -7323,6 +7329,11 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
     size_t cursor = 0;
     size_t top = 0;
     bool running = true;
+    bool first_frame = true;
+#if defined(PSCAL_TARGET_IOS)
+    bool prev_session_queue = pager_session_queue_enabled;
+    pager_session_queue_enabled = true;
+#endif
 
     while (running) {
         int rows = pager_terminal_rows();
@@ -7338,7 +7349,7 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
             top = (links->count > window) ? (links->count - window) : 0;
         }
 
-        printf("\x1b[2J\x1b[H");
+        smallclueMenuStartFrame(&first_frame);
         if (source_label && *source_label) {
             printf("Links in %s (%zu/%zu)  [Arrows=move Enter=open q=cancel]\n",
                    source_label, cursor + 1, links->count);
@@ -7398,17 +7409,26 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
             case '\r':
                 printf("\x1b[2J\x1b[H");
                 fflush(stdout);
+#if defined(PSCAL_TARGET_IOS)
+                pager_session_queue_enabled = prev_session_queue;
+#endif
                 return (int)cursor;
             case 'q':
             case 'Q':
             case 3:
                 printf("\x1b[2J\x1b[H");
                 fflush(stdout);
+#if defined(PSCAL_TARGET_IOS)
+                pager_session_queue_enabled = prev_session_queue;
+#endif
                 return -1;
             default:
                 break;
         }
     }
+#if defined(PSCAL_TARGET_IOS)
+    pager_session_queue_enabled = prev_session_queue;
+#endif
     return -1;
 }
 
@@ -7665,6 +7685,15 @@ static int smallclueMarkdownListDocuments(void) {
     return 0;
 }
 
+static void smallclueMenuStartFrame(bool *first_frame) {
+    if (first_frame && *first_frame) {
+        printf("\x1b[2J\x1b[H");
+        *first_frame = false;
+        return;
+    }
+    printf("\x1b[H\x1b[J");
+}
+
 static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
                                           size_t count,
                                           size_t top,
@@ -7672,8 +7701,9 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
                                           size_t window,
                                           const char *docs_dir,
                                           int term_cols,
-                                          bool show_docs_dir) {
-    printf("\x1b[2J\x1b[H");
+                                          bool show_docs_dir,
+                                          bool *first_frame) {
+    smallclueMenuStartFrame(first_frame);
     char header[256];
     snprintf(header, sizeof(header),
              "Markdown docs (Arrows=move, Enter=open, q=quit) [%zu/%zu]",
@@ -7764,11 +7794,18 @@ static int markdownInteractiveSelectDocument(void) {
         return 0;
     }
 
+    pager_control_fd_reset();
+
     size_t cursor = 0;
     size_t top = 0;
     char selected[PATH_MAX];
     bool running = true;
     bool has_selection = false;
+    bool first_frame = true;
+#if defined(PSCAL_TARGET_IOS)
+    bool prev_session_queue = pager_session_queue_enabled;
+    pager_session_queue_enabled = true;
+#endif
 
     while (running) {
         int rows = pager_terminal_rows();
@@ -7795,7 +7832,7 @@ static int markdownInteractiveSelectDocument(void) {
             top = (count > window) ? (count - window) : 0;
         }
 
-        markdownInteractiveRenderList(entries, count, top, cursor, window, docs_dir, cols, show_docs_dir);
+        markdownInteractiveRenderList(entries, count, top, cursor, window, docs_dir, cols, show_docs_dir, &first_frame);
 
         int key = pager_read_key();
         switch (key) {
@@ -7853,6 +7890,10 @@ static int markdownInteractiveSelectDocument(void) {
 
     printf("\x1b[2J\x1b[H");
     fflush(stdout);
+    pager_control_fd_reset();
+#if defined(PSCAL_TARGET_IOS)
+    pager_session_queue_enabled = prev_session_queue;
+#endif
 
     for (size_t i = 0; i < count; ++i) {
         markdownDocEntryFree(&entries[i]);
@@ -9260,8 +9301,8 @@ static bool smallclueLicensesResolvePath(const char *filename, char *out, size_t
     return false;
 }
 
-static void smallclueLicensesRenderMenu(size_t selected) {
-    printf("\033[2J\033[H");
+static void smallclueLicensesRenderMenu(size_t selected, bool *first_frame) {
+    smallclueMenuStartFrame(first_frame);
     printf("PSCAL & Third-Party Licenses\n");
     printf("Use arrows to navigate, Enter to view, q to quit.\n\n");
     size_t total = smallclueLicensesCount();
@@ -9283,8 +9324,13 @@ static int smallclueLicensesCommand(int argc, char **argv) {
     }
     size_t selected = 0;
     bool running = true;
+    bool first_frame = true;
+#if defined(PSCAL_TARGET_IOS)
+    bool prev_session_queue = pager_session_queue_enabled;
+    pager_session_queue_enabled = true;
+#endif
     while (running) {
-        smallclueLicensesRenderMenu(selected);
+        smallclueLicensesRenderMenu(selected, &first_frame);
         int key = pager_read_key();
         switch (key) {
             case PAGER_KEY_ARROW_UP:
@@ -9298,7 +9344,7 @@ static int smallclueLicensesCommand(int argc, char **argv) {
                 const SmallclueLicense *entry = &kSmallclueLicenses[selected];
                 char resolved[PATH_MAX];
                 if (!smallclueLicensesResolvePath(entry->filename, resolved, sizeof(resolved))) {
-                    smallclueLicensesRenderMenu(selected);
+                    smallclueLicensesRenderMenu(selected, &first_frame);
                     fprintf(stdout, "\nlicenses: %s: not found\n", entry->filename);
                     fprintf(stdout, "Press any key to continue.");
                     fflush(stdout);
@@ -9320,6 +9366,9 @@ static int smallclueLicensesCommand(int argc, char **argv) {
     printf("\033[2J\033[H");
     fflush(stdout);
     pager_control_fd_reset();
+#if defined(PSCAL_TARGET_IOS)
+    pager_session_queue_enabled = prev_session_queue;
+#endif
     smallclueEmitTerminalSane();
     return 0;
 }
