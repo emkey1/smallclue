@@ -1449,7 +1449,7 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"mount", "mount [-t type] [-o options] device dir\n"
               "  Mount filesystems (use -t type)"},
     {"micro", "micro [FILE]\n"
-              "  Micro editor (set PSCALI_MICRO_COMPAT_NEXTVI=1 for compatibility mode)"},
+              "  Micro editor"},
     {"more", "more [FILE...]\n"
              "  Pager (alias of less)"},
     {"mv", "mv SRC... DEST\n"
@@ -2150,6 +2150,18 @@ static const char *smallclueTopState(const VProcSnapshot *snap) {
     return "running";
 }
 
+static const char *smallclueTopPtyLabel(const VProcSnapshot *snap, char *buf, size_t buf_size) {
+    if (!buf || buf_size == 0) {
+        return "-";
+    }
+    if (!snap || snap->tty_pty_num < 0) {
+        snprintf(buf, buf_size, "-");
+        return buf;
+    }
+    snprintf(buf, buf_size, "pts/%d", snap->tty_pty_num);
+    return buf;
+}
+
 static bool smallclueWriteAll(int fd, const char *data, size_t len) {
     if (!data || len == 0) {
         return true;
@@ -2314,8 +2326,8 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         char header[160];
         int hn = snprintf(header, sizeof(header),
-                          "%-6s %-6s %-6s %-6s %-3s %-10s %-6s %-6s %s\n",
-                          "PID", "PPID", "PGID", "SID", "FG", "STATE", "UTIME", "STIME", "CMD");
+                          "%-6s %-6s %-6s %-6s %-3s %-8s %-10s %-6s %-6s %s\n",
+                          "PID", "PPID", "PGID", "SID", "FG", "PTY", "STATE", "UTIME", "STIME", "CMD");
         if (hn > 0) {
             (void)smallclueWriteAll(STDOUT_FILENO, header, (size_t)hn);
         }
@@ -2355,6 +2367,8 @@ static int smallclueTopCommand(int argc, char **argv) {
                     if (snap->pid == self_pid) {
                         cmd = "top";
                     }
+                    char pty_label[16];
+                    (void)smallclueTopPtyLabel(snap, pty_label, sizeof(pty_label));
 
                     char indent[96];
                     size_t used = 0;
@@ -2368,9 +2382,9 @@ static int smallclueTopCommand(int argc, char **argv) {
                     vprocFormatCpuTimes(snap->rusage_utime, snap->rusage_stime, &ut_s, &st_s);
                     char line[320];
                     int n = snprintf(line, sizeof(line),
-                                     "%-6d %-6d %-6d %-6d %-3s %-10s %-6.1f %-6.1f %s%s\n",
+                                     "%-6d %-6d %-6d %-6d %-3s %-8s %-10s %-6.1f %-6.1f %s%s\n",
                                      snap->pid, snap->parent_pid, snap->pgid, snap->sid,
-                                     fg ? "fg" : "", state, ut_s, st_s, indent, cmd);
+                                     fg ? "fg" : "", pty_label, state, ut_s, st_s, indent, cmd);
                     if (n > 0) {
                         (void)smallclueWriteAll(STDOUT_FILENO, line, (size_t)n);
                     }
@@ -2396,13 +2410,15 @@ static int smallclueTopCommand(int argc, char **argv) {
                 if (snap->pid == self_pid) {
                     cmd = "top";
                 }
+                char pty_label[16];
+                (void)smallclueTopPtyLabel(snap, pty_label, sizeof(pty_label));
                 double ut_s = 0.0, st_s = 0.0;
                 vprocFormatCpuTimes(snap->rusage_utime, snap->rusage_stime, &ut_s, &st_s);
                 char line[320];
                 int n = snprintf(line, sizeof(line),
-                                 "%-6d %-6d %-6d %-6d %-3s %-10s %-6.1f %-6.1f %s\n",
+                                 "%-6d %-6d %-6d %-6d %-3s %-8s %-10s %-6.1f %-6.1f %s\n",
                                  snap->pid, snap->parent_pid, snap->pgid, snap->sid,
-                                 fg ? "fg" : "", state, ut_s, st_s, cmd);
+                                 fg ? "fg" : "", pty_label, state, ut_s, st_s, cmd);
                 if (n > 0) {
                     (void)smallclueWriteAll(STDOUT_FILENO, line, (size_t)n);
                 }
