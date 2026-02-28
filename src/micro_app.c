@@ -9,9 +9,11 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/socket.h>
 #include <termios.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <signal.h>
 
 #include "termios_shim.h"
 #if defined(PSCAL_TARGET_IOS)
@@ -221,21 +223,17 @@ typedef struct {
     int saved_host_stdin;
     int saved_host_stdout;
     int saved_host_stderr;
-    int stdin_pipe[2];
-    int stdout_pipe[2];
-    int stderr_pipe[2];
-    int vproc_stdin;
-    int vproc_stdout;
-    int vproc_stderr;
+    int session_stdin;
+    int session_stdout;
+    int session_stderr;
+    int pty_master;
+    int pty_slave;
     pthread_t stdin_thread;
-    pthread_t stdout_thread;
-    pthread_t stderr_thread;
+    pthread_t output_thread;
     bool stdin_thread_started;
-    bool stdout_thread_started;
-    bool stderr_thread_started;
+    bool output_thread_started;
     MicroIoBridgeThreadCtx stdin_ctx;
-    MicroIoBridgeThreadCtx stdout_ctx;
-    MicroIoBridgeThreadCtx stderr_ctx;
+    MicroIoBridgeThreadCtx output_ctx;
 } MicroHostStdioBridge;
 
 static void microHostStdioBridgeTeardown(MicroHostStdioBridge *bridge);
@@ -248,15 +246,11 @@ static void microHostStdioBridgeInit(MicroHostStdioBridge *bridge) {
     bridge->saved_host_stdin = -1;
     bridge->saved_host_stdout = -1;
     bridge->saved_host_stderr = -1;
-    bridge->stdin_pipe[0] = -1;
-    bridge->stdin_pipe[1] = -1;
-    bridge->stdout_pipe[0] = -1;
-    bridge->stdout_pipe[1] = -1;
-    bridge->stderr_pipe[0] = -1;
-    bridge->stderr_pipe[1] = -1;
-    bridge->vproc_stdin = -1;
-    bridge->vproc_stdout = -1;
-    bridge->vproc_stderr = -1;
+    bridge->session_stdin = -1;
+    bridge->session_stdout = -1;
+    bridge->session_stderr = -1;
+    bridge->pty_master = -1;
+    bridge->pty_slave = -1;
 }
 
 static void microHostCloseIfOpen(int *fd) {
@@ -267,7 +261,7 @@ static void microHostCloseIfOpen(int *fd) {
     *fd = -1;
 }
 
-static void microVprocCloseIfOpen(int *fd) {
+static void microCloseIfOpen(int *fd) {
     if (!fd || *fd < 0) {
         return;
     }
@@ -306,6 +300,10 @@ static void *microIoBridgeThreadMain(void *opaque) {
     if (!ctx || ctx->read_fd < 0 || ctx->write_fd < 0) {
         return NULL;
     }
+    sigset_t blocked;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGPIPE);
+    (void)pthread_sigmask(SIG_BLOCK, &blocked, NULL);
     unsigned char buf[4096];
     for (;;) {
         ssize_t nr = microIoBridgeRead(ctx, buf, sizeof(buf));
@@ -316,6 +314,9 @@ static void *microIoBridgeThreadMain(void *opaque) {
         while (off < (size_t)nr) {
             ssize_t nw = microIoBridgeWrite(ctx, buf + off, (size_t)nr - off);
             if (nw <= 0) {
+                if (nw < 0 && (errno == EPIPE || errno == EIO || errno == EBADF)) {
+                    return NULL;
+                }
                 return NULL;
             }
             off += (size_t)nw;
@@ -330,67 +331,87 @@ static bool microHostStdioBridgeSetup(MicroHostStdioBridge *bridge) {
     }
     microHostStdioBridgeInit(bridge);
 
-    bridge->vproc_stdin = dup(STDIN_FILENO);
-    bridge->vproc_stdout = dup(STDOUT_FILENO);
-    bridge->vproc_stderr = dup(STDERR_FILENO);
     bridge->saved_host_stdin = vprocHostDup(STDIN_FILENO);
     bridge->saved_host_stdout = vprocHostDup(STDOUT_FILENO);
     bridge->saved_host_stderr = vprocHostDup(STDERR_FILENO);
+    bridge->session_stdin = dup(STDIN_FILENO);
+    bridge->session_stdout = dup(STDOUT_FILENO);
+    bridge->session_stderr = dup(STDERR_FILENO);
 
-    if (bridge->vproc_stdin < 0 || bridge->vproc_stdout < 0 || bridge->vproc_stderr < 0 ||
-        bridge->saved_host_stdin < 0 || bridge->saved_host_stdout < 0 || bridge->saved_host_stderr < 0) {
+    if (bridge->saved_host_stdin < 0 || bridge->saved_host_stdout < 0 || bridge->saved_host_stderr < 0 ||
+        bridge->session_stdin < 0 || bridge->session_stdout < 0 || bridge->session_stderr < 0) {
+        goto fail;
+    }
+    (void)fcntl(bridge->session_stdin, F_SETFD, FD_CLOEXEC);
+    (void)fcntl(bridge->session_stdout, F_SETFD, FD_CLOEXEC);
+    (void)fcntl(bridge->session_stderr, F_SETFD, FD_CLOEXEC);
+
+    bridge->pty_master = vprocHostOpen("/dev/ptmx", O_RDWR | O_NOCTTY, 0);
+    if (bridge->pty_master >= 0) {
+        if (grantpt(bridge->pty_master) != 0 || unlockpt(bridge->pty_master) != 0) {
+            goto fail;
+        }
+        char pty_slave_name[128];
+        if (ptsname_r(bridge->pty_master, pty_slave_name, sizeof(pty_slave_name)) != 0) {
+            goto fail;
+        }
+        bridge->pty_slave = vprocHostOpen(pty_slave_name, O_RDWR | O_NOCTTY, 0);
+        if (bridge->pty_slave < 0) {
+            goto fail;
+        }
+    } else {
+        int sv[2] = { -1, -1 };
+        if (vprocHostSocketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+            goto fail;
+        }
+        bridge->pty_master = sv[0];
+        bridge->pty_slave = sv[1];
+        if (microDebugEnabled()) {
+            fprintf(stderr,
+                    "[micro-bridge] using socketpair fallback host=(%d,%d)\n",
+                    bridge->pty_master,
+                    bridge->pty_slave);
+        }
+    }
+
+    if (vprocHostDup2(bridge->pty_slave, STDIN_FILENO) < 0 ||
+        vprocHostDup2(bridge->pty_slave, STDOUT_FILENO) < 0 ||
+        vprocHostDup2(bridge->pty_slave, STDERR_FILENO) < 0) {
         goto fail;
     }
 
-    if (vprocHostPipe(bridge->stdin_pipe) != 0 ||
-        vprocHostPipe(bridge->stdout_pipe) != 0 ||
-        vprocHostPipe(bridge->stderr_pipe) != 0) {
-        goto fail;
-    }
-
-    if (vprocHostDup2(bridge->stdin_pipe[0], STDIN_FILENO) < 0 ||
-        vprocHostDup2(bridge->stdout_pipe[1], STDOUT_FILENO) < 0 ||
-        vprocHostDup2(bridge->stderr_pipe[1], STDERR_FILENO) < 0) {
-        goto fail;
-    }
-
-    bridge->stdin_ctx.read_fd = bridge->vproc_stdin;
-    bridge->stdin_ctx.write_fd = bridge->stdin_pipe[1];
+    /* Feed micro stdin from the shell session stream. */
+    bridge->stdin_ctx.read_fd = bridge->session_stdin;
+    bridge->stdin_ctx.write_fd = bridge->pty_master;
     bridge->stdin_ctx.read_host = false;
     bridge->stdin_ctx.write_host = true;
 
-    bridge->stdout_ctx.read_fd = bridge->stdout_pipe[0];
-    bridge->stdout_ctx.write_fd = bridge->vproc_stdout;
-    bridge->stdout_ctx.read_host = true;
-    bridge->stdout_ctx.write_host = false;
-
-    bridge->stderr_ctx.read_fd = bridge->stderr_pipe[0];
-    bridge->stderr_ctx.write_fd = bridge->vproc_stderr;
-    bridge->stderr_ctx.read_host = true;
-    bridge->stderr_ctx.write_host = false;
+    /* Route micro output back into the shell session stream (not host stdout). */
+    bridge->output_ctx.read_fd = bridge->pty_master;
+    bridge->output_ctx.write_fd = bridge->session_stdout;
+    bridge->output_ctx.read_host = true;
+    bridge->output_ctx.write_host = false;
 
     if (pthread_create(&bridge->stdin_thread, NULL, microIoBridgeThreadMain, &bridge->stdin_ctx) != 0) {
         goto fail;
     }
     bridge->stdin_thread_started = true;
-    if (pthread_create(&bridge->stdout_thread, NULL, microIoBridgeThreadMain, &bridge->stdout_ctx) != 0) {
+    if (pthread_create(&bridge->output_thread, NULL, microIoBridgeThreadMain, &bridge->output_ctx) != 0) {
         goto fail;
     }
-    bridge->stdout_thread_started = true;
-    if (pthread_create(&bridge->stderr_thread, NULL, microIoBridgeThreadMain, &bridge->stderr_ctx) != 0) {
-        goto fail;
-    }
-    bridge->stderr_thread_started = true;
+    bridge->output_thread_started = true;
     bridge->active = true;
     if (microDebugEnabled()) {
         fprintf(stderr,
-                "[micro-bridge] setup ok host_saved=(%d,%d,%d) vproc_dup=(%d,%d,%d)\n",
+                "[micro-bridge] setup ok host_saved=(%d,%d,%d) session_dup=(%d,%d,%d) host_pty=(m:%d s:%d)\n",
                 bridge->saved_host_stdin,
                 bridge->saved_host_stdout,
                 bridge->saved_host_stderr,
-                bridge->vproc_stdin,
-                bridge->vproc_stdout,
-                bridge->vproc_stderr);
+                bridge->session_stdin,
+                bridge->session_stdout,
+                bridge->session_stderr,
+                bridge->pty_master,
+                bridge->pty_slave);
     }
     return true;
 
@@ -417,30 +438,26 @@ static void microHostStdioBridgeTeardown(MicroHostStdioBridge *bridge) {
         (void)vprocHostDup2(bridge->saved_host_stderr, STDERR_FILENO);
     }
 
-    microVprocCloseIfOpen(&bridge->vproc_stdin);
-    microVprocCloseIfOpen(&bridge->vproc_stdout);
-    microVprocCloseIfOpen(&bridge->vproc_stderr);
-
-    microHostCloseIfOpen(&bridge->stdin_pipe[0]);
-    microHostCloseIfOpen(&bridge->stdin_pipe[1]);
-    microHostCloseIfOpen(&bridge->stdout_pipe[0]);
-    microHostCloseIfOpen(&bridge->stdout_pipe[1]);
-    microHostCloseIfOpen(&bridge->stderr_pipe[0]);
-    microHostCloseIfOpen(&bridge->stderr_pipe[1]);
-
     if (bridge->stdin_thread_started) {
+        microHostCloseIfOpen(&bridge->pty_slave);
+        microHostCloseIfOpen(&bridge->pty_master);
+        microCloseIfOpen(&bridge->session_stdin);
+        (void)pthread_cancel(bridge->stdin_thread);
         (void)pthread_join(bridge->stdin_thread, NULL);
         bridge->stdin_thread_started = false;
     }
-    if (bridge->stdout_thread_started) {
-        (void)pthread_join(bridge->stdout_thread, NULL);
-        bridge->stdout_thread_started = false;
-    }
-    if (bridge->stderr_thread_started) {
-        (void)pthread_join(bridge->stderr_thread, NULL);
-        bridge->stderr_thread_started = false;
+    if (bridge->output_thread_started) {
+        microCloseIfOpen(&bridge->session_stdout);
+        (void)pthread_cancel(bridge->output_thread);
+        (void)pthread_join(bridge->output_thread, NULL);
+        bridge->output_thread_started = false;
     }
 
+    microHostCloseIfOpen(&bridge->pty_slave);
+    microHostCloseIfOpen(&bridge->pty_master);
+    microCloseIfOpen(&bridge->session_stdin);
+    microCloseIfOpen(&bridge->session_stdout);
+    microCloseIfOpen(&bridge->session_stderr);
     microHostCloseIfOpen(&bridge->saved_host_stdin);
     microHostCloseIfOpen(&bridge->saved_host_stdout);
     microHostCloseIfOpen(&bridge->saved_host_stderr);
@@ -451,6 +468,7 @@ static void microHostStdioBridgeTeardown(MicroHostStdioBridge *bridge) {
 }
 #endif
 
+#if !defined(PSCAL_TARGET_IOS)
 static int microSetupTty(void) {
     int fd = open("/dev/tty", O_RDWR);
     if (fd >= 0) {
@@ -466,6 +484,7 @@ static int microSetupTty(void) {
     }
     return fd;
 }
+#endif
 
 int smallclueRunMicro(int argc, char **argv) {
     MicroEnvBackup envBackup;
@@ -479,24 +498,49 @@ int smallclueRunMicro(int argc, char **argv) {
     }
 #if defined(PSCAL_TARGET_IOS)
     MicroHostStdioBridge hostBridge;
-    bool hostBridgeActive = microHostStdioBridgeSetup(&hostBridge);
+    bool hostBridgeActive = false;
+    const char *enableBridge = getenv("PSCALI_MICRO_HOST_BRIDGE");
+    bool bridgeRequested = true;
+    if (enableBridge && strcmp(enableBridge, "0") == 0) {
+        bridgeRequested = false;
+    }
+    if (bridgeRequested) {
+        hostBridgeActive = microHostStdioBridgeSetup(&hostBridge);
+    }
     if (microDebugEnabled()) {
-        fprintf(stderr, "[micro] host stdio bridge active=%d\n", hostBridgeActive ? 1 : 0);
+        fprintf(stderr,
+                "[micro] host stdio bridge requested=%d active=%d\n",
+                bridgeRequested ? 1 : 0,
+                hostBridgeActive ? 1 : 0);
     }
 #endif
     MicroStdFdBackup stdioBackup;
     microSaveStandardFds(&stdioBackup);
-    int dupFd = microSetupTty();
+    int dupFd = -1;
+#if defined(PSCAL_TARGET_IOS)
+    if (hostBridgeActive && microDebugEnabled()) {
+        fprintf(stderr, "[micro] skipping microSetupTty while host bridge is active\n");
+    }
+#else
+    dupFd = microSetupTty();
+#endif
     struct termios savedIos;
     bool savedIosValid = false;
     int ttyFd = STDIN_FILENO;
     bool haveTty = false;
     if (smallclueTcgetattr(ttyFd, &savedIos) != 0) {
+#if defined(PSCAL_TARGET_IOS)
+        /* On iOS keep micro bound to the active session stdio; do not fall back
+         * to opening /dev/tty (that can route to Xcode console instead of vpty). */
+        haveTty = false;
+        savedIosValid = false;
+#else
         ttyFd = dupFd >= 0 ? dupFd : open("/dev/tty", O_RDWR);
         if (ttyFd >= 0 && smallclueTcgetattr(ttyFd, &savedIos) == 0) {
             haveTty = true;
             savedIosValid = true;
         }
+#endif
     } else {
         haveTty = true;
         savedIosValid = true;
@@ -514,8 +558,10 @@ int smallclueRunMicro(int argc, char **argv) {
 
     int status = 1;
 #if defined(PSCAL_TARGET_IOS)
+    vprocProtectKqueueCloseEnter();
     extern int pscal_micro_main_entry(int argc, char **argv);
     status = pscal_micro_main_entry(launchArgc, launchArgv);
+    vprocProtectKqueueCloseExit();
 #else
     extern int pscal_micro_main_entry(int argc, char **argv) __attribute__((weak));
     if (!pscal_micro_main_entry) {
