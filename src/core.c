@@ -1949,18 +1949,18 @@ static int smallcluePsCommand(int argc, char **argv) {
     if (!snaps || count == 0) {
         free(snaps);
         if (isatty(STDOUT_FILENO)) {
-            printf("\033[1m PID   PPID  PGID   SID STATE      COMMAND\033[0m\n");
+            printf("\033[1m%4s %6s %5s %5s %-10s %s\033[0m\n", "PID", "PPID", "PGID", "SID", "STATE", "COMMAND");
         } else {
-            puts(" PID   PPID  PGID   SID STATE      COMMAND");
+            printf("%4s %6s %5s %5s %-10s %s\n", "PID", "PPID", "PGID", "SID", "STATE", "COMMAND");
         }
         puts(" <no virtual tasks>");
         return 0;
     }
 
     if (isatty(STDOUT_FILENO)) {
-        printf("\033[1m PID   PPID  PGID   SID STATE      COMMAND\033[0m\n");
+        printf("\033[1m%4s %6s %5s %5s %-10s %s\033[0m\n", "PID", "PPID", "PGID", "SID", "STATE", "COMMAND");
     } else {
-        puts(" PID   PPID  PGID   SID STATE      COMMAND");
+        printf("%4s %6s %5s %5s %-10s %s\n", "PID", "PPID", "PGID", "SID", "STATE", "COMMAND");
     }
     for (size_t i = 0; i < count; ++i) {
         const VProcSnapshot *s = &snaps[i];
@@ -2087,9 +2087,9 @@ static int smallcluePsCommand(int argc, char **argv) {
         }
 
         if (isatty(STDOUT_FILENO)) {
-            printf("\033[1m PID   PPID USER     COMMAND\033[0m\n");
+            printf("\033[1m%4s %6s %-8s %s\033[0m\n", "PID", "PPID", "USER", "COMMAND");
         } else {
-            printf(" PID   PPID USER     COMMAND\n");
+            printf("%4s %6s %-8s %s\n", "PID", "PPID", "USER", "COMMAND");
         }
         for (size_t i = 0; i < count; ++i) {
             struct passwd *pw = getpwuid(entries[i].uid);
@@ -2109,9 +2109,9 @@ static int smallcluePsCommand(int argc, char **argv) {
         uid_t uid = getuid();
         const char *cmd = argv && argv[0] ? argv[0] : "ps";
         if (isatty(STDOUT_FILENO)) {
-            printf("\033[1m PID   PPID USER     COMMAND\033[0m\n");
+            printf("\033[1m%4s %6s %-8s %s\033[0m\n", "PID", "PPID", "USER", "COMMAND");
         } else {
-            printf(" PID   PPID USER     COMMAND\n");
+            printf("%4s %6s %-8s %s\n", "PID", "PPID", "USER", "COMMAND");
         }
         struct passwd *pw = getpwuid(uid);
         char user_buf[32];
@@ -2324,10 +2324,17 @@ static int smallclueTopCommand(int argc, char **argv) {
         }
 #endif
 
-        char header[160];
-        int hn = snprintf(header, sizeof(header),
+        char header[256];
+        int hn = 0;
+        if (isatty(STDOUT_FILENO)) {
+            hn = snprintf(header, sizeof(header),
+                          "\033[1m%-6s %-6s %-6s %-6s %-3s %-8s %-10s %-6s %-6s %s\033[0m\n",
+                          "PID", "PPID", "PGID", "SID", "FG", "PTY", "STATE", "UTIME", "STIME", "CMD");
+        } else {
+            hn = snprintf(header, sizeof(header),
                           "%-6s %-6s %-6s %-6s %-3s %-8s %-10s %-6s %-6s %s\n",
                           "PID", "PPID", "PGID", "SID", "FG", "PTY", "STATE", "UTIME", "STIME", "CMD");
+        }
         if (hn > 0) {
             (void)smallclueWriteAll(STDOUT_FILENO, header, (size_t)hn);
         }
@@ -10401,13 +10408,23 @@ static void smallclueDfFormatSize(char *buf, size_t bufsize,
 }
 
 static void smallclueDfPrintHeader(bool human) {
-    printf("%-24s %12s %12s %12s %6s %s\n",
-           "Filesystem",
-           human ? "Size" : "1K-blocks",
-           human ? "Used" : "Used",
-           human ? "Avail" : "Avail",
-           "Use%",
-           "Mounted on");
+    if (isatty(STDOUT_FILENO)) {
+        printf("\033[1m%-24s %12s %12s %12s %6s %s\033[0m\n",
+               "Filesystem",
+               human ? "Size" : "1K-blocks",
+               human ? "Used" : "Used",
+               human ? "Avail" : "Avail",
+               "Use%",
+               "Mounted on");
+    } else {
+        printf("%-24s %12s %12s %12s %6s %s\n",
+               "Filesystem",
+               human ? "Size" : "1K-blocks",
+               human ? "Used" : "Used",
+               human ? "Avail" : "Avail",
+               "Use%",
+               "Mounted on");
+    }
 }
 
 static int smallclueDfCommand(int argc, char **argv) {
