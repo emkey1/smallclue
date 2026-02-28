@@ -124,6 +124,13 @@ int smallclueVprocTestCommand(int argc, char **argv);
 
 static ssize_t smallclueGetlineStream(char **line, size_t *cap, FILE *stream, int *out_errno);
 
+static void smallclueSecureMemzero(void *ptr, size_t size) {
+    volatile unsigned char *p = ptr;
+    while (size--) {
+        *p++ = 0;
+    }
+}
+
 static const char *smallclueResolvePath(const char *path, char *buffer, size_t buflen) {
     if (!path) {
         return NULL;
@@ -969,6 +976,7 @@ static int smallclueSudoCommand(int argc, char **argv) {
             char *pass = smallclueGetPass("[sudo] password for root: ");
             if (!pass) return 1;
             char *encrypted = crypt(pass, sp->sp_pwdp);
+            smallclueSecureMemzero(pass, strlen(pass));
             if (!encrypted || strcmp(encrypted, sp->sp_pwdp) != 0) {
                 fprintf(stderr, "sudo: authentication failure\n");
                 return 1;
@@ -1068,6 +1076,7 @@ static int smallcluePasswdCommand(int argc, char **argv) {
             return 1;
         }
         char *encrypted = crypt(pass, sp->sp_pwdp);
+        smallclueSecureMemzero(pass, strlen(pass));
         if (!encrypted || strcmp(encrypted, sp->sp_pwdp) != 0) {
             fprintf(stderr, "passwd: authentication failure\n");
             ulckpwdf();
@@ -1082,6 +1091,7 @@ static int smallcluePasswdCommand(int argc, char **argv) {
         return 1;
     }
     char *new_pass_copy = strdup(new_pass);
+    smallclueSecureMemzero(new_pass, strlen(new_pass));
     if (!new_pass_copy) {
         fprintf(stderr, "passwd: out of memory\n");
         ulckpwdf();
@@ -1089,8 +1099,13 @@ static int smallcluePasswdCommand(int argc, char **argv) {
     }
 
     char *confirm_pass = smallclueGetPass("Retype new password: ");
-    if (!confirm_pass || strcmp(new_pass_copy, confirm_pass) != 0) {
+    int mismatch = (!confirm_pass || strcmp(new_pass_copy, confirm_pass) != 0);
+    if (confirm_pass) {
+        smallclueSecureMemzero(confirm_pass, strlen(confirm_pass));
+    }
+    if (mismatch) {
         fprintf(stderr, "passwd: passwords do not match\n");
+        smallclueSecureMemzero(new_pass_copy, strlen(new_pass_copy));
         free(new_pass_copy);
         ulckpwdf();
         return 1;
@@ -1124,6 +1139,7 @@ static int smallcluePasswdCommand(int argc, char **argv) {
     salt[salt_idx] = '\0';
 
     char *hashed = crypt(new_pass_copy, salt);
+    smallclueSecureMemzero(new_pass_copy, strlen(new_pass_copy));
     free(new_pass_copy);
 
     if (!hashed) {
