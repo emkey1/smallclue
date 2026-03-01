@@ -11372,6 +11372,10 @@ static const char *smallclueStrCaseStr(const char *haystack, const char *needle,
     if (!ignore_case) {
         return strstr(haystack, needle);
     }
+#if defined(_GNU_SOURCE) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+    /* Optimization: Use optimized libc strcasestr for case-insensitive search */
+    return strcasestr(haystack, needle);
+#else
     size_t needle_len = strlen(needle);
     for (const char *p = haystack; *p; ++p) {
         size_t i = 0;
@@ -11394,6 +11398,7 @@ static const char *smallclueStrCaseStr(const char *haystack, const char *needle,
         }
     }
     return NULL;
+#endif
 }
 
 static bool smallclueParseDashLineCount(const char *arg, long *value) {

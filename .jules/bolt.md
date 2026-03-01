@@ -1,0 +1,3 @@
+## 2024-05-19 - Optimization of smallclueStrCaseStr for grep -i
+**Learning:** `grep -i` operations in this codebase suffer significantly from a manual character-by-character check for case-insensitive matching in the `smallclueStrCaseStr` helper when `ignore_case` is set.
+**Action:** Use `#if defined(_GNU_SOURCE) || defined(__APPLE__)` (and other BSDs) to utilize the `strcasestr` standard library function. This relies on the fact that `_GNU_SOURCE` is defined in the `setup_posix_env.sh` compilation script. The manual fallback mechanism is preserved to ensure compatibility on systems without `strcasestr`.
