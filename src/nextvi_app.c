@@ -15,6 +15,8 @@
 #include "termios_shim.h"
 #if defined(PSCAL_TARGET_IOS)
 #include "common/path_virtualization.h"
+#include "common/path_truncate.h"
+#include "ios/vproc.h"
 #endif
 
 extern int nextvi_main_entry(int argc, char **argv);
@@ -189,7 +191,103 @@ static void smallclueResetNextviGlobals(void) {
 typedef struct {
     int argc;
     char **argv;
+#if defined(PSCAL_TARGET_IOS)
+    VProc *vp;
+    VProcSessionStdio *session_stdio;
+#endif
 } NextviThreadArgs;
+
+#if defined(PSCAL_TARGET_IOS)
+static bool smallclueResolveEditorCwd(char *out, size_t out_len) {
+    if (!out || out_len == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    {
+        const char *pwd = getenv("PWD");
+        if (pwd && pwd[0] == '/') {
+            char stripped[PATH_MAX];
+            if (pathTruncateStrip(pwd, stripped, sizeof(stripped)) && stripped[0] == '/') {
+                snprintf(out, out_len, "%s", stripped);
+            } else {
+                snprintf(out, out_len, "%s", pwd);
+            }
+            return out[0] == '/';
+        }
+    }
+    if (vprocShellGetcwdShim(out, out_len) != NULL && out[0] == '/') {
+        return true;
+    }
+    if (getcwd(out, out_len) != NULL && out[0] == '/') {
+        char stripped[PATH_MAX];
+        if (pathTruncateStrip(out, stripped, sizeof(stripped)) && stripped[0] == '/') {
+            snprintf(out, out_len, "%s", stripped);
+        }
+        return true;
+    }
+    if (out_len > 1) {
+        out[0] = '/';
+        out[1] = '\0';
+        return true;
+    }
+    return false;
+}
+
+static void smallclueNormalizeEditorArgPaths(NextviThreadArgs *args) {
+    if (!args || args->argc <= 1 || !args->argv) {
+        return;
+    }
+    char cwd[PATH_MAX];
+    if (!smallclueResolveEditorCwd(cwd, sizeof(cwd))) {
+        return;
+    }
+    bool parse_options = true;
+    for (int i = 1; i < args->argc; ++i) {
+        char *arg = args->argv[i];
+        if (!arg || arg[0] == '\0') {
+            continue;
+        }
+        if (parse_options) {
+            if (strcmp(arg, "--") == 0) {
+                parse_options = false;
+                continue;
+            }
+            if (arg[0] == '-' && arg[1] != '\0') {
+                continue;
+            }
+            if (arg[0] == '+') {
+                continue;
+            }
+            parse_options = false;
+        }
+        if (arg[0] == '+') {
+            continue;
+        }
+        char resolved[PATH_MAX];
+        if (arg[0] == '/') {
+            char stripped[PATH_MAX];
+            if (pathTruncateStrip(arg, stripped, sizeof(stripped)) && stripped[0] == '/') {
+                snprintf(resolved, sizeof(resolved), "%s", stripped);
+            } else {
+                snprintf(resolved, sizeof(resolved), "%s", arg);
+            }
+        } else {
+            int written = snprintf(resolved, sizeof(resolved), "%s/%s",
+                                   (strcmp(cwd, "/") == 0) ? "" : cwd,
+                                   arg);
+            if (written <= 0 || written >= (int)sizeof(resolved)) {
+                continue;
+            }
+        }
+        char *replacement = strdup(resolved);
+        if (!replacement) {
+            continue;
+        }
+        free(args->argv[i]);
+        args->argv[i] = replacement;
+    }
+}
+#endif
 
 static char **smallclueCopyArgv(int argc, char **argv) {
     if (argc <= 0 || !argv) {
@@ -361,8 +459,49 @@ static int smallclueRunEditorChild(int argc, char **argv) {
 
 static void *smallclueRunEditorThread(void *opaque) {
     NextviThreadArgs *args = (NextviThreadArgs *)opaque;
+    bool activated = false;
+    bool stdio_swapped = false;
+    VProcSessionStdio *prev_stdio = NULL;
+#if defined(PSCAL_TARGET_IOS)
+    if (args && args->vp) {
+        vprocActivate(args->vp);
+        vprocRegisterThread(args->vp, pthread_self());
+        activated = true;
+        /*
+         * Keep editor relative-path resolution pinned to the invoking shell's
+         * cwd. Without this, reused command-scope vprocs can drift and nextvi
+         * may reopen relative targets as empty "new" files from a different cwd.
+         */
+        {
+            char shell_cwd[PATH_MAX];
+            if (smallclueResolveEditorCwd(shell_cwd, sizeof(shell_cwd)) &&
+                shell_cwd[0] == '/') {
+                (void)vprocChdirShim(shell_cwd);
+                setenv("PWD", shell_cwd, 1);
+            }
+        }
+    }
+    if (args && args->session_stdio) {
+        prev_stdio = vprocSessionStdioCurrent();
+        vprocSessionStdioActivate(args->session_stdio);
+        stdio_swapped = true;
+    }
+    sigset_t unblock;
+    sigemptyset(&unblock);
+    sigaddset(&unblock, SIGWINCH);
+    (void)pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
+#endif
     (void)smallclueRunEditorChild(args->argc, args->argv);
 
+#if defined(PSCAL_TARGET_IOS)
+    if (stdio_swapped) {
+        vprocSessionStdioActivate(prev_stdio);
+    }
+    if (activated) {
+        vprocUnregisterThread(args->vp, pthread_self());
+        vprocDeactivate();
+    }
+#endif
     pthread_mutex_lock(&s_nextvi_sessions_lock);
     nextviSessionUnregisterByThread(pthread_self());
     pthread_mutex_unlock(&s_nextvi_sessions_lock);
@@ -393,6 +532,11 @@ int smallclueRunEditor(int argc, char **argv) {
         smallclueFreeThreadArgs(args);
         return 1;
     }
+#if defined(PSCAL_TARGET_IOS)
+    smallclueNormalizeEditorArgPaths(args);
+    args->vp = vprocCurrent();
+    args->session_stdio = vprocSessionStdioCurrent();
+#endif
 
     // Identify target file and reserve a session slot to block duplicates.
     char *target_path = smallclueDetectTargetPath(argc, argv);
