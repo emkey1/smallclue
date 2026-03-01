@@ -461,8 +461,8 @@ static void *smallclueRunEditorThread(void *opaque) {
     NextviThreadArgs *args = (NextviThreadArgs *)opaque;
     bool activated = false;
     bool stdio_swapped = false;
-    VProcSessionStdio *prev_stdio = NULL;
 #if defined(PSCAL_TARGET_IOS)
+    VProcSessionStdio *prev_stdio = NULL;
     if (args && args->vp) {
         vprocActivate(args->vp);
         vprocRegisterThread(args->vp, pthread_self());
