@@ -320,29 +320,30 @@ static void microApplyBridgeWinsizeLocked(int pty_master,
                                           bool use_shim_ioctl,
                                           int cols,
                                           int rows) {
-    if ((pty_master < 0 && pty_slave < 0) || cols <= 0 || rows <= 0) {
+    if (cols <= 0 || rows <= 0) {
         return;
     }
-    struct winsize ws;
-    memset(&ws, 0, sizeof(ws));
-    ws.ws_col = (unsigned short)cols;
-    ws.ws_row = (unsigned short)rows;
-    if (use_shim_ioctl) {
-        if (!vprocCurrent()) {
-            return;
-        }
-        if (pty_slave >= 0) {
-            (void)vprocIoctlShim(pty_slave, TIOCSWINSZ, &ws);
-        }
-        if (pty_master >= 0) {
-            (void)vprocIoctlShim(pty_master, TIOCSWINSZ, &ws);
-        }
-    } else {
-        if (pty_slave >= 0) {
-            (void)ioctl(pty_slave, TIOCSWINSZ, &ws);
-        }
-        if (pty_master >= 0) {
-            (void)ioctl(pty_master, TIOCSWINSZ, &ws);
+    if (pty_master >= 0 || pty_slave >= 0) {
+        struct winsize ws;
+        memset(&ws, 0, sizeof(ws));
+        ws.ws_col = (unsigned short)cols;
+        ws.ws_row = (unsigned short)rows;
+        if (use_shim_ioctl) {
+            if (vprocCurrent()) {
+                if (pty_slave >= 0) {
+                    (void)vprocIoctlShim(pty_slave, TIOCSWINSZ, &ws);
+                }
+                if (pty_master >= 0) {
+                    (void)vprocIoctlShim(pty_master, TIOCSWINSZ, &ws);
+                }
+            }
+        } else {
+            if (pty_slave >= 0) {
+                (void)ioctl(pty_slave, TIOCSWINSZ, &ws);
+            }
+            if (pty_master >= 0) {
+                (void)ioctl(pty_master, TIOCSWINSZ, &ws);
+            }
         }
     }
     microUpdateSizeEnv(cols, rows);
@@ -390,7 +391,7 @@ void pscalMicroNotifySessionWinsize(uint64_t session_id, int cols, int rows) {
         }
     }
     microApplyBridgeWinsizeLocked(pty_master, pty_slave, pty_use_shim, cols, rows);
-    if (pty_master >= 0 || pty_slave >= 0) {
+    if (match) {
         microSignalResizeLocked();
     }
     pthread_mutex_unlock(&gMicroBridgeStateMu);
@@ -720,6 +721,63 @@ static void *microBridgeResizeThreadMain(void *opaque) {
     return NULL;
 }
 
+static bool microBridgeTryShimPty(MicroHostStdioBridge *bridge, int host_ptmx_errno) {
+    if (!bridge) {
+        return false;
+    }
+    const char *allow_shim_env = getenv("PSCALI_MICRO_ALLOW_SHIM_PTY");
+    /* iOS should use vproc virtual PTYs by default. Allow disabling
+     * only for targeted diagnostics with PSCALI_MICRO_ALLOW_SHIM_PTY=0. */
+    bool allow_shim = true;
+    if (allow_shim_env && strcmp(allow_shim_env, "0") == 0) {
+        allow_shim = false;
+    }
+    if (!allow_shim) {
+        if (microDebugEnabled()) {
+            fprintf(stderr,
+                    "[micro-bridge] shim PTY disabled (host errno=%d)\n",
+                    host_ptmx_errno);
+        }
+        return false;
+    }
+
+    int pty_num = -1;
+    int unlocked = 0;
+    char pty_slave_name[64];
+
+    bridge->pty_master = vprocOpenShim("/dev/ptmx", O_RDWR | O_NOCTTY, 0);
+    if (bridge->pty_master < 0) {
+        if (microDebugEnabled()) {
+            fprintf(stderr,
+                    "[micro-bridge] shim PTY unavailable: host errno=%d shim errno=%d\n",
+                    host_ptmx_errno,
+                    errno);
+        }
+        return false;
+    }
+
+    bridge->pty_use_shim = true;
+    bridge->vp = vprocCurrent();
+    (void)vprocIoctlShim(bridge->pty_master, TIOCSPTLCK_, &unlocked);
+    if (vprocIoctlShim(bridge->pty_master, TIOCGPTN_, &pty_num) != 0 || pty_num < 0) {
+        microCloseIfOpen(&bridge->pty_master, true);
+        bridge->pty_use_shim = false;
+        bridge->vp = NULL;
+        return false;
+    }
+
+    snprintf(pty_slave_name, sizeof(pty_slave_name), "/dev/pts/%d", pty_num);
+    bridge->pty_slave = vprocOpenShim(pty_slave_name, O_RDWR | O_NOCTTY, 0);
+    if (bridge->pty_slave < 0) {
+        microCloseIfOpen(&bridge->pty_master, true);
+        bridge->pty_use_shim = false;
+        bridge->vp = NULL;
+        return false;
+    }
+
+    return true;
+}
+
 static bool microHostStdioBridgeSetup(MicroHostStdioBridge *bridge,
                                       VProcSessionStdio *preferred_session_stdio,
                                       uint64_t preferred_session_id) {
@@ -759,6 +817,17 @@ static bool microHostStdioBridgeSetup(MicroHostStdioBridge *bridge,
     if (session_id == 0 && PSCALRuntimeCurrentSessionId) {
         session_id = PSCALRuntimeCurrentSessionId();
     }
+    if (preferred_session_id != 0 && session_id != preferred_session_id) {
+        microResizeTracef("[micro-resize] micro bridgeSetup session override resolved=%llu preferred=%llu",
+                          (unsigned long long)session_id,
+                          (unsigned long long)preferred_session_id);
+        session_id = preferred_session_id;
+        if (preferred_session_stdio &&
+            preferred_session_stdio->session_id == preferred_session_id) {
+            session_stdio = preferred_session_stdio;
+            vprocSessionStdioActivate(session_stdio);
+        }
+    }
     if (session_id == 0) {
         microResizeTracef("[micro-resize] micro bridgeSetup missing-session preferred=%llu runtime_current=%llu",
                           (unsigned long long)preferred_session_id,
@@ -772,98 +841,84 @@ static bool microHostStdioBridgeSetup(MicroHostStdioBridge *bridge,
                       (void *)bridge->session_stdio,
                       (unsigned long long)preferred_session_id);
 
-    bridge->pty_master = vprocHostOpen("/dev/ptmx", O_RDWR | O_NOCTTY, 0);
-    if (bridge->pty_master < 0) {
-        bridge->pty_master = vprocHostOpen("/private/dev/ptmx", O_RDWR | O_NOCTTY, 0);
+    const bool force_pipe_stdio_mode = true;
+    int host_ptmx_errno = 0;
+    const char *allow_host_pty_env = getenv("PSCALI_MICRO_ALLOW_HOST_PTY");
+    /* Keep micro attached to vproc/session PTYs by default on iOS.
+     * Enable host PTY fallback only for targeted diagnostics. */
+    bool allow_host_pty_fallback = false;
+    if (allow_host_pty_env && *allow_host_pty_env && strcmp(allow_host_pty_env, "0") != 0) {
+        allow_host_pty_fallback = true;
     }
-    if (bridge->pty_master < 0) {
-        bridge->pty_master = vprocHostOpen("/dev/pts/ptmx", O_RDWR | O_NOCTTY, 0);
-    }
-    if (bridge->pty_master < 0) {
-        bridge->pty_master = vprocHostOpen("/private/dev/pts/ptmx", O_RDWR | O_NOCTTY, 0);
-    }
-    if (bridge->pty_master >= 0) {
-        char pty_slave_name[128];
-        if (grantpt(bridge->pty_master) != 0 || unlockpt(bridge->pty_master) != 0) {
-            goto fail;
+    if (!force_pipe_stdio_mode && !microBridgeTryShimPty(bridge, 0) && allow_host_pty_fallback) {
+        bridge->pty_master = vprocHostOpen("/dev/ptmx", O_RDWR | O_NOCTTY, 0);
+        if (bridge->pty_master < 0) {
+            bridge->pty_master = vprocHostOpen("/private/dev/ptmx", O_RDWR | O_NOCTTY, 0);
         }
-        if (ptsname_r(bridge->pty_master, pty_slave_name, sizeof(pty_slave_name)) != 0) {
-            goto fail;
+        if (bridge->pty_master < 0) {
+            bridge->pty_master = vprocHostOpen("/dev/pts/ptmx", O_RDWR | O_NOCTTY, 0);
         }
-        bridge->pty_slave = vprocHostOpen(pty_slave_name, O_RDWR | O_NOCTTY, 0);
-        if (bridge->pty_slave < 0) {
-            goto fail;
+        if (bridge->pty_master < 0) {
+            bridge->pty_master = vprocHostOpen("/private/dev/pts/ptmx", O_RDWR | O_NOCTTY, 0);
         }
-    } else {
-        int host_ptmx_errno = errno;
+        if (bridge->pty_master >= 0) {
+            char pty_slave_name[128];
+            if (grantpt(bridge->pty_master) != 0 || unlockpt(bridge->pty_master) != 0) {
+                goto fail;
+            }
+            if (ptsname_r(bridge->pty_master, pty_slave_name, sizeof(pty_slave_name)) != 0) {
+                goto fail;
+            }
+            bridge->pty_slave = vprocHostOpen(pty_slave_name, O_RDWR | O_NOCTTY, 0);
+            if (bridge->pty_slave < 0) {
+                goto fail;
+            }
+        } else {
+            host_ptmx_errno = errno;
 #if defined(PSCAL_MICRO_HAS_OPENPTY)
-        int openpty_master = -1;
-        int openpty_slave = -1;
-        if (openpty(&openpty_master, &openpty_slave, NULL, NULL, NULL) == 0) {
-            bridge->pty_master = openpty_master;
-            bridge->pty_slave = openpty_slave;
-            if (microDebugEnabled()) {
-                fprintf(stderr,
-                        "[micro-bridge] bridgeSetup host PTY allocated via openpty (ptmx errno=%d)\n",
-                        host_ptmx_errno);
-            }
-        }
-#endif
-        if (bridge->pty_master < 0 || bridge->pty_slave < 0) {
-            const char *allow_shim_env = getenv("PSCALI_MICRO_ALLOW_SHIM_PTY");
-            /* iOS should use vproc virtual PTYs by default. Allow disabling
-             * only for targeted diagnostics with PSCALI_MICRO_ALLOW_SHIM_PTY=0. */
-            bool allow_shim_fallback = true;
-            if (allow_shim_env && strcmp(allow_shim_env, "0") == 0) {
-                allow_shim_fallback = false;
-            }
-            int pty_num = -1;
-            int unlocked = 0;
-            char pty_slave_name[64];
-            if (allow_shim_fallback) {
-                bridge->pty_master = vprocOpenShim("/dev/ptmx", O_RDWR | O_NOCTTY, 0);
-                if (bridge->pty_master >= 0) {
-                    bridge->pty_use_shim = true;
-                    bridge->vp = vprocCurrent();
-                    (void)vprocIoctlShim(bridge->pty_master, TIOCSPTLCK_, &unlocked);
-                    if (vprocIoctlShim(bridge->pty_master, TIOCGPTN_, &pty_num) == 0 && pty_num >= 0) {
-                        snprintf(pty_slave_name, sizeof(pty_slave_name), "/dev/pts/%d", pty_num);
-                        bridge->pty_slave = vprocOpenShim(pty_slave_name, O_RDWR | O_NOCTTY, 0);
-                        if (bridge->pty_slave < 0) {
-                            microCloseIfOpen(&bridge->pty_master, true);
-                            bridge->pty_use_shim = false;
-                            bridge->vp = NULL;
-                        }
-                    } else {
-                        microCloseIfOpen(&bridge->pty_master, true);
-                        bridge->pty_use_shim = false;
-                        bridge->vp = NULL;
-                    }
-                } else if (microDebugEnabled()) {
+            int openpty_master = -1;
+            int openpty_slave = -1;
+            if (openpty(&openpty_master, &openpty_slave, NULL, NULL, NULL) == 0) {
+                bridge->pty_master = openpty_master;
+                bridge->pty_slave = openpty_slave;
+                if (microDebugEnabled()) {
                     fprintf(stderr,
-                            "[micro-bridge] bridgeSetup shim PTY unavailable: host errno=%d shim errno=%d\n",
-                            host_ptmx_errno,
-                            errno);
+                            "[micro-bridge] bridgeSetup host PTY allocated via openpty (ptmx errno=%d)\n",
+                            host_ptmx_errno);
                 }
-            } else if (microDebugEnabled()) {
-                fprintf(stderr,
-                        "[micro-bridge] bridgeSetup host PTY unavailable errno=%d (shim fallback disabled)\n",
-                        host_ptmx_errno);
+            }
+#endif
+            if (bridge->pty_master < 0 || bridge->pty_slave < 0) {
+                (void)microBridgeTryShimPty(bridge, host_ptmx_errno);
             }
         }
-        if (bridge->pty_master < 0 || bridge->pty_slave < 0) {
-            /* Last-resort mode: no PTY semantics, but keep I/O attached to
-             * the active tab via host stdio capture pipes. */
-            bridge->pipe_stdio_mode = true;
-            bridge->pty_master = -1;
-            bridge->pty_slave = -1;
-            bridge->pty_use_shim = false;
-            bridge->vp = NULL;
-            if (microDebugEnabled()) {
-                fprintf(stderr,
-                        "[micro-bridge] bridgeSetup fallback to stdio-pipe relay only (ptmx errno=%d)\n",
-                        host_ptmx_errno);
-            }
+    } else if (!force_pipe_stdio_mode && !allow_host_pty_fallback && bridge->pty_master < 0) {
+        if (microDebugEnabled()) {
+            fprintf(stderr,
+                    "[micro-bridge] host PTY fallback disabled; shim PTY required\n");
+        }
+    }
+
+    if (force_pipe_stdio_mode) {
+        bridge->pipe_stdio_mode = true;
+        bridge->pty_master = -1;
+        bridge->pty_slave = -1;
+        bridge->pty_use_shim = false;
+        bridge->vp = NULL;
+    }
+
+    if (bridge->pty_master < 0 || bridge->pty_slave < 0) {
+        /* Last-resort mode: no PTY semantics, but keep I/O attached to
+         * the active tab via host stdio capture pipes. */
+        bridge->pipe_stdio_mode = true;
+        bridge->pty_master = -1;
+        bridge->pty_slave = -1;
+        bridge->pty_use_shim = false;
+        bridge->vp = NULL;
+        if (microDebugEnabled()) {
+            fprintf(stderr,
+                    "[micro-bridge] bridgeSetup fallback to stdio-pipe relay only (ptmx errno=%d)\n",
+                    host_ptmx_errno);
         }
     }
 
@@ -1123,18 +1178,38 @@ int smallclueRunMicro(int argc, char **argv) {
     uint64_t activeSessionId = 0;
     bool launchSlotAcquired = false;
     VProcSessionStdio *launchSession = vprocSessionStdioCurrent();
-    if ((!launchSession || launchSession->session_id == 0) &&
-        PSCALRuntimeGetCurrentRuntimeStdio) {
-        VProcSessionStdio *runtimeSession = PSCALRuntimeGetCurrentRuntimeStdio();
+    VProcSessionStdio *runtimeSession = NULL;
+    uint64_t runtimeSessionId = 0;
+    if (PSCALRuntimeGetCurrentRuntimeStdio) {
+        runtimeSession = PSCALRuntimeGetCurrentRuntimeStdio();
         if (runtimeSession && runtimeSession->session_id != 0) {
-            launchSession = runtimeSession;
+            runtimeSessionId = runtimeSession->session_id;
         }
+    }
+    if (PSCALRuntimeCurrentSessionId) {
+        uint64_t currentRuntimeSessionId = PSCALRuntimeCurrentSessionId();
+        if (currentRuntimeSessionId != 0) {
+            runtimeSessionId = currentRuntimeSessionId;
+        }
+    }
+    if ((!launchSession || launchSession->session_id == 0) &&
+        runtimeSession && runtimeSession->session_id != 0) {
+        launchSession = runtimeSession;
     }
     if (launchSession) {
         launchSessionId = launchSession->session_id;
     }
-    if (launchSessionId == 0 && PSCALRuntimeCurrentSessionId) {
-        launchSessionId = PSCALRuntimeCurrentSessionId();
+    if (runtimeSessionId != 0 && launchSessionId != runtimeSessionId) {
+        microResizeTracef("[micro-resize] micro launch session override launch=%llu runtime=%llu",
+                          (unsigned long long)launchSessionId,
+                          (unsigned long long)runtimeSessionId);
+        launchSessionId = runtimeSessionId;
+        if (runtimeSession && runtimeSession->session_id == runtimeSessionId) {
+            launchSession = runtimeSession;
+        }
+    }
+    if (launchSessionId == 0) {
+        launchSessionId = runtimeSessionId;
     }
     if (launchSessionId != 0) {
         int launchCols = 0;
@@ -1173,16 +1248,8 @@ int smallclueRunMicro(int argc, char **argv) {
 #if defined(PSCAL_TARGET_IOS)
     MicroHostStdioBridge hostBridge;
     bool hostBridgeActive = false;
-    bool bridgeStrictFailure = true;
-    const char *enableBridge = getenv("PSCALI_MICRO_HOST_BRIDGE");
-    bool bridgeRequested = true;
-    if (enableBridge && strcmp(enableBridge, "0") == 0) {
-        bridgeRequested = false;
-    }
-    const char *bridgeStrict = getenv("PSCALI_MICRO_BRIDGE_STRICT");
-    if (bridgeStrict && strcmp(bridgeStrict, "0") == 0) {
-        bridgeStrictFailure = false;
-    }
+    const bool bridgeRequested = true;
+    const bool bridgeStrictFailure = true;
     if (bridgeRequested) {
         hostBridgeActive = microHostStdioBridgeSetup(&hostBridge,
                                                      launchSession,
@@ -1204,19 +1271,6 @@ int smallclueRunMicro(int argc, char **argv) {
             fprintf(stderr,
                     "micro: unable to initialize PTY bridge (errno=%d), continuing without bridge\n",
                     bridge_errno);
-        }
-        if (hostBridgeActive && hostBridge.pipe_stdio_mode && bridgeStrictFailure) {
-            fprintf(stderr,
-                    "micro: unable to initialize PTY bridge (strict mode, no PTY available)\n");
-            microHostStdioBridgeTeardown(&hostBridge);
-            hostBridgeActive = false;
-            free(patchedArgv);
-            microRestoreEnvironment(&envBackup);
-            microBridgeMainThreadSet((pthread_t)0, false);
-            if (launchSlotAcquired) {
-                microReleaseLaunchSlot();
-            }
-            return 1;
         }
     }
     microResizeTracef("[micro-resize] micro bridge requested=%d active=%d launch_session=%llu bridge_session=%llu",
