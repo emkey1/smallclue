@@ -130,6 +130,12 @@ static void microPrepareEnvironment(MicroEnvBackup *backup) {
     setenv("TERM", "xterm-256color", 1);
     setenv("PSCALI_TCELL_USE_STDIO", "1", 1);
     setenv("PSCALI_TCELL_ALLOW_NONRAW", "0", 1);
+    if (!getenv("PSCAL_MICRO_EMBEDDED")) {
+        setenv("PSCAL_MICRO_EMBEDDED", "1", 1);
+    }
+    if (!getenv("PSCAL_MICRO_ENV_RESIZE_POLL")) {
+        setenv("PSCAL_MICRO_ENV_RESIZE_POLL", "1", 1);
+    }
 
 #if defined(PSCAL_TARGET_IOS)
     char resolvedWorkdir[PATH_MAX];
@@ -315,6 +321,142 @@ static void microUpdateSizeEnv(int cols, int rows) {
     }
 }
 
+static int microParsePositiveEnvInt(const char *name) {
+    if (!name || !*name) {
+        return 0;
+    }
+    const char *value = getenv(name);
+    if (!value || !*value) {
+        return 0;
+    }
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (end == value || (end && *end != '\0') || parsed <= 0 || parsed > 1000) {
+        return 0;
+    }
+    return (int)parsed;
+}
+
+static bool microProbeWinsizeFd(int fd, int *cols_out, int *rows_out) {
+    if (fd < 0 || !cols_out || !rows_out) {
+        return false;
+    }
+    struct winsize ws;
+    memset(&ws, 0, sizeof(ws));
+    if (ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0) {
+        *cols_out = (int)ws.ws_col;
+        *rows_out = (int)ws.ws_row;
+        return true;
+    }
+#if defined(PSCAL_TARGET_IOS)
+    if (vprocCurrent()) {
+        memset(&ws, 0, sizeof(ws));
+        if (vprocIoctlShim(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0) {
+            *cols_out = (int)ws.ws_col;
+            *rows_out = (int)ws.ws_row;
+            return true;
+        }
+    }
+#endif
+    return false;
+}
+
+static bool microProbeWinsizeSessionStdio(const VProcSessionStdio *session_stdio,
+                                          int *cols_out,
+                                          int *rows_out,
+                                          const char **source_out) {
+    if (!session_stdio || !cols_out || !rows_out) {
+        return false;
+    }
+    if (microProbeWinsizeFd(session_stdio->stdout_host_fd, cols_out, rows_out)) {
+        if (source_out) {
+            *source_out = "session-stdout";
+        }
+        return true;
+    }
+    if (microProbeWinsizeFd(session_stdio->stdin_host_fd, cols_out, rows_out)) {
+        if (source_out) {
+            *source_out = "session-stdin";
+        }
+        return true;
+    }
+    if (microProbeWinsizeFd(session_stdio->stderr_host_fd, cols_out, rows_out)) {
+        if (source_out) {
+            *source_out = "session-stderr";
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool microResolveLaunchWinsize(uint64_t session_id,
+                                      const VProcSessionStdio *session_stdio,
+                                      int *cols_out,
+                                      int *rows_out,
+                                      const char **source_out) {
+    if (!cols_out || !rows_out) {
+        return false;
+    }
+    *cols_out = 0;
+    *rows_out = 0;
+    if (source_out) {
+        *source_out = "none";
+    }
+
+    if (microProbeWinsizeSessionStdio(session_stdio, cols_out, rows_out, source_out)) {
+        return true;
+    }
+
+    if (microProbeWinsizeFd(STDOUT_FILENO, cols_out, rows_out)) {
+        if (source_out) {
+            *source_out = "stdout";
+        }
+        return true;
+    }
+    if (microProbeWinsizeFd(STDIN_FILENO, cols_out, rows_out)) {
+        if (source_out) {
+            *source_out = "stdin";
+        }
+        return true;
+    }
+    if (microProbeWinsizeFd(STDERR_FILENO, cols_out, rows_out)) {
+        if (source_out) {
+            *source_out = "stderr";
+        }
+        return true;
+    }
+    if (session_id != 0) {
+        /* Runtime/session binding can lag slightly behind command launch on iOS.
+         * Retry briefly so startup geometry reflects the active terminal. */
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            if (vprocGetSessionWinsize(session_id, cols_out, rows_out) == 0 &&
+                *cols_out > 0 &&
+                *rows_out > 0) {
+                if (source_out) {
+                    *source_out = "session";
+                }
+                return true;
+            }
+            if (attempt < 7) {
+                usleep(25000);
+            }
+        }
+    }
+
+    int env_cols = microParsePositiveEnvInt("COLUMNS");
+    int env_rows = microParsePositiveEnvInt("LINES");
+    if (env_cols > 0 && env_rows > 0) {
+        *cols_out = env_cols;
+        *rows_out = env_rows;
+        if (source_out) {
+            *source_out = "env";
+        }
+        return true;
+    }
+
+    return false;
+}
+
 static void microApplyBridgeWinsizeLocked(int pty_master,
                                           int pty_slave,
                                           bool use_shim_ioctl,
@@ -390,8 +532,8 @@ void pscalMicroNotifySessionWinsize(uint64_t session_id, int cols, int rows) {
             miss_log_budget--;
         }
     }
-    microApplyBridgeWinsizeLocked(pty_master, pty_slave, pty_use_shim, cols, rows);
     if (match) {
+        microApplyBridgeWinsizeLocked(pty_master, pty_slave, pty_use_shim, cols, rows);
         microSignalResizeLocked();
     }
     pthread_mutex_unlock(&gMicroBridgeStateMu);
@@ -842,9 +984,10 @@ static bool microHostStdioBridgeSetup(MicroHostStdioBridge *bridge,
                       (unsigned long long)preferred_session_id);
 
     const char *force_pipe_env = getenv("PSCALI_MICRO_FORCE_PIPE");
-    /* Default to pipe relay mode on iOS so micro output cannot leak to the
-     * host/Xcode console when writes bypass interposed shim calls. Allow
-     * PSCALI_MICRO_FORCE_PIPE=0 for targeted PTY diagnostics. */
+    /* Keep pipe relay as default so all micro output stays on the active
+     * terminal tab instead of leaking to host/Xcode console streams.
+     * PTY-first mode can still be enabled for diagnostics with
+     * PSCALI_MICRO_FORCE_PIPE=0. */
     bool force_pipe_stdio_mode = true;
     if (force_pipe_env && *force_pipe_env) {
         force_pipe_stdio_mode = (strcmp(force_pipe_env, "0") != 0);
@@ -973,20 +1116,34 @@ static bool microHostStdioBridgeSetup(MicroHostStdioBridge *bridge,
     /* Seed initial size from the active session PTY when available. This is
      * more reliable than host stdout in embedded/iOS contexts. */
     if (!microBridgeApplySessionWinsize(bridge, true, false)) {
-        struct winsize ws;
-        memset(&ws, 0, sizeof(ws));
-        if (bridge->saved_host_stdout >= 0 &&
-            ioctl(bridge->saved_host_stdout, TIOCGWINSZ, &ws) == 0 &&
-            ws.ws_col > 0 &&
-            ws.ws_row > 0) {
+        int host_cols = 0;
+        int host_rows = 0;
+        const char *seed_source = "none";
+        if (microProbeWinsizeSessionStdio(bridge->session_stdio, &host_cols, &host_rows, &seed_source)) {
+            /* source already set by helper */
+        } else if (microProbeWinsizeFd(bridge->saved_host_stdout, &host_cols, &host_rows)) {
+            seed_source = "host-stdout";
+        } else if (microProbeWinsizeFd(bridge->saved_host_stdin, &host_cols, &host_rows)) {
+            seed_source = "host-stdin";
+        } else if (microProbeWinsizeFd(bridge->saved_host_stderr, &host_cols, &host_rows)) {
+            seed_source = "host-stderr";
+        } else {
+            host_cols = microParsePositiveEnvInt("COLUMNS");
+            host_rows = microParsePositiveEnvInt("LINES");
+            if (host_cols > 0 && host_rows > 0) {
+                seed_source = "env";
+            }
+        }
+        if (host_cols > 0 && host_rows > 0) {
             microApplyBridgeWinsizeLocked(bridge->pty_master,
                                           bridge->pty_slave,
                                           bridge->pty_use_shim,
-                                          (int)ws.ws_col,
-                                          (int)ws.ws_row);
-            bridge->last_cols = (int)ws.ws_col;
-            bridge->last_rows = (int)ws.ws_row;
-            microResizeTracef("[micro-resize] micro bridgeSetup seeded-from-host session=%llu cols=%d rows=%d",
+                                          host_cols,
+                                          host_rows);
+            bridge->last_cols = host_cols;
+            bridge->last_rows = host_rows;
+            microResizeTracef("[micro-resize] micro bridgeSetup seeded-from-%s session=%llu cols=%d rows=%d",
+                              seed_source,
                               (unsigned long long)bridge->session_id,
                               bridge->last_cols,
                               bridge->last_rows);
@@ -1216,23 +1373,25 @@ int smallclueRunMicro(int argc, char **argv) {
     if (launchSessionId == 0) {
         launchSessionId = runtimeSessionId;
     }
-    if (launchSessionId != 0) {
+    {
         int launchCols = 0;
         int launchRows = 0;
-        if (vprocGetSessionWinsize(launchSessionId, &launchCols, &launchRows) == 0 &&
-            launchCols > 0 &&
-            launchRows > 0) {
+        const char *launchSource = "none";
+        if (microResolveLaunchWinsize(launchSessionId,
+                                      launchSession,
+                                      &launchCols,
+                                      &launchRows,
+                                      &launchSource)) {
             microUpdateSizeEnv(launchCols, launchRows);
-            microResizeTracef("[micro-resize] micro launch seeded env session=%llu cols=%d rows=%d",
+            microResizeTracef("[micro-resize] micro launch seeded env source=%s session=%llu cols=%d rows=%d",
+                              launchSource,
                               (unsigned long long)launchSessionId,
                               launchCols,
                               launchRows);
         } else {
-            microResizeTracef("[micro-resize] micro launch no-session-size session=%llu",
+            microResizeTracef("[micro-resize] micro launch unable to resolve winsize session=%llu",
                               (unsigned long long)launchSessionId);
         }
-    } else {
-        microResizeTracef("[micro-resize] micro launch has no session id");
     }
     if (!microAcquireLaunchSlot(launchSessionId, &activeSessionId)) {
         microReportLaunchBusy(launchSessionId, activeSessionId);
