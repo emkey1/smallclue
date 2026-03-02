@@ -12884,18 +12884,37 @@ static int smallclueTrCommand(int argc, char **argv) {
             map[from] = to;
         }
     }
-    int ch;
-    while ((ch = getchar()) != EOF) {
-        unsigned char c = (unsigned char)ch;
+    char buf[16384];
+    char out_buf[16384];
+    ssize_t n;
+    int read_err = 0;
+
+    while ((n = smallclueReadStream(stdin, buf, sizeof(buf), &read_err)) > 0) {
         if (delete_only) {
-            if (delete_map[c]) {
-                continue;
+            size_t out_idx = 0;
+            for (ssize_t i = 0; i < n; ++i) {
+                unsigned char c = (unsigned char)buf[i];
+                if (!delete_map[c]) {
+                    out_buf[out_idx++] = c;
+                }
             }
-            putchar(c);
+            if (out_idx > 0) {
+                fwrite(out_buf, 1, out_idx, stdout);
+            }
         } else {
-            putchar(map[c]);
+            for (ssize_t i = 0; i < n; ++i) {
+                unsigned char c = (unsigned char)buf[i];
+                buf[i] = map[c];
+            }
+            fwrite(buf, 1, (size_t)n, stdout);
         }
     }
+
+    if (read_err) {
+        fprintf(stderr, "tr: read error: %s\n", strerror(read_err));
+        return 1;
+    }
+
     return 0;
 }
 
