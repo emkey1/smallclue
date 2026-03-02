@@ -841,7 +841,9 @@ static bool microHostStdioBridgeSetup(MicroHostStdioBridge *bridge,
                       (void *)bridge->session_stdio,
                       (unsigned long long)preferred_session_id);
 
-    const bool force_pipe_stdio_mode = true;
+    const char *force_pipe_env = getenv("PSCALI_MICRO_FORCE_PIPE");
+    const bool force_pipe_stdio_mode =
+        (force_pipe_env && *force_pipe_env && strcmp(force_pipe_env, "0") != 0);
     int host_ptmx_errno = 0;
     const char *allow_host_pty_env = getenv("PSCALI_MICRO_ALLOW_HOST_PTY");
     /* Keep micro attached to vproc/session PTYs by default on iOS.
