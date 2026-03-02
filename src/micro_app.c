@@ -698,9 +698,11 @@ static bool microBridgeApplySessionWinsize(MicroHostStdioBridge *bridge,
 static void *microBridgeResizeThreadMain(void *opaque) {
     MicroHostStdioBridge *bridge = (MicroHostStdioBridge *)opaque;
     bool vproc_active = false;
+    bool signal_resize = false;
     if (!bridge) {
         return NULL;
     }
+    signal_resize = !bridge->pipe_stdio_mode;
     if (bridge->pty_use_shim && bridge->vp) {
         vprocActivate(bridge->vp);
         vprocRegisterThread(bridge->vp, pthread_self());
@@ -711,7 +713,7 @@ static void *microBridgeResizeThreadMain(void *opaque) {
     sigaddset(&blocked, SIGPIPE);
     (void)pthread_sigmask(SIG_BLOCK, &blocked, NULL);
     while (!bridge->stop_requested) {
-        (void)microBridgeApplySessionWinsize(bridge, false, true);
+        (void)microBridgeApplySessionWinsize(bridge, false, signal_resize);
         usleep(150000);
     }
     if (vproc_active) {
@@ -842,8 +844,13 @@ static bool microHostStdioBridgeSetup(MicroHostStdioBridge *bridge,
                       (unsigned long long)preferred_session_id);
 
     const char *force_pipe_env = getenv("PSCALI_MICRO_FORCE_PIPE");
-    const bool force_pipe_stdio_mode =
-        (force_pipe_env && *force_pipe_env && strcmp(force_pipe_env, "0") != 0);
+    /* Default to pipe relay mode on iOS so micro output cannot leak to the
+     * host/Xcode console when writes bypass interposed shim calls. Allow
+     * PSCALI_MICRO_FORCE_PIPE=0 for targeted PTY diagnostics. */
+    bool force_pipe_stdio_mode = true;
+    if (force_pipe_env && *force_pipe_env) {
+        force_pipe_stdio_mode = (strcmp(force_pipe_env, "0") != 0);
+    }
     int host_ptmx_errno = 0;
     const char *allow_host_pty_env = getenv("PSCALI_MICRO_ALLOW_HOST_PTY");
     /* Keep micro attached to vproc/session PTYs by default on iOS.
@@ -1064,12 +1071,10 @@ static bool microHostStdioBridgeSetup(MicroHostStdioBridge *bridge,
                       bridge->pty_master,
                       bridge->pty_slave,
                       bridge->pty_use_shim ? 1 : 0);
-    if (!bridge->pipe_stdio_mode) {
-        if (vprocHostPthreadCreate(&bridge->resize_thread, NULL, microBridgeResizeThreadMain, bridge) == 0) {
-            bridge->resize_thread_started = true;
-        } else if (microDebugEnabled()) {
-            fprintf(stderr, "[micro-bridge] resize thread create failed errno=%d\n", errno);
-        }
+    if (vprocHostPthreadCreate(&bridge->resize_thread, NULL, microBridgeResizeThreadMain, bridge) == 0) {
+        bridge->resize_thread_started = true;
+    } else if (microDebugEnabled()) {
+        fprintf(stderr, "[micro-bridge] resize thread create failed errno=%d\n", errno);
     }
     if (microDebugEnabled()) {
         fprintf(stderr,
