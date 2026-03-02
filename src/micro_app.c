@@ -698,11 +698,9 @@ static bool microBridgeApplySessionWinsize(MicroHostStdioBridge *bridge,
 static void *microBridgeResizeThreadMain(void *opaque) {
     MicroHostStdioBridge *bridge = (MicroHostStdioBridge *)opaque;
     bool vproc_active = false;
-    bool signal_resize = false;
     if (!bridge) {
         return NULL;
     }
-    signal_resize = !bridge->pipe_stdio_mode;
     if (bridge->pty_use_shim && bridge->vp) {
         vprocActivate(bridge->vp);
         vprocRegisterThread(bridge->vp, pthread_self());
@@ -713,7 +711,7 @@ static void *microBridgeResizeThreadMain(void *opaque) {
     sigaddset(&blocked, SIGPIPE);
     (void)pthread_sigmask(SIG_BLOCK, &blocked, NULL);
     while (!bridge->stop_requested) {
-        (void)microBridgeApplySessionWinsize(bridge, false, signal_resize);
+        (void)microBridgeApplySessionWinsize(bridge, false, true);
         usleep(150000);
     }
     if (vproc_active) {
