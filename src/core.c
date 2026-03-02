@@ -2326,10 +2326,19 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         char header[160];
         int hn = snprintf(header, sizeof(header),
-                          "%-6s %-6s %-6s %-6s %-3s %-8s %-10s %-6s %-6s %s\n",
+                          "%-6s %-6s %-6s %-6s %-3s %-8s %-10s %-6s %-6s %s",
                           "PID", "PPID", "PGID", "SID", "FG", "PTY", "STATE", "UTIME", "STIME", "CMD");
         if (hn > 0) {
-            (void)smallclueWriteAll(STDOUT_FILENO, header, (size_t)hn);
+            char styled_header[256];
+            int styled_hn;
+            if (isatty(STDOUT_FILENO)) {
+                styled_hn = snprintf(styled_header, sizeof(styled_header), "\033[1m%s\033[0m\n", header);
+            } else {
+                styled_hn = snprintf(styled_header, sizeof(styled_header), "%s\n", header);
+            }
+            if (styled_hn > 0) {
+                (void)smallclueWriteAll(STDOUT_FILENO, styled_header, (size_t)styled_hn);
+            }
         }
 
         if (tree) {
@@ -10401,13 +10410,19 @@ static void smallclueDfFormatSize(char *buf, size_t bufsize,
 }
 
 static void smallclueDfPrintHeader(bool human) {
-    printf("%-24s %12s %12s %12s %6s %s\n",
-           "Filesystem",
-           human ? "Size" : "1K-blocks",
-           human ? "Used" : "Used",
-           human ? "Avail" : "Avail",
-           "Use%",
-           "Mounted on");
+    char header[256];
+    snprintf(header, sizeof(header), "%-24s %12s %12s %12s %6s %s",
+             "Filesystem",
+             human ? "Size" : "1K-blocks",
+             human ? "Used" : "Used",
+             human ? "Avail" : "Avail",
+             "Use%",
+             "Mounted on");
+    if (isatty(STDOUT_FILENO)) {
+        printf("\033[1m%s\033[0m\n", header);
+    } else {
+        printf("%s\n", header);
+    }
 }
 
 static int smallclueDfCommand(int argc, char **argv) {
