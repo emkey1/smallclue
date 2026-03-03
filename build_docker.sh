@@ -12,7 +12,9 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 echo "Building SmallClue Docker image..."
-docker build --pull -t smallclue .
+docker build --pull \
+  --build-arg SMALLCLUE_DOCKER_ALLOW_APT="${SMALLCLUE_DOCKER_ALLOW_APT:-0}" \
+  -t smallclue .
 
 echo "Build complete."
 echo "To run the container interactively:"
