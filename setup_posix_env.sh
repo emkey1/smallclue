@@ -354,7 +354,7 @@ if [ -d "$OPENSSH_DIR" ]; then
         ssh.o readconf.o clientloop.o sshtty.o sshconnect.o sshconnect2.o mux.o ssh-sk-client.o \
         scp.o progressmeter.o sftp-common.o sftp-client.o sftp-glob.o \
         sftp.o sftp-usergroup.o \
-        ssh-keygen.o sshsig.o)
+        ssh-keygen.o sshsig.o ssh-pkcs11.o)
 
     echo "Building OpenSSH sshd..."
     (cd "$OPENSSH_DIR" && make -j4 sshd)
@@ -363,7 +363,7 @@ if [ -d "$OPENSSH_DIR" ]; then
 $OPENSSH_DIR/sshconnect.o $OPENSSH_DIR/sshconnect2.o $OPENSSH_DIR/mux.o $OPENSSH_DIR/ssh-sk-client.o \
 $OPENSSH_DIR/scp.o $OPENSSH_DIR/progressmeter.o $OPENSSH_DIR/sftp-common.o $OPENSSH_DIR/sftp-client.o $OPENSSH_DIR/sftp-glob.o \
 $OPENSSH_DIR/sftp.o $OPENSSH_DIR/sftp-usergroup.o \
-$OPENSSH_DIR/ssh-keygen.o $OPENSSH_DIR/sshsig.o"
+$OPENSSH_DIR/ssh-keygen.o $OPENSSH_DIR/sshsig.o $OPENSSH_DIR/ssh-pkcs11.o"
 
     # Link against built static libs and system libs (zlib, crypto)
     # On Linux with -static, -lcrypto -lz will use static versions if available.
