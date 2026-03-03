@@ -1334,6 +1334,47 @@ static int microSetupTty(void) {
 }
 #endif
 
+#if !defined(PSCAL_TARGET_IOS)
+static int microExecExternalBinary(int argc, char **argv) {
+    const char *overridePath = getenv("PSCAL_MICRO_EXTERNAL");
+    const char *candidates[4];
+    size_t count = 0;
+    if (overridePath && *overridePath) {
+        candidates[count++] = overridePath;
+    }
+    candidates[count++] = "/usr/bin/micro-real";
+    candidates[count++] = "/usr/local/bin/micro-real";
+    candidates[count] = NULL;
+
+    for (size_t i = 0; i < count; ++i) {
+        const char *candidate = candidates[i];
+        if (!candidate || access(candidate, X_OK) != 0) {
+            continue;
+        }
+
+        int execArgc = argc > 0 ? argc : 1;
+        char **execArgv = (char **)calloc((size_t)execArgc + 1, sizeof(char *));
+        if (!execArgv) {
+            fprintf(stderr, "micro: out of memory preparing external launch\n");
+            return 1;
+        }
+        execArgv[0] = (char *)candidate;
+        for (int argIndex = 1; argIndex < execArgc; ++argIndex) {
+            execArgv[argIndex] = argv[argIndex];
+        }
+        execArgv[execArgc] = NULL;
+        execv(candidate, execArgv);
+        free(execArgv);
+        fprintf(stderr, "micro: failed to exec %s: %s\n", candidate, strerror(errno));
+        return 127;
+    }
+
+    fprintf(stderr,
+            "micro: embedded runtime unavailable and no external micro binary found (expected /usr/bin/micro-real)\n");
+    return 127;
+}
+#endif
+
 int smallclueRunMicro(int argc, char **argv) {
 #if defined(PSCAL_TARGET_IOS)
     uint64_t launchSessionId = 0;
@@ -1409,6 +1450,15 @@ int smallclueRunMicro(int argc, char **argv) {
     if (patchedArgv) {
         launchArgv = patchedArgv;
     }
+#if !defined(PSCAL_TARGET_IOS)
+    extern int pscal_micro_main_entry(int argc, char **argv) __attribute__((weak));
+    if (!pscal_micro_main_entry) {
+        int externalStatus = microExecExternalBinary(launchArgc, launchArgv);
+        free(patchedArgv);
+        microRestoreEnvironment(&envBackup);
+        return externalStatus;
+    }
+#endif
 #if defined(PSCAL_TARGET_IOS)
     MicroHostStdioBridge hostBridge;
     bool hostBridgeActive = false;
@@ -1505,12 +1555,7 @@ int smallclueRunMicro(int argc, char **argv) {
     status = pscal_micro_main_entry(launchArgc, launchArgv);
     vprocProtectKqueueCloseExit();
 #else
-    extern int pscal_micro_main_entry(int argc, char **argv) __attribute__((weak));
-    if (!pscal_micro_main_entry) {
-        status = 127;
-    } else {
-        status = pscal_micro_main_entry(launchArgc, launchArgv);
-    }
+    status = pscal_micro_main_entry(launchArgc, launchArgv);
 #endif
 
     if (haveTty && savedIosValid && appliedRawMode) {

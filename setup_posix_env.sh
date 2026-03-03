@@ -397,7 +397,6 @@ gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${EXTRA
     src/core.c \
     src/runtime_support.c \
     src/micro_app.c \
-    src/micro_main_stub.c \
     src/nextvi_app.c \
     ${NEXTVI_SRC} \
     ${OPENSSH_SRC} \
@@ -500,6 +499,11 @@ fi
 
 # 5. Install smallclue and dash
 cp smallclue "$ROOTFS/bin/"
+if [ -x "third-party/micro-bin/micro" ]; then
+    echo "Installing micro..."
+    cp "third-party/micro-bin/micro" "$ROOTFS/usr/bin/micro-real"
+    chmod 755 "$ROOTFS/usr/bin/micro-real"
+fi
 if [ -f "third-party/openssh/sshd" ]; then
     echo "Installing sshd..."
     cp "third-party/openssh/sshd" "$ROOTFS/bin/sshd"

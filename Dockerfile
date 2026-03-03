@@ -1,3 +1,14 @@
+FROM golang:bookworm AS microbuilder
+
+RUN set -eux; \
+    export MICRO_VERSION="v2.0.15"; \
+    mkdir -p /tmp/src /out; \
+    cd /tmp/src; \
+    curl -fL --retry 3 --retry-delay 2 "https://codeload.github.com/zyedidia/micro/tar.gz/refs/tags/${MICRO_VERSION}" -o micro.tar.gz; \
+    tar -xzf micro.tar.gz; \
+    cd "micro-${MICRO_VERSION#v}"; \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/micro ./cmd/micro
+
 FROM buildpack-deps:bookworm AS builder
 
 WORKDIR /app
@@ -43,6 +54,7 @@ RUN set -eux; \
 
 # Copy source
 COPY . .
+COPY --from=microbuilder /out/micro /app/third-party/micro-bin/micro
 
 # Patch setup_posix_env.sh to skip device management inside Docker
 # 1. Disable device population
