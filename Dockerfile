@@ -5,7 +5,7 @@ WORKDIR /app
 # Ensure build dependencies are present (buildpack-deps usually already has these)
 RUN set -eux; \
     need_apt=0; \
-    for cmd in gcc g++ make git autoconf automake libtool curl ssh; do \
+    for cmd in gcc g++ make git autoconf automake libtool curl; do \
         command -v "$cmd" >/dev/null 2>&1 || need_apt=1; \
     done; \
     [ -f /usr/include/openssl/ssl.h ] || need_apt=1; \
@@ -31,8 +31,7 @@ RUN set -eux; \
             libssl-dev \
             zlib1g-dev \
             ca-certificates \
-            curl \
-            openssh-client; \
+            curl; \
         rm -rf /var/lib/apt/lists/*; \
     fi
 
