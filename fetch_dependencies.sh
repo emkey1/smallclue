@@ -176,9 +176,14 @@ if [ -d "$DASH_SRC" ]; then
     INPUT_C="$DASH_SRC/input.c"
     if ! grep -q "linenoise.h" "$INPUT_C"; then
         echo "Patching dash input.c..."
-        sed -i.bak '/#include "trap.h"/a #include "linenoise.h"\
-#include <stdlib.h>\
-#include <stdio.h>' "$INPUT_C"
+        awk '
+            { print }
+            /#include "trap.h"/ {
+                print "#include \"linenoise.h\""
+                print "#include <stdlib.h>"
+                print "#include <stdio.h>"
+            }
+        ' "$INPUT_C" > "$INPUT_C.tmp" && mv "$INPUT_C.tmp" "$INPUT_C"
 
         # Create patch content for linenoise integration
         cat > "$DASH_SRC/linenoise_patch.c" <<'EOF'
