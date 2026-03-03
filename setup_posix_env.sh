@@ -396,6 +396,8 @@ gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${EXTRA
     src/main.c \
     src/core.c \
     src/runtime_support.c \
+    src/micro_app.c \
+    src/micro_main_stub.c \
     src/nextvi_app.c \
     ${NEXTVI_SRC} \
     ${OPENSSH_SRC} \

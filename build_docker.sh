@@ -20,6 +20,7 @@ mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/docker-build-$(date +%Y%m%d-%H%M%S).log"
 
 echo "Building SmallClue Docker image..."
+echo "  note: setup_posix_env.sh runs as root inside Docker build; no sudo prompt is expected."
 echo "  tag: $IMAGE_TAG"
 echo "  progress: $BUILD_PROGRESS"
 echo "  allow apt fallback: $ALLOW_APT"
