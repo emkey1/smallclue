@@ -260,7 +260,10 @@ if [ -d "$OPENSSH_DIR" ]; then
         sed -i.bak 's/\bcleanup_exit\b/scp_cleanup_exit/g' "$OPENSSH_DIR/scp.c"
         # Add prototype to avoid implicit declaration warning
         if ! grep -q "void scp_cleanup_exit(int);" "$OPENSSH_DIR/scp.c"; then
-             sed -i.bak '/#include "includes.h"/a void scp_cleanup_exit(int);' "$OPENSSH_DIR/scp.c"
+            awk '
+                { print }
+                /#include "includes.h"/ { print "void scp_cleanup_exit(int);" }
+            ' "$OPENSSH_DIR/scp.c" > "$OPENSSH_DIR/scp.c.tmp" && mv "$OPENSSH_DIR/scp.c.tmp" "$OPENSSH_DIR/scp.c"
         fi
         rm -f "$OPENSSH_DIR/scp.c.bak"
     fi
