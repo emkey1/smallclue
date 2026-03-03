@@ -2,6 +2,8 @@
 set -e
 
 THIRD_PARTY_DIR="third-party"
+OPENSSH_PORTABLE_VERSION="10.2p1"
+OPENSSH_EXPECTED_VERSION_PREFIX="OpenSSH_10."
 
 mkdir -p "$THIRD_PARTY_DIR"
 
@@ -111,10 +113,16 @@ fi
 
 # --- OpenSSH ---
 reset_incomplete_repo "$THIRD_PARTY_DIR/openssh" "0" "configure" "configure.ac" "ssh.c" "scp.c" "sftp.c"
+if [ -d "$THIRD_PARTY_DIR/openssh" ] && [ -f "$THIRD_PARTY_DIR/openssh/version.h" ]; then
+    if ! grep -q "$OPENSSH_EXPECTED_VERSION_PREFIX" "$THIRD_PARTY_DIR/openssh/version.h"; then
+        echo "Removing outdated OpenSSH source (need $OPENSSH_EXPECTED_VERSION_PREFIX*)..."
+        rm -rf "$THIRD_PARTY_DIR/openssh"
+    fi
+fi
 if [ ! -d "$THIRD_PARTY_DIR/openssh" ]; then
     echo "Fetching OpenSSH Portable release source..."
-    OPENSSH_TARBALL="$THIRD_PARTY_DIR/openssh-9.7p1.tar.gz"
-    OPENSSH_URL="https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-9.7p1.tar.gz"
+    OPENSSH_TARBALL="$THIRD_PARTY_DIR/openssh-${OPENSSH_PORTABLE_VERSION}.tar.gz"
+    OPENSSH_URL="https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-${OPENSSH_PORTABLE_VERSION}.tar.gz"
     curl -fL --retry 3 --retry-delay 2 -o "$OPENSSH_TARBALL" "$OPENSSH_URL"
     mkdir -p "$THIRD_PARTY_DIR/openssh"
     tar -xzf "$OPENSSH_TARBALL" --strip-components=1 -C "$THIRD_PARTY_DIR/openssh"
