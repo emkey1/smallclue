@@ -7,3 +7,7 @@
 **Vulnerability:** The 'sudo' applet failed to sanitize the environment (LD_PRELOAD, PATH, etc.) before executing commands as root, allowing local privilege escalation via shared library injection or PATH manipulation.
 **Learning:** Authentication alone is insufficient for SUID binaries; the execution environment must also be scrubbed to prevent the child process from inheriting attacker-controlled variables that influence execution.
 **Prevention:** Always unset dangerous environment variables (LD_*, IFS) and reset PATH to a safe default before executing commands in a privileged context.
+## 2024-05-24 - Secure Password Wiping in Authentication Utilities
+**Vulnerability:** Passwords used in authentication (`sudo` and `passwd` applets) were left in memory indefinitely after use, allowing potential exposure via memory scraping or core dumps.
+**Learning:** Even well-intentioned code that securely hashes passwords (using `crypt`) can leave plaintext secrets in dynamically allocated strings or static buffers. Dead store elimination by compilers often optimizes away standard `memset` calls intended to zero out these buffers before freeing them.
+**Prevention:** Always use a secure memory zeroing function (like `smallclueSecureMemzero` utilizing `volatile` pointers) to guarantee that sensitive data is scrubbed from memory immediately after its lifecycle ends.
