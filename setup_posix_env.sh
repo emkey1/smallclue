@@ -81,8 +81,37 @@ EOF
 # 2. Create extra stubs
 cat > src/openssh_globals.c <<EOF
 #include <signal.h>
+#include <stdint.h>
 volatile sig_atomic_t pscal_openssh_interrupted = 0;
 int pscal_openssh_showprogress = 1;
+
+/*
+ * Some OpenSSH object files (e.g. ML-KEM code paths) may reference htole64/le64toh
+ * as external symbols depending on libc feature exposure. Provide weak fallbacks so
+ * static smallclue links remain portable across Linux build environments.
+ */
+#if defined(__linux__)
+# ifdef htole64
+#  undef htole64
+# endif
+# ifdef le64toh
+#  undef le64toh
+# endif
+__attribute__((weak)) uint64_t htole64(uint64_t v) {
+# if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return v;
+# else
+    return __builtin_bswap64(v);
+# endif
+}
+__attribute__((weak)) uint64_t le64toh(uint64_t v) {
+# if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return v;
+# else
+    return __builtin_bswap64(v);
+# endif
+}
+#endif
 EOF
 
 cat > src/runtime_stubs_extra.c <<EOF
