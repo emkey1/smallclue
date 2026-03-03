@@ -3,18 +3,30 @@ FROM debian:bookworm-slim AS builder
 WORKDIR /app
 
 # Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    git \
-    autoconf \
-    automake \
-    libtool \
-    libssl-dev \
-    zlib1g-dev \
-    ca-certificates \
-    curl \
-    openssh-client \
-    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources; \
+    elif [ -f /etc/apt/sources.list ]; then \
+        sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*; \
+    apt-get clean; \
+    apt-get update \
+        -o Acquire::Retries=5 \
+        -o Acquire::http::No-Cache=true \
+        -o Acquire::https::No-Cache=true; \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        git \
+        autoconf \
+        automake \
+        libtool \
+        libssl-dev \
+        zlib1g-dev \
+        ca-certificates \
+        curl \
+        openssh-client; \
+    rm -rf /var/lib/apt/lists/*
 
 # Copy source
 COPY . .
