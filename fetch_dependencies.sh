@@ -7,14 +7,15 @@ mkdir -p "$THIRD_PARTY_DIR"
 
 reset_incomplete_repo() {
     local dir="$1"
-    shift
+    local require_git="$2"
+    shift 2
     local required=("$@")
 
     if [ ! -d "$dir" ]; then
         return 0
     fi
 
-    if [ ! -d "$dir/.git" ]; then
+    if [ "$require_git" = "1" ] && [ ! -d "$dir/.git" ]; then
         echo "Removing incomplete dependency at $dir (missing .git)..."
         rm -rf "$dir"
         return 0
@@ -36,7 +37,7 @@ reset_incomplete_repo() {
 }
 
 # --- Nextvi ---
-reset_incomplete_repo "$THIRD_PARTY_DIR/nextvi" "vi.c" "term.c"
+reset_incomplete_repo "$THIRD_PARTY_DIR/nextvi" "1" "vi.c" "term.c"
 if [ ! -d "$THIRD_PARTY_DIR/nextvi" ]; then
     echo "Cloning nextvi..."
     git clone https://github.com/kyx0r/nextvi "$THIRD_PARTY_DIR/nextvi"
@@ -109,12 +110,15 @@ if [ -f "$TERM_C" ]; then
 fi
 
 # --- OpenSSH ---
-reset_incomplete_repo "$THIRD_PARTY_DIR/openssh" "configure.ac" "ssh.c" "scp.c" "sftp.c"
+reset_incomplete_repo "$THIRD_PARTY_DIR/openssh" "0" "configure" "configure.ac" "ssh.c" "scp.c" "sftp.c"
 if [ ! -d "$THIRD_PARTY_DIR/openssh" ]; then
-    echo "Cloning OpenSSH Portable..."
-    git clone https://github.com/openssh/openssh-portable "$THIRD_PARTY_DIR/openssh"
-    # Pin to a stable release
-    (cd "$THIRD_PARTY_DIR/openssh" && git checkout V_9_7_P1)
+    echo "Fetching OpenSSH Portable release source..."
+    OPENSSH_TARBALL="$THIRD_PARTY_DIR/openssh-9.7p1.tar.gz"
+    OPENSSH_URL="https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-9.7p1.tar.gz"
+    curl -fL --retry 3 --retry-delay 2 -o "$OPENSSH_TARBALL" "$OPENSSH_URL"
+    mkdir -p "$THIRD_PARTY_DIR/openssh"
+    tar -xzf "$OPENSSH_TARBALL" --strip-components=1 -C "$THIRD_PARTY_DIR/openssh"
+    rm -f "$OPENSSH_TARBALL"
 
     # Patch OpenSSH clients
     OPENSSH_DIR="$THIRD_PARTY_DIR/openssh"
@@ -135,32 +139,9 @@ if [ ! -d "$THIRD_PARTY_DIR/openssh" ]; then
 fi
 
 OPENSSH_DIR="$THIRD_PARTY_DIR/openssh"
-if [ -d "$OPENSSH_DIR" ] && [ ! -f "$OPENSSH_DIR/Makefile" ]; then
-    # Try configure if autoreconf is available or if configure exists
-    if [ -f "$OPENSSH_DIR/configure" ]; then
-        echo "Configuring OpenSSH..."
-        (cd "$OPENSSH_DIR" && ./configure)
-    elif command -v autoreconf >/dev/null 2>&1; then
-        echo "Generating configure for OpenSSH (this may take a moment)..."
-        if ! (cd "$OPENSSH_DIR" && autoreconf -i > autoreconf.log 2>&1); then
-            echo "Error: autoreconf failed."
-            echo "--- autoreconf output ---"
-            cat "$OPENSSH_DIR/autoreconf.log"
-            echo "-------------------------"
-            echo "Please ensure you have autoconf and automake installed."
-            exit 1
-        fi
-        (cd "$OPENSSH_DIR" && ./configure)
-    else
-        echo "Error: autoreconf not found. Cannot configure OpenSSH."
-        echo "Please install autoconf (and automake)."
-        if [ "$(uname -s)" = "Darwin" ]; then
-            echo "On macOS: brew install autoconf automake"
-        else
-            echo "On Linux: sudo apt-get install autoconf automake"
-        fi
-        exit 1
-    fi
+if [ -d "$OPENSSH_DIR" ] && [ ! -f "$OPENSSH_DIR/configure" ]; then
+    echo "Warning: OpenSSH configure script is missing."
+    echo "setup_posix_env.sh will try autoreconf during the build stage."
 fi
 
 # --- Linenoise ---

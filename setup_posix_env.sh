@@ -14,7 +14,7 @@ if [ ! -d "third-party/nextvi/.git" ]; then
     echo "Nextvi repository missing or incomplete."
     MISSING_DEPS=1
 fi
-if [ ! -d "third-party/openssh/.git" ]; then
+if [ ! -d "third-party/openssh" ] || [ ! -f "third-party/openssh/ssh.c" ] || [ ! -f "third-party/openssh/scp.c" ] || [ ! -f "third-party/openssh/sftp.c" ] || [ ! -f "third-party/openssh/configure.ac" ]; then
     echo "OpenSSH repository missing or incomplete."
     MISSING_DEPS=1
 fi
@@ -142,7 +142,7 @@ OPENSSH_SHIM="src/openssh_shim.c"
 OPENSSH_DIR="third-party/openssh"
 if [ -d "$OPENSSH_DIR" ]; then
     # Revert sshd.c patching if present (from previous failed runs)
-    if grep -q "pscal_openssh_sshd_main" "$OPENSSH_DIR/sshd.c"; then
+    if [ -d "$OPENSSH_DIR/.git" ] && [ -f "$OPENSSH_DIR/sshd.c" ] && grep -q "pscal_openssh_sshd_main" "$OPENSSH_DIR/sshd.c"; then
         echo "Reverting sshd.c changes..."
         (cd "$OPENSSH_DIR" && git checkout sshd.c)
     fi
@@ -193,9 +193,13 @@ if [ -d "$OPENSSH_DIR" ]; then
             if [ "$(uname -s)" = "Linux" ]; then
                 OPENSSH_CONFIG_FLAGS="$OPENSSH_CONFIG_FLAGS LDFLAGS=-static"
             fi
-            (cd "$OPENSSH_DIR" && ./configure $OPENSSH_CONFIG_FLAGS)
+            if ! (cd "$OPENSSH_DIR" && ./configure $OPENSSH_CONFIG_FLAGS); then
+                echo "Error: OpenSSH configure failed."
+                exit 1
+            fi
         else
             echo "Error: configure script not found and could not be generated."
+            echo "Try re-running: ./fetch_dependencies.sh"
             exit 1
         fi
     fi
