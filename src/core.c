@@ -6,6 +6,7 @@
 #include "smallclue.h"
 
 #include "common/runtime_tty.h"
+#include "dvtm_app.h"
 #include "micro_app.h"
 #include "nextvi_app.h"
 #include "openssh_app.h"
@@ -650,6 +651,9 @@ static int smallclueMkdirParents(const char *path, mode_t mode, bool verbose);
 static void smallclueGetTerminalSize(int *rows, int *cols);
 static int smallclueEditorCommand(int argc, char **argv);
 static int smallclueMicroCommand(int argc, char **argv);
+#if defined(SMALLCLUE_WITH_DVTM)
+static int smallclueDvtmCommand(int argc, char **argv);
+#endif
 static int smallclueSshCommand(int argc, char **argv);
 static int smallclueScpCommand(int argc, char **argv);
 static int smallclueSftpCommand(int argc, char **argv);
@@ -1259,6 +1263,9 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"date", smallclueDateCommand, "Display current date/time"},
     {"dirname", smallclueDirnameCommand, "Strip last path component"},
     {"du", smallclueDuCommand, "Summarize disk usage"},
+#if defined(SMALLCLUE_WITH_DVTM)
+    {"dvtm", smallclueDvtmCommand, "Dynamic virtual terminal manager"},
+#endif
     {"echo", smallclueEchoCommand, "Print arguments"},
     {"micro", smallclueMicroCommand, "Micro text editor"},
     {"nextvi", smallclueEditorCommand, "Nextvi text editor"},
@@ -1390,6 +1397,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                 "  Strip last path component"},
     {"du", "du [-h] [PATH...]\n"
            "  -h human-readable sizes"},
+#if defined(SMALLCLUE_WITH_DVTM)
+    {"dvtm", "dvtm\n"
+             "  Launch dvtm terminal multiplexer"},
+#endif
     {"echo", "echo [args...]\n"
              "  Print arguments"},
     {"env", "env [-i] [NAME=VALUE ...] [command]\n"
@@ -10175,6 +10186,11 @@ static int smallclueEditorCommand(int argc, char **argv) {
 static int smallclueMicroCommand(int argc, char **argv) {
     return smallclueRunMicro(argc, argv);
 }
+#if defined(SMALLCLUE_WITH_DVTM)
+static int smallclueDvtmCommand(int argc, char **argv) {
+    return smallclueRunDvtm(argc, argv);
+}
+#endif
 static int smallclueSshCommand(int argc, char **argv) {
     return smallclueRunSsh(argc, argv);
 }

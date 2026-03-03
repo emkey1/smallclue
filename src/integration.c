@@ -390,6 +390,9 @@ DEFINE_SMALLCLUE_WRAPPER("micro", micro)
 DEFINE_SMALLCLUE_WRAPPER("less", less)
 DEFINE_SMALLCLUE_WRAPPER("ls", ls)
 DEFINE_SMALLCLUE_WRAPPER("md", md)
+#if defined(SMALLCLUE_WITH_DVTM)
+DEFINE_SMALLCLUE_WRAPPER("dvtm", dvtm)
+#endif
 DEFINE_SMALLCLUE_WRAPPER("wget", wget)
 DEFINE_SMALLCLUE_WRAPPER("watch", watch)
 DEFINE_SMALLCLUE_WRAPPER("more", more)
@@ -540,6 +543,9 @@ static void smallclueRegisterBuiltinsOnce(void) {
 #endif
     registerSmallclueBuiltin("wget", vmBuiltinSmallclue_wget, "wget");
     registerSmallclueBuiltin("watch", vmBuiltinSmallclue_watch, "watch");
+#if defined(SMALLCLUE_WITH_DVTM)
+    registerSmallclueBuiltin("dvtm", vmBuiltinSmallclue_dvtm, "dvtm");
+#endif
     registerSmallclueBuiltin("version", vmBuiltinSmallclue_version, "version");
     registerSmallclueBuiltin("time", vmBuiltinSmallclue_timecmd, "time");
 #if defined(PSCAL_TARGET_IOS)
