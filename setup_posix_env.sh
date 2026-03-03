@@ -160,8 +160,16 @@ if [ -d "$OPENSSH_DIR" ]; then
         fi
 
         if [ "$NEED_RECONF" -eq 1 ]; then
-             echo "Cleaning OpenSSH build to reconfigure..."
-             (cd "$OPENSSH_DIR" && make distclean)
+            echo "Cleaning OpenSSH build to reconfigure..."
+            MAKEFILE_SHELL_PATH="$(awk -F= '/^SHELL[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' "$OPENSSH_DIR/Makefile")"
+            if [ -n "$MAKEFILE_SHELL_PATH" ] && [ ! -x "$MAKEFILE_SHELL_PATH" ]; then
+                echo "OpenSSH Makefile references missing shell: $MAKEFILE_SHELL_PATH"
+                echo "Purging generated OpenSSH build files instead of make distclean..."
+                (cd "$OPENSSH_DIR" && rm -f Makefile config.status config.log config.h && rm -rf autom4te.cache)
+            elif ! (cd "$OPENSSH_DIR" && make distclean); then
+                echo "Warning: make distclean failed; purging generated OpenSSH build files..."
+                (cd "$OPENSSH_DIR" && rm -f Makefile config.status config.log config.h && rm -rf autom4te.cache)
+            fi
         fi
     fi
 
