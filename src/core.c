@@ -1933,11 +1933,13 @@ typedef struct {
     char *command;
 } SmallcluePsEntry;
 
+#if !defined(PSCAL_TARGET_IOS)
 static int smallcluePsCompare(const void *a, const void *b) {
     const SmallcluePsEntry *pa = (const SmallcluePsEntry *)a;
     const SmallcluePsEntry *pb = (const SmallcluePsEntry *)b;
     return pa->pid - pb->pid;
 }
+#endif
 
 static int smallcluePsCommand(int argc, char **argv) {
     (void)argc;
@@ -7951,8 +7953,13 @@ static void smallclueCurlApplyCommonOptions(CURL *curl, const char *url) {
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     /* Restrict protocols to HTTP/HTTPS to prevent SSRF via redirects to file:// etc. */
+#if LIBCURL_VERSION_NUM >= 0x075500
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
 }
 
 static size_t smallclueCurlWriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
