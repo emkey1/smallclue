@@ -5,7 +5,38 @@ THIRD_PARTY_DIR="third-party"
 
 mkdir -p "$THIRD_PARTY_DIR"
 
+reset_incomplete_repo() {
+    local dir="$1"
+    shift
+    local required=("$@")
+
+    if [ ! -d "$dir" ]; then
+        return 0
+    fi
+
+    if [ ! -d "$dir/.git" ]; then
+        echo "Removing incomplete dependency at $dir (missing .git)..."
+        rm -rf "$dir"
+        return 0
+    fi
+
+    local missing=0
+    local f
+    for f in "${required[@]}"; do
+        if [ ! -e "$dir/$f" ]; then
+            missing=1
+            break
+        fi
+    done
+
+    if [ "$missing" -eq 1 ]; then
+        echo "Removing incomplete dependency at $dir (missing required files)..."
+        rm -rf "$dir"
+    fi
+}
+
 # --- Nextvi ---
+reset_incomplete_repo "$THIRD_PARTY_DIR/nextvi" "vi.c" "term.c"
 if [ ! -d "$THIRD_PARTY_DIR/nextvi" ]; then
     echo "Cloning nextvi..."
     git clone https://github.com/kyx0r/nextvi "$THIRD_PARTY_DIR/nextvi"
@@ -78,6 +109,7 @@ if [ -f "$TERM_C" ]; then
 fi
 
 # --- OpenSSH ---
+reset_incomplete_repo "$THIRD_PARTY_DIR/openssh" "configure.ac" "ssh.c" "scp.c" "sftp.c"
 if [ ! -d "$THIRD_PARTY_DIR/openssh" ]; then
     echo "Cloning OpenSSH Portable..."
     git clone https://github.com/openssh/openssh-portable "$THIRD_PARTY_DIR/openssh"
