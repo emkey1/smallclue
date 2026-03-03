@@ -9079,30 +9079,54 @@ static int smallclueYesNoLoop(const char *text, int initial_status) {
         return initial_status;
     }
     size_t len = strlen(text);
-    char *line = (char *)malloc(len + 2);
-    if (!line) {
+    size_t buf_size = 16 * 1024;
+    char *buffer = (char *)malloc(buf_size);
+    if (!buffer) {
         return 1;
     }
-    memcpy(line, text, len);
-    line[len] = '\n';
-    line[len + 1] = '\0';
-    size_t line_len = len + 1;
+
+    size_t filled = 0;
+    while (filled + len + 1 <= buf_size) {
+        memcpy(buffer + filled, text, len);
+        buffer[filled + len] = '\n';
+        filled += len + 1;
+    }
+
+    if (filled == 0) {
+        /* Pattern too large for buffer, fall back to single line. */
+        free(buffer);
+        size_t line_len = len + 1;
+        char *line = (char *)malloc(line_len + 1);
+        if (!line) return 1;
+        memcpy(line, text, len);
+        line[len] = '\n';
+        line[len + 1] = '\0';
+        int status = initial_status;
+        while (true) {
+            if (smallclueShouldAbort(&status)) break;
+            if (fwrite(line, 1, line_len, stdout) != line_len) {
+                status = errno ? errno : status;
+                break;
+            }
+        }
+        free(line);
+        return status;
+    }
+
     int status = initial_status;
+    size_t iteration = 0;
     while (true) {
-        if (smallclueShouldAbort(&status)) {
-            break;
+        if ((iteration++ & 127) == 0) {
+            if (smallclueShouldAbort(&status)) {
+                break;
+            }
         }
-        size_t written = fwrite(line, 1, line_len, stdout);
-        if (written != line_len) {
-            status = errno ? errno : status;
-            break;
-        }
-        if (fflush(stdout) != 0) {
+        if (fwrite(buffer, 1, filled, stdout) != filled) {
             status = errno ? errno : status;
             break;
         }
     }
-    free(line);
+    free(buffer);
     return status;
 }
 
@@ -11349,17 +11373,18 @@ static int smallclueDaysInMonth(int month, int year) {
     return days_per_month[month - 1];
 }
 
+/* Sakamoto's algorithm to determine the day of the week.
+ * Returns 0 = Sunday, 1 = Monday, etc.
+ * Replaces mktime() to avoid libc overhead and time zone dependencies.
+ * Assumes m is 1-12. */
+static int smallclueDayOfWeek(int d, int m, int y) {
+    static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    y -= m < 3;
+    return (y + y/4 - y/100 + y/400 + t[m-1] + d) % 7;
+}
+
 static int smallclueFirstWeekdayOfMonth(int month, int year) {
-    struct tm tm_buf;
-    memset(&tm_buf, 0, sizeof(tm_buf));
-    tm_buf.tm_year = year - 1900;
-    tm_buf.tm_mon = month - 1;
-    tm_buf.tm_mday = 1;
-    tm_buf.tm_isdst = -1;
-    if (mktime(&tm_buf) == (time_t)-1) {
-        return 0;
-    }
-    return tm_buf.tm_wday; /* 0 = Sunday */
+    return smallclueDayOfWeek(1, month, year);
 }
 
 typedef struct {
@@ -11560,6 +11585,10 @@ static int smallclueCalCommand(int argc, char **argv) {
 static const char *smallclueStrCaseStr(const char *haystack, const char *needle, int ignore_case) {
     if (!haystack || !needle || !*needle) {
         return haystack;
+    }
+    /* Optimization: Use optimized libc strstr for case-sensitive search */
+    if (!ignore_case) {
+        return strstr(haystack, needle);
     }
     size_t needle_len = strlen(needle);
     for (const char *p = haystack; *p; ++p) {
@@ -13073,18 +13102,37 @@ static int smallclueTrCommand(int argc, char **argv) {
             map[from] = to;
         }
     }
-    int ch;
-    while ((ch = getchar()) != EOF) {
-        unsigned char c = (unsigned char)ch;
+    char buf[16384];
+    char out_buf[16384];
+    ssize_t n;
+    int read_err = 0;
+
+    while ((n = smallclueReadStream(stdin, buf, sizeof(buf), &read_err)) > 0) {
         if (delete_only) {
-            if (delete_map[c]) {
-                continue;
+            size_t out_idx = 0;
+            for (ssize_t i = 0; i < n; ++i) {
+                unsigned char c = (unsigned char)buf[i];
+                if (!delete_map[c]) {
+                    out_buf[out_idx++] = c;
+                }
             }
-            putchar(c);
+            if (out_idx > 0) {
+                fwrite(out_buf, 1, out_idx, stdout);
+            }
         } else {
-            putchar(map[c]);
+            for (ssize_t i = 0; i < n; ++i) {
+                unsigned char c = (unsigned char)buf[i];
+                buf[i] = map[c];
+            }
+            fwrite(buf, 1, (size_t)n, stdout);
         }
     }
+
+    if (read_err) {
+        fprintf(stderr, "tr: read error: %s\n", strerror(read_err));
+        return 1;
+    }
+
     return 0;
 }
 
