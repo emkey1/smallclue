@@ -189,12 +189,61 @@ if [ -d "$OPENSSH_DIR" ]; then
         fi
 
         if [ -f "$OPENSSH_DIR/configure" ]; then
-            OPENSSH_CONFIG_FLAGS="--sysconfdir=/etc/ssh"
+            OPENSSH_CONFIG_ENV=()
+            OPENSSH_CONFIG_ARGS=(--sysconfdir=/etc/ssh)
+
             if [ "$(uname -s)" = "Linux" ]; then
-                OPENSSH_CONFIG_FLAGS="$OPENSSH_CONFIG_FLAGS LDFLAGS=-static"
+                OPENSSH_CONFIG_ENV+=("LDFLAGS=-static")
             fi
-            if ! (cd "$OPENSSH_DIR" && ./configure $OPENSSH_CONFIG_FLAGS); then
+
+            if [ "$(uname -s)" = "Darwin" ]; then
+                CLEAN_PATH=""
+                IFS=':' read -r -a PATH_PARTS <<< "$PATH"
+                for p in "${PATH_PARTS[@]}"; do
+                    case "$p" in
+                        *miniconda*|*anaconda*|*/conda/*) continue ;;
+                    esac
+                    if [ -z "$CLEAN_PATH" ]; then
+                        CLEAN_PATH="$p"
+                    else
+                        CLEAN_PATH="$CLEAN_PATH:$p"
+                    fi
+                done
+                if [ -z "$CLEAN_PATH" ]; then
+                    CLEAN_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+                fi
+                OPENSSH_CONFIG_ENV+=("PATH=$CLEAN_PATH")
+
+                BREW_OPENSSL_PREFIX=""
+                if command -v brew >/dev/null 2>&1; then
+                    BREW_OPENSSL_PREFIX="$(brew --prefix openssl@3 2>/dev/null || true)"
+                    if [ -z "$BREW_OPENSSL_PREFIX" ]; then
+                        BREW_OPENSSL_PREFIX="$(brew --prefix openssl@1.1 2>/dev/null || true)"
+                    fi
+                fi
+
+                if [ -n "$BREW_OPENSSL_PREFIX" ] && [ -d "$BREW_OPENSSL_PREFIX/include" ] && [ -d "$BREW_OPENSSL_PREFIX/lib" ]; then
+                    echo "Configuring OpenSSH with Homebrew OpenSSL at $BREW_OPENSSL_PREFIX"
+                    OPENSSH_CONFIG_ENV+=("CPPFLAGS=-I$BREW_OPENSSL_PREFIX/include")
+                    OPENSSH_CONFIG_ENV+=("LDFLAGS=-L$BREW_OPENSSL_PREFIX/lib")
+                    OPENSSH_CONFIG_ENV+=("PKG_CONFIG_PATH=$BREW_OPENSSL_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}")
+                    if [ -x "$BREW_OPENSSL_PREFIX/bin/openssl" ]; then
+                        OPENSSH_CONFIG_ENV+=("OPENSSL_BIN=$BREW_OPENSSL_PREFIX/bin/openssl")
+                    fi
+                else
+                    CLEAN_OPENSSL_BIN="$(PATH="$CLEAN_PATH" command -v openssl || true)"
+                    if [ -n "$CLEAN_OPENSSL_BIN" ]; then
+                        echo "Configuring OpenSSH with OpenSSL binary: $CLEAN_OPENSSL_BIN"
+                        OPENSSH_CONFIG_ENV+=("OPENSSL_BIN=$CLEAN_OPENSSL_BIN")
+                    fi
+                fi
+            fi
+
+            if ! (cd "$OPENSSH_DIR" && env "${OPENSSH_CONFIG_ENV[@]}" ./configure "${OPENSSH_CONFIG_ARGS[@]}"); then
                 echo "Error: OpenSSH configure failed."
+                if [ -f "$OPENSSH_DIR/config.log" ]; then
+                    echo "See: $OPENSSH_DIR/config.log"
+                fi
                 exit 1
             fi
         else
