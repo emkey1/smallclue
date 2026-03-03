@@ -265,7 +265,7 @@ if [ -d "$OPENSSH_DIR" ]; then
     # Rename usage first
     # scp.c
     if grep -q "cleanup_exit" "$OPENSSH_DIR/scp.c"; then
-        sed -i.bak 's/\bcleanup_exit\b/scp_cleanup_exit/g' "$OPENSSH_DIR/scp.c"
+        sed -i.bak 's/cleanup_exit/scp_cleanup_exit/g' "$OPENSSH_DIR/scp.c"
         # Add prototype to avoid implicit declaration warning
         if ! grep -q "void scp_cleanup_exit(int);" "$OPENSSH_DIR/scp.c"; then
             awk '
@@ -276,37 +276,44 @@ if [ -d "$OPENSSH_DIR" ]; then
         rm -f "$OPENSSH_DIR/scp.c.bak"
     fi
     if grep -q "volatile sig_atomic_t interrupted" "$OPENSSH_DIR/scp.c"; then
-        sed -i.bak 's/\binterrupted\b/pscal_openssh_interrupted/g' "$OPENSSH_DIR/scp.c"
+        sed -i.bak 's/interrupted/pscal_openssh_interrupted/g' "$OPENSSH_DIR/scp.c"
         # Now change definitions to extern
         sed -i.bak 's/volatile sig_atomic_t pscal_openssh_interrupted = 0;/extern volatile sig_atomic_t pscal_openssh_interrupted;/g' "$OPENSSH_DIR/scp.c"
         rm -f "$OPENSSH_DIR/scp.c.bak"
     fi
     if grep -q "int showprogress" "$OPENSSH_DIR/scp.c"; then
-        sed -i.bak 's/\bshowprogress\b/pscal_openssh_showprogress/g' "$OPENSSH_DIR/scp.c"
+        sed -i.bak 's/showprogress/pscal_openssh_showprogress/g' "$OPENSSH_DIR/scp.c"
         sed -i.bak 's/int pscal_openssh_showprogress = 1;/extern int pscal_openssh_showprogress;/g' "$OPENSSH_DIR/scp.c"
         rm -f "$OPENSSH_DIR/scp.c.bak"
     fi
 
     # sftp.c
     if grep -q "volatile sig_atomic_t interrupted" "$OPENSSH_DIR/sftp.c"; then
-        sed -i.bak 's/\binterrupted\b/pscal_openssh_interrupted/g' "$OPENSSH_DIR/sftp.c"
+        sed -i.bak 's/interrupted/pscal_openssh_interrupted/g' "$OPENSSH_DIR/sftp.c"
         sed -i.bak 's/volatile sig_atomic_t pscal_openssh_interrupted = 0;/extern volatile sig_atomic_t pscal_openssh_interrupted;/g' "$OPENSSH_DIR/sftp.c"
         rm -f "$OPENSSH_DIR/sftp.c.bak"
     fi
     if grep -q "int showprogress" "$OPENSSH_DIR/sftp.c"; then
-        sed -i.bak 's/\bshowprogress\b/pscal_openssh_showprogress/g' "$OPENSSH_DIR/sftp.c"
+        sed -i.bak 's/showprogress/pscal_openssh_showprogress/g' "$OPENSSH_DIR/sftp.c"
         sed -i.bak 's/int pscal_openssh_showprogress = 1;/extern int pscal_openssh_showprogress;/g' "$OPENSSH_DIR/sftp.c"
         rm -f "$OPENSSH_DIR/sftp.c.bak"
     fi
 
     # sftp-client.c
-    if grep -q "volatile sig_atomic_t interrupted" "$OPENSSH_DIR/sftp-client.c"; then
-        sed -i.bak 's/\binterrupted\b/pscal_openssh_interrupted/g' "$OPENSSH_DIR/sftp-client.c"
+    if grep -q "interrupted" "$OPENSSH_DIR/sftp-client.c"; then
+        sed -i.bak 's/interrupted/pscal_openssh_interrupted/g' "$OPENSSH_DIR/sftp-client.c"
         rm -f "$OPENSSH_DIR/sftp-client.c.bak"
     fi
-    if grep -q "extern int showprogress" "$OPENSSH_DIR/sftp-client.c"; then
-        sed -i.bak 's/\bshowprogress\b/pscal_openssh_showprogress/g' "$OPENSSH_DIR/sftp-client.c"
-        sed -i.bak 's/extern int showprogress;/extern int pscal_openssh_showprogress;/g' "$OPENSSH_DIR/sftp-client.c"
+    if grep -q "showprogress" "$OPENSSH_DIR/sftp-client.c"; then
+        sed -i.bak 's/showprogress/pscal_openssh_showprogress/g' "$OPENSSH_DIR/sftp-client.c"
+        if ! grep -q "extern int pscal_openssh_showprogress;" "$OPENSSH_DIR/sftp-client.c"; then
+            awk '
+                { print }
+                /extern volatile sig_atomic_t pscal_openssh_interrupted;/ {
+                    print "extern int pscal_openssh_showprogress;"
+                }
+            ' "$OPENSSH_DIR/sftp-client.c" > "$OPENSSH_DIR/sftp-client.c.tmp" && mv "$OPENSSH_DIR/sftp-client.c.tmp" "$OPENSSH_DIR/sftp-client.c"
+        fi
         rm -f "$OPENSSH_DIR/sftp-client.c.bak"
     fi
 
