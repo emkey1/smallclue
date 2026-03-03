@@ -2,15 +2,17 @@ FROM buildpack-deps:bookworm AS builder
 
 WORKDIR /app
 
+ARG SMALLCLUE_DOCKER_ALLOW_APT=0
+
 # Ensure build dependencies are present (buildpack-deps usually already has these)
 RUN set -eux; \
     need_apt=0; \
-    for cmd in gcc g++ make git autoconf automake libtool curl; do \
+    for cmd in gcc g++ make git curl; do \
         command -v "$cmd" >/dev/null 2>&1 || need_apt=1; \
     done; \
-    [ -f /usr/include/openssl/ssl.h ] || need_apt=1; \
-    [ -f /usr/include/zlib.h ] || need_apt=1; \
-    if [ "$need_apt" -eq 1 ]; then \
+    printf '#include <openssl/ssl.h>\n' | gcc -E - >/dev/null 2>&1 || need_apt=1; \
+    printf '#include <zlib.h>\n' | gcc -E - >/dev/null 2>&1 || need_apt=1; \
+    if [ "$need_apt" -eq 1 ] && [ "${SMALLCLUE_DOCKER_ALLOW_APT:-0}" = "1" ]; then \
         if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
             sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources; \
         elif [ -f /etc/apt/sources.list ]; then \
@@ -33,6 +35,10 @@ RUN set -eux; \
             ca-certificates \
             curl; \
         rm -rf /var/lib/apt/lists/*; \
+    elif [ "$need_apt" -eq 1 ]; then \
+        echo "Required build dependencies were not detected in the base image." >&2; \
+        echo "Rebuild with --build-arg SMALLCLUE_DOCKER_ALLOW_APT=1 to enable apt fallback." >&2; \
+        exit 1; \
     fi
 
 # Copy source
