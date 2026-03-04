@@ -12,10 +12,13 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdint.h>
 
 #include "termios_shim.h"
 #if defined(PSCAL_TARGET_IOS)
@@ -1335,6 +1338,342 @@ static int microSetupTty(void) {
 #endif
 
 #if !defined(PSCAL_TARGET_IOS)
+typedef struct {
+    unsigned char bytes[4];
+    size_t have;
+    size_t expect;
+} MicroUtf8State;
+
+static bool microOptionAltEnabled(void) {
+    const char *env = getenv("PSCALI_MICRO_OPTION_IS_ALT");
+    if (!env || !*env) {
+        return true;
+    }
+    return strcmp(env, "0") != 0;
+}
+
+static bool microMapOptionRuneToAlt(uint32_t cp, unsigned char *out_key) {
+    if (!out_key) {
+        return false;
+    }
+    switch (cp) {
+        case 0x00E5: *out_key = 'a'; return true; /* Option+a */
+        case 0x222B: *out_key = 'b'; return true; /* Option+b */
+        case 0x00E7: *out_key = 'c'; return true; /* Option+c */
+        case 0x2202: *out_key = 'd'; return true; /* Option+d */
+        case 0x00B4: *out_key = 'e'; return true; /* Option+e */
+        case 0x0192: *out_key = 'f'; return true; /* Option+f */
+        case 0x00A9: *out_key = 'g'; return true; /* Option+g */
+        case 0x02D9: *out_key = 'h'; return true; /* Option+h */
+        case 0x02C6: *out_key = 'i'; return true; /* Option+i */
+        case 0x2206: *out_key = 'j'; return true; /* Option+j */
+        case 0x02DA: *out_key = 'k'; return true; /* Option+k */
+        case 0x00AC: *out_key = 'l'; return true; /* Option+l */
+        case 0x00B5: *out_key = 'm'; return true; /* Option+m */
+        case 0x02DC: *out_key = 'n'; return true; /* Option+n */
+        case 0x00F8: *out_key = 'o'; return true; /* Option+o */
+        case 0x03C0: *out_key = 'p'; return true; /* Option+p */
+        case 0x0153: *out_key = 'q'; return true; /* Option+q */
+        case 0x00AE: *out_key = 'r'; return true; /* Option+r */
+        case 0x00DF: *out_key = 's'; return true; /* Option+s */
+        case 0x2020: *out_key = 't'; return true; /* Option+t */
+        case 0x00A8: *out_key = 'u'; return true; /* Option+u */
+        case 0x221A: *out_key = 'v'; return true; /* Option+v */
+        case 0x2211: *out_key = 'w'; return true; /* Option+w */
+        case 0x2248: *out_key = 'x'; return true; /* Option+x */
+        case 0x00A5: *out_key = 'y'; return true; /* Option+y */
+        case 0x03A9: *out_key = 'z'; return true; /* Option+z */
+        case 0x2265: *out_key = '.'; return true; /* Option+. */
+        default:
+            break;
+    }
+    return false;
+}
+
+static bool microDecodeUtf8(const unsigned char *bytes, size_t len, uint32_t *out_cp) {
+    if (!bytes || !out_cp) {
+        return false;
+    }
+    if (len == 1 && (bytes[0] & 0x80) == 0) {
+        *out_cp = bytes[0];
+        return true;
+    }
+    if (len == 2 && (bytes[0] & 0xE0) == 0xC0 &&
+        (bytes[1] & 0xC0) == 0x80) {
+        *out_cp = ((uint32_t)(bytes[0] & 0x1F) << 6) |
+                  (uint32_t)(bytes[1] & 0x3F);
+        return true;
+    }
+    if (len == 3 && (bytes[0] & 0xF0) == 0xE0 &&
+        (bytes[1] & 0xC0) == 0x80 &&
+        (bytes[2] & 0xC0) == 0x80) {
+        *out_cp = ((uint32_t)(bytes[0] & 0x0F) << 12) |
+                  ((uint32_t)(bytes[1] & 0x3F) << 6) |
+                  (uint32_t)(bytes[2] & 0x3F);
+        return true;
+    }
+    if (len == 4 && (bytes[0] & 0xF8) == 0xF0 &&
+        (bytes[1] & 0xC0) == 0x80 &&
+        (bytes[2] & 0xC0) == 0x80 &&
+        (bytes[3] & 0xC0) == 0x80) {
+        *out_cp = ((uint32_t)(bytes[0] & 0x07) << 18) |
+                  ((uint32_t)(bytes[1] & 0x3F) << 12) |
+                  ((uint32_t)(bytes[2] & 0x3F) << 6) |
+                  (uint32_t)(bytes[3] & 0x3F);
+        return true;
+    }
+    return false;
+}
+
+static int microWriteAll(int fd, const unsigned char *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, buf + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+static void microUtf8StateReset(MicroUtf8State *st) {
+    if (!st) {
+        return;
+    }
+    st->have = 0;
+    st->expect = 0;
+}
+
+static bool microTranslateOptionByte(MicroUtf8State *st,
+                                     unsigned char in,
+                                     unsigned char *out,
+                                     size_t *out_len) {
+    if (!st || !out || !out_len) {
+        return false;
+    }
+    *out_len = 0;
+
+    if (st->expect == 0) {
+        if ((in & 0x80) == 0) {
+            out[0] = in;
+            *out_len = 1;
+            return true;
+        }
+        if ((in & 0xE0) == 0xC0) {
+            st->expect = 2;
+        } else if ((in & 0xF0) == 0xE0) {
+            st->expect = 3;
+        } else if ((in & 0xF8) == 0xF0) {
+            st->expect = 4;
+        } else {
+            out[0] = in;
+            *out_len = 1;
+            return true;
+        }
+        st->bytes[0] = in;
+        st->have = 1;
+        return false;
+    }
+
+    if ((in & 0xC0) != 0x80) {
+        size_t flush = st->have;
+        memcpy(out, st->bytes, flush);
+        out[flush] = in;
+        *out_len = flush + 1;
+        microUtf8StateReset(st);
+        return true;
+    }
+
+    st->bytes[st->have++] = in;
+    if (st->have < st->expect) {
+        return false;
+    }
+
+    uint32_t cp = 0;
+    unsigned char alt_key = 0;
+    if (microDecodeUtf8(st->bytes, st->expect, &cp) &&
+        microMapOptionRuneToAlt(cp, &alt_key)) {
+        out[0] = 0x1B;
+        out[1] = alt_key;
+        *out_len = 2;
+    } else {
+        memcpy(out, st->bytes, st->expect);
+        *out_len = st->expect;
+    }
+    microUtf8StateReset(st);
+    return true;
+}
+
+static void microApplyWinsizeFromStdin(int pty_master) {
+    struct winsize ws;
+    memset(&ws, 0, sizeof(ws));
+    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0 &&
+        ws.ws_col > 0 && ws.ws_row > 0) {
+        (void)ioctl(pty_master, TIOCSWINSZ, &ws);
+    }
+}
+
+static int microRunExternalWithOptionAlt(const char *candidate,
+                                         int execArgc,
+                                         char **execArgv) {
+    int pty_master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (pty_master < 0) {
+        return -1;
+    }
+    if (grantpt(pty_master) != 0 || unlockpt(pty_master) != 0) {
+        close(pty_master);
+        return -1;
+    }
+
+    char pty_slave_name[128];
+    memset(pty_slave_name, 0, sizeof(pty_slave_name));
+#if defined(__linux__)
+    if (ptsname_r(pty_master, pty_slave_name, sizeof(pty_slave_name)) != 0) {
+        close(pty_master);
+        return -1;
+    }
+#else
+    char *pts_name = ptsname(pty_master);
+    if (!pts_name || !*pts_name) {
+        close(pty_master);
+        return -1;
+    }
+    snprintf(pty_slave_name, sizeof(pty_slave_name), "%s", pts_name);
+#endif
+
+    pid_t child = fork();
+    if (child < 0) {
+        close(pty_master);
+        return -1;
+    }
+    if (child == 0) {
+        int pty_slave = -1;
+        setsid();
+        pty_slave = open(pty_slave_name, O_RDWR | O_NOCTTY);
+        if (pty_slave < 0) {
+            _exit(127);
+        }
+        (void)ioctl(pty_slave, TIOCSCTTY, 0);
+        if (pty_slave != STDIN_FILENO) {
+            dup2(pty_slave, STDIN_FILENO);
+        }
+        if (pty_slave != STDOUT_FILENO) {
+            dup2(pty_slave, STDOUT_FILENO);
+        }
+        if (pty_slave != STDERR_FILENO) {
+            dup2(pty_slave, STDERR_FILENO);
+        }
+        if (pty_slave > STDERR_FILENO) {
+            close(pty_slave);
+        }
+        close(pty_master);
+        execv(candidate, execArgv);
+        _exit(127);
+    }
+
+    microApplyWinsizeFromStdin(pty_master);
+
+    bool stdin_is_tty = isatty(STDIN_FILENO);
+    struct termios saved_termios;
+    bool saved_termios_valid = false;
+    if (stdin_is_tty && tcgetattr(STDIN_FILENO, &saved_termios) == 0) {
+        struct termios raw = saved_termios;
+        cfmakeraw(&raw);
+        if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
+            saved_termios_valid = true;
+        }
+    }
+
+    bool stdin_open = true;
+    int child_status = 0;
+    bool child_exited = false;
+    MicroUtf8State utf8_state;
+    microUtf8StateReset(&utf8_state);
+
+    while (true) {
+        if (!child_exited) {
+            pid_t w = waitpid(child, &child_status, WNOHANG);
+            if (w == child) {
+                child_exited = true;
+            }
+        }
+
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        int maxfd = pty_master;
+        FD_SET(pty_master, &readfds);
+        if (stdin_open) {
+            FD_SET(STDIN_FILENO, &readfds);
+            if (STDIN_FILENO > maxfd) {
+                maxfd = STDIN_FILENO;
+            }
+        }
+
+        int sel = select(maxfd + 1, &readfds, NULL, NULL, NULL);
+        if (sel < 0) {
+            if (errno == EINTR) {
+                if (stdin_is_tty) {
+                    microApplyWinsizeFromStdin(pty_master);
+                }
+                continue;
+            }
+            break;
+        }
+
+        if (stdin_open && FD_ISSET(STDIN_FILENO, &readfds)) {
+            unsigned char in = 0;
+            ssize_t nr = read(STDIN_FILENO, &in, 1);
+            if (nr <= 0) {
+                stdin_open = false;
+            } else {
+                unsigned char out[8];
+                size_t out_len = 0;
+                if (microTranslateOptionByte(&utf8_state, in, out, &out_len) && out_len > 0) {
+                    if (microWriteAll(pty_master, out, out_len) != 0) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (FD_ISSET(pty_master, &readfds)) {
+            unsigned char outbuf[4096];
+            ssize_t nr = read(pty_master, outbuf, sizeof(outbuf));
+            if (nr <= 0) {
+                break;
+            }
+            if (microWriteAll(STDOUT_FILENO, outbuf, (size_t)nr) != 0) {
+                break;
+            }
+        }
+    }
+
+    if (utf8_state.have > 0) {
+        (void)microWriteAll(pty_master, utf8_state.bytes, utf8_state.have);
+    }
+
+    if (!child_exited) {
+        (void)waitpid(child, &child_status, 0);
+    }
+    close(pty_master);
+
+    if (saved_termios_valid) {
+        (void)tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios);
+    }
+
+    if (WIFEXITED(child_status)) {
+        return WEXITSTATUS(child_status);
+    }
+    if (WIFSIGNALED(child_status)) {
+        return 128 + WTERMSIG(child_status);
+    }
+    return 1;
+}
+
 static int microExecExternalBinary(int argc, char **argv) {
     const char *overridePath = getenv("PSCAL_MICRO_EXTERNAL");
     const char *candidates[4];
@@ -1363,6 +1702,16 @@ static int microExecExternalBinary(int argc, char **argv) {
             execArgv[argIndex] = argv[argIndex];
         }
         execArgv[execArgc] = NULL;
+        if (microOptionAltEnabled() && isatty(STDIN_FILENO) && isatty(STDOUT_FILENO)) {
+            int relayStatus = microRunExternalWithOptionAlt(candidate, execArgc, execArgv);
+            if (relayStatus >= 0) {
+                free(execArgv);
+                return relayStatus;
+            }
+            if (microDebugEnabled()) {
+                fprintf(stderr, "micro: option-alt relay unavailable; falling back to direct exec\n");
+            }
+        }
         execv(candidate, execArgv);
         free(execArgv);
         fprintf(stderr, "micro: failed to exec %s: %s\n", candidate, strerror(errno));

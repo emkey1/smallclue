@@ -45,6 +45,14 @@ if ! "${BUILD_CMD[@]}" 2>&1 | tee "$LOG_FILE"; then
   echo
   echo "Docker build failed. Last 120 log lines:"
   tail -n 120 "$LOG_FILE" || true
+  if grep -qi "no space left on device" "$LOG_FILE"; then
+    echo
+    echo "Detected Docker storage exhaustion."
+    echo "Try:"
+    echo "  docker system df"
+    echo "  docker system prune -af --volumes"
+    echo "If needed, increase Docker Desktop disk image size in Settings > Resources."
+  fi
   echo
   echo "Error summary:"
   grep -E "(^ERROR:|error:|not complete successfully|did not complete successfully|\\*\\*\\*)" "$LOG_FILE" | tail -n 20 || true
