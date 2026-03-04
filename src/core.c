@@ -32,6 +32,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <dlfcn.h>
 #include <poll.h>
 #include <fnmatch.h>
 #include <grp.h>
@@ -87,11 +88,13 @@ void PSCALRuntimeBeginScriptCapture(const char *path, int append) __attribute__(
 void PSCALRuntimeEndScriptCapture(void) __attribute__((weak));
 int PSCALRuntimeScriptCaptureActive(void) __attribute__((weak));
 int pscalRuntimeOpenShellTab(void) __attribute__((weak));
+char *pscalRuntimePickMountSourceDirectory(void) __attribute__((weak));
 #ifndef PSCAL_RUNTIME_CAPTURE_IMPL
 __attribute__((weak)) void PSCALRuntimeBeginScriptCapture(const char *path, int append) { (void)path; (void)append; }
 __attribute__((weak)) void PSCALRuntimeEndScriptCapture(void) {}
 __attribute__((weak)) int PSCALRuntimeScriptCaptureActive(void) { return 0; }
 __attribute__((weak)) int pscalRuntimeOpenShellTab(void) { errno = ENOSYS; return -1; }
+__attribute__((weak)) char *pscalRuntimePickMountSourceDirectory(void) { errno = ENOSYS; return NULL; }
 #endif
 __attribute__((weak)) char *pscalRuntimeCopyMarketingVersion(void) { return NULL; }
 #endif
@@ -139,6 +142,52 @@ static const char *smallclueResolvePath(const char *path, char *buffer, size_t b
     (void)buflen;
     return path;
 }
+
+#if defined(PSCAL_TARGET_IOS)
+static char *smallclueHostRealpathPath(const char *path, char *resolved, size_t resolved_size) {
+    if (!path || !resolved || resolved_size == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    typedef char *(*SmallclueRealpathFn)(const char *, char *);
+    static SmallclueRealpathFn realpath_fn = NULL;
+    static bool attempted = false;
+    if (!attempted) {
+        attempted = true;
+        realpath_fn = (SmallclueRealpathFn)dlsym(RTLD_NEXT, "realpath");
+        if (!realpath_fn) {
+            realpath_fn = (SmallclueRealpathFn)dlsym(RTLD_DEFAULT, "realpath");
+        }
+    }
+    if (!realpath_fn) {
+        errno = ENOSYS;
+        return NULL;
+    }
+    return realpath_fn(path, resolved);
+}
+
+static int smallclueHostStatPath(const char *path, struct stat *st) {
+    if (!path || !st) {
+        errno = EINVAL;
+        return -1;
+    }
+    typedef int (*SmallclueStatFn)(const char *, struct stat *);
+    static SmallclueStatFn stat_fn = NULL;
+    static bool attempted = false;
+    if (!attempted) {
+        attempted = true;
+        stat_fn = (SmallclueStatFn)dlsym(RTLD_NEXT, "stat");
+        if (!stat_fn) {
+            stat_fn = (SmallclueStatFn)dlsym(RTLD_DEFAULT, "stat");
+        }
+    }
+    if (!stat_fn) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return stat_fn(path, st);
+}
+#endif
 
 static bool smallclueCopyPath(char *out, size_t outSize, const char *value) {
     if (!out || outSize == 0 || !value) {
@@ -1472,8 +1521,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  -v verbose"},
     {"mknod", "mknod [-m mode] NAME TYPE [MAJOR MINOR]\n"
               "  Create special files (b=block, c/u=char, p=fifo)"},
-    {"mount", "mount [-t type] [-o options] device dir\n"
-              "  Mount filesystems (use -t type)"},
+    {"mount", "mount [-t type] [-o options] [source] dir\n"
+              "  Mount filesystems (iOS: omit source to open folder picker)"},
     {"micro", "micro [FILE]\n"
               "  Micro editor"},
     {"more", "more [FILE...]\n"
@@ -14374,6 +14423,221 @@ static int smallclueMountCommand(int argc, char **argv) {
         perror("mount");
         return 1;
     }
+    return 0;
+#elif defined(PSCAL_TARGET_IOS)
+    const char *usage = "usage: mount [-t type] [-o options] [source] dir\n";
+    const char *type = NULL;
+    char *options = NULL;
+    char *picked_source = NULL;
+    unsigned long flags = 0;
+    enum {
+        SMALLCLUE_MOUNT_RDONLY = 1ul << 0,
+        SMALLCLUE_MOUNT_NOSUID = 1ul << 1,
+        SMALLCLUE_MOUNT_NODEV = 1ul << 2,
+        SMALLCLUE_MOUNT_NOEXEC = 1ul << 3,
+        SMALLCLUE_MOUNT_REMOUNT = 1ul << 4,
+        SMALLCLUE_MOUNT_BIND = 1ul << 5
+    };
+
+    smallclueResetGetopt();
+    int opt;
+    while ((opt = getopt(argc, argv, "t:o:")) != -1) {
+        switch (opt) {
+            case 't':
+                type = optarg;
+                break;
+            case 'o':
+                if (options) {
+                    size_t old_len = strlen(options);
+                    size_t new_len = old_len + 1 + strlen(optarg) + 1;
+                    char *new_opts = (char *)realloc(options, new_len);
+                    if (new_opts) {
+                        options = new_opts;
+                        strcat(options, ",");
+                        strcat(options, optarg);
+                    }
+                } else {
+                    options = strdup(optarg);
+                }
+                break;
+            default:
+                free(options);
+                fputs(usage, stderr);
+                return 1;
+        }
+    }
+
+    if (options) {
+        char *opts = strdup(options);
+        if (opts) {
+            char *token = strtok(opts, ",");
+            while (token) {
+                if (strcmp(token, "ro") == 0) flags |= SMALLCLUE_MOUNT_RDONLY;
+                else if (strcmp(token, "rw") == 0) flags &= ~SMALLCLUE_MOUNT_RDONLY;
+                else if (strcmp(token, "nosuid") == 0) flags |= SMALLCLUE_MOUNT_NOSUID;
+                else if (strcmp(token, "suid") == 0) flags &= ~SMALLCLUE_MOUNT_NOSUID;
+                else if (strcmp(token, "nodev") == 0) flags |= SMALLCLUE_MOUNT_NODEV;
+                else if (strcmp(token, "dev") == 0) flags &= ~SMALLCLUE_MOUNT_NODEV;
+                else if (strcmp(token, "noexec") == 0) flags |= SMALLCLUE_MOUNT_NOEXEC;
+                else if (strcmp(token, "exec") == 0) flags &= ~SMALLCLUE_MOUNT_NOEXEC;
+                else if (strcmp(token, "remount") == 0) flags |= SMALLCLUE_MOUNT_REMOUNT;
+                else if (strcmp(token, "bind") == 0) flags |= SMALLCLUE_MOUNT_BIND;
+                token = strtok(NULL, ",");
+            }
+            free(opts);
+        }
+    }
+
+    if (optind >= argc) {
+        const char *root_source = "rootfs";
+        const char *root_type = "ext4";
+        struct statfs sfs;
+        if (statfs("/", &sfs) == 0) {
+            if (sfs.f_mntfromname[0]) {
+                root_source = sfs.f_mntfromname;
+            }
+            if (sfs.f_fstypename[0]) {
+                root_type = sfs.f_fstypename;
+            }
+        }
+        printf("%s / %s rw 0 0\n", root_source, root_type);
+
+        size_t mount_count = pathTruncateMountSnapshot(NULL, 0);
+        PathTruncateMountEntry *entries = NULL;
+        if (mount_count > 0) {
+            entries = (PathTruncateMountEntry *)calloc(mount_count, sizeof(PathTruncateMountEntry));
+            if (!entries) {
+                free(options);
+                fprintf(stderr, "mount: out of memory\n");
+                return 1;
+            }
+            mount_count = pathTruncateMountSnapshot(entries, mount_count);
+            for (size_t i = 0; i < mount_count; ++i) {
+                const char *entry_type = entries[i].type[0] ? entries[i].type : "auto";
+                const char *entry_opts = entries[i].options[0] ? entries[i].options : "rw";
+                printf("%s %s %s %s 0 0\n",
+                       entries[i].source,
+                       entries[i].target,
+                       entry_type,
+                       entry_opts);
+            }
+        }
+        free(entries);
+        free(options);
+        return 0;
+    }
+
+    if (optind + 2 < argc) {
+        free(options);
+        free(picked_source);
+        fputs(usage, stderr);
+        return 1;
+    }
+
+    const char *source = NULL;
+    const char *target = NULL;
+    if (optind + 1 < argc) {
+        source = argv[optind];
+        target = argv[optind + 1];
+    } else {
+        target = argv[optind];
+        if (!pscalRuntimePickMountSourceDirectory) {
+            free(options);
+            fputs("mount: interactive picker unavailable on this runtime\n", stderr);
+            return 1;
+        }
+        picked_source = pscalRuntimePickMountSourceDirectory();
+        if (!picked_source || picked_source[0] == '\0') {
+            int pick_errno = errno ? errno : ECANCELED;
+            free(options);
+            free(picked_source);
+            fprintf(stderr, "mount: source picker: %s\n", strerror(pick_errno));
+            return 1;
+        }
+        source = picked_source;
+    }
+
+    char source_real[PATH_MAX];
+    bool source_resolved_ok = false;
+    char source_resolved[PATH_MAX];
+    const char *source_path = smallclueResolvePath(source, source_resolved, sizeof(source_resolved));
+    if (source_path && source_path[0] != '\0' &&
+        smallclueHostRealpathPath(source_path, source_real, sizeof(source_real))) {
+        source_resolved_ok = true;
+    } else if (source[0] == '/' &&
+               smallclueHostRealpathPath(source, source_real, sizeof(source_real))) {
+        source_resolved_ok = true;
+    }
+    if (!source_resolved_ok) {
+        fprintf(stderr, "mount: %s: %s\n", source, strerror(errno));
+        free(options);
+        free(picked_source);
+        return 1;
+    }
+    struct stat source_st;
+    if (smallclueHostStatPath(source_real, &source_st) != 0) {
+        fprintf(stderr, "mount: %s: %s\n", source, strerror(errno));
+        free(options);
+        free(picked_source);
+        return 1;
+    }
+    if (!S_ISDIR(source_st.st_mode)) {
+        fprintf(stderr, "mount: %s: not a directory\n", source);
+        free(options);
+        free(picked_source);
+        return 1;
+    }
+
+    char target_virtual[PATH_MAX];
+    if (!realpath(target, target_virtual)) {
+        fprintf(stderr, "mount: %s: %s\n", target, strerror(errno));
+        free(options);
+        free(picked_source);
+        return 1;
+    }
+
+    char target_host[PATH_MAX];
+    if (!pathTruncateExpand(target_virtual, target_host, sizeof(target_host))) {
+        fprintf(stderr, "mount: %s: %s\n", target, strerror(errno));
+        free(options);
+        free(picked_source);
+        return 1;
+    }
+
+    char target_real[PATH_MAX];
+    if (!smallclueHostRealpathPath(target_host, target_real, sizeof(target_real))) {
+        fprintf(stderr, "mount: %s: %s\n", target, strerror(errno));
+        free(options);
+        free(picked_source);
+        return 1;
+    }
+    struct stat target_st;
+    if (smallclueHostStatPath(target_real, &target_st) != 0) {
+        fprintf(stderr, "mount: %s: %s\n", target, strerror(errno));
+        free(options);
+        free(picked_source);
+        return 1;
+    }
+    if (!S_ISDIR(target_st.st_mode)) {
+        fprintf(stderr, "mount: %s: not a directory\n", target);
+        free(options);
+        free(picked_source);
+        return 1;
+    }
+
+    if (!pathTruncateMountAdd(source_real,
+                              target_virtual,
+                              type ? type : "bind",
+                              options,
+                              flags)) {
+        perror("mount");
+        free(options);
+        free(picked_source);
+        return 1;
+    }
+
+    free(options);
+    free(picked_source);
     return 0;
 #else
     (void)argc;
