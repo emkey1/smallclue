@@ -9352,7 +9352,7 @@ static const SmallclueLicense kSmallclueLicenses[] = {
     {"curl", "curl_LICENSE.txt"},
     {"OpenSSL", "openssl_LICENSE.txt"},
     {"SDL2", "sdl_LICENSE.txt"},
-    {"Micro", "micro_LICENSE.txt"},
+    {"Micro editor", "micro_LICENSE.txt"},
     {"Nextvi", "nextvi_LICENSE.txt"},
     {"yyjson", "yyjson_LICENSE.txt"},
     {"hterm", "hterm_LICENSE.txt"},
