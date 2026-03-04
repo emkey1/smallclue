@@ -1977,18 +1977,18 @@ static int smallcluePsCommand(int argc, char **argv) {
     if (!snaps || count == 0) {
         free(snaps);
         if (isatty(STDOUT_FILENO)) {
-            printf("\033[1m PID   PPID  PGID   SID STATE      COMMAND\033[0m\n");
+            printf("\033[1m  PID   PPID   PGID    SID STATE      COMMAND\033[0m\n");
         } else {
-            puts(" PID   PPID  PGID   SID STATE      COMMAND");
+            puts("  PID   PPID   PGID    SID STATE      COMMAND");
         }
         puts(" <no virtual tasks>");
         return 0;
     }
 
     if (isatty(STDOUT_FILENO)) {
-        printf("\033[1m PID   PPID  PGID   SID STATE      COMMAND\033[0m\n");
+        printf("\033[1m  PID   PPID   PGID    SID STATE      COMMAND\033[0m\n");
     } else {
-        puts(" PID   PPID  PGID   SID STATE      COMMAND");
+        puts("  PID   PPID   PGID    SID STATE      COMMAND");
     }
     for (size_t i = 0; i < count; ++i) {
         const VProcSnapshot *s = &snaps[i];
@@ -2007,7 +2007,7 @@ static int smallcluePsCommand(int argc, char **argv) {
         const char *cmd = (s->command[0] != '\0')
             ? s->command
             : ((s->comm[0] != '\0') ? s->comm : "?");
-        printf("%4d %6d %5d %5d %-10s %s\n",
+        printf("%5d %6d %6d %6d %-10s %s\n",
                s->pid,
                s->parent_pid,
                s->pgid,
@@ -2115,9 +2115,9 @@ static int smallcluePsCommand(int argc, char **argv) {
         }
 
         if (isatty(STDOUT_FILENO)) {
-            printf("\033[1m PID   PPID USER     COMMAND\033[0m\n");
+            printf("\033[1m  PID   PPID USER     COMMAND\033[0m\n");
         } else {
-            printf(" PID   PPID USER     COMMAND\n");
+            printf("  PID   PPID USER     COMMAND\n");
         }
         for (size_t i = 0; i < count; ++i) {
             struct passwd *pw = getpwuid(entries[i].uid);
@@ -2127,7 +2127,7 @@ static int smallcluePsCommand(int argc, char **argv) {
             } else {
                 snprintf(user_buf, sizeof(user_buf), "%d", (int)entries[i].uid);
             }
-            printf("%4d %6d %-8s %s\n", entries[i].pid, entries[i].ppid, user_buf, entries[i].command);
+            printf("%5d %6d %-8s %s\n", entries[i].pid, entries[i].ppid, user_buf, entries[i].command);
             free(entries[i].command);
         }
         free(entries);
@@ -2137,9 +2137,9 @@ static int smallcluePsCommand(int argc, char **argv) {
         uid_t uid = getuid();
         const char *cmd = argv && argv[0] ? argv[0] : "ps";
         if (isatty(STDOUT_FILENO)) {
-            printf("\033[1m PID   PPID USER     COMMAND\033[0m\n");
+            printf("\033[1m  PID   PPID USER     COMMAND\033[0m\n");
         } else {
-            printf(" PID   PPID USER     COMMAND\n");
+            printf("  PID   PPID USER     COMMAND\n");
         }
         struct passwd *pw = getpwuid(uid);
         char user_buf[32];
@@ -2148,7 +2148,7 @@ static int smallcluePsCommand(int argc, char **argv) {
         } else {
             snprintf(user_buf, sizeof(user_buf), "%d", (int)uid);
         }
-        printf("%4d %6d %-8s %s\n", (int)pid, (int)ppid, user_buf, cmd);
+        printf("%5d %6d %-8s %s\n", (int)pid, (int)ppid, user_buf, cmd);
     }
     return 0;
 #endif
@@ -2356,11 +2356,11 @@ static int smallclueTopCommand(int argc, char **argv) {
         int hn;
         if (isatty(STDOUT_FILENO)) {
             hn = snprintf(header, sizeof(header),
-                          "\033[1m%-6s %-6s %-6s %-6s %-3s %-8s %-10s %-6s %-6s %s\033[0m\n",
+                          "\033[1m%6s %6s %6s %6s %-3s %-8s %-10s %6s %6s %s\033[0m\n",
                           "PID", "PPID", "PGID", "SID", "FG", "PTY", "STATE", "UTIME", "STIME", "CMD");
         } else {
             hn = snprintf(header, sizeof(header),
-                          "%-6s %-6s %-6s %-6s %-3s %-8s %-10s %-6s %-6s %s\n",
+                          "%6s %6s %6s %6s %-3s %-8s %-10s %6s %6s %s\n",
                           "PID", "PPID", "PGID", "SID", "FG", "PTY", "STATE", "UTIME", "STIME", "CMD");
         }
         if (hn > 0) {
@@ -2417,7 +2417,7 @@ static int smallclueTopCommand(int argc, char **argv) {
                     vprocFormatCpuTimes(snap->rusage_utime, snap->rusage_stime, &ut_s, &st_s);
                     char line[320];
                     int n = snprintf(line, sizeof(line),
-                                     "%-6d %-6d %-6d %-6d %-3s %-8s %-10s %-6.1f %-6.1f %s%s\n",
+                                     "%6d %6d %6d %6d %-3s %-8s %-10s %6.1f %6.1f %s%s\n",
                                      snap->pid, snap->parent_pid, snap->pgid, snap->sid,
                                      fg ? "fg" : "", pty_label, state, ut_s, st_s, indent, cmd);
                     if (n > 0) {
@@ -2451,7 +2451,7 @@ static int smallclueTopCommand(int argc, char **argv) {
                 vprocFormatCpuTimes(snap->rusage_utime, snap->rusage_stime, &ut_s, &st_s);
                 char line[320];
                 int n = snprintf(line, sizeof(line),
-                                 "%-6d %-6d %-6d %-6d %-3s %-8s %-10s %-6.1f %-6.1f %s\n",
+                                 "%6d %6d %6d %6d %-3s %-8s %-10s %6.1f %6.1f %s\n",
                                  snap->pid, snap->parent_pid, snap->pgid, snap->sid,
                                  fg ? "fg" : "", pty_label, state, ut_s, st_s, cmd);
                 if (n > 0) {
