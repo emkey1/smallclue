@@ -403,6 +403,7 @@ gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${EXTRA
     ${OPENSSH_OBJS} \
     src/openssh_app.c \
     src/vproc_test_app.c \
+    src/micro_app.c \
     ${OPENSSH_SHIM} \
     src/runtime_stubs_extra.c \
     ${OPENSSH_LIBS} \

@@ -1060,6 +1060,8 @@ static char *smallclueGetPass(const char *prompt) {
     struct termios old, new;
     int fd = fileno(stdin);
 
+    smallclueSecureMemzero(buf, sizeof(buf));
+
     if (tcgetattr(fd, &old) != 0) {
         return NULL;
     }
@@ -1072,6 +1074,7 @@ static char *smallclueGetPass(const char *prompt) {
     fprintf(stderr, "%s", prompt);
     if (fgets(buf, sizeof(buf), stdin) == NULL) {
         tcsetattr(fd, TCSAFLUSH, &old);
+        smallclueSecureMemzero(buf, sizeof(buf));
         return NULL;
     }
     tcsetattr(fd, TCSAFLUSH, &old);
@@ -3000,10 +3003,13 @@ static size_t pagerMaxTop(const PagerBuffer *buffer, int page_rows) {
 static int pagerPromptAndRead(const char *cmd_name) {
     const char *label = pager_command_name(cmd_name);
     bool md_mode = (label && strcmp(label, "md") == 0);
+    bool color = isatty(STDOUT_FILENO);
+    const char *inv = color ? "\033[7m" : "";
+    const char *rst = color ? "\033[0m" : "";
     if (md_mode) {
-        fprintf(stdout, "\r--%s-- (Space=next, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit) ", label);
+        fprintf(stdout, "\r%s--%s-- (Space=next, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)%s ", inv, label, rst);
     } else {
-        fprintf(stdout, "\r--%s-- (Space=next, b=prev, arrows=scroll, q=quit) ", label);
+        fprintf(stdout, "\r%s--%s-- (Space=next, b=prev, arrows=scroll, q=quit)%s ", inv, label, rst);
     }
     fflush(stdout);
     int key = pager_read_key();
