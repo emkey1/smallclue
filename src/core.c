@@ -1011,6 +1011,8 @@ static char *smallclueGetPass(const char *prompt) {
     struct termios old, new;
     int fd = fileno(stdin);
 
+    smallclueSecureMemzero(buf, sizeof(buf));
+
     if (tcgetattr(fd, &old) != 0) {
         return NULL;
     }
@@ -1023,6 +1025,7 @@ static char *smallclueGetPass(const char *prompt) {
     fprintf(stderr, "%s", prompt);
     if (fgets(buf, sizeof(buf), stdin) == NULL) {
         tcsetattr(fd, TCSAFLUSH, &old);
+        smallclueSecureMemzero(buf, sizeof(buf));
         return NULL;
     }
     tcsetattr(fd, TCSAFLUSH, &old);
