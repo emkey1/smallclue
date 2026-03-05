@@ -11,3 +11,8 @@
 **Vulnerability:** Passwords used in authentication (`sudo` and `passwd` applets) were left in memory indefinitely after use, allowing potential exposure via memory scraping or core dumps.
 **Learning:** Even well-intentioned code that securely hashes passwords (using `crypt`) can leave plaintext secrets in dynamically allocated strings or static buffers. Dead store elimination by compilers often optimizes away standard `memset` calls intended to zero out these buffers before freeing them.
 **Prevention:** Always use a secure memory zeroing function (like `smallclueSecureMemzero` utilizing `volatile` pointers) to guarantee that sensitive data is scrubbed from memory immediately after its lifecycle ends.
+
+## 2024-05-24 - [Incomplete Password Wiping in Static Buffers]
+**Vulnerability:** When wiping passwords in `sudo` and `passwd` applets, the caller only zeroed the buffer up to `strlen(pass)`. Because the `smallclueGetPass` function used a shared static buffer, shorter passwords entered subsequently did not overwrite the remnants of previous longer passwords in the buffer, leading to potential data leakage.
+**Learning:** Zeroing a dynamically-sized subset (like `strlen`) of a fixed-size static buffer leaves the rest of the buffer intact, which may contain sensitive data from previous calls. Relying solely on the caller to manage static buffer clearing is error-prone.
+**Prevention:** Always securely zero out the entire static buffer (`sizeof(buf)`) at the beginning of the function and on failure before returning, instead of relying on the caller to zero the buffer based on the string length.
