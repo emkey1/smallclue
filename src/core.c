@@ -1917,30 +1917,35 @@ static bool smallclueReadTokensFromStdin(SmallclueLineVector *vec) {
     char *token = NULL;
     size_t tokcap = 0;
     size_t toklen = 0;
-    int ch;
+    char buf[16384];
     int read_err = 0;
-    while ((ch = smallclueGetcStream(stdin, &read_err)) != EOF) {
-        if (isspace((unsigned char)ch)) {
-            if (toklen > 0) {
-                if (!smallclueLineVectorAppend(vec, token, toklen)) {
+    ssize_t n;
+
+    while ((n = smallclueReadStream(stdin, buf, sizeof(buf), &read_err)) > 0) {
+        for (ssize_t i = 0; i < n; ++i) {
+            int ch = (unsigned char)buf[i];
+            if (isspace(ch)) {
+                if (toklen > 0) {
+                    if (!smallclueLineVectorAppend(vec, token, toklen)) {
+                        free(token);
+                        return false;
+                    }
+                    toklen = 0;
+                }
+                continue;
+            }
+            if (toklen + 1 >= tokcap) {
+                size_t newcap = tokcap ? tokcap * 2 : 64;
+                char *tmp = (char *)realloc(token, newcap);
+                if (!tmp) {
                     free(token);
                     return false;
                 }
-                toklen = 0;
+                token = tmp;
+                tokcap = newcap;
             }
-            continue;
+            token[toklen++] = (char)ch;
         }
-        if (toklen + 1 >= tokcap) {
-            size_t newcap = tokcap ? tokcap * 2 : 64;
-            char *tmp = (char *)realloc(token, newcap);
-            if (!tmp) {
-                free(token);
-                return false;
-            }
-            token = tmp;
-            tokcap = newcap;
-        }
-        token[toklen++] = (char)ch;
     }
     if (read_err) {
         free(token);
@@ -9187,11 +9192,17 @@ typedef enum {
 static uint16_t smallclueBsdSum(FILE *f, unsigned long long *out_blocks) {
     uint16_t sum = 0;
     unsigned long long total = 0;
-    int c;
-    while ((c = fgetc(f)) != EOF) {
-        sum = (uint16_t)((sum >> 1) | ((sum & 1) << 15));
-        sum = (uint16_t)((sum + (uint16_t)c) & 0xFFFF);
-        total++;
+    char buf[16384];
+    int read_err = 0;
+    ssize_t n;
+
+    while ((n = smallclueReadStream(f, buf, sizeof(buf), &read_err)) > 0) {
+        for (ssize_t i = 0; i < n; ++i) {
+            unsigned char c = (unsigned char)buf[i];
+            sum = (uint16_t)((sum >> 1) | ((sum & 1) << 15));
+            sum = (uint16_t)((sum + (uint16_t)c) & 0xFFFF);
+        }
+        total += (unsigned long long)n;
     }
     if (out_blocks) {
         *out_blocks = (total + 1023ULL) / 1024ULL; /* 1K blocks */
@@ -9202,10 +9213,15 @@ static uint16_t smallclueBsdSum(FILE *f, unsigned long long *out_blocks) {
 static uint16_t smallclueSysvSum(FILE *f, unsigned long long *out_blocks) {
     uint32_t sum = 0;
     unsigned long long total = 0;
-    int c;
-    while ((c = fgetc(f)) != EOF) {
-        sum += (uint8_t)c;
-        total++;
+    char buf[16384];
+    int read_err = 0;
+    ssize_t n;
+
+    while ((n = smallclueReadStream(f, buf, sizeof(buf), &read_err)) > 0) {
+        for (ssize_t i = 0; i < n; ++i) {
+            sum += (uint8_t)buf[i];
+        }
+        total += (unsigned long long)n;
     }
     /* Fold to 16 bits */
     sum = (sum & 0xFFFF) + (sum >> 16);
