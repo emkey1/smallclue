@@ -7790,7 +7790,6 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
     } else {
         printf("%s", header);
     }
-    printf("\x1b[0m\n");
     size_t end = top + window;
     if (end > count) {
         end = count;
