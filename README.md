@@ -69,7 +69,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **env**: Run a program in a modified environment.
 * **ps**: Report a snapshot of current processes.
 * **kill**: Send signals to processes.
-* **uptime**: Tell how long the system has been running.
+* **uptime**: Show app uptime since launch (use `-s` for system uptime).
 * **uname**: Print system information.
 * **id**: Print user identity information.
 * **date**: Print or set the system date and time.

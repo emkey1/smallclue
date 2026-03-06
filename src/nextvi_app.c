@@ -17,6 +17,13 @@
 #include "common/path_virtualization.h"
 #include "common/path_truncate.h"
 #include "ios/vproc.h"
+#if defined(__APPLE__)
+extern void *PSCALRuntimeGetCurrentRuntimeContext(void) __attribute__((weak_import));
+extern void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) __attribute__((weak_import));
+#else
+extern void *PSCALRuntimeGetCurrentRuntimeContext(void) __attribute__((weak));
+extern void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) __attribute__((weak));
+#endif
 #endif
 
 extern int nextvi_main_entry(int argc, char **argv);
@@ -194,6 +201,7 @@ typedef struct {
 #if defined(PSCAL_TARGET_IOS)
     VProc *vp;
     VProcSessionStdio *session_stdio;
+    void *runtime_ctx;
 #endif
 } NextviThreadArgs;
 
@@ -389,20 +397,28 @@ static int smallclueRunEditorChild(int argc, char **argv) {
 
     smallclueResetNextviGlobals();
 
+    int dup_fd = -1;
+#if !defined(PSCAL_TARGET_IOS)
     SmallclueStdFdBackup stdio_backup;
+    /*
+     * Non-iOS builds may need to rebind stdio to a controlling tty for nextvi.
+     * On iOS this is process-global and can corrupt other tab sessions.
+     */
     smallclueSaveStandardFds(&stdio_backup);
-
-    int dup_fd = smallclueSetupTty();
+    dup_fd = smallclueSetupTty();
+#endif
     struct termios saved_ios;
     bool saved_ios_valid = false;
     int tty_fd = STDIN_FILENO;
     bool have_tty = false;
     if (smallclueTcgetattr(tty_fd, &saved_ios) != 0) {
+#if !defined(PSCAL_TARGET_IOS)
         tty_fd = dup_fd >= 0 ? dup_fd : open("/dev/tty", O_RDWR);
         if (tty_fd >= 0 && smallclueTcgetattr(tty_fd, &saved_ios) == 0) {
             have_tty = true;
             saved_ios_valid = true;
         }
+#endif
     } else {
         have_tty = true;
         saved_ios_valid = true;
@@ -448,7 +464,9 @@ static int smallclueRunEditorChild(int argc, char **argv) {
     if (dup_fd >= 0 && dup_fd != STDIN_FILENO && dup_fd != tty_fd) {
         close(dup_fd);
     }
+#if !defined(PSCAL_TARGET_IOS)
     smallclueRestoreStandardFds(&stdio_backup);
+#endif
     if (saved_term) {
         setenv("TERM", saved_term, 1);
     } else {
@@ -457,12 +475,26 @@ static int smallclueRunEditorChild(int argc, char **argv) {
     return status;
 }
 
+static int smallclueRunEditorIsolated(int argc, char **argv) {
+    int status = smallclueRunEditorChild(argc, argv);
+    return status;
+}
+
 static void *smallclueRunEditorThread(void *opaque) {
     NextviThreadArgs *args = (NextviThreadArgs *)opaque;
 #if defined(PSCAL_TARGET_IOS)
     bool activated = false;
     bool stdio_swapped = false;
+    bool runtime_ctx_swapped = false;
     VProcSessionStdio *prev_stdio = NULL;
+    void *prev_runtime_ctx = NULL;
+    if (PSCALRuntimeGetCurrentRuntimeContext) {
+        prev_runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext();
+    }
+    if (PSCALRuntimeSetCurrentRuntimeContext && args && args->runtime_ctx) {
+        PSCALRuntimeSetCurrentRuntimeContext(args->runtime_ctx);
+        runtime_ctx_swapped = true;
+    }
     if (args && args->vp) {
         vprocActivate(args->vp);
         vprocRegisterThread(args->vp, pthread_self());
@@ -491,7 +523,7 @@ static void *smallclueRunEditorThread(void *opaque) {
     sigaddset(&unblock, SIGWINCH);
     (void)pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
 #endif
-    (void)smallclueRunEditorChild(args->argc, args->argv);
+    (void)smallclueRunEditorIsolated(args->argc, args->argv);
 
 #if defined(PSCAL_TARGET_IOS)
     if (stdio_swapped) {
@@ -500,6 +532,9 @@ static void *smallclueRunEditorThread(void *opaque) {
     if (activated) {
         vprocUnregisterThread(args->vp, pthread_self());
         vprocDeactivate();
+    }
+    if (runtime_ctx_swapped && PSCALRuntimeSetCurrentRuntimeContext) {
+        PSCALRuntimeSetCurrentRuntimeContext(prev_runtime_ctx);
     }
 #endif
     pthread_mutex_lock(&s_nextvi_sessions_lock);
@@ -516,7 +551,7 @@ int smallclueRunEditor(int argc, char **argv) {
      * iSH kernels can expose partial futex behavior for some pthread paths.
      * Run nextvi directly in the caller thread to avoid pthread_create/join.
      */
-    return smallclueRunEditorChild(argc, argv);
+    return smallclueRunEditorIsolated(argc, argv);
 #else
     const char *tool_name = (argc > 0 && argv && argv[0]) ? argv[0] : "nextvi";
 
@@ -536,6 +571,9 @@ int smallclueRunEditor(int argc, char **argv) {
     smallclueNormalizeEditorArgPaths(args);
     args->vp = vprocCurrent();
     args->session_stdio = vprocSessionStdioCurrent();
+    args->runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext
+        ? PSCALRuntimeGetCurrentRuntimeContext()
+        : NULL;
 #endif
 
     // Identify target file and reserve a session slot to block duplicates.

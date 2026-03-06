@@ -2,10 +2,44 @@
 set -e
 
 THIRD_PARTY_DIR="third-party"
+OPENSSH_PORTABLE_VERSION="10.2p1"
+OPENSSH_EXPECTED_VERSION_PREFIX="OpenSSH_10."
 
 mkdir -p "$THIRD_PARTY_DIR"
 
+reset_incomplete_repo() {
+    local dir="$1"
+    local require_git="$2"
+    shift 2
+    local required=("$@")
+
+    if [ ! -d "$dir" ]; then
+        return 0
+    fi
+
+    if [ "$require_git" = "1" ] && [ ! -d "$dir/.git" ]; then
+        echo "Removing incomplete dependency at $dir (missing .git)..."
+        rm -rf "$dir"
+        return 0
+    fi
+
+    local missing=0
+    local f
+    for f in "${required[@]}"; do
+        if [ ! -e "$dir/$f" ]; then
+            missing=1
+            break
+        fi
+    done
+
+    if [ "$missing" -eq 1 ]; then
+        echo "Removing incomplete dependency at $dir (missing required files)..."
+        rm -rf "$dir"
+    fi
+}
+
 # --- Nextvi ---
+reset_incomplete_repo "$THIRD_PARTY_DIR/nextvi" "1" "vi.c" "term.c"
 if [ ! -d "$THIRD_PARTY_DIR/nextvi" ]; then
     echo "Cloning nextvi..."
     git clone https://github.com/kyx0r/nextvi "$THIRD_PARTY_DIR/nextvi"
@@ -78,11 +112,21 @@ if [ -f "$TERM_C" ]; then
 fi
 
 # --- OpenSSH ---
+reset_incomplete_repo "$THIRD_PARTY_DIR/openssh" "0" "configure" "configure.ac" "ssh.c" "scp.c" "sftp.c"
+if [ -d "$THIRD_PARTY_DIR/openssh" ] && [ -f "$THIRD_PARTY_DIR/openssh/version.h" ]; then
+    if ! grep -q "$OPENSSH_EXPECTED_VERSION_PREFIX" "$THIRD_PARTY_DIR/openssh/version.h"; then
+        echo "Removing outdated OpenSSH source (need $OPENSSH_EXPECTED_VERSION_PREFIX*)..."
+        rm -rf "$THIRD_PARTY_DIR/openssh"
+    fi
+fi
 if [ ! -d "$THIRD_PARTY_DIR/openssh" ]; then
-    echo "Cloning OpenSSH Portable..."
-    git clone https://github.com/openssh/openssh-portable "$THIRD_PARTY_DIR/openssh"
-    # Pin to a stable release
-    (cd "$THIRD_PARTY_DIR/openssh" && git checkout V_9_7_P1)
+    echo "Fetching OpenSSH Portable release source..."
+    OPENSSH_TARBALL="$THIRD_PARTY_DIR/openssh-${OPENSSH_PORTABLE_VERSION}.tar.gz"
+    OPENSSH_URL="https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-${OPENSSH_PORTABLE_VERSION}.tar.gz"
+    curl -fL --retry 3 --retry-delay 2 -o "$OPENSSH_TARBALL" "$OPENSSH_URL"
+    mkdir -p "$THIRD_PARTY_DIR/openssh"
+    tar -xzf "$OPENSSH_TARBALL" --strip-components=1 -C "$THIRD_PARTY_DIR/openssh"
+    rm -f "$OPENSSH_TARBALL"
 
     # Patch OpenSSH clients
     OPENSSH_DIR="$THIRD_PARTY_DIR/openssh"
@@ -103,32 +147,9 @@ if [ ! -d "$THIRD_PARTY_DIR/openssh" ]; then
 fi
 
 OPENSSH_DIR="$THIRD_PARTY_DIR/openssh"
-if [ -d "$OPENSSH_DIR" ] && [ ! -f "$OPENSSH_DIR/Makefile" ]; then
-    # Try configure if autoreconf is available or if configure exists
-    if [ -f "$OPENSSH_DIR/configure" ]; then
-        echo "Configuring OpenSSH..."
-        (cd "$OPENSSH_DIR" && ./configure)
-    elif command -v autoreconf >/dev/null 2>&1; then
-        echo "Generating configure for OpenSSH (this may take a moment)..."
-        if ! (cd "$OPENSSH_DIR" && autoreconf -i > autoreconf.log 2>&1); then
-            echo "Error: autoreconf failed."
-            echo "--- autoreconf output ---"
-            cat "$OPENSSH_DIR/autoreconf.log"
-            echo "-------------------------"
-            echo "Please ensure you have autoconf and automake installed."
-            exit 1
-        fi
-        (cd "$OPENSSH_DIR" && ./configure)
-    else
-        echo "Error: autoreconf not found. Cannot configure OpenSSH."
-        echo "Please install autoconf (and automake)."
-        if [ "$(uname -s)" = "Darwin" ]; then
-            echo "On macOS: brew install autoconf automake"
-        else
-            echo "On Linux: sudo apt-get install autoconf automake"
-        fi
-        exit 1
-    fi
+if [ -d "$OPENSSH_DIR" ] && [ ! -f "$OPENSSH_DIR/configure" ]; then
+    echo "Warning: OpenSSH configure script is missing."
+    echo "setup_posix_env.sh will try autoreconf during the build stage."
 fi
 
 # --- Linenoise ---
@@ -161,19 +182,238 @@ if [ -d "$DASH_SRC" ]; then
 
     # Patch input.c
     INPUT_C="$DASH_SRC/input.c"
-    if ! grep -q "linenoise.h" "$INPUT_C"; then
-        echo "Patching dash input.c..."
-        sed -i.bak '/#include "trap.h"/a #include "linenoise.h"\
-#include <stdlib.h>\
-#include <stdio.h>' "$INPUT_C"
+    if [ -f "$INPUT_C" ]; then
+        if ! grep -q 'linenoise.h' "$INPUT_C"; then
+            echo "Patching dash input.c includes..."
+            awk '
+                { print }
+                /#include "trap.h"/ {
+                    print "#include \"linenoise.h\""
+                }
+            ' "$INPUT_C" > "$INPUT_C.tmp" && mv "$INPUT_C.tmp" "$INPUT_C"
+        fi
 
-        # Create patch content for linenoise integration
-        cat > "$DASH_SRC/linenoise_patch.c" <<'EOF'
+        if ! grep -q '^#include <ctype.h>' "$INPUT_C"; then
+            awk '
+                BEGIN { done = 0 }
+                {
+                    print
+                    if (!done && $0 ~ /^#include <stdio.h>/) {
+                        print "#include <ctype.h>"
+                        print "#include <dirent.h>"
+                        print "#include <limits.h>"
+                        print "#include <sys/stat.h>"
+                        done = 1
+                    }
+                }
+            ' "$INPUT_C" > "$INPUT_C.tmp" && mv "$INPUT_C.tmp" "$INPUT_C"
+        fi
+
+        if ! grep -q 'PSCAL_LINENOISE_COMPLETION_BEGIN' "$INPUT_C"; then
+            echo "Patching dash input.c completion helpers..."
+            cat > "$DASH_SRC/linenoise_completion_helpers.c" <<'EOF'
+/* PSCAL_LINENOISE_COMPLETION_BEGIN */
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+static void
+smallclueLinenoiseAddMergedCompletion(const char *buf, size_t token_start,
+				      const char *replacement,
+				      linenoiseCompletions *lc)
+{
+	size_t prefix_len = token_start;
+	size_t repl_len = strlen(replacement);
+	char merged[PATH_MAX * 2];
+
+	if (prefix_len + repl_len + 1 >= sizeof(merged))
+		return;
+	memcpy(merged, buf, prefix_len);
+	memcpy(merged + prefix_len, replacement, repl_len);
+	merged[prefix_len + repl_len] = '\0';
+	linenoiseAddCompletion(lc, merged);
+}
+
+static int
+smallcluePrefixMatch(const char *text, const char *prefix)
+{
+	size_t prefix_len = strlen(prefix);
+	return strncmp(text, prefix, prefix_len) == 0;
+}
+
+static void
+smallclueLinenoiseCompletePath(const char *buf, size_t token_start,
+			       const char *token, linenoiseCompletions *lc)
+{
+	const char *slash = strrchr(token, '/');
+	const char *name_prefix = token;
+	char dir_open[PATH_MAX];
+	char dir_emit[PATH_MAX];
+	DIR *dir;
+	struct dirent *entry;
+
+	if (slash) {
+		size_t emit_len = (size_t)(slash - token + 1);
+		if (emit_len >= sizeof(dir_emit))
+			return;
+		memcpy(dir_emit, token, emit_len);
+		dir_emit[emit_len] = '\0';
+		name_prefix = slash + 1;
+		if (strcmp(dir_emit, "/") == 0) {
+			snprintf(dir_open, sizeof(dir_open), "/");
+		} else {
+			size_t open_len = emit_len - 1;
+			if (open_len >= sizeof(dir_open))
+				return;
+			memcpy(dir_open, token, open_len);
+			dir_open[open_len] = '\0';
+			if (open_len == 0)
+				snprintf(dir_open, sizeof(dir_open), ".");
+		}
+	} else {
+		dir_emit[0] = '\0';
+		snprintf(dir_open, sizeof(dir_open), ".");
+	}
+
+	dir = opendir(dir_open);
+	if (!dir)
+		return;
+
+	while ((entry = readdir(dir)) != NULL) {
+		char candidate[PATH_MAX];
+		char fullpath[PATH_MAX];
+		size_t candidate_len;
+		struct stat st;
+
+		if (name_prefix[0] != '.' && entry->d_name[0] == '.')
+			continue;
+		if (!smallcluePrefixMatch(entry->d_name, name_prefix))
+			continue;
+
+		snprintf(candidate, sizeof(candidate), "%s%s", dir_emit, entry->d_name);
+		if (slash) {
+			if (strcmp(dir_open, "/") == 0)
+				snprintf(fullpath, sizeof(fullpath), "/%s", entry->d_name);
+			else
+				snprintf(fullpath, sizeof(fullpath), "%s/%s", dir_open, entry->d_name);
+		} else {
+			snprintf(fullpath, sizeof(fullpath), "%s", entry->d_name);
+		}
+
+		candidate_len = strlen(candidate);
+		if (candidate_len + 1 < sizeof(candidate) &&
+		    stat(fullpath, &st) == 0 &&
+		    S_ISDIR(st.st_mode) &&
+		    (candidate_len == 0 || candidate[candidate_len - 1] != '/')) {
+			candidate[candidate_len++] = '/';
+			candidate[candidate_len] = '\0';
+		}
+
+		smallclueLinenoiseAddMergedCompletion(buf, token_start, candidate, lc);
+	}
+
+	closedir(dir);
+}
+
+static void
+smallclueLinenoiseCompleteCommands(const char *buf, size_t token_start,
+				   const char *token, linenoiseCompletions *lc)
+{
+	char *path_copy;
+	char *saveptr = NULL;
+	char *segment;
+	const char *path_env = getenv("PATH");
+
+	if (!path_env || !*path_env)
+		return;
+
+	path_copy = strdup(path_env);
+	if (!path_copy)
+		return;
+
+	for (segment = strtok_r(path_copy, ":", &saveptr);
+	     segment;
+	     segment = strtok_r(NULL, ":", &saveptr)) {
+		DIR *dir;
+		struct dirent *entry;
+		const char *dir_path = (*segment == '\0') ? "." : segment;
+
+		dir = opendir(dir_path);
+		if (!dir)
+			continue;
+
+		while ((entry = readdir(dir)) != NULL) {
+			char fullpath[PATH_MAX];
+			struct stat st;
+
+			if (entry->d_name[0] == '.')
+				continue;
+			if (!smallcluePrefixMatch(entry->d_name, token))
+				continue;
+
+			snprintf(fullpath, sizeof(fullpath), "%s/%s", dir_path, entry->d_name);
+			if (stat(fullpath, &st) != 0 || !S_ISREG(st.st_mode))
+				continue;
+			if (access(fullpath, X_OK) != 0)
+				continue;
+
+			smallclueLinenoiseAddMergedCompletion(buf, token_start, entry->d_name, lc);
+		}
+		closedir(dir);
+	}
+
+	free(path_copy);
+}
+
+static void
+smallclueLinenoiseCompletion(const char *buf, linenoiseCompletions *lc)
+{
+	size_t len;
+	size_t token_start;
+	const char *token;
+
+	if (!buf)
+		return;
+
+	len = strlen(buf);
+	if (len == 0)
+		return;
+
+	token_start = len;
+	while (token_start > 0 &&
+	       !isspace((unsigned char)buf[token_start - 1]))
+		token_start--;
+
+	token = buf + token_start;
+	if (*token == '\0')
+		return;
+
+	if (token_start == 0 && strchr(token, '/') == NULL)
+		smallclueLinenoiseCompleteCommands(buf, token_start, token, lc);
+	smallclueLinenoiseCompletePath(buf, token_start, token, lc);
+}
+/* PSCAL_LINENOISE_COMPLETION_END */
+EOF
+            HELPER_LINE=$(grep -n '^#define IBUFSIZ' "$INPUT_C" | head -n 1 | cut -d: -f1)
+            if [ -n "$HELPER_LINE" ]; then
+                head -n $((HELPER_LINE - 1)) "$INPUT_C" > "$INPUT_C.tmp"
+                cat "$DASH_SRC/linenoise_completion_helpers.c" >> "$INPUT_C.tmp"
+                tail -n +"$HELPER_LINE" "$INPUT_C" >> "$INPUT_C.tmp"
+                mv "$INPUT_C.tmp" "$INPUT_C"
+            fi
+            rm -f "$DASH_SRC/linenoise_completion_helpers.c"
+        fi
+
+        # Replace the linenoise read block with completion-aware version.
+        if ! grep -q 'linenoiseSetCompletionCallback' "$INPUT_C"; then
+            echo "Patching dash input.c linenoise read loop..."
+            cat > "$DASH_SRC/linenoise_patch.c" <<'EOF'
 	if (fd == 0 && isatty(0)) {
 		static char *ln_buf = NULL;
 		static int ln_len = 0;
 		static int ln_pos = 0;
 		static int history_loaded = 0;
+		static int completion_loaded = 0;
 
 		if (!history_loaded) {
 			const char *home = getenv("HOME");
@@ -183,6 +423,10 @@ if [ -d "$DASH_SRC" ]; then
 				linenoiseHistoryLoad(path);
 			}
 			history_loaded = 1;
+		}
+		if (!completion_loaded) {
+			linenoiseSetCompletionCallback(smallclueLinenoiseCompletion);
+			completion_loaded = 1;
 		}
 
 		if (ln_buf == NULL) {
@@ -202,7 +446,7 @@ if [ -d "$DASH_SRC" ]; then
 				if (ln_buf) {
 					strcpy(ln_buf, line);
 					ln_buf[len] = '\n';
-					ln_buf[len+1] = '\0';
+					ln_buf[len + 1] = '\0';
 					ln_len = len + 1;
 					ln_pos = 0;
 				}
@@ -214,7 +458,8 @@ if [ -d "$DASH_SRC" ]; then
 
 		if (ln_buf) {
 			int to_copy = ln_len - ln_pos;
-			if (to_copy > nr) to_copy = nr;
+			if (to_copy > nr)
+				to_copy = nr;
 			memcpy(buf, ln_buf + ln_pos, to_copy);
 			ln_pos += to_copy;
 			if (ln_pos >= ln_len) {
@@ -227,19 +472,22 @@ if [ -d "$DASH_SRC" ]; then
 		}
 	}
 EOF
-        # Replace the libedit block with a marker
-        sed -i.bak 's/if (fd == 0 && el) {/if (0) { \/* replaced by linenoise *\//' "$INPUT_C"
-
-        # Insert new block before the marker
-        LINE_NUM=$(grep -n "if (0) { /\* replaced by linenoise \*/" "$INPUT_C" | cut -d: -f1)
-        if [ ! -z "$LINE_NUM" ]; then
-             head -n $(($LINE_NUM - 2)) "$INPUT_C" > "$INPUT_C.tmp"
-             cat "$DASH_SRC/linenoise_patch.c" >> "$INPUT_C.tmp"
-             tail -n +$(($LINE_NUM - 1)) "$INPUT_C" >> "$INPUT_C.tmp"
-             mv "$INPUT_C.tmp" "$INPUT_C"
+            START_LINE=$(grep -n 'if (fd == 0 && isatty(0)) {' "$INPUT_C" | head -n 1 | cut -d: -f1)
+            END_LINE=$(awk -v start="$START_LINE" 'NR > start && /#ifndef SMALL/ { print NR; exit }' "$INPUT_C")
+            if [ -n "$START_LINE" ] && [ -n "$END_LINE" ]; then
+                head -n $((START_LINE - 1)) "$INPUT_C" > "$INPUT_C.tmp"
+                cat "$DASH_SRC/linenoise_patch.c" >> "$INPUT_C.tmp"
+                tail -n +"$END_LINE" "$INPUT_C" >> "$INPUT_C.tmp"
+                mv "$INPUT_C.tmp" "$INPUT_C"
+            fi
+            rm -f "$DASH_SRC/linenoise_patch.c"
         fi
 
-        rm -f "$INPUT_C.bak" "$DASH_SRC/linenoise_patch.c"
+        # Keep the old libedit branch compiled out when linenoise is active.
+        if ! grep -q "if (0) { /\* replaced by linenoise \*/" "$INPUT_C"; then
+            sed -i.bak 's/if (fd == 0 && el) {/if (0) { \/* replaced by linenoise *\//' "$INPUT_C"
+            rm -f "$INPUT_C.bak"
+        fi
     fi
 
     # Patch parser.c to suppress prompt when using linenoise (which handles prompt itself)

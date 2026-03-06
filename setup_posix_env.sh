@@ -14,7 +14,7 @@ if [ ! -d "third-party/nextvi/.git" ]; then
     echo "Nextvi repository missing or incomplete."
     MISSING_DEPS=1
 fi
-if [ ! -d "third-party/openssh/.git" ]; then
+if [ ! -d "third-party/openssh" ] || [ ! -f "third-party/openssh/ssh.c" ] || [ ! -f "third-party/openssh/scp.c" ] || [ ! -f "third-party/openssh/sftp.c" ] || [ ! -f "third-party/openssh/configure.ac" ]; then
     echo "OpenSSH repository missing or incomplete."
     MISSING_DEPS=1
 fi
@@ -81,8 +81,37 @@ EOF
 # 2. Create extra stubs
 cat > src/openssh_globals.c <<EOF
 #include <signal.h>
+#include <stdint.h>
 volatile sig_atomic_t pscal_openssh_interrupted = 0;
 int pscal_openssh_showprogress = 1;
+
+/*
+ * Some OpenSSH object files (e.g. ML-KEM code paths) may reference htole64/le64toh
+ * as external symbols depending on libc feature exposure. Provide weak fallbacks so
+ * static smallclue links remain portable across Linux build environments.
+ */
+#if defined(__linux__)
+# ifdef htole64
+#  undef htole64
+# endif
+# ifdef le64toh
+#  undef le64toh
+# endif
+__attribute__((weak)) uint64_t htole64(uint64_t v) {
+# if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return v;
+# else
+    return __builtin_bswap64(v);
+# endif
+}
+__attribute__((weak)) uint64_t le64toh(uint64_t v) {
+# if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return v;
+# else
+    return __builtin_bswap64(v);
+# endif
+}
+#endif
 EOF
 
 cat > src/runtime_stubs_extra.c <<EOF
@@ -142,7 +171,7 @@ OPENSSH_SHIM="src/openssh_shim.c"
 OPENSSH_DIR="third-party/openssh"
 if [ -d "$OPENSSH_DIR" ]; then
     # Revert sshd.c patching if present (from previous failed runs)
-    if grep -q "pscal_openssh_sshd_main" "$OPENSSH_DIR/sshd.c"; then
+    if [ -d "$OPENSSH_DIR/.git" ] && [ -f "$OPENSSH_DIR/sshd.c" ] && grep -q "pscal_openssh_sshd_main" "$OPENSSH_DIR/sshd.c"; then
         echo "Reverting sshd.c changes..."
         (cd "$OPENSSH_DIR" && git checkout sshd.c)
     fi
@@ -160,8 +189,16 @@ if [ -d "$OPENSSH_DIR" ]; then
         fi
 
         if [ "$NEED_RECONF" -eq 1 ]; then
-             echo "Cleaning OpenSSH build to reconfigure..."
-             (cd "$OPENSSH_DIR" && make distclean)
+            echo "Cleaning OpenSSH build to reconfigure..."
+            MAKEFILE_SHELL_PATH="$(awk -F= '/^SHELL[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' "$OPENSSH_DIR/Makefile")"
+            if [ -n "$MAKEFILE_SHELL_PATH" ] && [ ! -x "$MAKEFILE_SHELL_PATH" ]; then
+                echo "OpenSSH Makefile references missing shell: $MAKEFILE_SHELL_PATH"
+                echo "Purging generated OpenSSH build files instead of make distclean..."
+                (cd "$OPENSSH_DIR" && rm -f Makefile config.status config.log config.h && rm -rf autom4te.cache)
+            elif ! (cd "$OPENSSH_DIR" && make distclean); then
+                echo "Warning: make distclean failed; purging generated OpenSSH build files..."
+                (cd "$OPENSSH_DIR" && rm -f Makefile config.status config.log config.h && rm -rf autom4te.cache)
+            fi
         fi
     fi
 
@@ -189,13 +226,66 @@ if [ -d "$OPENSSH_DIR" ]; then
         fi
 
         if [ -f "$OPENSSH_DIR/configure" ]; then
-            OPENSSH_CONFIG_FLAGS="--sysconfdir=/etc/ssh"
+            OPENSSH_CONFIG_ENV=()
+            OPENSSH_CONFIG_ARGS=(--sysconfdir=/etc/ssh)
+
             if [ "$(uname -s)" = "Linux" ]; then
-                OPENSSH_CONFIG_FLAGS="$OPENSSH_CONFIG_FLAGS LDFLAGS=-static"
+                OPENSSH_CONFIG_ENV+=("LDFLAGS=-static")
             fi
-            (cd "$OPENSSH_DIR" && ./configure $OPENSSH_CONFIG_FLAGS)
+
+            if [ "$(uname -s)" = "Darwin" ]; then
+                CLEAN_PATH=""
+                IFS=':' read -r -a PATH_PARTS <<< "$PATH"
+                for p in "${PATH_PARTS[@]}"; do
+                    case "$p" in
+                        *miniconda*|*anaconda*|*/conda/*) continue ;;
+                    esac
+                    if [ -z "$CLEAN_PATH" ]; then
+                        CLEAN_PATH="$p"
+                    else
+                        CLEAN_PATH="$CLEAN_PATH:$p"
+                    fi
+                done
+                if [ -z "$CLEAN_PATH" ]; then
+                    CLEAN_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+                fi
+                OPENSSH_CONFIG_ENV+=("PATH=$CLEAN_PATH")
+
+                BREW_OPENSSL_PREFIX=""
+                if command -v brew >/dev/null 2>&1; then
+                    BREW_OPENSSL_PREFIX="$(brew --prefix openssl@3 2>/dev/null || true)"
+                    if [ -z "$BREW_OPENSSL_PREFIX" ]; then
+                        BREW_OPENSSL_PREFIX="$(brew --prefix openssl@1.1 2>/dev/null || true)"
+                    fi
+                fi
+
+                if [ -n "$BREW_OPENSSL_PREFIX" ] && [ -d "$BREW_OPENSSL_PREFIX/include" ] && [ -d "$BREW_OPENSSL_PREFIX/lib" ]; then
+                    echo "Configuring OpenSSH with Homebrew OpenSSL at $BREW_OPENSSL_PREFIX"
+                    OPENSSH_CONFIG_ENV+=("CPPFLAGS=-I$BREW_OPENSSL_PREFIX/include")
+                    OPENSSH_CONFIG_ENV+=("LDFLAGS=-L$BREW_OPENSSL_PREFIX/lib")
+                    OPENSSH_CONFIG_ENV+=("PKG_CONFIG_PATH=$BREW_OPENSSL_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}")
+                    if [ -x "$BREW_OPENSSL_PREFIX/bin/openssl" ]; then
+                        OPENSSH_CONFIG_ENV+=("OPENSSL_BIN=$BREW_OPENSSL_PREFIX/bin/openssl")
+                    fi
+                else
+                    CLEAN_OPENSSL_BIN="$(PATH="$CLEAN_PATH" command -v openssl || true)"
+                    if [ -n "$CLEAN_OPENSSL_BIN" ]; then
+                        echo "Configuring OpenSSH with OpenSSL binary: $CLEAN_OPENSSL_BIN"
+                        OPENSSH_CONFIG_ENV+=("OPENSSL_BIN=$CLEAN_OPENSSL_BIN")
+                    fi
+                fi
+            fi
+
+            if ! (cd "$OPENSSH_DIR" && env "${OPENSSH_CONFIG_ENV[@]}" ./configure "${OPENSSH_CONFIG_ARGS[@]}"); then
+                echo "Error: OpenSSH configure failed."
+                if [ -f "$OPENSSH_DIR/config.log" ]; then
+                    echo "See: $OPENSSH_DIR/config.log"
+                fi
+                exit 1
+            fi
         else
             echo "Error: configure script not found and could not be generated."
+            echo "Try re-running: ./fetch_dependencies.sh"
             exit 1
         fi
     fi
@@ -204,45 +294,55 @@ if [ -d "$OPENSSH_DIR" ]; then
     # Rename usage first
     # scp.c
     if grep -q "cleanup_exit" "$OPENSSH_DIR/scp.c"; then
-        sed -i.bak 's/\bcleanup_exit\b/scp_cleanup_exit/g' "$OPENSSH_DIR/scp.c"
+        sed -i.bak 's/cleanup_exit/scp_cleanup_exit/g' "$OPENSSH_DIR/scp.c"
         # Add prototype to avoid implicit declaration warning
         if ! grep -q "void scp_cleanup_exit(int);" "$OPENSSH_DIR/scp.c"; then
-             sed -i.bak '/#include "includes.h"/a void scp_cleanup_exit(int);' "$OPENSSH_DIR/scp.c"
+            awk '
+                { print }
+                /#include "includes.h"/ { print "void scp_cleanup_exit(int);" }
+            ' "$OPENSSH_DIR/scp.c" > "$OPENSSH_DIR/scp.c.tmp" && mv "$OPENSSH_DIR/scp.c.tmp" "$OPENSSH_DIR/scp.c"
         fi
         rm -f "$OPENSSH_DIR/scp.c.bak"
     fi
     if grep -q "volatile sig_atomic_t interrupted" "$OPENSSH_DIR/scp.c"; then
-        sed -i.bak 's/\binterrupted\b/pscal_openssh_interrupted/g' "$OPENSSH_DIR/scp.c"
+        sed -i.bak 's/interrupted/pscal_openssh_interrupted/g' "$OPENSSH_DIR/scp.c"
         # Now change definitions to extern
         sed -i.bak 's/volatile sig_atomic_t pscal_openssh_interrupted = 0;/extern volatile sig_atomic_t pscal_openssh_interrupted;/g' "$OPENSSH_DIR/scp.c"
         rm -f "$OPENSSH_DIR/scp.c.bak"
     fi
     if grep -q "int showprogress" "$OPENSSH_DIR/scp.c"; then
-        sed -i.bak 's/\bshowprogress\b/pscal_openssh_showprogress/g' "$OPENSSH_DIR/scp.c"
+        sed -i.bak 's/showprogress/pscal_openssh_showprogress/g' "$OPENSSH_DIR/scp.c"
         sed -i.bak 's/int pscal_openssh_showprogress = 1;/extern int pscal_openssh_showprogress;/g' "$OPENSSH_DIR/scp.c"
         rm -f "$OPENSSH_DIR/scp.c.bak"
     fi
 
     # sftp.c
     if grep -q "volatile sig_atomic_t interrupted" "$OPENSSH_DIR/sftp.c"; then
-        sed -i.bak 's/\binterrupted\b/pscal_openssh_interrupted/g' "$OPENSSH_DIR/sftp.c"
+        sed -i.bak 's/interrupted/pscal_openssh_interrupted/g' "$OPENSSH_DIR/sftp.c"
         sed -i.bak 's/volatile sig_atomic_t pscal_openssh_interrupted = 0;/extern volatile sig_atomic_t pscal_openssh_interrupted;/g' "$OPENSSH_DIR/sftp.c"
         rm -f "$OPENSSH_DIR/sftp.c.bak"
     fi
     if grep -q "int showprogress" "$OPENSSH_DIR/sftp.c"; then
-        sed -i.bak 's/\bshowprogress\b/pscal_openssh_showprogress/g' "$OPENSSH_DIR/sftp.c"
+        sed -i.bak 's/showprogress/pscal_openssh_showprogress/g' "$OPENSSH_DIR/sftp.c"
         sed -i.bak 's/int pscal_openssh_showprogress = 1;/extern int pscal_openssh_showprogress;/g' "$OPENSSH_DIR/sftp.c"
         rm -f "$OPENSSH_DIR/sftp.c.bak"
     fi
 
     # sftp-client.c
-    if grep -q "volatile sig_atomic_t interrupted" "$OPENSSH_DIR/sftp-client.c"; then
-        sed -i.bak 's/\binterrupted\b/pscal_openssh_interrupted/g' "$OPENSSH_DIR/sftp-client.c"
+    if grep -q "interrupted" "$OPENSSH_DIR/sftp-client.c"; then
+        sed -i.bak 's/interrupted/pscal_openssh_interrupted/g' "$OPENSSH_DIR/sftp-client.c"
         rm -f "$OPENSSH_DIR/sftp-client.c.bak"
     fi
-    if grep -q "extern int showprogress" "$OPENSSH_DIR/sftp-client.c"; then
-        sed -i.bak 's/\bshowprogress\b/pscal_openssh_showprogress/g' "$OPENSSH_DIR/sftp-client.c"
-        sed -i.bak 's/extern int showprogress;/extern int pscal_openssh_showprogress;/g' "$OPENSSH_DIR/sftp-client.c"
+    if grep -q "showprogress" "$OPENSSH_DIR/sftp-client.c"; then
+        sed -i.bak 's/showprogress/pscal_openssh_showprogress/g' "$OPENSSH_DIR/sftp-client.c"
+        if ! grep -q "extern int pscal_openssh_showprogress;" "$OPENSSH_DIR/sftp-client.c"; then
+            awk '
+                { print }
+                /extern volatile sig_atomic_t pscal_openssh_interrupted;/ {
+                    print "extern int pscal_openssh_showprogress;"
+                }
+            ' "$OPENSSH_DIR/sftp-client.c" > "$OPENSSH_DIR/sftp-client.c.tmp" && mv "$OPENSSH_DIR/sftp-client.c.tmp" "$OPENSSH_DIR/sftp-client.c"
+        fi
         rm -f "$OPENSSH_DIR/sftp-client.c.bak"
     fi
 
@@ -254,7 +354,7 @@ if [ -d "$OPENSSH_DIR" ]; then
         ssh.o readconf.o clientloop.o sshtty.o sshconnect.o sshconnect2.o mux.o ssh-sk-client.o \
         scp.o progressmeter.o sftp-common.o sftp-client.o sftp-glob.o \
         sftp.o sftp-usergroup.o \
-        ssh-keygen.o sshsig.o)
+        ssh-keygen.o sshsig.o ssh-pkcs11.o)
 
     echo "Building OpenSSH sshd..."
     (cd "$OPENSSH_DIR" && make -j4 sshd)
@@ -263,7 +363,7 @@ if [ -d "$OPENSSH_DIR" ]; then
 $OPENSSH_DIR/sshconnect.o $OPENSSH_DIR/sshconnect2.o $OPENSSH_DIR/mux.o $OPENSSH_DIR/ssh-sk-client.o \
 $OPENSSH_DIR/scp.o $OPENSSH_DIR/progressmeter.o $OPENSSH_DIR/sftp-common.o $OPENSSH_DIR/sftp-client.o $OPENSSH_DIR/sftp-glob.o \
 $OPENSSH_DIR/sftp.o $OPENSSH_DIR/sftp-usergroup.o \
-$OPENSSH_DIR/ssh-keygen.o $OPENSSH_DIR/sshsig.o"
+$OPENSSH_DIR/ssh-keygen.o $OPENSSH_DIR/sshsig.o $OPENSSH_DIR/ssh-pkcs11.o"
 
     # Link against built static libs and system libs (zlib, crypto)
     # On Linux with -static, -lcrypto -lz will use static versions if available.
@@ -296,6 +396,7 @@ gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${EXTRA
     src/main.c \
     src/core.c \
     src/runtime_support.c \
+    src/micro_app.c \
     src/nextvi_app.c \
     ${NEXTVI_SRC} \
     ${OPENSSH_SRC} \
@@ -399,6 +500,11 @@ fi
 
 # 5. Install smallclue and dash
 cp smallclue "$ROOTFS/bin/"
+if [ -x "third-party/micro-bin/micro" ]; then
+    echo "Installing micro..."
+    cp "third-party/micro-bin/micro" "$ROOTFS/usr/bin/micro-real"
+    chmod 755 "$ROOTFS/usr/bin/micro-real"
+fi
 if [ -f "third-party/openssh/sshd" ]; then
     echo "Installing sshd..."
     cp "third-party/openssh/sshd" "$ROOTFS/bin/sshd"

@@ -316,6 +316,69 @@ static char *smallclueConcatOptionValue(const char *prefix, const char *value) {
     return out;
 }
 
+static bool smallclueSshOptionMatchesKey(const char *option, const char *key) {
+    if (!option || !key) {
+        return false;
+    }
+    while (*option != '\0' && isspace((unsigned char)*option)) {
+        ++option;
+    }
+    size_t key_len = strlen(key);
+    if (key_len == 0 || strncasecmp(option, key, key_len) != 0) {
+        return false;
+    }
+    char tail = option[key_len];
+    return tail == '\0' || tail == '=' || isspace((unsigned char)tail);
+}
+
+static bool smallclueSshArgvHasOptionKey(int argc, char **argv, const char *key) {
+    if (argc <= 1 || !argv || !key || !*key) {
+        return false;
+    }
+    for (int i = 1; i < argc; ++i) {
+        const char *arg = argv[i];
+        if (!arg) {
+            continue;
+        }
+        if (strcmp(arg, "--") == 0) {
+            break;
+        }
+        if (strcmp(arg, "-o") == 0) {
+            if (i + 1 < argc && smallclueSshOptionMatchesKey(argv[i + 1], key)) {
+                return true;
+            }
+            ++i;
+            continue;
+        }
+        if (strncmp(arg, "-o", 2) == 0 && arg[2] != '\0' &&
+            smallclueSshOptionMatchesKey(arg + 2, key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int smallclueSshEnvPositiveInt(const char *name, int fallback,
+                                      int min_value, int max_value) {
+    if (!name || fallback < min_value || fallback > max_value) {
+        return fallback;
+    }
+    const char *raw = getenv(name);
+    if (!raw || !*raw) {
+        return fallback;
+    }
+    errno = 0;
+    char *end = NULL;
+    long parsed = strtol(raw, &end, 10);
+    if (errno != 0 || end == raw || (end && *end != '\0')) {
+        return fallback;
+    }
+    if (parsed < min_value || parsed > max_value) {
+        return fallback;
+    }
+    return (int)parsed;
+}
+
 static char **smallclueExpandSshArgs(int argc, char **argv, int *out_count) {
     if (!argv || argc <= 0 || !out_count) {
         return NULL;
@@ -837,15 +900,58 @@ static int smallclueRunOpensshEntryOnce(const char *label, int (*entry)(int, cha
     char **invoke_argv = argv;
     char **augmented_argv = NULL;
     const char *setenv_option = "-oSetEnv=PSCALI_DISABLE_SOFT_SIGNALING=1";
+    char connect_timeout_option[48] = {0};
+    char connection_attempts_option[48] = {0};
+    bool inject_connect_timeout = false;
+    bool inject_connection_attempts = false;
     if (label && strcmp(label, "ssh") == 0 && argc > 0 && argv) {
-        augmented_argv = (char **)calloc((size_t)argc + 2u, sizeof(char *));
+        /*
+         * OpenSSH's closefrom() is process-wide and unsafe in our multitab
+         * runtime (it can close unrelated tab/session descriptors). Force the
+         * iOS guard on every SSH launch.
+         */
+        setenv("PSCALI_SSH_SKIP_CLOSEFROM", "1", 1);
+
+        if (!smallclueSshArgvHasOptionKey(argc, argv, "ConnectTimeout")) {
+            int timeout_seconds = smallclueSshEnvPositiveInt("PSCALI_SSH_CONNECT_TIMEOUT",
+                                                             8, 1, 600);
+            int written = snprintf(connect_timeout_option, sizeof(connect_timeout_option),
+                                   "-oConnectTimeout=%d", timeout_seconds);
+            inject_connect_timeout = written > 0 &&
+                                     (size_t)written < sizeof(connect_timeout_option);
+        }
+        if (!smallclueSshArgvHasOptionKey(argc, argv, "ConnectionAttempts")) {
+            int attempts = smallclueSshEnvPositiveInt("PSCALI_SSH_CONNECTION_ATTEMPTS",
+                                                      3, 1, 20);
+            int written = snprintf(connection_attempts_option,
+                                   sizeof(connection_attempts_option),
+                                   "-oConnectionAttempts=%d", attempts);
+            inject_connection_attempts = written > 0 &&
+                                         (size_t)written < sizeof(connection_attempts_option);
+        }
+        size_t extra = 1u;
+        if (inject_connect_timeout) {
+            extra++;
+        }
+        if (inject_connection_attempts) {
+            extra++;
+        }
+        augmented_argv = (char **)calloc((size_t)argc + extra + 1u, sizeof(char *));
         if (augmented_argv) {
+            int out = 0;
             augmented_argv[0] = argv[0];
-            augmented_argv[1] = (char *)setenv_option;
-            for (int i = 1; i < argc; ++i) {
-                augmented_argv[i + 1] = argv[i];
+            out = 1;
+            augmented_argv[out++] = (char *)setenv_option;
+            if (inject_connect_timeout) {
+                augmented_argv[out++] = connect_timeout_option;
             }
-            invoke_argc = argc + 1;
+            if (inject_connection_attempts) {
+                augmented_argv[out++] = connection_attempts_option;
+            }
+            for (int i = 1; i < argc; ++i) {
+                augmented_argv[out++] = argv[i];
+            }
+            invoke_argc = out;
             invoke_argv = augmented_argv;
         }
     }
@@ -1219,11 +1325,13 @@ static void *smallclueRunSshSessionThread(void *arg) {
         return NULL;
     }
     void *prev_runtime_ctx = NULL;
+    bool runtime_ctx_swapped = false;
     if (PSCALRuntimeGetCurrentRuntimeContext) {
         prev_runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext();
     }
     if (PSCALRuntimeSetCurrentRuntimeContext && ctx->runtime_ctx) {
         PSCALRuntimeSetCurrentRuntimeContext(ctx->runtime_ctx);
+        runtime_ctx_swapped = true;
     }
     if (smallclueSshDebugEnabled()) {
         char logbuf[192];
@@ -1240,7 +1348,7 @@ static void *smallclueRunSshSessionThread(void *arg) {
         smallclueSshSessionNotifyExit(ctx->session_id, status);
         smallclueFreeArgv(ctx->argv, ctx->argc);
         free(ctx);
-        if (PSCALRuntimeSetCurrentRuntimeContext && prev_runtime_ctx) {
+        if (runtime_ctx_swapped && PSCALRuntimeSetCurrentRuntimeContext) {
             PSCALRuntimeSetCurrentRuntimeContext(prev_runtime_ctx);
         }
         return NULL;
@@ -1255,7 +1363,7 @@ static void *smallclueRunSshSessionThread(void *arg) {
         smallclueSshSessionNotifyExit(ctx->session_id, status);
         smallclueFreeArgv(ctx->argv, ctx->argc);
         free(ctx);
-        if (PSCALRuntimeSetCurrentRuntimeContext && prev_runtime_ctx) {
+        if (runtime_ctx_swapped && PSCALRuntimeSetCurrentRuntimeContext) {
             PSCALRuntimeSetCurrentRuntimeContext(prev_runtime_ctx);
         }
         return NULL;
@@ -1353,7 +1461,7 @@ static void *smallclueRunSshSessionThread(void *arg) {
     smallclueSshSessionNotifyExit(ctx->session_id, status);
     smallclueFreeArgv(ctx->argv, ctx->argc);
     free(ctx);
-    if (PSCALRuntimeSetCurrentRuntimeContext && prev_runtime_ctx) {
+    if (runtime_ctx_swapped && PSCALRuntimeSetCurrentRuntimeContext) {
         PSCALRuntimeSetCurrentRuntimeContext(prev_runtime_ctx);
     }
     return NULL;
@@ -1505,6 +1613,13 @@ static int smallclueRunOpensshEntry(const char *label, int (*entry)(int, char **
 
 int smallclueRunSsh(int argc, char **argv) {
     smallclueEnsureWritableHomeSsh();
+#if defined(PSCAL_TARGET_IOS)
+    /*
+     * In the tabbed iOS runtime, closefrom() is unsafe because it closes
+     * descriptors process-wide. Keep OpenSSH in skip-closefrom mode.
+     */
+    setenv("PSCALI_SSH_SKIP_CLOSEFROM", "1", 1);
+#endif
     if (argc < 2) {
         fprintf(stderr, "usage: ssh [options] host [command]\n");
         return 255;
