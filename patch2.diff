@@ -1,0 +1,22 @@
+--- src/core.c
++++ src/core.c
+@@ -7781,14 +7781,14 @@
+     snprintf(header, sizeof(header),
+              "Markdown docs (Arrows=move, Enter=open, q=quit) [%zu/%zu]",
+              cursor + 1, count);
++    printf("\x1b[7m");
+     if (term_cols > 0 && (int)strlen(header) > term_cols) {
+         if (term_cols <= 3) {
+             fwrite(header, 1, (size_t)term_cols, stdout);
+         } else {
+             fwrite(header, 1, (size_t)(term_cols - 3), stdout);
+             fputs("...", stdout);
+         }
+-        fputc('\n', stdout);
+     } else {
+-        printf("%s\n", header);
++        printf("%s", header);
+     }
++    printf("\x1b[0m\n");
+     size_t end = top + window;
+     if (end > count) {
