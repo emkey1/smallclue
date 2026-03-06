@@ -128,6 +128,21 @@ int PSCALRuntimeScriptCaptureActive(void) { return 0; }
 int smallclueVprocTestCommand(int argc, char **argv);
 
 static ssize_t smallclueGetlineStream(char **line, size_t *cap, FILE *stream, int *out_errno);
+static uint64_t gSmallclueProcessStartMonoNs = 0;
+
+static uint64_t smallclueNowMonoNs(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    }
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000000000ull + (uint64_t)tv.tv_usec * 1000ull;
+}
+
+__attribute__((constructor)) static void smallclueCaptureProcessStart(void) {
+    gSmallclueProcessStartMonoNs = smallclueNowMonoNs();
+}
 
 static const char *smallclueResolvePath(const char *path, char *buffer, size_t buflen) {
     if (!path) {
@@ -346,6 +361,318 @@ static const char *smallclueDisplayPath(const char *path, char *buffer, size_t b
 #endif
     return path;
 }
+
+static bool smallclueResolveCommandPathForExec(const char *name, char *resolved, size_t resolved_size);
+
+#if defined(PSCAL_TARGET_IOS)
+static bool smallcluePathHasShebang(const char *path) {
+    if (!path || !*path) {
+        return false;
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    char header[2];
+    ssize_t n = read(fd, header, sizeof(header));
+    close(fd);
+    return n == 2 && header[0] == '#' && header[1] == '!';
+}
+
+static bool smallclueReadShebangInterpreter(const char *path,
+                                            char *interpreter,
+                                            size_t interpreter_size,
+                                            char *interpreter_arg,
+                                            size_t interpreter_arg_size) {
+    if (!path || !*path || !interpreter || interpreter_size == 0 ||
+        !interpreter_arg || interpreter_arg_size == 0) {
+        return false;
+    }
+    interpreter[0] = '\0';
+    interpreter_arg[0] = '\0';
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        return false;
+    }
+    char line[PATH_MAX + 64];
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp);
+        return false;
+    }
+    fclose(fp);
+    if (line[0] != '#' || line[1] != '!') {
+        return false;
+    }
+    char *cursor = line + 2;
+    while (*cursor && isspace((unsigned char)*cursor)) {
+        cursor++;
+    }
+    if (!*cursor) {
+        return false;
+    }
+    char *interp_start = cursor;
+    while (*cursor && !isspace((unsigned char)*cursor)) {
+        cursor++;
+    }
+    char *interp_end = cursor;
+    while (*cursor && isspace((unsigned char)*cursor)) {
+        cursor++;
+    }
+    char *arg_start = cursor;
+    while (*cursor && *cursor != '\n' && *cursor != '\r') {
+        cursor++;
+    }
+    *interp_end = '\0';
+    *cursor = '\0';
+    if (snprintf(interpreter, interpreter_size, "%s", interp_start) <= 0 ||
+        interpreter[0] == '\0') {
+        return false;
+    }
+    if (*arg_start) {
+        if (snprintf(interpreter_arg, interpreter_arg_size, "%s", arg_start) <= 0) {
+            interpreter_arg[0] = '\0';
+        }
+    }
+    return true;
+}
+
+static bool smallclueWatchExecViaShebang(const char *script_path, int argc, char **argv) {
+    if (!script_path || !*script_path || argc <= 0 || !argv || !argv[0]) {
+        return false;
+    }
+    char interpreter[PATH_MAX];
+    char interpreter_arg[PATH_MAX];
+    if (!smallclueReadShebangInterpreter(script_path,
+                                         interpreter,
+                                         sizeof(interpreter),
+                                         interpreter_arg,
+                                         sizeof(interpreter_arg))) {
+        return false;
+    }
+    char arg_words[PATH_MAX];
+    arg_words[0] = '\0';
+    if (interpreter_arg[0]) {
+        snprintf(arg_words, sizeof(arg_words), "%s", interpreter_arg);
+    }
+    char *words[16];
+    size_t word_count = 0;
+    char *cursor = arg_words;
+    while (*cursor && word_count < (sizeof(words) / sizeof(words[0]))) {
+        while (*cursor && isspace((unsigned char)*cursor)) {
+            cursor++;
+        }
+        if (!*cursor) {
+            break;
+        }
+        words[word_count++] = cursor;
+        while (*cursor && !isspace((unsigned char)*cursor)) {
+            cursor++;
+        }
+        if (*cursor) {
+            *cursor++ = '\0';
+        }
+    }
+    const char *interp_leaf = strrchr(interpreter, '/');
+    interp_leaf = interp_leaf ? (interp_leaf + 1) : interpreter;
+
+    char resolved_interpreter[PATH_MAX];
+    const char *interp_cmd = interpreter;
+    const char *interp_exec = interpreter;
+    bool using_env_style = (interp_leaf && strcmp(interp_leaf, "env") == 0);
+    if (using_env_style && word_count > 0) {
+        interp_cmd = words[0];
+        if (smallclueResolveCommandPathForExec(words[0],
+                                               resolved_interpreter,
+                                               sizeof(resolved_interpreter))) {
+            interp_exec = resolved_interpreter;
+        } else {
+            interp_exec = words[0];
+        }
+    } else if (smallclueResolveCommandPathForExec(interpreter,
+                                                  resolved_interpreter,
+                                                  sizeof(resolved_interpreter))) {
+        interp_exec = resolved_interpreter;
+    } else if (strchr(interpreter, '/')) {
+        const char *base = strrchr(interpreter, '/');
+        base = base ? (base + 1) : interpreter;
+        if (base && *base) {
+            interp_cmd = base;
+            if (smallclueResolveCommandPathForExec(base,
+                                                   resolved_interpreter,
+                                                   sizeof(resolved_interpreter))) {
+                interp_exec = resolved_interpreter;
+            } else {
+                interp_exec = base;
+            }
+        }
+    }
+
+    size_t interpreter_word_start = (using_env_style && word_count > 0) ? 1u : 0u;
+    size_t interpreter_word_count = (word_count > interpreter_word_start)
+                                        ? (word_count - interpreter_word_start)
+                                        : 0u;
+    size_t child_argc = (size_t)argc + interpreter_word_count + 1u;
+    char **child_argv = (char **)calloc(child_argc + 1u, sizeof(char *));
+    if (!child_argv) {
+        errno = ENOMEM;
+        return false;
+    }
+    size_t out = 0;
+    child_argv[out++] = (char *)interp_exec;
+    for (size_t i = 0; i < interpreter_word_count; ++i) {
+        child_argv[out++] = words[interpreter_word_start + i];
+    }
+    child_argv[out++] = (char *)script_path;
+    for (int i = 1; i < argc; ++i) {
+        child_argv[out++] = argv[i];
+    }
+    child_argv[out] = NULL;
+    execv(interp_exec, child_argv);
+    int saved = errno;
+    if ((saved == ENOENT || saved == EACCES) &&
+        strcmp(interp_exec, interp_cmd) != 0) {
+        child_argv[0] = (char *)interp_cmd;
+        execvp(interp_cmd, child_argv);
+        saved = errno;
+    }
+    free(child_argv);
+    errno = saved;
+    return false;
+}
+#endif
+
+static bool smallclueCommandPathRunnable(const char *path) {
+    if (!path || !*path) {
+        return false;
+    }
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return false;
+    }
+    if (access(path, X_OK) == 0) {
+        return true;
+    }
+#if defined(PSCAL_TARGET_IOS)
+    if ((st.st_mode & 0111) != 0) {
+        return true;
+    }
+    if (access(path, R_OK) == 0 && smallcluePathHasShebang(path)) {
+        return true;
+    }
+#endif
+    return false;
+}
+
+static bool smallclueResolveExecutableCandidate(const char *candidate, char *resolved, size_t resolved_size) {
+    if (!candidate || !*candidate || !resolved || resolved_size == 0) {
+        return false;
+    }
+    const char *probes[4];
+    size_t probe_count = 0;
+#if defined(PSCAL_TARGET_IOS)
+    char expanded[PATH_MAX];
+    char stripped[PATH_MAX];
+    char stripped_expanded[PATH_MAX];
+    if (candidate[0] == '/' &&
+        pathTruncateExpand(candidate, expanded, sizeof(expanded)) &&
+        strcmp(expanded, candidate) != 0) {
+        probes[probe_count++] = expanded;
+    }
+#endif
+    probes[probe_count++] = candidate;
+#if defined(PSCAL_TARGET_IOS)
+    if (candidate[0] == '/' &&
+        pathTruncateStrip(candidate, stripped, sizeof(stripped)) &&
+        strcmp(stripped, candidate) != 0) {
+        probes[probe_count++] = stripped;
+        if (pathTruncateExpand(stripped, stripped_expanded, sizeof(stripped_expanded)) &&
+            strcmp(stripped_expanded, stripped) != 0) {
+            probes[probe_count++] = stripped_expanded;
+        }
+    }
+#endif
+    for (size_t i = 0; i < probe_count; ++i) {
+        const char *path = probes[i];
+        if (!path || !*path) {
+            continue;
+        }
+        if (!smallclueCommandPathRunnable(path)) {
+            continue;
+        }
+        int copied = snprintf(resolved, resolved_size, "%s", path);
+        return copied >= 0 && (size_t)copied < resolved_size;
+    }
+    return false;
+}
+
+static bool smallclueResolveCommandPathForExec(const char *name, char *resolved, size_t resolved_size) {
+    if (!name || !*name || !resolved || resolved_size == 0) {
+        return false;
+    }
+    if (strchr(name, '/')) {
+        return smallclueResolveExecutableCandidate(name, resolved, resolved_size);
+    }
+    const char *path = getenv("PATH");
+    if (path && *path) {
+        char *copy = strdup(path);
+        if (copy) {
+            char *saveptr = NULL;
+            for (char *token = strtok_r(copy, ":", &saveptr);
+                 token;
+                 token = strtok_r(NULL, ":", &saveptr)) {
+                const char *dir = (*token == '\0') ? "." : token;
+                char candidate[PATH_MAX];
+                int written = snprintf(candidate, sizeof(candidate), "%s/%s", dir, name);
+                if (written <= 0 || (size_t)written >= sizeof(candidate)) {
+                    continue;
+                }
+                if (smallclueResolveExecutableCandidate(candidate, resolved, resolved_size)) {
+                    free(copy);
+                    return true;
+                }
+            }
+            free(copy);
+        }
+    }
+#if defined(PSCAL_TARGET_IOS)
+    const char *fallback_dirs[] = { "/bin", "/Documents/bin" };
+    for (size_t i = 0; i < sizeof(fallback_dirs) / sizeof(fallback_dirs[0]); ++i) {
+        char candidate[PATH_MAX];
+        int written = snprintf(candidate, sizeof(candidate), "%s/%s", fallback_dirs[i], name);
+        if (written <= 0 || (size_t)written >= sizeof(candidate)) {
+            continue;
+        }
+        if (smallclueResolveExecutableCandidate(candidate, resolved, resolved_size)) {
+            return true;
+        }
+    }
+#endif
+    return false;
+}
+
+#if defined(PSCAL_TARGET_IOS)
+static bool smallclueResolveExecutableFromBaseCwd(const char *base_cwd,
+                                                  const char *name,
+                                                  char *resolved,
+                                                  size_t resolved_size) {
+    if (!name || !*name || !resolved || resolved_size == 0) {
+        return false;
+    }
+    if (name[0] == '/') {
+        return smallclueResolveExecutableCandidate(name, resolved, resolved_size);
+    }
+    if (base_cwd && base_cwd[0] == '/' && strchr(name, '/')) {
+        char candidate[PATH_MAX];
+        int written = snprintf(candidate, sizeof(candidate), "%s/%s", base_cwd, name);
+        if (written > 0 &&
+            (size_t)written < sizeof(candidate) &&
+            smallclueResolveExecutableCandidate(candidate, resolved, resolved_size)) {
+            return true;
+        }
+    }
+    return smallclueResolveCommandPathForExec(name, resolved, resolved_size);
+}
+#endif
 
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
@@ -973,6 +1300,10 @@ static int smallclueSuCommand(int argc, char **argv) {
     if (!shell || !*shell) {
         shell = "/bin/sh";
     }
+    char resolved_shell[PATH_MAX];
+    if (smallclueResolveCommandPathForExec(shell, resolved_shell, sizeof(resolved_shell))) {
+        shell = resolved_shell;
+    }
 
     if (command) {
         execl(shell, shell, "-c", command, (char *)NULL);
@@ -1049,6 +1380,12 @@ static int smallclueSudoCommand(int argc, char **argv) {
         }
     }
 
+    char resolved_exec[PATH_MAX];
+    const char *exec_path = argv[1];
+    if (smallclueResolveCommandPathForExec(argv[1], resolved_exec, sizeof(resolved_exec))) {
+        exec_path = resolved_exec;
+    }
+    execv(exec_path, &argv[1]);
     execvp(argv[1], &argv[1]);
     fprintf(stderr, "sudo: %s: %s\n", argv[1], strerror(errno));
     return (errno == ENOENT) ? 127 : 126;
@@ -1408,7 +1745,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"type", smallclueTypeCommand, "Describe command names"},
     {"uname", smallclueUnameCommand, "Show system information"},
     {"uniq", smallclueUniqCommand, "Report or omit repeated lines"},
-    {"uptime", smallclueUptimeCommand, "Show system uptime"},
+    {"uptime", smallclueUptimeCommand, "Show app uptime (use -s for system uptime)"},
     {"version", smallclueVersionCommand, "Show app version"},
     {"vproc-test", smallclueVprocTestCommand, "Run vproc/terminal diagnostics"},
     {"watch", smallclueWatchCommand, "Periodically run a command"},
@@ -1651,8 +1988,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -c count\n"
              "  -d duplicates only\n"
              "  -u unique only"},
-    {"uptime", "uptime\n"
-               "  Show system uptime"},
+    {"uptime", "uptime [-s]\n"
+               "  Show app uptime since launch\n"
+               "  -s show system uptime"},
     {"version", "version\n"
                 "  Show PSCAL app marketing version"},
     {"vproc-test", "vproc-test [--help]\n"
@@ -9765,7 +10103,7 @@ static int smallclueUnameCommand(int argc, char **argv) {
     return 0;
 }
 
-static int64_t smallclueUptimeSeconds(void) {
+static int64_t smallclueSystemUptimeSeconds(void) {
 #if defined(__APPLE__)
     struct timeval boottv;
     size_t len = sizeof(boottv);
@@ -9780,17 +10118,46 @@ static int64_t smallclueUptimeSeconds(void) {
         return (int64_t)secs;
     }
 #endif
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
-        return (int64_t)ts.tv_sec;
+    uint64_t now_ns = smallclueNowMonoNs();
+    if (now_ns > 0) {
+        return (int64_t)(now_ns / 1000000000ull);
     }
     return -1;
 }
 
+static int64_t smallclueAppUptimeSeconds(void) {
+    uint64_t start_ns = gSmallclueProcessStartMonoNs;
+    if (start_ns == 0) {
+        start_ns = smallclueNowMonoNs();
+        gSmallclueProcessStartMonoNs = start_ns;
+    }
+    uint64_t now_ns = smallclueNowMonoNs();
+    if (now_ns < start_ns) {
+        return 0;
+    }
+    return (int64_t)((now_ns - start_ns) / 1000000000ull);
+}
+
 static int smallclueUptimeCommand(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
-    int64_t seconds = smallclueUptimeSeconds();
+    bool show_system = false;
+    int opt;
+    optind = 1;
+    while ((opt = getopt(argc, argv, "s")) != -1) {
+        switch (opt) {
+            case 's':
+                show_system = true;
+                break;
+            default:
+                fprintf(stderr, "usage: uptime [-s]\n");
+                return 1;
+        }
+    }
+    if (optind < argc) {
+        fprintf(stderr, "usage: uptime [-s]\n");
+        return 1;
+    }
+
+    int64_t seconds = show_system ? smallclueSystemUptimeSeconds() : smallclueAppUptimeSeconds();
     if (seconds < 0) {
         fprintf(stderr, "uptime: unavailable\n");
         return 1;
@@ -9882,11 +10249,70 @@ static int smallclueTimeCommand(int argc, char **argv) {
 }
 
 #if defined(PSCAL_TARGET_IOS)
-static int smallclueWatchRunApplet(const SmallclueApplet *applet, int argc, char **argv) {
-    if (!applet) {
+static int smallclueWatchRunExternalCommand(int argc, char **argv, const char *base_cwd) {
+    if (argc <= 0 || !argv || !argv[0] || argv[0][0] == '\0') {
+        return 127;
+    }
+    pid_t pid = -1;
+    char exec_path[PATH_MAX];
+    if (!smallclueResolveExecutableFromBaseCwd(base_cwd, argv[0], exec_path, sizeof(exec_path))) {
+        if (!strchr(argv[0], '/')) {
+            char local_candidate[PATH_MAX];
+            int written = 0;
+            if (base_cwd && base_cwd[0] == '/') {
+                written = snprintf(local_candidate, sizeof(local_candidate), "%s/%s", base_cwd, argv[0]);
+            } else {
+                written = snprintf(local_candidate, sizeof(local_candidate), "./%s", argv[0]);
+            }
+            if (written > 0 && (size_t)written < sizeof(local_candidate) &&
+                smallclueResolveExecutableCandidate(local_candidate, exec_path, sizeof(exec_path))) {
+                goto watch_exec_ready;
+            }
+        }
         fprintf(stderr, "watch: %s: command not found\n", argv[0]);
         return 127;
     }
+watch_exec_ready:
+    pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "watch: %s: %s\n", argv[0], strerror(errno));
+        return 126;
+    }
+    if (pid == 0) {
+        execv(exec_path, argv);
+        int err = errno;
+        if ((err == EPERM || err == ENOEXEC || err == EACCES) &&
+            smallcluePathHasShebang(exec_path)) {
+            (void)smallclueWatchExecViaShebang(exec_path, argc, argv);
+            err = errno;
+        }
+        execvp(argv[0], argv);
+        err = errno;
+        fprintf(stderr, "watch: %s: %s\n", argv[0], strerror(err));
+        _exit((err == ENOENT) ? 127 : 126);
+    }
+    int wait_status = 0;
+    while (waitpid(pid, &wait_status, 0) < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        fprintf(stderr, "watch: %s: %s\n", argv[0], strerror(errno));
+        return 126;
+    }
+    if (WIFEXITED(wait_status)) {
+        return WEXITSTATUS(wait_status);
+    }
+    if (WIFSIGNALED(wait_status)) {
+        return 128 + WTERMSIG(wait_status);
+    }
+    return 1;
+}
+
+static int smallclueWatchRunCommand(int argc, char **argv) {
+    if (argc <= 0 || !argv || !argv[0] || argv[0][0] == '\0') {
+        return 127;
+    }
+    const SmallclueApplet *applet = smallclueFindApplet(argv[0]);
     const char *dbg = getenv("SMALLCLUE_DEBUG");
     char label[96] = {0};
     size_t used = 0;
@@ -9904,15 +10330,22 @@ static int smallclueWatchRunApplet(const SmallclueApplet *applet, int argc, char
     }
     label[used] = '\0';
 
+    char shell_cwd[PATH_MAX];
+    const char *resolve_cwd = NULL;
+    if (vprocShellGetcwdShim(shell_cwd, sizeof(shell_cwd)) != NULL && shell_cwd[0] == '/') {
+        resolve_cwd = shell_cwd;
+    }
+
     VProc *active_vp = vprocCurrent();
     int shell_pid = vprocGetShellSelfPid();
     bool force_new_vproc = !(active_vp && vprocPid(active_vp) > 0 && vprocPid(active_vp) != shell_pid);
     VProcCommandScope scope;
     bool scoped = vprocCommandScopeBegin(&scope,
-                                         label[0] ? label : (argv && argv[0] ? argv[0] : applet->name),
+                                         label[0] ? label : argv[0],
                                          force_new_vproc,
                                          false);
-    int status = smallclueDispatchApplet(applet, argc, argv);
+    int status = applet ? smallclueDispatchApplet(applet, argc, argv)
+                        : smallclueWatchRunExternalCommand(argc, argv, resolve_cwd);
     if (scoped) {
         vprocCommandScopeEnd(&scope, status);
         if (dbg && *dbg) {
@@ -9998,10 +10431,6 @@ static int smallclueWatchCommand(int argc, char **argv) {
      * synthetic tasks. */
 #endif
 
-#if defined(PSCAL_TARGET_IOS)
-    const SmallclueApplet *applet = smallclueFindApplet(argv[idx]);
-#endif
-
     int status = 0;
     int iterations = 0;
     while (1) {
@@ -10016,7 +10445,7 @@ static int smallclueWatchCommand(int argc, char **argv) {
         printf("Every %.2fs: %s\n\n", interval, cmdline ? cmdline : argv[idx]);
         fflush(stdout);
 #if defined(PSCAL_TARGET_IOS)
-        status = smallclueWatchRunApplet(applet, cmd_argc, &argv[idx]);
+        status = smallclueWatchRunCommand(cmd_argc, &argv[idx]);
 #else
         int sys_rc = system(cmdline ? cmdline : argv[idx]);
         if (sys_rc == -1) {
@@ -10452,15 +10881,23 @@ static bool smallclueDfQuery(const char *path, SmallclueDfStats *out) {
         return false;
     }
     memset(out, 0, sizeof(*out));
+    const char *query_path = path;
+#if defined(PSCAL_TARGET_IOS)
+    char resolved_path[PATH_MAX];
+    const char *resolved = smallclueResolvePath(path, resolved_path, sizeof(resolved_path));
+    if (resolved && resolved[0] != '\0') {
+        query_path = resolved;
+    }
+#endif
 #if defined(SMALLCLUE_HAVE_STATVFS)
     struct statvfs st;
-    if (statvfs(path, &st) != 0) {
+    if (statvfs(query_path, &st) != 0) {
         return false;
     }
     unsigned long long block_size = st.f_frsize ? st.f_frsize : st.f_bsize;
 #elif defined(SMALLCLUE_HAVE_STATFS)
     struct statfs st;
-    if (statfs(path, &st) != 0) {
+    if (statfs(query_path, &st) != 0) {
         return false;
     }
     unsigned long long block_size = st.f_bsize ? st.f_bsize : st.f_iosize;
@@ -10492,7 +10929,7 @@ static bool smallclueDfQuery(const char *path, SmallclueDfStats *out) {
     if (out->mount_point[0] == '\0') {
         const char *label = path;
         char resolved[PATH_MAX];
-        if (realpath(path, resolved)) {
+        if (realpath(query_path, resolved)) {
             label = resolved;
         }
         strncpy(out->mount_point, label, sizeof(out->mount_point) - 1);
@@ -13321,6 +13758,12 @@ static int smallclueEnvCommand(int argc, char **argv) {
         }
         return 0;
     }
+    char resolved_exec[PATH_MAX];
+    const char *exec_path = argv[index];
+    if (smallclueResolveCommandPathForExec(argv[index], resolved_exec, sizeof(resolved_exec))) {
+        exec_path = resolved_exec;
+    }
+    execv(exec_path, &argv[index]);
     execvp(argv[index], &argv[index]);
     fprintf(stderr, "env: %s: %s\n", argv[index], strerror(errno));
     if (errno == ENOENT) {
@@ -14320,6 +14763,133 @@ static int smallclueMknodCommand(int argc, char **argv) {
     return 0;
 }
 
+#if defined(PSCAL_TARGET_IOS)
+static bool smallclueFstabEncodeField(const char *input, char *out, size_t out_size) {
+    if (!input || !out || out_size == 0) {
+        errno = EINVAL;
+        return false;
+    }
+    size_t out_len = 0;
+    for (size_t i = 0; input[i] != '\0'; ++i) {
+        unsigned char ch = (unsigned char)input[i];
+        if (ch == '\\' || isspace(ch) || ch == '#') {
+            if (out_len + 4 >= out_size) {
+                errno = ENAMETOOLONG;
+                return false;
+            }
+            out[out_len++] = '\\';
+            out[out_len++] = (char)('0' + ((ch >> 6) & 0x07));
+            out[out_len++] = (char)('0' + ((ch >> 3) & 0x07));
+            out[out_len++] = (char)('0' + (ch & 0x07));
+            continue;
+        }
+        if (out_len + 1 >= out_size) {
+            errno = ENAMETOOLONG;
+            return false;
+        }
+        out[out_len++] = (char)ch;
+    }
+    out[out_len] = '\0';
+    return true;
+}
+
+static bool smallclueMountPersistFstabEntry(const char *source,
+                                            const char *target,
+                                            const char *type,
+                                            const char *options) {
+    if (!source || source[0] != '/' ||
+        !target || target[0] != '/' ||
+        !type || type[0] == '\0' ||
+        !options || options[0] == '\0') {
+        errno = EINVAL;
+        return false;
+    }
+
+    char source_encoded[PATH_MAX * 4];
+    char target_encoded[PATH_MAX * 4];
+    char type_encoded[sizeof(((PathTruncateMountEntry *)0)->type) * 4];
+    char options_encoded[sizeof(((PathTruncateMountEntry *)0)->options) * 4];
+    if (!smallclueFstabEncodeField(source, source_encoded, sizeof(source_encoded)) ||
+        !smallclueFstabEncodeField(target, target_encoded, sizeof(target_encoded)) ||
+        !smallclueFstabEncodeField(type, type_encoded, sizeof(type_encoded)) ||
+        !smallclueFstabEncodeField(options, options_encoded, sizeof(options_encoded))) {
+        return false;
+    }
+
+    char entry_line[(PATH_MAX * 8) + 128];
+    int written = snprintf(entry_line,
+                           sizeof(entry_line),
+                           "%s %s %s %s 0 0",
+                           source_encoded,
+                           target_encoded,
+                           type_encoded,
+                           options_encoded);
+    if (written < 0 || (size_t)written >= sizeof(entry_line)) {
+        errno = ENAMETOOLONG;
+        return false;
+    }
+
+    FILE *fp = fopen("/etc/fstab", "a+");
+    if (!fp) {
+        return false;
+    }
+
+    bool exists = false;
+    rewind(fp);
+    char line[(PATH_MAX * 8) + 128];
+    while (fgets(line, sizeof(line), fp)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (strcmp(line, entry_line) == 0) {
+            exists = true;
+            break;
+        }
+    }
+    if (!exists) {
+        if (fseek(fp, 0, SEEK_END) != 0) {
+            int saved_errno = errno;
+            fclose(fp);
+            errno = saved_errno;
+            return false;
+        }
+        long end = ftell(fp);
+        if (end > 0) {
+            if (fseek(fp, end - 1, SEEK_SET) != 0) {
+                int saved_errno = errno;
+                fclose(fp);
+                errno = saved_errno;
+                return false;
+            }
+            int last = fgetc(fp);
+            if (last == EOF && ferror(fp)) {
+                int saved_errno = errno;
+                fclose(fp);
+                errno = saved_errno;
+                return false;
+            }
+            if (last != '\n') {
+                if (fseek(fp, 0, SEEK_END) != 0 || fputc('\n', fp) == EOF) {
+                    int saved_errno = errno;
+                    fclose(fp);
+                    errno = saved_errno;
+                    return false;
+                }
+            }
+        }
+        if (fprintf(fp, "%s\n", entry_line) < 0 || fflush(fp) != 0) {
+            int saved_errno = errno;
+            fclose(fp);
+            errno = saved_errno;
+            return false;
+        }
+    }
+    fclose(fp);
+    return true;
+}
+#endif
+
 static int smallclueMountCommand(int argc, char **argv) {
 #if defined(__linux__) || defined(linux) || defined(__linux)
     const char *usage = "usage: mount [-t type] [-o options] device dir\n";
@@ -14431,10 +15001,11 @@ static int smallclueMountCommand(int argc, char **argv) {
     }
     return 0;
 #elif defined(PSCAL_TARGET_IOS)
-    const char *usage = "usage: mount [-t type] [-o options] [source] dir\n";
+    const char *usage = "usage: mount [-p] [-t type] [-o options] [source] dir\n";
     const char *type = NULL;
     char *options = NULL;
     char *picked_source = NULL;
+    bool persist_to_fstab = false;
     unsigned long flags = 0;
     enum {
         SMALLCLUE_MOUNT_RDONLY = 1ul << 0,
@@ -14447,8 +15018,11 @@ static int smallclueMountCommand(int argc, char **argv) {
 
     smallclueResetGetopt();
     int opt;
-    while ((opt = getopt(argc, argv, "t:o:")) != -1) {
+    while ((opt = getopt(argc, argv, "pt:o:")) != -1) {
         switch (opt) {
+            case 'p':
+                persist_to_fstab = true;
+                break;
             case 't':
                 type = optarg;
                 break;
@@ -14640,6 +15214,20 @@ static int smallclueMountCommand(int argc, char **argv) {
         free(options);
         free(picked_source);
         return 1;
+    }
+
+    if (persist_to_fstab) {
+        const char *entry_type = (type && type[0] != '\0') ? type : "bind";
+        const char *entry_options = (options && options[0] != '\0') ? options : "rw";
+        if (!smallclueMountPersistFstabEntry(source_real, target_virtual, entry_type, entry_options)) {
+            int saved_errno = errno;
+            fprintf(stderr,
+                    "mount: mounted but failed to persist in /etc/fstab: %s\n",
+                    strerror(saved_errno ? saved_errno : EIO));
+            free(options);
+            free(picked_source);
+            return 1;
+        }
     }
 
     free(options);
@@ -14870,34 +15458,18 @@ static char *smallclueSearchPath(const char *name) {
     if (!name || !*name) {
         return NULL;
     }
-    if (strchr(name, '/')) {
-        if (access(name, X_OK) == 0) {
-            return strdup(name);
-        }
+    char resolved[PATH_MAX];
+    if (!smallclueResolveCommandPathForExec(name, resolved, sizeof(resolved))) {
         return NULL;
     }
-    const char *env = getenv("PATH");
-    if (!env || !*env) {
-        return NULL;
+#if defined(PSCAL_TARGET_IOS)
+    char display[PATH_MAX];
+    if (pathTruncateStrip(resolved, display, sizeof(display)) &&
+        strcmp(display, resolved) != 0) {
+        return strdup(display);
     }
-    char *copy = strdup(env);
-    if (!copy) {
-        return NULL;
-    }
-    char *token = strtok(copy, ":");
-    while (token) {
-        char candidate[PATH_MAX];
-        if (snprintf(candidate, sizeof(candidate), "%s/%s", token, name) < (int)sizeof(candidate)) {
-            if (access(candidate, X_OK) == 0) {
-                char *result = strdup(candidate);
-                free(copy);
-                return result;
-            }
-        }
-        token = strtok(NULL, ":");
-    }
-    free(copy);
-    return NULL;
+#endif
+    return strdup(resolved);
 }
 
 static int smallclueWhichCommand(int argc, char **argv) {
@@ -14925,8 +15497,10 @@ static int smallclueWhichCommand(int argc, char **argv) {
     for (int i = optind; i < argc; ++i) {
         const char *name = argv[i];
         if (strchr(name, '/')) {
-            if (access(name, X_OK) == 0) {
-                puts(name);
+            char *path = smallclueSearchPath(name);
+            if (path) {
+                puts(path);
+                free(path);
             } else {
                 status = 1;
             }
@@ -14941,8 +15515,22 @@ static int smallclueWhichCommand(int argc, char **argv) {
                 while (token) {
                     char candidate[PATH_MAX];
                     int w = snprintf(candidate, sizeof(candidate), "%s/%s", token, name);
-                    if (w > 0 && (size_t)w < sizeof(candidate) && access(candidate, X_OK) == 0) {
-                        puts(candidate);
+                    char resolved_candidate[PATH_MAX];
+                    if (w > 0 && (size_t)w < sizeof(candidate) &&
+                        smallclueResolveExecutableCandidate(candidate,
+                                                            resolved_candidate,
+                                                            sizeof(resolved_candidate))) {
+#if defined(PSCAL_TARGET_IOS)
+                        char display[PATH_MAX];
+                        if (pathTruncateStrip(resolved_candidate, display, sizeof(display)) &&
+                            strcmp(display, resolved_candidate) != 0) {
+                            puts(display);
+                        } else {
+                            puts(resolved_candidate);
+                        }
+#else
+                        puts(resolved_candidate);
+#endif
                         found = true;
                         if (!all) {
                             break;
