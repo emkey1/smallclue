@@ -472,22 +472,6 @@ static void microBridgeMainThreadSet(uint64_t session_id, pthread_t tid, bool va
     pthread_mutex_unlock(&gMicroBridgeStateMu);
 }
 
-static void microUpdateSizeEnv(int cols, int rows) {
-    char buf[16];
-    if (cols > 0) {
-        int n = snprintf(buf, sizeof(buf), "%d", cols);
-        if (n > 0) {
-            setenv("COLUMNS", buf, 1);
-        }
-    }
-    if (rows > 0) {
-        int n = snprintf(buf, sizeof(buf), "%d", rows);
-        if (n > 0) {
-            setenv("LINES", buf, 1);
-        }
-    }
-}
-
 static bool microNotifyGoResize(uint64_t session_id, int cols, int rows) {
     if (session_id == 0 || cols <= 0 || rows <= 0) {
         return false;
@@ -666,9 +650,8 @@ static void microApplyBridgeWinsizeLocked(uint64_t session_id,
             }
         }
     }
-    if (pty_master < 0 && pty_slave < 0 && !microNotifyGoResize(session_id, cols, rows)) {
-        /* Pipe relay fallback: keep env as backward-compatible resize path. */
-        microUpdateSizeEnv(cols, rows);
+    if (pty_master < 0 && pty_slave < 0) {
+        (void)microNotifyGoResize(session_id, cols, rows);
     }
     microResizeTracef("[micro-resize] micro applyBridgeWinsize pty_master=%d pty_slave=%d cols=%d rows=%d shim=%d",
                       pty_master,
@@ -982,8 +965,10 @@ static bool microBridgeApplySessionWinsize(MicroHostStdioBridge *bridge,
         microSignalResizeLocked(main_thread, main_thread_valid);
     }
     pthread_mutex_unlock(&gMicroBridgeStateMu);
-    bridge->last_cols = cols;
-    bridge->last_rows = rows;
+    if (!(bridge->pipe_stdio_mode && !signal_resize)) {
+        bridge->last_cols = cols;
+        bridge->last_rows = rows;
+    }
     microResizeTracef("[micro-resize] micro bridgeApplySessionWinsize session=%llu force=%d signal=%d applied=%dx%d",
                       (unsigned long long)bridge->session_id,
                       force ? 1 : 0,
@@ -1291,8 +1276,10 @@ static bool microHostStdioBridgeSetup(MicroHostStdioBridge *bridge,
                                           bridge->pty_use_shim,
                                           host_cols,
                                           host_rows);
-            bridge->last_cols = host_cols;
-            bridge->last_rows = host_rows;
+            if (!bridge->pipe_stdio_mode) {
+                bridge->last_cols = host_cols;
+                bridge->last_rows = host_rows;
+            }
             microResizeTracef("[micro-resize] micro bridgeSetup seeded-from-%s session=%llu cols=%d rows=%d",
                               seed_source,
                               (unsigned long long)bridge->session_id,
@@ -1920,8 +1907,7 @@ int smallclueRunMicro(int argc, char **argv) {
                                       &launchCols,
                                       &launchRows,
                                       &launchSource)) {
-            microUpdateSizeEnv(launchCols, launchRows);
-            microResizeTracef("[micro-resize] micro launch seeded env source=%s session=%llu cols=%d rows=%d",
+            microResizeTracef("[micro-resize] micro launch resolved source=%s session=%llu cols=%d rows=%d",
                               launchSource,
                               (unsigned long long)launchSessionId,
                               launchCols,
