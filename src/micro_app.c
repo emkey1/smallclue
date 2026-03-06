@@ -36,6 +36,7 @@
 typedef struct PSCALRuntimeContext PSCALRuntimeContext;
 extern uint64_t PSCALRuntimeCurrentSessionId(void) __attribute__((weak_import));
 extern VProcSessionStdio *PSCALRuntimeGetCurrentRuntimeStdio(void) __attribute__((weak_import));
+extern int pscal_micro_go_notify_resize(uint64_t session_id, int cols, int rows) __attribute__((weak_import));
 #endif
 
 typedef struct {
@@ -51,6 +52,76 @@ typedef struct {
     int saved_fds[3];
     bool saved_valid[3];
 } MicroStdFdBackup;
+
+#if defined(PSCAL_TARGET_IOS)
+typedef struct {
+    uint64_t session_id;
+    int tcell_stdin_fd;
+    int tcell_stdout_fd;
+} MicroGoLaunchContext;
+
+static pthread_once_t gMicroGoLaunchCtxKeyOnce = PTHREAD_ONCE_INIT;
+static pthread_key_t gMicroGoLaunchCtxKey;
+
+static void microGoLaunchContextDestroy(void *opaque) {
+    free(opaque);
+}
+
+static void microGoLaunchContextEnsureKey(void) {
+    (void)pthread_key_create(&gMicroGoLaunchCtxKey, microGoLaunchContextDestroy);
+}
+
+static MicroGoLaunchContext *microGoLaunchContextGet(void) {
+    (void)pthread_once(&gMicroGoLaunchCtxKeyOnce, microGoLaunchContextEnsureKey);
+    return (MicroGoLaunchContext *)pthread_getspecific(gMicroGoLaunchCtxKey);
+}
+
+static void microGoLaunchContextSet(uint64_t session_id, int stdin_fd, int stdout_fd) {
+    (void)pthread_once(&gMicroGoLaunchCtxKeyOnce, microGoLaunchContextEnsureKey);
+    MicroGoLaunchContext *ctx = (MicroGoLaunchContext *)pthread_getspecific(gMicroGoLaunchCtxKey);
+    if (!ctx) {
+        ctx = (MicroGoLaunchContext *)calloc(1, sizeof(*ctx));
+        if (!ctx) {
+            return;
+        }
+        (void)pthread_setspecific(gMicroGoLaunchCtxKey, ctx);
+    }
+    ctx->session_id = session_id;
+    ctx->tcell_stdin_fd = stdin_fd;
+    ctx->tcell_stdout_fd = stdout_fd;
+}
+
+static void microGoLaunchContextClear(void) {
+    MicroGoLaunchContext *ctx = microGoLaunchContextGet();
+    if (!ctx) {
+        return;
+    }
+    ctx->session_id = 0;
+    ctx->tcell_stdin_fd = -1;
+    ctx->tcell_stdout_fd = -1;
+}
+
+uint64_t pscal_micro_current_session_id(void) {
+    MicroGoLaunchContext *ctx = microGoLaunchContextGet();
+    if (!ctx) {
+        return 0;
+    }
+    return ctx->session_id;
+}
+
+int pscal_micro_current_stdio_fds(int *stdin_fd, int *stdout_fd) {
+    if (!stdin_fd || !stdout_fd) {
+        return 0;
+    }
+    MicroGoLaunchContext *ctx = microGoLaunchContextGet();
+    if (!ctx || ctx->tcell_stdin_fd < 0 || ctx->tcell_stdout_fd < 0) {
+        return 0;
+    }
+    *stdin_fd = ctx->tcell_stdin_fd;
+    *stdout_fd = ctx->tcell_stdout_fd;
+    return 1;
+}
+#endif
 
 static char *microDupEnv(const char *name) {
     const char *value = getenv(name);
@@ -137,7 +208,9 @@ static void microPrepareEnvironment(MicroEnvBackup *backup) {
         setenv("PSCAL_MICRO_EMBEDDED", "1", 1);
     }
     if (!getenv("PSCAL_MICRO_ENV_RESIZE_POLL")) {
-        setenv("PSCAL_MICRO_ENV_RESIZE_POLL", "1", 1);
+        /* Resize is delivered per-session via C->Go callback in embedded mode.
+         * Keep env polling disabled by default to avoid cross-instance env races. */
+        setenv("PSCAL_MICRO_ENV_RESIZE_POLL", "0", 1);
     }
 
 #if defined(PSCAL_TARGET_IOS)
@@ -273,26 +346,103 @@ static void microRestoreStandardFds(MicroStdFdBackup *backup) {
 }
 
 #if defined(PSCAL_TARGET_IOS)
-static pthread_mutex_t gMicroLaunchMu = PTHREAD_MUTEX_INITIALIZER;
-static bool gMicroLaunchActive = false;
-static uint64_t gMicroLaunchSessionId = 0;
 static pthread_mutex_t gMicroBridgeStateMu = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t gMicroBridgeSessionId = 0;
-static int gMicroBridgePtyMaster = -1;
-static int gMicroBridgePtySlave = -1;
-static bool gMicroBridgePtyUseShim = false;
-static pthread_t gMicroMainThread;
-static bool gMicroMainThreadValid = false;
+typedef struct {
+    uint64_t session_id;
+    int pty_master;
+    int pty_slave;
+    bool pty_use_shim;
+    pthread_t main_thread;
+    bool main_thread_valid;
+} MicroBridgeSessionState;
+static MicroBridgeSessionState *gMicroBridgeStates = NULL;
+static size_t gMicroBridgeStateCount = 0;
+static size_t gMicroBridgeStateCapacity = 0;
+
+static ssize_t microBridgeStateFindIndexLocked(uint64_t session_id) {
+    if (session_id == 0) {
+        return -1;
+    }
+    for (size_t i = 0; i < gMicroBridgeStateCount; ++i) {
+        if (gMicroBridgeStates[i].session_id == session_id) {
+            return (ssize_t)i;
+        }
+    }
+    return -1;
+}
+
+static int microBridgeStateEnsureCapacityLocked(size_t needed) {
+    if (needed <= gMicroBridgeStateCapacity) {
+        return 0;
+    }
+    size_t new_cap = gMicroBridgeStateCapacity == 0 ? 4 : gMicroBridgeStateCapacity * 2;
+    while (new_cap < needed) {
+        new_cap *= 2;
+    }
+    MicroBridgeSessionState *resized = (MicroBridgeSessionState *)realloc(
+        gMicroBridgeStates, new_cap * sizeof(*resized));
+    if (!resized) {
+        return -1;
+    }
+    memset(resized + gMicroBridgeStateCapacity,
+           0,
+           (new_cap - gMicroBridgeStateCapacity) * sizeof(*resized));
+    gMicroBridgeStates = resized;
+    gMicroBridgeStateCapacity = new_cap;
+    return 0;
+}
+
+static void microBridgeStateRemoveIndexLocked(size_t idx) {
+    if (idx >= gMicroBridgeStateCount) {
+        return;
+    }
+    if (idx + 1 < gMicroBridgeStateCount) {
+        gMicroBridgeStates[idx] = gMicroBridgeStates[gMicroBridgeStateCount - 1];
+    }
+    gMicroBridgeStateCount--;
+}
+
+static MicroBridgeSessionState *microBridgeStateGetOrCreateLocked(uint64_t session_id) {
+    if (session_id == 0) {
+        return NULL;
+    }
+    ssize_t idx = microBridgeStateFindIndexLocked(session_id);
+    if (idx >= 0) {
+        return &gMicroBridgeStates[idx];
+    }
+    if (microBridgeStateEnsureCapacityLocked(gMicroBridgeStateCount + 1) != 0) {
+        return NULL;
+    }
+    MicroBridgeSessionState *entry = &gMicroBridgeStates[gMicroBridgeStateCount++];
+    memset(entry, 0, sizeof(*entry));
+    entry->session_id = session_id;
+    entry->pty_master = -1;
+    entry->pty_slave = -1;
+    return entry;
+}
 
 static void microBridgeStateSet(uint64_t session_id,
                                 int pty_master,
                                 int pty_slave,
                                 bool pty_use_shim) {
+    if (session_id == 0) {
+        return;
+    }
     pthread_mutex_lock(&gMicroBridgeStateMu);
-    gMicroBridgeSessionId = session_id;
-    gMicroBridgePtyMaster = pty_master;
-    gMicroBridgePtySlave = pty_slave;
-    gMicroBridgePtyUseShim = pty_use_shim;
+    MicroBridgeSessionState *entry = microBridgeStateGetOrCreateLocked(session_id);
+    if (entry) {
+        entry->pty_master = pty_master;
+        entry->pty_slave = pty_slave;
+        entry->pty_use_shim = pty_use_shim;
+        if (!entry->main_thread_valid &&
+            entry->pty_master < 0 &&
+            entry->pty_slave < 0) {
+            ssize_t idx = microBridgeStateFindIndexLocked(session_id);
+            if (idx >= 0) {
+                microBridgeStateRemoveIndexLocked((size_t)idx);
+            }
+        }
+    }
     microResizeTracef("[micro-resize] micro bridgeStateSet session=%llu pty_master=%d pty_slave=%d shim=%d",
                       (unsigned long long)session_id,
                       pty_master,
@@ -301,10 +451,24 @@ static void microBridgeStateSet(uint64_t session_id,
     pthread_mutex_unlock(&gMicroBridgeStateMu);
 }
 
-static void microBridgeMainThreadSet(pthread_t tid, bool valid) {
+static void microBridgeMainThreadSet(uint64_t session_id, pthread_t tid, bool valid) {
+    if (session_id == 0) {
+        return;
+    }
     pthread_mutex_lock(&gMicroBridgeStateMu);
-    gMicroMainThread = tid;
-    gMicroMainThreadValid = valid;
+    MicroBridgeSessionState *entry = microBridgeStateGetOrCreateLocked(session_id);
+    if (entry) {
+        entry->main_thread = tid;
+        entry->main_thread_valid = valid;
+        if (!entry->main_thread_valid &&
+            entry->pty_master < 0 &&
+            entry->pty_slave < 0) {
+            ssize_t idx = microBridgeStateFindIndexLocked(session_id);
+            if (idx >= 0) {
+                microBridgeStateRemoveIndexLocked((size_t)idx);
+            }
+        }
+    }
     pthread_mutex_unlock(&gMicroBridgeStateMu);
 }
 
@@ -322,6 +486,16 @@ static void microUpdateSizeEnv(int cols, int rows) {
             setenv("LINES", buf, 1);
         }
     }
+}
+
+static bool microNotifyGoResize(uint64_t session_id, int cols, int rows) {
+    if (session_id == 0 || cols <= 0 || rows <= 0) {
+        return false;
+    }
+    if (!pscal_micro_go_notify_resize) {
+        return false;
+    }
+    return pscal_micro_go_notify_resize(session_id, cols, rows) != 0;
 }
 
 static int microParsePositiveEnvInt(const char *name) {
@@ -460,7 +634,8 @@ static bool microResolveLaunchWinsize(uint64_t session_id,
     return false;
 }
 
-static void microApplyBridgeWinsizeLocked(int pty_master,
+static void microApplyBridgeWinsizeLocked(uint64_t session_id,
+                                          int pty_master,
                                           int pty_slave,
                                           bool use_shim_ioctl,
                                           int cols,
@@ -491,7 +666,10 @@ static void microApplyBridgeWinsizeLocked(int pty_master,
             }
         }
     }
-    microUpdateSizeEnv(cols, rows);
+    if (pty_master < 0 && pty_slave < 0 && !microNotifyGoResize(session_id, cols, rows)) {
+        /* Pipe relay fallback: keep env as backward-compatible resize path. */
+        microUpdateSizeEnv(cols, rows);
+    }
     microResizeTracef("[micro-resize] micro applyBridgeWinsize pty_master=%d pty_slave=%d cols=%d rows=%d shim=%d",
                       pty_master,
                       pty_slave,
@@ -500,10 +678,10 @@ static void microApplyBridgeWinsizeLocked(int pty_master,
                       use_shim_ioctl ? 1 : 0);
 }
 
-static void microSignalResizeLocked(void) {
+static void microSignalResizeLocked(pthread_t thread, bool thread_valid) {
 #ifdef SIGWINCH
-    if (gMicroMainThreadValid) {
-        int rc = pthread_kill(gMicroMainThread, SIGWINCH);
+    if (thread_valid) {
+        int rc = pthread_kill(thread, SIGWINCH);
         if (rc != 0) {
             microResizeTracef("[micro-resize] micro signalResize sig=SIGWINCH rc=%d", rc);
         }
@@ -517,17 +695,27 @@ void pscalMicroNotifySessionWinsize(uint64_t session_id, int cols, int rows) {
         return;
     }
     pthread_mutex_lock(&gMicroBridgeStateMu);
-    bool match = (gMicroBridgeSessionId == session_id);
-    int pty_master = match ? gMicroBridgePtyMaster : -1;
-    int pty_slave = match ? gMicroBridgePtySlave : -1;
-    bool pty_use_shim = match ? gMicroBridgePtyUseShim : false;
+    ssize_t idx = microBridgeStateFindIndexLocked(session_id);
+    bool match = (idx >= 0);
+    int pty_master = -1;
+    int pty_slave = -1;
+    bool pty_use_shim = false;
+    pthread_t main_thread = (pthread_t)0;
+    bool main_thread_valid = false;
+    if (match) {
+        MicroBridgeSessionState *entry = &gMicroBridgeStates[idx];
+        pty_master = entry->pty_master;
+        pty_slave = entry->pty_slave;
+        pty_use_shim = entry->pty_use_shim;
+        main_thread = entry->main_thread;
+        main_thread_valid = entry->main_thread_valid;
+    }
     if (match || miss_log_budget > 0) {
-        microResizeTracef("[micro-resize] micro notifySessionWinsize session=%llu cols=%d rows=%d match=%d state_session=%llu pty_master=%d pty_slave=%d shim=%d",
+        microResizeTracef("[micro-resize] micro notifySessionWinsize session=%llu cols=%d rows=%d match=%d pty_master=%d pty_slave=%d shim=%d",
                           (unsigned long long)session_id,
                           cols,
                           rows,
                           match ? 1 : 0,
-                          (unsigned long long)gMicroBridgeSessionId,
                           pty_master,
                           pty_slave,
                           pty_use_shim ? 1 : 0);
@@ -536,55 +724,10 @@ void pscalMicroNotifySessionWinsize(uint64_t session_id, int cols, int rows) {
         }
     }
     if (match) {
-        microApplyBridgeWinsizeLocked(pty_master, pty_slave, pty_use_shim, cols, rows);
-        microSignalResizeLocked();
+        microApplyBridgeWinsizeLocked(session_id, pty_master, pty_slave, pty_use_shim, cols, rows);
+        microSignalResizeLocked(main_thread, main_thread_valid);
     }
     pthread_mutex_unlock(&gMicroBridgeStateMu);
-}
-
-static bool microAcquireLaunchSlot(uint64_t session_id, uint64_t *active_session_id) {
-    bool acquired = false;
-    pthread_mutex_lock(&gMicroLaunchMu);
-    if (!gMicroLaunchActive) {
-        gMicroLaunchActive = true;
-        gMicroLaunchSessionId = session_id;
-        acquired = true;
-    } else if (active_session_id) {
-        *active_session_id = gMicroLaunchSessionId;
-    }
-    pthread_mutex_unlock(&gMicroLaunchMu);
-    return acquired;
-}
-
-static void microReleaseLaunchSlot(void) {
-    pthread_mutex_lock(&gMicroLaunchMu);
-    gMicroLaunchActive = false;
-    gMicroLaunchSessionId = 0;
-    pthread_mutex_unlock(&gMicroLaunchMu);
-}
-
-static void microReportLaunchBusy(uint64_t requester_session_id,
-                                  uint64_t active_session_id) {
-    char msg[192];
-    int n = 0;
-    if (active_session_id != 0) {
-        n = snprintf(msg,
-                     sizeof(msg),
-                     "micro: another instance is already running (session %llu)\r\n",
-                     (unsigned long long)active_session_id);
-    } else {
-        n = snprintf(msg, sizeof(msg),
-                     "micro: another instance is already running\r\n");
-    }
-    if (n <= 0) {
-        return;
-    }
-    size_t len = (size_t)n;
-    if (requester_session_id != 0) {
-        if (vprocSessionEmitOutput(requester_session_id, msg, len) >= 0) {
-            return;
-        }
-    }
 }
 
 typedef struct {
@@ -613,6 +756,7 @@ typedef struct {
     int pty_slave;
     bool pty_use_shim;
     bool pipe_stdio_mode;
+    bool stdio_redirected;
     int stdin_pipe_read;
     int stdin_pipe_write;
     int output_pipe_read;
@@ -650,6 +794,7 @@ static void microHostStdioBridgeInit(MicroHostStdioBridge *bridge) {
     bridge->pty_slave = -1;
     bridge->pty_use_shim = false;
     bridge->pipe_stdio_mode = false;
+    bridge->stdio_redirected = false;
     bridge->stdin_pipe_read = -1;
     bridge->stdin_pipe_write = -1;
     bridge->output_pipe_read = -1;
@@ -820,13 +965,21 @@ static bool microBridgeApplySessionWinsize(MicroHostStdioBridge *bridge,
         return true;
     }
     pthread_mutex_lock(&gMicroBridgeStateMu);
-    microApplyBridgeWinsizeLocked(bridge->pty_master,
+    pthread_t main_thread = (pthread_t)0;
+    bool main_thread_valid = false;
+    ssize_t idx = microBridgeStateFindIndexLocked(bridge->session_id);
+    if (idx >= 0) {
+        main_thread = gMicroBridgeStates[idx].main_thread;
+        main_thread_valid = gMicroBridgeStates[idx].main_thread_valid;
+    }
+    microApplyBridgeWinsizeLocked(bridge->session_id,
+                                  bridge->pty_master,
                                   bridge->pty_slave,
                                   bridge->pty_use_shim,
                                   cols,
                                   rows);
     if (signal_resize) {
-        microSignalResizeLocked();
+        microSignalResizeLocked(main_thread, main_thread_valid);
     }
     pthread_mutex_unlock(&gMicroBridgeStateMu);
     bridge->last_cols = cols;
@@ -1101,20 +1254,14 @@ static bool microHostStdioBridgeSetup(MicroHostStdioBridge *bridge,
             vprocDup2Shim(bridge->pty_slave, STDERR_FILENO) < 0) {
             goto fail;
         }
+        bridge->stdio_redirected = true;
     } else if (bridge->pty_slave >= 0) {
         if (vprocHostDup2(bridge->pty_slave, STDIN_FILENO) < 0 ||
             vprocHostDup2(bridge->pty_slave, STDOUT_FILENO) < 0 ||
             vprocHostDup2(bridge->pty_slave, STDERR_FILENO) < 0) {
             goto fail;
         }
-    }
-
-    if (bridge->pipe_stdio_mode) {
-        if (vprocHostDup2(bridge->stdin_pipe_read, STDIN_FILENO) < 0 ||
-            vprocHostDup2(bridge->output_pipe_write, STDOUT_FILENO) < 0 ||
-            vprocHostDup2(bridge->output_pipe_write, STDERR_FILENO) < 0) {
-            goto fail;
-        }
+        bridge->stdio_redirected = true;
     }
     /* Seed initial size from the active session PTY when available. This is
      * more reliable than host stdout in embedded/iOS contexts. */
@@ -1138,7 +1285,8 @@ static bool microHostStdioBridgeSetup(MicroHostStdioBridge *bridge,
             }
         }
         if (host_cols > 0 && host_rows > 0) {
-            microApplyBridgeWinsizeLocked(bridge->pty_master,
+            microApplyBridgeWinsizeLocked(bridge->session_id,
+                                          bridge->pty_master,
                                           bridge->pty_slave,
                                           bridge->pty_use_shim,
                                           host_cols,
@@ -1270,16 +1418,18 @@ static void microHostStdioBridgeTeardown(MicroHostStdioBridge *bridge) {
     }
     bridge->active = false;
     bridge->stop_requested = 1;
-    microBridgeStateSet(0, -1, -1, false);
+    microBridgeStateSet(bridge->session_id, -1, -1, false);
 
-    if (bridge->saved_host_stdin >= 0) {
-        (void)vprocHostDup2(bridge->saved_host_stdin, STDIN_FILENO);
-    }
-    if (bridge->saved_host_stdout >= 0) {
-        (void)vprocHostDup2(bridge->saved_host_stdout, STDOUT_FILENO);
-    }
-    if (bridge->saved_host_stderr >= 0) {
-        (void)vprocHostDup2(bridge->saved_host_stderr, STDERR_FILENO);
+    if (bridge->stdio_redirected) {
+        if (bridge->saved_host_stdin >= 0) {
+            (void)vprocHostDup2(bridge->saved_host_stdin, STDIN_FILENO);
+        }
+        if (bridge->saved_host_stdout >= 0) {
+            (void)vprocHostDup2(bridge->saved_host_stdout, STDOUT_FILENO);
+        }
+        if (bridge->saved_host_stderr >= 0) {
+            (void)vprocHostDup2(bridge->saved_host_stderr, STDERR_FILENO);
+        }
     }
 
     /* Closing the PTY fds wakes any blocking bridge reads. */
@@ -1727,8 +1877,6 @@ static int microExecExternalBinary(int argc, char **argv) {
 int smallclueRunMicro(int argc, char **argv) {
 #if defined(PSCAL_TARGET_IOS)
     uint64_t launchSessionId = 0;
-    uint64_t activeSessionId = 0;
-    bool launchSlotAcquired = false;
     VProcSessionStdio *launchSession = vprocSessionStdioCurrent();
     VProcSessionStdio *runtimeSession = NULL;
     uint64_t runtimeSessionId = 0;
@@ -1751,17 +1899,17 @@ int smallclueRunMicro(int argc, char **argv) {
     if (launchSession) {
         launchSessionId = launchSession->session_id;
     }
-    if (runtimeSessionId != 0 && launchSessionId != runtimeSessionId) {
-        microResizeTracef("[micro-resize] micro launch session override launch=%llu runtime=%llu",
+    if (launchSessionId == 0 && runtimeSessionId != 0) {
+        launchSessionId = runtimeSessionId;
+    } else if (launchSessionId != 0 &&
+               runtimeSessionId != 0 &&
+               launchSessionId != runtimeSessionId) {
+        microResizeTracef("[micro-resize] micro launch session mismatch launch=%llu runtime=%llu",
                           (unsigned long long)launchSessionId,
                           (unsigned long long)runtimeSessionId);
-        launchSessionId = runtimeSessionId;
-        if (runtimeSession && runtimeSession->session_id == runtimeSessionId) {
-            launchSession = runtimeSession;
-        }
     }
     if (launchSessionId == 0) {
-        launchSessionId = runtimeSessionId;
+        microResizeTracef("[micro-resize] micro launch missing thread-local session");
     }
     {
         int launchCols = 0;
@@ -1783,15 +1931,13 @@ int smallclueRunMicro(int argc, char **argv) {
                               (unsigned long long)launchSessionId);
         }
     }
-    if (!microAcquireLaunchSlot(launchSessionId, &activeSessionId)) {
-        microReportLaunchBusy(launchSessionId, activeSessionId);
-        return 1;
-    }
-    launchSlotAcquired = true;
-    microBridgeMainThreadSet(pthread_self(), true);
+    uint64_t mainThreadSessionId = launchSessionId;
+    microBridgeMainThreadSet(mainThreadSessionId, pthread_self(), true);
 #endif
     MicroEnvBackup envBackup;
     microPrepareEnvironment(&envBackup);
+#if defined(PSCAL_TARGET_IOS)
+#endif
     const char *microConfigHome = getenv("MICRO_CONFIG_HOME");
     int launchArgc = argc;
     char **launchArgv = argv;
@@ -1811,6 +1957,8 @@ int smallclueRunMicro(int argc, char **argv) {
 #if defined(PSCAL_TARGET_IOS)
     MicroHostStdioBridge hostBridge;
     bool hostBridgeActive = false;
+    int launchTcellStdinFd = STDIN_FILENO;
+    int launchTcellStdoutFd = STDOUT_FILENO;
     const bool bridgeRequested = true;
     const bool bridgeStrictFailure = true;
     if (bridgeRequested) {
@@ -1825,10 +1973,7 @@ int smallclueRunMicro(int argc, char **argv) {
                         bridge_errno);
                 free(patchedArgv);
                 microRestoreEnvironment(&envBackup);
-                microBridgeMainThreadSet((pthread_t)0, false);
-                if (launchSlotAcquired) {
-                    microReleaseLaunchSlot();
-                }
+                microBridgeMainThreadSet(mainThreadSessionId, (pthread_t)0, false);
                 return 1;
             }
             fprintf(stderr,
@@ -1841,15 +1986,43 @@ int smallclueRunMicro(int argc, char **argv) {
                       hostBridgeActive ? 1 : 0,
                       (unsigned long long)launchSessionId,
                       (unsigned long long)hostBridge.session_id);
+    if (hostBridgeActive &&
+        hostBridge.session_id != 0 &&
+        hostBridge.session_id != mainThreadSessionId) {
+        microBridgeMainThreadSet(mainThreadSessionId, (pthread_t)0, false);
+        mainThreadSessionId = hostBridge.session_id;
+        microBridgeMainThreadSet(mainThreadSessionId, pthread_self(), true);
+    }
     if (microDebugEnabled()) {
         fprintf(stderr,
                 "[micro] host stdio bridge requested=%d active=%d\n",
                 bridgeRequested ? 1 : 0,
                 hostBridgeActive ? 1 : 0);
     }
+    if (hostBridgeActive) {
+        if (hostBridge.pipe_stdio_mode) {
+            launchTcellStdinFd = hostBridge.stdin_pipe_read;
+            launchTcellStdoutFd = hostBridge.output_pipe_write;
+        } else if (hostBridge.pty_slave >= 0) {
+            launchTcellStdinFd = hostBridge.pty_slave;
+            launchTcellStdoutFd = hostBridge.pty_slave;
+        }
+    }
+    {
+        uint64_t goLaunchSessionId = hostBridge.session_id != 0
+                                     ? hostBridge.session_id
+                                     : launchSessionId;
+        microGoLaunchContextSet(goLaunchSessionId,
+                                launchTcellStdinFd,
+                                launchTcellStdoutFd);
+    }
 #endif
     MicroStdFdBackup stdioBackup;
+#if !defined(PSCAL_TARGET_IOS)
     microSaveStandardFds(&stdioBackup);
+#else
+    memset(&stdioBackup, 0, sizeof(stdioBackup));
+#endif
     int dupFd = -1;
 #if defined(PSCAL_TARGET_IOS)
     if (hostBridgeActive && microDebugEnabled()) {
@@ -1918,7 +2091,11 @@ int smallclueRunMicro(int argc, char **argv) {
             close(ttyFd);
         }
     }
-    if (isatty(STDOUT_FILENO)) {
+    if (isatty(STDOUT_FILENO)
+#if defined(PSCAL_TARGET_IOS)
+        && !hostBridgeActive
+#endif
+    ) {
         static const char resetSeq[] = "\033[r\033[?1l\033>\033[?25h\033[?1049l\033[?47l";
         static const char clearSeq[] = "\033[2J\033[H\r\n";
         (void)write(STDOUT_FILENO, resetSeq, sizeof(resetSeq) - 1);
@@ -1929,19 +2106,19 @@ int smallclueRunMicro(int argc, char **argv) {
         close(dupFd);
     }
 
+#if !defined(PSCAL_TARGET_IOS)
     microRestoreStandardFds(&stdioBackup);
+#endif
 #if defined(PSCAL_TARGET_IOS)
+    microGoLaunchContextClear();
     if (hostBridgeActive) {
         microHostStdioBridgeTeardown(&hostBridge);
     }
-    microBridgeMainThreadSet((pthread_t)0, false);
+    microBridgeMainThreadSet(mainThreadSessionId, (pthread_t)0, false);
 #endif
     free(patchedArgv);
     microRestoreEnvironment(&envBackup);
 #if defined(PSCAL_TARGET_IOS)
-    if (launchSlotAcquired) {
-        microReleaseLaunchSlot();
-    }
 #endif
     return status;
 }
