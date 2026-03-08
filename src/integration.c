@@ -323,6 +323,8 @@ DEFINE_SMALLCLUE_WRAPPER("init", init)
 DEFINE_SMALLCLUE_WRAPPER("runit", runit)
 DEFINE_SMALLCLUE_WRAPPER("mdev", mdev)
 DEFINE_SMALLCLUE_WRAPPER("mknod", mknod)
+DEFINE_SMALLCLUE_WRAPPER("mount", mount)
+DEFINE_SMALLCLUE_WRAPPER("umount", umount)
 DEFINE_SMALLCLUE_WRAPPER("halt", halt)
 
 #if SMALLCLUE_HAS_IFADDRS
@@ -477,6 +479,8 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("runit", vmBuiltinSmallclue_runit, "runit");
     registerSmallclueBuiltin("mdev", vmBuiltinSmallclue_mdev, "mdev");
     registerSmallclueBuiltin("mknod", vmBuiltinSmallclue_mknod, "mknod");
+    registerSmallclueBuiltin("mount", vmBuiltinSmallclue_mount, "mount");
+    registerSmallclueBuiltin("umount", vmBuiltinSmallclue_umount, "umount");
     registerSmallclueBuiltin("halt", vmBuiltinSmallclue_halt, "halt");
     registerSmallclueBuiltin("poweroff", vmBuiltinSmallclue_halt, "poweroff");
     registerSmallclueBuiltin("reboot", vmBuiltinSmallclue_halt, "reboot");

@@ -904,14 +904,17 @@ static int smallclueRunOpensshEntryOnce(const char *label, int (*entry)(int, cha
     char connection_attempts_option[48] = {0};
     bool inject_connect_timeout = false;
     bool inject_connection_attempts = false;
-    if (label && strcmp(label, "ssh") == 0 && argc > 0 && argv) {
+    if (argc > 0 && argv) {
         /*
          * OpenSSH's closefrom() is process-wide and unsafe in our multitab
          * runtime (it can close unrelated tab/session descriptors). Force the
-         * iOS guard on every SSH launch.
+         * iOS guard for all OpenSSH entrypoints (ssh/scp/sftp), including
+         * nested ssh invocations launched by sftp/scp transport setup.
          */
         setenv("PSCALI_SSH_SKIP_CLOSEFROM", "1", 1);
+    }
 
+    if (label && strcmp(label, "ssh") == 0 && argc > 0 && argv) {
         if (!smallclueSshArgvHasOptionKey(argc, argv, "ConnectTimeout")) {
             int timeout_seconds = smallclueSshEnvPositiveInt("PSCALI_SSH_CONNECT_TIMEOUT",
                                                              8, 1, 600);
@@ -1553,7 +1556,7 @@ int PSCALRuntimeCreateSshSession(int argc,
     if (PSCALRuntimeGetCurrentRuntimeContext) {
         ctx->runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext();
     }
-    ctx->argv = (char **)calloc((size_t)argc, sizeof(char *));
+    ctx->argv = (char **)calloc((size_t)argc + 1u, sizeof(char *));
     if (!ctx->argv) {
         smallclueCloseSessionFds(ctx);
         free(ctx);
@@ -1564,11 +1567,13 @@ int PSCALRuntimeCreateSshSession(int argc,
         ctx->argv[i] = smallclueDupString(argv[i]);
         if (!ctx->argv[i]) {
             smallclueFreeArgv(ctx->argv, i);
+            smallclueCloseSessionFds(ctx);
             free(ctx);
             errno = ENOMEM;
             return -1;
         }
     }
+    ctx->argv[argc] = NULL;
 
     if (PSCALRuntimeRegisterSessionContext) {
         PSCALRuntimeRegisterSessionContext(session_id);

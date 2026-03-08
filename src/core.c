@@ -809,12 +809,6 @@ static bool smallclueShouldAbort(int *out_status) {
             sigaddset(&watchset, SIGTSTP);
             int signo = 0;
             if (vprocSigwait(cur_pid, &watchset, &signo) == 0) {
-                if (signo == SIGTSTP && !allow_cooperative_sigtstp) {
-                    if (dbg && *dbg) {
-                        fprintf(stderr, "[smallclue] ignore vproc SIGTSTP for non-coop stop\n");
-                    }
-                    return false;
-                }
                 if (out_status) {
                     *out_status = 128 + signo;
                 }
@@ -850,13 +844,6 @@ static bool smallclueShouldAbort(int *out_status) {
             (sigismember(&pending, SIGINT) || sigismember(&pending, SIGTSTP))) {
             int signo = 0;
             if (sigwait(&watchset, &signo) == 0) {
-                if (signo == SIGTSTP && !allow_cooperative_sigtstp) {
-                    sigprocmask(SIG_SETMASK, &oldset, NULL);
-                    if (dbg && *dbg) {
-                        fprintf(stderr, "[smallclue] ignore host SIGTSTP for non-coop stop\n");
-                    }
-                    return false;
-                }
                 if (out_status) {
                     *out_status = 128 + signo;
                 }
@@ -1006,6 +993,7 @@ static int smallclueKillCommand(int argc, char **argv);
 static int smallclueMkdirCommand(int argc, char **argv);
 static int smallclueMknodCommand(int argc, char **argv);
 static int smallclueMountCommand(int argc, char **argv);
+static int smallclueUmountCommand(int argc, char **argv);
 static int smallclueWhoamiCommand(int argc, char **argv);
 static void smallclueEmitTerminalSane(void);
 #if defined(PSCAL_TARGET_IOS)
@@ -1697,6 +1685,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"mkdir", smallclueMkdirCommand, "Create directories"},
     {"mknod", smallclueMknodCommand, "Create special files"},
     {"mount", smallclueMountCommand, "Mount filesystems"},
+    {"umount", smallclueUmountCommand, "Unmount filesystems"},
     {"more", smallcluePagerCommand, "Paginate file contents"},
     {"mv", smallclueMvCommand, "Move or rename files"},
     {"nslookup", smallclueNslookupCommand, "DNS lookup utility"},
@@ -1861,8 +1850,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  -v verbose"},
     {"mknod", "mknod [-m mode] NAME TYPE [MAJOR MINOR]\n"
               "  Create special files (b=block, c/u=char, p=fifo)"},
-    {"mount", "mount [-t type] [-o options] [source] dir\n"
-              "  Mount filesystems (iOS: omit source to open folder picker)"},
+    {"mount", "mount [-p] [-t type] [-o options] [source] dir\n"
+              "  Mount filesystems (iOS: omit source to open folder picker; -p persists to /etc/fstab)"},
+    {"umount", "umount [-p] dir\n"
+               "  Unmount filesystems (iOS: -p also removes matching /etc/fstab entry)"},
     {"micro", "micro [FILE]\n"
               "  Micro editor"},
     {"more", "more [FILE...]\n"
@@ -2056,7 +2047,7 @@ static const char * __attribute__((unused)) smallclueLookupHelp(const char *name
 static const char *pager_command_name(const char *name);
 static int pager_read_key(void);
 static char *pagerReadLogicalLine(const PagerBuffer *buffer, size_t line_index, bool *had_newline);
-static void smallclueMenuStartFrame(bool *first_frame);
+static void smallclueMenuStartFrameTo(FILE *out, bool *first_frame);
 
 static void pagerBell(void) {
     fputc('\a', stdout);
@@ -2183,6 +2174,43 @@ static ssize_t smallclueReadStream(FILE *stream, void *buf, size_t count, int *o
         }
     }
     return (ssize_t)read_bytes;
+}
+
+static bool smallclueWriteFullyStream(FILE *stream, const void *buf, size_t count, int *out_errno) {
+    if (out_errno) {
+        *out_errno = 0;
+    }
+    if (!stream || (!buf && count > 0)) {
+        if (out_errno) {
+            *out_errno = EINVAL;
+        }
+        return false;
+    }
+    size_t off = 0;
+    while (off < count) {
+        errno = 0;
+        size_t nw = fwrite((const char *)buf + off, 1, count - off, stream);
+        if (nw > 0) {
+            off += nw;
+            continue;
+        }
+        if (ferror(stream)) {
+            int err = errno ? errno : EIO;
+            if (err == EINTR || err == EAGAIN) {
+                clearerr(stream);
+                continue;
+            }
+            if (out_errno) {
+                *out_errno = err;
+            }
+            return false;
+        }
+        if (out_errno) {
+            *out_errno = EIO;
+        }
+        return false;
+    }
+    return true;
 }
 
 static int smallclueGetcStream(FILE *stream, int *out_errno) {
@@ -3146,6 +3174,38 @@ static int smallclueStringCompare(const void *a, const void *b) {
     return strcmp(*lhs, *rhs);
 }
 
+static FILE *smallclueOpenTempFile(const char *tag) {
+#if defined(PSCAL_TARGET_IOS)
+    const char *tmp_root = getenv("TMPDIR");
+    if (!tmp_root || !*tmp_root) {
+        tmp_root = "/tmp";
+    }
+    const char *name = (tag && *tag) ? tag : "tmp";
+    char tmpl[PATH_MAX];
+    snprintf(tmpl, sizeof(tmpl), "%s/smallclue-%s-XXXXXX", tmp_root, name);
+    int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        return NULL;
+    }
+    int tracked_fd = vprocHostDup(fd);
+    if (tracked_fd >= 0) {
+        close(fd);
+        fd = tracked_fd;
+    }
+    FILE *fp = fdopen(fd, "w+b");
+    if (!fp) {
+        close(fd);
+        unlink(tmpl);
+        return NULL;
+    }
+    unlink(tmpl);
+    return fp;
+#else
+    (void)tag;
+    return tmpfile();
+#endif
+}
+
 static int pagerCollectLines(const char *cmd_name, const char *path, FILE *stream, PagerBuffer *buffer) {
     if (!stream || !buffer) {
         return 1;
@@ -3164,6 +3224,18 @@ static int pagerCollectLines(const char *cmd_name, const char *path, FILE *strea
                 pager_command_name(cmd_name), strerror(errno));
         return 1;
     }
+#if defined(PSCAL_TARGET_IOS)
+    /*
+     * mkstemp() may bypass vproc's open tracking on iOS. Move the descriptor
+     * to a vproc-tracked duplicate so stdio writes are permitted by shim
+     * fallback hardening.
+     */
+    int tracked_fd = vprocHostDup(fd);
+    if (tracked_fd >= 0) {
+        close(fd);
+        fd = tracked_fd;
+    }
+#endif
     FILE *fp = fdopen(fd, "w+b");
     if (!fp) {
         close(fd);
@@ -3199,10 +3271,11 @@ static int pagerCollectLines(const char *cmd_name, const char *path, FILE *strea
             return 1;
         }
         if (read_bytes > 0) {
-            size_t written = fwrite(buf, 1, (size_t)read_bytes, fp);
-            if (written != (size_t)read_bytes) {
-                fprintf(stderr, "%s: failed to buffer pager input\n",
-                        pager_command_name(cmd_name));
+            int write_err = 0;
+            if (!smallclueWriteFullyStream(fp, buf, (size_t)read_bytes, &write_err)) {
+                fprintf(stderr, "%s: failed to buffer pager input: %s\n",
+                        pager_command_name(cmd_name),
+                        strerror(write_err ? write_err : EIO));
                 free(offsets);
                 fclose(fp);
                 return 1;
@@ -3527,6 +3600,7 @@ static void pagerSigwinchHandler(int signo) {
 }
 
 static int pager_terminal_rows(void);
+static int pager_terminal_cols(void);
 
 static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, int page_rows) {
     if (!buffer || buffer->line_count == 0) {
@@ -3791,6 +3865,8 @@ static _Thread_local int pager_control_fd_value = -2;
 #if defined(PSCAL_TARGET_IOS)
 static _Thread_local bool pager_session_queue_enabled = false;
 #endif
+static _Thread_local int pager_observed_rows = 0;
+static _Thread_local int pager_observed_cols = 0;
 
 // Duplicate an FD for pager control input only if it can be read from.
 static int pagerDupForRead(int fd) {
@@ -4142,10 +4218,29 @@ static int pager_read_key(void) {
     }
     int result = 'q';
     const int seq_timeout_ms = 120;
+    const int resize_poll_ms = 100;
+    if (pager_observed_rows <= 0 || pager_observed_cols <= 0) {
+        int initial_rows = pager_terminal_rows();
+        int initial_cols = pager_terminal_cols();
+        if (initial_rows > 0) {
+            pager_observed_rows = initial_rows;
+        }
+        if (initial_cols > 0) {
+            pager_observed_cols = initial_cols;
+        }
+    }
     for (;;) {
         unsigned char ch = 0;
-        ssize_t n = pagerReadByteWithTimeout(fd, use_session_queue, &ch, true, seq_timeout_ms);
+        ssize_t n = pagerReadByteWithTimeout(fd, use_session_queue, &ch, false, resize_poll_ms);
         if (n == -2) {
+            int rows_now = pager_terminal_rows();
+            int cols_now = pager_terminal_cols();
+            if (rows_now > 0) {
+                pager_observed_rows = rows_now;
+            }
+            if (cols_now > 0) {
+                pager_observed_cols = cols_now;
+            }
             result = PAGER_KEY_RESIZE;
             break;
         }
@@ -4159,6 +4254,22 @@ static int pager_read_key(void) {
             }
         }
         if (n <= 0) {
+            int rows_now = pager_terminal_rows();
+            int cols_now = pager_terminal_cols();
+            if (rows_now > 0 && cols_now > 0) {
+                if (pager_observed_rows <= 0 || pager_observed_cols <= 0) {
+                    pager_observed_rows = rows_now;
+                    pager_observed_cols = cols_now;
+                } else if (rows_now != pager_observed_rows || cols_now != pager_observed_cols) {
+                    pager_observed_rows = rows_now;
+                    pager_observed_cols = cols_now;
+                    result = PAGER_KEY_RESIZE;
+                    break;
+                }
+            }
+            if (n == 0) {
+                continue;
+            }
             break;
         }
         if (ch == '\x1b') {
@@ -4216,11 +4327,6 @@ static int pager_terminal_rows(void) {
     const char *lines = getenv("LINES");
     if (lines && *lines) {
         parsed = atoi(lines);
-#if defined(PSCAL_TARGET_IOS)
-        if (parsed > 0) {
-            return parsed;
-        }
-#endif
     }
     struct winsize ws;
     if (isatty(STDOUT_FILENO) && ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
@@ -4249,11 +4355,6 @@ static int pager_terminal_cols(void) {
     const char *cols = getenv("COLUMNS");
     if (cols && *cols) {
         parsed = atoi(cols);
-#if defined(PSCAL_TARGET_IOS)
-        if (parsed > 0) {
-            return parsed;
-        }
-#endif
     }
     struct winsize ws;
     if (isatty(STDOUT_FILENO) && ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
@@ -7541,7 +7642,7 @@ static int smallclueMarkdownDisplayDataEx(const char *label,
         return 0;
     }
 
-    FILE *source = tmpfile();
+    FILE *source = smallclueOpenTempFile("md-source");
     if (!source) {
         free(converted_html);
         return 1;
@@ -7557,7 +7658,7 @@ static int smallclueMarkdownDisplayDataEx(const char *label,
     fflush(source);
     rewind(source);
 
-    FILE *buffer = tmpfile();
+    FILE *buffer = smallclueOpenTempFile("md-buffer");
     bool direct = false;
     if (!buffer) {
         buffer = stdout;
@@ -7803,7 +7904,13 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
             top = (links->count > window) ? (links->count - window) : 0;
         }
 
-        smallclueMenuStartFrame(&first_frame);
+        char *frame = NULL;
+        size_t frame_len = 0;
+        FILE *out = open_memstream(&frame, &frame_len);
+        if (!out) {
+            out = stdout;
+        }
+        smallclueMenuStartFrameTo(out, &first_frame);
         char header[256];
         if (source_label && *source_label) {
             snprintf(header, sizeof(header), "Links in %s (%zu/%zu)  [Arrows=move Enter=open q=cancel]",
@@ -7812,14 +7919,14 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
             snprintf(header, sizeof(header), "Links (%zu/%zu)  [Arrows=move Enter=open q=cancel]",
                    cursor + 1, links->count);
         }
-        printf("\x1b[7m");
+        fputs("\x1b[7m", out);
         if (cols > 0 && (int)strlen(header) > cols) {
-            if (cols <= 3) { fwrite(header, 1, (size_t)cols, stdout); }
-            else { fwrite(header, 1, (size_t)(cols - 3), stdout); fputs("...", stdout); }
+            if (cols <= 3) { fwrite(header, 1, (size_t)cols, out); }
+            else { fwrite(header, 1, (size_t)(cols - 3), out); fputs("...", out); }
         } else {
-            printf("%s", header);
+            fprintf(out, "%s", header);
         }
-        printf("\x1b[0m\n");
+        fputs("\x1b[0m\n", out);
 
         size_t end = top + window;
         if (end > links->count) end = links->count;
@@ -7829,19 +7936,27 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
             const char *target = links->items[i].target ? links->items[i].target : "";
             char line[PATH_MAX * 3];
             snprintf(line, sizeof(line), "%3zu. %s (%s)", i + 1, text, target);
-            if (active) printf("\x1b[7m");
+            if (active) fputs("\x1b[7m", out);
             if (cols > 0 && (int)strlen(line) > cols) {
                 if (cols > 3) {
-                    fwrite(line, 1, (size_t)(cols - 3), stdout);
-                    fputs("...", stdout);
+                    fwrite(line, 1, (size_t)(cols - 3), out);
+                    fputs("...", out);
                 } else {
-                    fwrite(line, 1, (size_t)cols, stdout);
+                    fwrite(line, 1, (size_t)cols, out);
                 }
-                fputc('\n', stdout);
+                fputc('\n', out);
             } else {
-                printf("%s\n", line);
+                fprintf(out, "%s\n", line);
             }
-            if (active) printf("\x1b[0m");
+            if (active) fputs("\x1b[0m", out);
+        }
+        if (out != stdout) {
+            fflush(out);
+            fclose(out);
+            if (frame && frame_len > 0) {
+                fwrite(frame, 1, frame_len, stdout);
+            }
+            free(frame);
         }
         fflush(stdout);
 
@@ -8148,13 +8263,16 @@ static int smallclueMarkdownListDocuments(void) {
     return 0;
 }
 
-static void smallclueMenuStartFrame(bool *first_frame) {
+static void smallclueMenuStartFrameTo(FILE *out, bool *first_frame) {
+    if (!out) {
+        out = stdout;
+    }
     if (first_frame && *first_frame) {
-        printf("\x1b[2J\x1b[H");
+        fputs("\x1b[2J\x1b[H", out);
         *first_frame = false;
         return;
     }
-    printf("\x1b[H\x1b[J");
+    fputs("\x1b[H\x1b[J", out);
 }
 
 static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
@@ -8166,23 +8284,29 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
                                           int term_cols,
                                           bool show_docs_dir,
                                           bool *first_frame) {
-    smallclueMenuStartFrame(first_frame);
+    char *frame = NULL;
+    size_t frame_len = 0;
+    FILE *out = open_memstream(&frame, &frame_len);
+    if (!out) {
+        out = stdout;
+    }
+    smallclueMenuStartFrameTo(out, first_frame);
     char header[256];
     snprintf(header, sizeof(header),
              "Markdown docs (Arrows=move, Enter=open, q=quit) [%zu/%zu]",
              cursor + 1, count);
-    printf("\x1b[7m");
+    fputs("\x1b[7m", out);
     if (term_cols > 0 && (int)strlen(header) > term_cols) {
         if (term_cols <= 3) {
-            fwrite(header, 1, (size_t)term_cols, stdout);
+            fwrite(header, 1, (size_t)term_cols, out);
         } else {
-            fwrite(header, 1, (size_t)(term_cols - 3), stdout);
-            fputs("...", stdout);
+            fwrite(header, 1, (size_t)(term_cols - 3), out);
+            fputs("...", out);
         }
     } else {
-        printf("%s", header);
+        fprintf(out, "%s", header);
     }
-    printf("\x1b[0m\n");
+    fputs("\x1b[0m\n", out);
     size_t end = top + window;
     if (end > count) {
         end = count;
@@ -8194,21 +8318,21 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
         const char *title = entries[idx].title ? entries[idx].title : "";
         snprintf(line, sizeof(line), " %-24.24s %s", name, title);
         if (highlight) {
-            printf("\x1b[7m");
+            fputs("\x1b[7m", out);
         }
         if (term_cols > 0 && (int)strlen(line) > term_cols) {
             if (term_cols <= 3) {
-                fwrite(line, 1, (size_t)term_cols, stdout);
+                fwrite(line, 1, (size_t)term_cols, out);
             } else {
-                fwrite(line, 1, (size_t)(term_cols - 3), stdout);
-                fputs("...", stdout);
+                fwrite(line, 1, (size_t)(term_cols - 3), out);
+                fputs("...", out);
             }
-            fputc('\n', stdout);
+            fputc('\n', out);
         } else {
-            printf("%s\n", line);
+            fprintf(out, "%s\n", line);
         }
         if (highlight) {
-            printf("\x1b[0m");
+            fputs("\x1b[0m", out);
         }
     }
     if (show_docs_dir) {
@@ -8218,15 +8342,23 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
         snprintf(footer, sizeof(footer), "Docs: %s", visible_docs_dir);
         if (term_cols > 0 && (int)strlen(footer) > term_cols) {
             if (term_cols <= 3) {
-                fwrite(footer, 1, (size_t)term_cols, stdout);
+                fwrite(footer, 1, (size_t)term_cols, out);
             } else {
-                fwrite(footer, 1, (size_t)(term_cols - 3), stdout);
-                fputs("...", stdout);
+                fwrite(footer, 1, (size_t)(term_cols - 3), out);
+                fputs("...", out);
             }
-            fputc('\n', stdout);
+            fputc('\n', out);
         } else {
-            printf("%s\n", footer);
+            fprintf(out, "%s\n", footer);
         }
+    }
+    if (out != stdout) {
+        fflush(out);
+        fclose(out);
+        if (frame && frame_len > 0) {
+            fwrite(frame, 1, frame_len, stdout);
+        }
+        free(frame);
     }
     fflush(stdout);
 }
@@ -9813,7 +9945,7 @@ static bool smallclueLicensesResolvePath(const char *filename, char *out, size_t
 }
 
 static void smallclueLicensesRenderMenu(size_t selected, bool *first_frame) {
-    smallclueMenuStartFrame(first_frame);
+    smallclueMenuStartFrameTo(stdout, first_frame);
     printf("PSCAL & Third-Party Licenses\n");
     printf("Use arrows to navigate, Enter to view, q to quit.\n\n");
     size_t total = smallclueLicensesCount();
@@ -14819,6 +14951,173 @@ static bool smallclueFstabEncodeField(const char *input, char *out, size_t out_s
     return true;
 }
 
+static bool smallclueFstabBufferAppend(char **buffer,
+                                       size_t *length,
+                                       size_t *capacity,
+                                       const char *data,
+                                       size_t data_len) {
+    if (!buffer || !length || !capacity) {
+        errno = EINVAL;
+        return false;
+    }
+    if (data_len == 0) {
+        return true;
+    }
+    if (!data) {
+        errno = EINVAL;
+        return false;
+    }
+    if (*length > SIZE_MAX - data_len) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    size_t needed = *length + data_len + 1;
+    if (needed > *capacity) {
+        size_t new_capacity = (*capacity > 0) ? *capacity : 1024;
+        while (new_capacity < needed) {
+            if (new_capacity > SIZE_MAX / 2) {
+                new_capacity = needed;
+                break;
+            }
+            new_capacity *= 2;
+        }
+        char *resized = (char *)realloc(*buffer, new_capacity);
+        if (!resized) {
+            errno = ENOMEM;
+            return false;
+        }
+        *buffer = resized;
+        *capacity = new_capacity;
+    }
+    memcpy(*buffer + *length, data, data_len);
+    *length += data_len;
+    (*buffer)[*length] = '\0';
+    return true;
+}
+
+static bool smallclueFstabReadWholeFile(int fd, char **out_data, size_t *out_len) {
+    if (fd < 0 || !out_data || !out_len) {
+        errno = EINVAL;
+        return false;
+    }
+    if (vprocHostLseek(fd, 0, SEEK_SET) < 0) {
+        return false;
+    }
+
+    char *buffer = NULL;
+    size_t length = 0;
+    size_t capacity = 0;
+    char chunk[2048];
+    while (true) {
+        ssize_t read_bytes = vprocHostRead(fd, chunk, sizeof(chunk));
+        if (read_bytes < 0) {
+            int saved_errno = errno;
+            free(buffer);
+            errno = saved_errno;
+            return false;
+        }
+        if (read_bytes == 0) {
+            break;
+        }
+        if (!smallclueFstabBufferAppend(&buffer,
+                                        &length,
+                                        &capacity,
+                                        chunk,
+                                        (size_t)read_bytes)) {
+            int saved_errno = errno;
+            free(buffer);
+            errno = saved_errno;
+            return false;
+        }
+    }
+
+    if (!buffer) {
+        buffer = (char *)calloc(1, 1);
+        if (!buffer) {
+            errno = ENOMEM;
+            return false;
+        }
+    }
+    buffer[length] = '\0';
+    *out_data = buffer;
+    *out_len = length;
+    return true;
+}
+
+static bool smallclueFstabRewriteWholeFile(int fd, const char *data, size_t data_len) {
+    if (fd < 0 || (!data && data_len > 0)) {
+        errno = EINVAL;
+        return false;
+    }
+    if (vprocHostLseek(fd, 0, SEEK_SET) < 0) {
+        return false;
+    }
+    if (ftruncate(fd, 0) != 0) {
+        return false;
+    }
+    if (vprocHostLseek(fd, 0, SEEK_SET) < 0) {
+        return false;
+    }
+    size_t written = 0;
+    while (written < data_len) {
+        ssize_t rc = vprocHostWrite(fd, data + written, data_len - written);
+        if (rc <= 0) {
+            if (rc == 0) {
+                errno = EIO;
+            }
+            return false;
+        }
+        written += (size_t)rc;
+    }
+    (void)vprocHostFsync(fd);
+    return true;
+}
+
+static bool smallclueFstabLineEquals(const char *line, size_t line_len, const char *value) {
+    if (!line || !value) {
+        return false;
+    }
+    while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) {
+        line_len--;
+    }
+    size_t value_len = strlen(value);
+    return line_len == value_len && memcmp(line, value, value_len) == 0;
+}
+
+static bool smallclueFstabLineMatchesTarget(const char *line,
+                                            size_t line_len,
+                                            const char *target_encoded) {
+    if (!line || !target_encoded) {
+        return false;
+    }
+    while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) {
+        line_len--;
+    }
+    char *scratch = (char *)malloc(line_len + 1);
+    if (!scratch) {
+        return false;
+    }
+    memcpy(scratch, line, line_len);
+    scratch[line_len] = '\0';
+
+    char *cursor = scratch;
+    while (*cursor && isspace((unsigned char)*cursor)) {
+        cursor++;
+    }
+    if (*cursor == '\0' || *cursor == '#') {
+        free(scratch);
+        return false;
+    }
+
+    char *saveptr = NULL;
+    char *source_field = strtok_r(cursor, " \t", &saveptr);
+    char *target_field = strtok_r(NULL, " \t", &saveptr);
+    (void)source_field;
+    bool match = (target_field && strcmp(target_field, target_encoded) == 0);
+    free(scratch);
+    return match;
+}
+
 static bool smallclueMountPersistFstabEntry(const char *source,
                                             const char *target,
                                             const char *type,
@@ -14855,63 +15154,170 @@ static bool smallclueMountPersistFstabEntry(const char *source,
         return false;
     }
 
-    FILE *fp = fopen("/etc/fstab", "a+");
-    if (!fp) {
+    int fd = vprocHostOpen("/etc/fstab", O_RDWR | O_CREAT, 0666);
+    if (fd < 0) {
+        return false;
+    }
+
+    char *existing = NULL;
+    size_t existing_len = 0;
+    if (!smallclueFstabReadWholeFile(fd, &existing, &existing_len)) {
+        int saved_errno = errno;
+        vprocHostClose(fd);
+        errno = saved_errno;
         return false;
     }
 
     bool exists = false;
-    rewind(fp);
-    char line[(PATH_MAX * 8) + 128];
-    while (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (strcmp(line, entry_line) == 0) {
+    const char *cursor = existing;
+    const char *end = existing + existing_len;
+    while (cursor < end) {
+        const char *newline = memchr(cursor, '\n', (size_t)(end - cursor));
+        size_t raw_len = newline ? (size_t)(newline - cursor + 1) : (size_t)(end - cursor);
+        size_t line_len = newline ? raw_len - 1 : raw_len;
+        if (smallclueFstabLineEquals(cursor, line_len, entry_line)) {
             exists = true;
             break;
         }
+        cursor += raw_len;
     }
+
     if (!exists) {
-        if (fseek(fp, 0, SEEK_END) != 0) {
+        char *updated = NULL;
+        size_t updated_len = 0;
+        size_t updated_capacity = 0;
+        if (!smallclueFstabBufferAppend(&updated,
+                                        &updated_len,
+                                        &updated_capacity,
+                                        existing,
+                                        existing_len)) {
             int saved_errno = errno;
-            fclose(fp);
+            free(existing);
+            vprocHostClose(fd);
             errno = saved_errno;
             return false;
         }
-        long end = ftell(fp);
-        if (end > 0) {
-            if (fseek(fp, end - 1, SEEK_SET) != 0) {
+        if (updated_len > 0 && updated[updated_len - 1] != '\n') {
+            if (!smallclueFstabBufferAppend(&updated,
+                                            &updated_len,
+                                            &updated_capacity,
+                                            "\n",
+                                            1)) {
                 int saved_errno = errno;
-                fclose(fp);
+                free(updated);
+                free(existing);
+                vprocHostClose(fd);
                 errno = saved_errno;
                 return false;
-            }
-            int last = fgetc(fp);
-            if (last == EOF && ferror(fp)) {
-                int saved_errno = errno;
-                fclose(fp);
-                errno = saved_errno;
-                return false;
-            }
-            if (last != '\n') {
-                if (fseek(fp, 0, SEEK_END) != 0 || fputc('\n', fp) == EOF) {
-                    int saved_errno = errno;
-                    fclose(fp);
-                    errno = saved_errno;
-                    return false;
-                }
             }
         }
-        if (fprintf(fp, "%s\n", entry_line) < 0 || fflush(fp) != 0) {
+        if (!smallclueFstabBufferAppend(&updated,
+                                        &updated_len,
+                                        &updated_capacity,
+                                        entry_line,
+                                        strlen(entry_line)) ||
+            !smallclueFstabBufferAppend(&updated,
+                                        &updated_len,
+                                        &updated_capacity,
+                                        "\n",
+                                        1)) {
             int saved_errno = errno;
-            fclose(fp);
+            free(updated);
+            free(existing);
+            vprocHostClose(fd);
             errno = saved_errno;
             return false;
         }
+        if (!smallclueFstabRewriteWholeFile(fd, updated, updated_len)) {
+            int saved_errno = errno;
+            free(updated);
+            free(existing);
+            vprocHostClose(fd);
+            errno = saved_errno;
+            return false;
+        }
+        free(updated);
     }
-    fclose(fp);
+
+    free(existing);
+    vprocHostClose(fd);
+    return true;
+}
+
+static bool smallclueMountRemoveFstabEntry(const char *target) {
+    if (!target || target[0] != '/') {
+        errno = EINVAL;
+        return false;
+    }
+
+    char target_encoded[PATH_MAX * 4];
+    if (!smallclueFstabEncodeField(target, target_encoded, sizeof(target_encoded))) {
+        return false;
+    }
+
+    int fd = vprocHostOpen("/etc/fstab", O_RDWR | O_CREAT, 0666);
+    if (fd < 0) {
+        return false;
+    }
+
+    char *existing = NULL;
+    size_t existing_len = 0;
+    if (!smallclueFstabReadWholeFile(fd, &existing, &existing_len)) {
+        int saved_errno = errno;
+        vprocHostClose(fd);
+        errno = saved_errno;
+        return false;
+    }
+
+    bool removed = false;
+    char *updated = NULL;
+    size_t updated_len = 0;
+    size_t updated_capacity = 0;
+    const char *cursor = existing;
+    const char *end = existing + existing_len;
+    while (cursor < end) {
+        const char *newline = memchr(cursor, '\n', (size_t)(end - cursor));
+        size_t raw_len = newline ? (size_t)(newline - cursor + 1) : (size_t)(end - cursor);
+        size_t line_len = newline ? raw_len - 1 : raw_len;
+        if (!smallclueFstabLineMatchesTarget(cursor, line_len, target_encoded)) {
+            if (!smallclueFstabBufferAppend(&updated,
+                                            &updated_len,
+                                            &updated_capacity,
+                                            cursor,
+                                            raw_len)) {
+                int saved_errno = errno;
+                free(updated);
+                free(existing);
+                vprocHostClose(fd);
+                errno = saved_errno;
+                return false;
+            }
+        } else {
+            removed = true;
+        }
+        cursor += raw_len;
+    }
+
+    if (!removed) {
+        free(updated);
+        free(existing);
+        vprocHostClose(fd);
+        errno = ENOENT;
+        return false;
+    }
+
+    if (!smallclueFstabRewriteWholeFile(fd, updated ? updated : "", updated_len)) {
+        int saved_errno = errno;
+        free(updated);
+        free(existing);
+        vprocHostClose(fd);
+        errno = saved_errno;
+        return false;
+    }
+
+    free(updated);
+    free(existing);
+    vprocHostClose(fd);
     return true;
 }
 #endif
@@ -15263,6 +15669,100 @@ static int smallclueMountCommand(int argc, char **argv) {
     (void)argc;
     (void)argv;
     fprintf(stderr, "mount: not supported on this platform\n");
+    return 1;
+#endif
+}
+
+static int smallclueUmountCommand(int argc, char **argv) {
+#if defined(__linux__) || defined(linux) || defined(__linux)
+    const char *usage = "usage: umount dir\n";
+    smallclueResetGetopt();
+    int opt;
+    while ((opt = getopt(argc, argv, "")) != -1) {
+        (void)opt;
+        fputs(usage, stderr);
+        return 1;
+    }
+    if (optind + 1 != argc) {
+        fputs(usage, stderr);
+        return 1;
+    }
+    const char *target = argv[optind];
+    if (umount(target) != 0) {
+        perror("umount");
+        return 1;
+    }
+    return 0;
+#elif defined(PSCAL_TARGET_IOS)
+    const char *usage = "usage: umount [-p] dir\n";
+    bool persist_to_fstab = false;
+
+    smallclueResetGetopt();
+    int opt;
+    while ((opt = getopt(argc, argv, "p")) != -1) {
+        switch (opt) {
+            case 'p':
+                persist_to_fstab = true;
+                break;
+            default:
+                fputs(usage, stderr);
+                return 1;
+        }
+    }
+    if (optind + 1 != argc) {
+        fputs(usage, stderr);
+        return 1;
+    }
+
+    const char *target = argv[optind];
+    char target_virtual[PATH_MAX];
+    bool have_target_virtual = false;
+    if (realpath(target, target_virtual)) {
+        have_target_virtual = true;
+    } else {
+        if (target[0] == '/') {
+            int n = snprintf(target_virtual, sizeof(target_virtual), "%s", target);
+            if (n > 0 && (size_t)n < sizeof(target_virtual)) {
+                have_target_virtual = true;
+            }
+        } else {
+            char cwd[PATH_MAX];
+            if (getcwd(cwd, sizeof(cwd))) {
+                int n = snprintf(target_virtual, sizeof(target_virtual), "%s/%s", cwd, target);
+                if (n > 0 && (size_t)n < sizeof(target_virtual)) {
+                    have_target_virtual = true;
+                }
+            }
+        }
+    }
+    if (!have_target_virtual) {
+        fprintf(stderr, "umount: %s: %s\n", target, strerror(errno));
+        return 1;
+    }
+
+    if (!pathTruncateMountRemove(target_virtual)) {
+        int saved_errno = errno;
+        fprintf(stderr,
+                "umount: %s: %s\n",
+                target,
+                strerror(saved_errno ? saved_errno : EINVAL));
+        return 1;
+    }
+
+    if (persist_to_fstab) {
+        if (!smallclueMountRemoveFstabEntry(target_virtual)) {
+            int saved_errno = errno;
+            fprintf(stderr,
+                    "umount: unmounted but failed to update /etc/fstab: %s\n",
+                    strerror(saved_errno ? saved_errno : EIO));
+            return 1;
+        }
+    }
+    return 0;
+#else
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "umount: not supported on this platform\n");
     return 1;
 #endif
 }

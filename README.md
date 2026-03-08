@@ -23,6 +23,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **mkdir** / **rmdir**: Create or remove directories.
 * **touch**: Update file timestamps or create empty files.
 * **ln**: Create links (symbolic and hard).
+* **mount** / **umount**: Add or remove filesystem mounts (iOS supports virtual bind mounts).
 * **pwd**: Print working directory.
 * **chmod**: Change file modes/permissions (supports octal and symbolic `u+x`).
 * **du**: Estimate file space usage.
