@@ -14126,27 +14126,36 @@ static int smallclueWcProcessFile(const char *path, SmallclueWcCounts *counts) {
         fp = stdin;
     }
 
-    counts->lines = counts->words = counts->bytes = 0;
+    uint64_t lines = 0;
+    uint64_t words = 0;
+    uint64_t bytes = 0;
     int in_word = 0;
     int read_err = 0;
     char buf[16384];
     ssize_t n;
 
     while ((n = smallclueReadStream(fp, buf, sizeof(buf), &read_err)) > 0) {
-        counts->bytes += (uint64_t)n;
+        bytes += (uint64_t)n;
         for (ssize_t i = 0; i < n; ++i) {
             unsigned char c = (unsigned char)buf[i];
             if (c == '\n') {
-                counts->lines++;
+                lines++;
             }
-            if (isspace(c)) {
+
+            /* Bolt optimization: inline space check instead of isspace() to avoid function call overhead */
+            int is_sp = (c == ' ') || (c >= '\t' && c <= '\r');
+            if (is_sp) {
                 in_word = 0;
             } else if (!in_word) {
-                counts->words++;
+                words++;
                 in_word = 1;
             }
         }
     }
+
+    counts->lines = lines;
+    counts->words = words;
+    counts->bytes = bytes;
 
     if (fp != stdin) {
         fclose(fp);
