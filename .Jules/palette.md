@@ -9,3 +9,7 @@
 ## 2024-11-06 - Pager Status Line Visual Separation
 **Learning:** Pager interfaces (like `less` or `more`) inherently mix UI elements (the status prompt) with arbitrary document text. Without visual styling, the prompt blends into the text, creating a confusing UX where users can't tell where the file ends and the tool begins.
 **Action:** Always use inverse video (e.g., `\033[7m`) for terminal pager status lines or similar floating TUI elements to ensure clear visual separation from the content being viewed.
+
+## 2024-11-20 - Fullscreen Applet Visual Hierarchy
+**Learning:** Fullscreen applets like `watch` lack visual separation between their status/header lines and the arbitrary command output they continuously render, making them harder to scan or distinguish from normal shell output.
+**Action:** Always wrap the header/status lines of fullscreen utilities in inverse video (`\033[7m`) to establish a clear visual hierarchy and separate the tool's UI from the command payload it displays.
