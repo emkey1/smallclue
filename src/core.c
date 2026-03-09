@@ -14,6 +14,9 @@
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
 #endif
+#if defined(PSCAL_HAS_LIBGIT2)
+#include <git2.h>
+#endif
 #if defined(PSCAL_TARGET_IOS)
 #include "common/path_virtualization.h"
 #include "ios/vproc.h"
@@ -126,6 +129,7 @@ int PSCALRuntimeScriptCaptureActive(void) { return 0; }
 #endif
 
 int smallclueVprocTestCommand(int argc, char **argv);
+int smallclueGitCommand(int argc, char **argv);
 
 static ssize_t smallclueGetlineStream(char **line, size_t *cap, FILE *stream, int *out_errno);
 static uint64_t gSmallclueProcessStartMonoNs = 0;
@@ -1666,6 +1670,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"file", smallclueFileCommand, "Identify file types"},
     {"find", smallclueFindCommand, "Search for files"},
     {"grep", smallclueGrepCommand, "Search for patterns"},
+    {"git", smallclueGitCommand, "Git plumbing and porcelain"},
     {"head", smallclueHeadCommand, "Print the first lines of files"},
     {"history", smallclueHistoryCommand, "Show command history"},
     {"id", smallclueIdCommand, "Print user identity information"},
@@ -1808,6 +1813,32 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -i ignore case\n"
              "  -n line numbers\n"
              "  -v invert match"},
+    {"git", "git [-C PATH] [--no-pager] [-c key=value] <subcommand> [args]\n"
+            "  Supported in this build:\n"
+            "  init,\n"
+            "  clone,\n"
+            "  remote,\n"
+            "  fetch,\n"
+            "  pull,\n"
+            "  push,\n"
+            "  add,\n"
+            "  commit,\n"
+            "  reset,\n"
+            "  restore,\n"
+            "  checkout,\n"
+            "  switch,\n"
+            "  config --get,\n"
+            "  symbolic-ref,\n"
+            "  rev-list,\n"
+            "  show-ref,\n"
+            "  ls-files,\n"
+            "  rev-parse,\n"
+            "  status,\n"
+            "  branch,\n"
+            "  tag,\n"
+            "  diff,\n"
+            "  log,\n"
+            "  show"},
     {"halt", "halt [-f]\n"
              "  Halt the system"},
     {"head", "head [-n N] [FILE...]\n"
@@ -9886,6 +9917,13 @@ static int smallclueVersionCommand(int argc, char **argv) {
     } else {
         printf("version: %s\n", version);
     }
+#if defined(PSCAL_HAS_LIBGIT2)
+    int lg2_major = 0;
+    int lg2_minor = 0;
+    int lg2_rev = 0;
+    git_libgit2_version(&lg2_major, &lg2_minor, &lg2_rev);
+    printf("libgit2: %d.%d.%d\n", lg2_major, lg2_minor, lg2_rev);
+#endif
     free(version);
     return 0;
 }
@@ -9899,6 +9937,7 @@ typedef struct {
 
 static const SmallclueLicense kSmallclueLicenses[] = {
     {"PSCAL", "pscal_LICENSE.txt"},
+    {"libgit2", "libgit2_LICENSE.txt"},
     {"OpenSSH", "openssh_LICENSE.txt"},
     {"curl", "curl_LICENSE.txt"},
     {"OpenSSL", "openssl_LICENSE.txt"},

@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+SMALLCLUE_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DVTM_RUNTIME_HOOKS_HEADER="${SMALLCLUE_SCRIPT_DIR}/src/dvtm_runtime_hooks.h"
+
 # Check for root privileges (needed for chown/mknod in rootfs)
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script requires root privileges to set up the rootfs correctly."
@@ -80,6 +83,21 @@ ensureDebianI386OpenSshDeps() {
     if ! aptInstallNoRecommends libc6:i386 libc6-dev:i386 zlib1g:i386 zlib1g-dev:i386 libssl3:i386 libssl-dev:i386; then
         return 1
     fi
+    return 0
+}
+
+ensureDebianI386DvtmDeps() {
+    if [ "$IS_DEBIAN_APT" -ne 1 ]; then
+        return 1
+    fi
+    ensureI386ArchDebian
+
+    # Prefer the current package name, fall back for older distros.
+    if ! aptInstallNoRecommends libncurses-dev:i386; then
+        aptInstallNoRecommends libncurses5-dev:i386 || return 1
+    fi
+    # libtinfo can be split out on some distros; best effort.
+    aptInstallNoRecommends libtinfo6:i386 >/dev/null 2>&1 || true
     return 0
 }
 
@@ -264,7 +282,7 @@ if ! selectI686Toolchain; then
     HOST_ARCH="$(uname -m)"
     if [ "$AUTO_INSTALL_DEPS" = "1" ] && [ "$IS_DEBIAN_APT" -eq 1 ] && [ "$DPKG_HAS_BROKEN" -eq 0 ]; then
         echo "Installing missing toolchain/build dependencies..."
-        ensureDebianPackages make file autoconf automake libtool pkg-config
+        ensureDebianPackages make file autoconf automake libtool pkg-config cmake ninja-build
         if [ "$HOST_ARCH" = "aarch64" ] || [ "$HOST_ARCH" = "arm64" ] || [ "$HOST_ARCH" = "armv7l" ]; then
             ensureDebianPackages gcc-i686-linux-gnu libc6-dev-i386-cross binutils-i686-linux-gnu qemu-user-static
         else
@@ -648,6 +666,148 @@ else
     echo "nextvi source not found; using stubs."
 fi
 
+SMALLCLUE_WITH_DVTM="${SMALLCLUE_WITH_DVTM:-1}"
+DVTM_DEFS=""
+DVTM_OBJS=""
+DVTM_LIBS=""
+SMALLCLUE_WITH_LIBGIT2="${SMALLCLUE_WITH_LIBGIT2:-1}"
+LIBGIT2_DEFS=""
+LIBGIT2_INCLUDES=""
+LIBGIT2_LIBS=""
+if [ "$SMALLCLUE_WITH_DVTM" = "1" ]; then
+    DVTM_DIR="third-party/dvtm"
+    DVTM_BUILD_DIR="$DVTM_DIR/.pscal-build-i686"
+    if [ ! -d "$DVTM_DIR" ] || [ ! -f "$DVTM_DIR/dvtm.c" ] || [ ! -f "$DVTM_DIR/vt.c" ] || [ ! -f "$DVTM_DIR/config.def.h" ]; then
+        echo "Error: dvtm source tree is missing required files."
+        echo "Run ./fetch_dependencies.sh and retry."
+        exit 1
+    fi
+    mkdir -p "$DVTM_BUILD_DIR"
+    cp "$DVTM_DIR/config.def.h" "$DVTM_BUILD_DIR/config.h"
+
+    DVTM_PROBE_SRC="$DVTM_BUILD_DIR/curses_probe.c"
+    cat > "$DVTM_PROBE_SRC" <<EOF
+#include <curses.h>
+int main(void) { initscr(); endwin(); return 0; }
+EOF
+
+    DVTM_INCLUDE_FLAGS="-I$DVTM_BUILD_DIR -I$DVTM_DIR"
+    if [ -d /usr/include/ncursesw ]; then
+        DVTM_INCLUDE_FLAGS="$DVTM_INCLUDE_FLAGS -I/usr/include/ncursesw"
+    fi
+
+    dvtm_probe_link() {
+        local libs="$1"
+        "${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" "${TARGET_LDFLAGS[@]}" -static -std=c99 \
+            -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_XOPEN_SOURCE_EXTENDED -D_GNU_SOURCE \
+            $DVTM_INCLUDE_FLAGS \
+            "$DVTM_PROBE_SRC" $libs -o "$DVTM_BUILD_DIR/curses_probe.bin" >/dev/null 2>&1
+    }
+
+    for try_libs in "-lncursesw -ltinfo -lutil" "-lncursesw -lutil" "-lncursesw -ltinfo" "-lncursesw" \
+                    "-lncurses -ltinfo -lutil" "-lncurses -lutil" "-lncurses" "-lcurses -lutil" "-lcurses"; do
+        if dvtm_probe_link "$try_libs"; then
+            DVTM_LIBS="$try_libs"
+            break
+        fi
+    done
+
+    if [ -z "$DVTM_LIBS" ] && [ "$AUTO_INSTALL_DEPS" = "1" ] && [ "$IS_DEBIAN_APT" -eq 1 ] && [ "$DPKG_HAS_BROKEN" -eq 0 ]; then
+        echo "Installing missing i386 curses development packages for dvtm..."
+        ensureDebianI386DvtmDeps || true
+        for try_libs in "-lncursesw -ltinfo -lutil" "-lncursesw -lutil" "-lncursesw -ltinfo" "-lncursesw" \
+                        "-lncurses -ltinfo -lutil" "-lncurses -lutil" "-lncurses" "-lcurses -lutil" "-lcurses"; do
+            if dvtm_probe_link "$try_libs"; then
+                DVTM_LIBS="$try_libs"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$DVTM_LIBS" ]; then
+        echo "Error: failed to locate static curses libraries for i686 dvtm build."
+        echo "Install i386 ncurses development packages, then retry."
+        echo "  sudo dpkg --add-architecture i386"
+        echo "  sudo apt-get update"
+        echo "  sudo apt-get install libncurses-dev:i386"
+        exit 1
+    fi
+
+    echo "Building dvtm applet support for i686 (${DVTM_LIBS})..."
+    "${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 \
+        -D_XOPEN_SOURCE_EXTENDED -D_GNU_SOURCE -DVERSION=\\\"0.16-pscal\\\" -Dexit=pscalDvtmRequestExit \
+        $DVTM_INCLUDE_FLAGS -include "$DVTM_RUNTIME_HOOKS_HEADER" -Isrc -Dmain=dvtm_main_entry \
+        -c "$DVTM_DIR/dvtm.c" -o "$DVTM_BUILD_DIR/dvtm.o"
+    "${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 \
+        -D_XOPEN_SOURCE_EXTENDED -D_GNU_SOURCE -DVERSION=\\\"0.16-pscal\\\" -Dexit=pscalDvtmRequestExit \
+        $DVTM_INCLUDE_FLAGS -include "$DVTM_RUNTIME_HOOKS_HEADER" -Isrc -c "$DVTM_DIR/vt.c" -o "$DVTM_BUILD_DIR/vt.o"
+
+    DVTM_OBJS="$DVTM_BUILD_DIR/dvtm.o $DVTM_BUILD_DIR/vt.o"
+    DVTM_DEFS="-DSMALLCLUE_WITH_DVTM"
+fi
+
+if [ "$SMALLCLUE_WITH_LIBGIT2" = "1" ]; then
+    LIBGIT2_DIR="third-party/libgit2"
+    LIBGIT2_BUILD_DIR="$LIBGIT2_DIR/.pscal-build-i686"
+    LIBGIT2_ARCHIVE=""
+    TARGET_CFLAGS_JOINED="${TARGET_CFLAGS[*]}"
+    TARGET_LDFLAGS_JOINED="${TARGET_LDFLAGS[*]}"
+
+    if [ ! -d "$LIBGIT2_DIR" ] || [ ! -f "$LIBGIT2_DIR/CMakeLists.txt" ] || [ ! -f "$LIBGIT2_DIR/include/git2.h" ]; then
+        echo "Error: libgit2 source tree is missing required files."
+        echo "Run ./fetch_dependencies.sh and retry."
+        exit 1
+    fi
+    if ! command -v cmake >/dev/null 2>&1; then
+        echo "Error: cmake is required to build libgit2."
+        exit 1
+    fi
+    CMAKE_GENERATOR_ARGS=()
+    if command -v ninja >/dev/null 2>&1; then
+        CMAKE_GENERATOR_ARGS=(-G Ninja)
+    fi
+
+    echo "Building libgit2 applet support for i686..."
+    cmake -S "$LIBGIT2_DIR" -B "$LIBGIT2_BUILD_DIR" "${CMAKE_GENERATOR_ARGS[@]}" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER="${CC_CMD[0]}" \
+        -DCMAKE_C_FLAGS="${TARGET_CFLAGS_JOINED}" \
+        -DCMAKE_EXE_LINKER_FLAGS="${TARGET_LDFLAGS_JOINED}" \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DBUILD_TESTS=OFF \
+        -DBUILD_BENCHMARKS=OFF \
+        -DBUILD_CLI=OFF \
+        -DBUILD_EXAMPLES=OFF \
+        -DBUILD_FUZZERS=OFF \
+        -DUSE_THREADS=ON \
+        -DUSE_SSH=OFF \
+        -DUSE_HTTPS=ON \
+        -DUSE_SHA1=builtin \
+        -DUSE_SHA256=builtin \
+        -DUSE_HTTP_PARSER=builtin \
+        -DUSE_AUTH_NTLM=OFF \
+        -DUSE_AUTH_NEGOTIATE=OFF \
+        -DUSE_REGEX=builtin \
+        -DUSE_COMPRESSION=builtin \
+        -DUSE_I18N=OFF \
+        -DENABLE_WERROR=OFF
+    cmake --build "$LIBGIT2_BUILD_DIR" --target libgit2package -j4
+
+    if [ -f "$LIBGIT2_BUILD_DIR/libgit2.a" ]; then
+        LIBGIT2_ARCHIVE="$LIBGIT2_BUILD_DIR/libgit2.a"
+    else
+        LIBGIT2_ARCHIVE=$(find "$LIBGIT2_BUILD_DIR" -name "libgit2.a" -print | head -n 1 || true)
+    fi
+    if [ -z "$LIBGIT2_ARCHIVE" ] || [ ! -f "$LIBGIT2_ARCHIVE" ]; then
+        echo "Error: libgit2 static archive not produced."
+        exit 1
+    fi
+
+    LIBGIT2_DEFS="-DPSCAL_HAS_LIBGIT2"
+    LIBGIT2_INCLUDES="-I$LIBGIT2_DIR/include"
+    LIBGIT2_LIBS="$LIBGIT2_ARCHIVE"
+fi
+
 # 4. Compile smallclue
 NEXTVI_DEFS=""
 if [ "$NEXTVI_DIRECT_MODE" = "1" ]; then
@@ -656,20 +816,25 @@ if [ "$NEXTVI_DIRECT_MODE" = "1" ]; then
 fi
 
 echo "Compiling smallclue (iSH/32-bit static)..."
-"${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" "${TARGET_LDFLAGS[@]}" -static -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${NEXTVI_DEFS} \
+"${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" "${TARGET_LDFLAGS[@]}" -static -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${NEXTVI_DEFS} ${DVTM_DEFS} ${LIBGIT2_DEFS} \
+    ${LIBGIT2_INCLUDES} \
     -I. -Isrc ${OPENSSH_LDFLAGS} -lpthread \
     src/main.c \
     src/core.c \
     src/runtime_support.c \
+    src/dvtm_app.c \
     src/nextvi_app.c \
     ${NEXTVI_SRC} \
     ${OPENSSH_SRC} \
     ${OPENSSH_OBJS} \
+    ${DVTM_OBJS} \
     src/openssh_app.c \
     src/vproc_test_app.c \
     ${OPENSSH_SHIM} \
     src/runtime_stubs_extra.c \
     ${OPENSSH_LIBS} \
+    ${DVTM_LIBS} \
+    ${LIBGIT2_LIBS} \
     -o smallclue
 
 if [ ! -f smallclue ]; then

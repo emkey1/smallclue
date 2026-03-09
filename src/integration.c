@@ -314,6 +314,7 @@ DEFINE_SMALLCLUE_WRAPPER("uniq", uniq)
 DEFINE_SMALLCLUE_WRAPPER("sed", sed)
 DEFINE_SMALLCLUE_WRAPPER("cut", cut)
 DEFINE_SMALLCLUE_WRAPPER("curl", curl)
+DEFINE_SMALLCLUE_WRAPPER("git", git)
 DEFINE_SMALLCLUE_WRAPPER("tr", tr)
 DEFINE_SMALLCLUE_WRAPPER("id", id)
 DEFINE_SMALLCLUE_WRAPPER("pbcopy", pbcopy)
@@ -470,6 +471,7 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("sed", vmBuiltinSmallclue_sed, "sed");
     registerSmallclueBuiltin("cut", vmBuiltinSmallclue_cut, "cut");
     registerSmallclueBuiltin("curl", vmBuiltinSmallclue_curl, "curl");
+    registerSmallclueBuiltin("git", vmBuiltinSmallclue_git, "git");
     registerSmallclueBuiltin("tr", vmBuiltinSmallclue_tr, "tr");
     registerSmallclueBuiltin("id", vmBuiltinSmallclue_id, "id");
     registerSmallclueBuiltin("pbcopy", vmBuiltinSmallclue_pbcopy, "pbcopy");

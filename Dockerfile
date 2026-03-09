@@ -55,11 +55,12 @@ ARG SMALLCLUE_DOCKER_ALLOW_APT=0
 # Ensure build dependencies are present (buildpack-deps usually already has these)
 RUN set -eux; \
     need_apt=0; \
-    for cmd in gcc g++ make git curl; do \
+    for cmd in gcc g++ make git curl cmake; do \
         command -v "$cmd" >/dev/null 2>&1 || need_apt=1; \
     done; \
     printf '#include <openssl/ssl.h>\n' | gcc -E - >/dev/null 2>&1 || need_apt=1; \
     printf '#include <zlib.h>\n' | gcc -E - >/dev/null 2>&1 || need_apt=1; \
+    printf '#include <curses.h>\n' | gcc -E - >/dev/null 2>&1 || need_apt=1; \
     if [ "$need_apt" -eq 1 ] && [ "${SMALLCLUE_DOCKER_ALLOW_APT:-0}" = "1" ]; then \
         if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
             sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources; \
@@ -78,6 +79,8 @@ RUN set -eux; \
             autoconf \
             automake \
             libtool \
+            cmake \
+            libncurses-dev \
             libssl-dev \
             zlib1g-dev \
             ca-certificates \

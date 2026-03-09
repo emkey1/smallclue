@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+SMALLCLUE_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DVTM_RUNTIME_HOOKS_HEADER="${SMALLCLUE_SCRIPT_DIR}/src/dvtm_runtime_hooks.h"
+
 # Check for root privileges
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script requires root privileges to set up the rootfs correctly."
@@ -20,6 +23,14 @@ if [ ! -d "third-party/openssh" ] || [ ! -f "third-party/openssh/ssh.c" ] || [ !
 fi
 if [ ! -d "third-party/dash" ]; then
     echo "Dash missing."
+    MISSING_DEPS=1
+fi
+if [ ! -d "third-party/dvtm/.git" ] || [ ! -f "third-party/dvtm/dvtm.c" ] || [ ! -f "third-party/dvtm/vt.c" ] || [ ! -f "third-party/dvtm/config.def.h" ]; then
+    echo "dvtm repository missing or incomplete."
+    MISSING_DEPS=1
+fi
+if [ ! -d "third-party/libgit2" ] || [ ! -f "third-party/libgit2/CMakeLists.txt" ] || [ ! -f "third-party/libgit2/include/git2.h" ]; then
+    echo "libgit2 repository missing or incomplete."
     MISSING_DEPS=1
 fi
 
@@ -162,6 +173,15 @@ if [ -f third-party/nextvi/vi.c ]; then
     echo "Using Nextvi from third-party/nextvi..."
     NEXTVI_SRC="third-party/nextvi/vi.c"
 fi
+
+SMALLCLUE_WITH_DVTM="${SMALLCLUE_WITH_DVTM:-1}"
+DVTM_OBJS=""
+DVTM_LIBS=""
+DVTM_EXTRA_DEFS=""
+SMALLCLUE_WITH_LIBGIT2="${SMALLCLUE_WITH_LIBGIT2:-1}"
+LIBGIT2_EXTRA_DEFS=""
+LIBGIT2_EXTRA_CFLAGS=""
+LIBGIT2_LIBS=""
 
 OPENSSH_SRC="src/openssh_stubs.c"
 OPENSSH_OBJS=""
@@ -391,22 +411,123 @@ if [ -d "$DASH_DIR" ] && [ ! -f "$DASH_DIR/src/dash" ]; then
     (cd "$DASH_DIR" && ./configure --enable-static && make -j4)
 fi
 
-gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${EXTRA_C_DEFS} \
+if [ "$SMALLCLUE_WITH_DVTM" = "1" ]; then
+    DVTM_DIR="third-party/dvtm"
+    DVTM_BUILD_DIR="${DVTM_DIR}/.pscal-build"
+    if [ ! -d "$DVTM_DIR" ] || [ ! -f "$DVTM_DIR/dvtm.c" ] || [ ! -f "$DVTM_DIR/vt.c" ] || [ ! -f "$DVTM_DIR/config.def.h" ]; then
+        echo "Error: dvtm source tree is missing required files."
+        echo "Run ./fetch_dependencies.sh and retry."
+        exit 1
+    fi
+
+    mkdir -p "$DVTM_BUILD_DIR"
+    cp "$DVTM_DIR/config.def.h" "$DVTM_BUILD_DIR/config.h"
+
+    DVTM_PROBE_SRC="$DVTM_BUILD_DIR/curses_probe.c"
+    cat > "$DVTM_PROBE_SRC" <<EOF
+#include <curses.h>
+#include <stdlib.h>
+int main(void) { initscr(); endwin(); return 0; }
+EOF
+
+    for try_libs in "-lncursesw -lutil" "-lncursesw" "-lncurses -lutil" "-lncurses" "-lcurses -lutil" "-lcurses"; do
+        if gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${EXTRA_C_DEFS} ${EXTRA_LD_FLAGS} \
+            "$DVTM_PROBE_SRC" ${try_libs} -o "$DVTM_BUILD_DIR/curses_probe.bin" >/dev/null 2>&1; then
+            DVTM_LIBS="$try_libs"
+            break
+        fi
+    done
+
+    if [ -z "$DVTM_LIBS" ]; then
+        echo "Error: failed to locate a curses+util link combination for dvtm."
+        echo "Tried: -lncursesw/-lncurses/-lcurses with and without -lutil."
+        exit 1
+    fi
+
+    echo "Building dvtm applet support (${DVTM_LIBS})..."
+    DVTM_COMMON_DEFS="-D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_XOPEN_SOURCE_EXTENDED -D_GNU_SOURCE ${EXTRA_C_DEFS} -DVERSION=\\\"0.16-pscal\\\" -Dexit=pscalDvtmRequestExit"
+    gcc -std=c99 ${DVTM_COMMON_DEFS} -include "$DVTM_RUNTIME_HOOKS_HEADER" -I"$DVTM_BUILD_DIR" -I"$DVTM_DIR" -Isrc \
+        -Dmain=dvtm_main_entry -c "$DVTM_DIR/dvtm.c" -o "$DVTM_BUILD_DIR/dvtm.o"
+    gcc -std=c99 ${DVTM_COMMON_DEFS} -include "$DVTM_RUNTIME_HOOKS_HEADER" -I"$DVTM_BUILD_DIR" -I"$DVTM_DIR" -Isrc \
+        -c "$DVTM_DIR/vt.c" -o "$DVTM_BUILD_DIR/vt.o"
+
+    DVTM_OBJS="$DVTM_BUILD_DIR/dvtm.o $DVTM_BUILD_DIR/vt.o"
+    DVTM_EXTRA_DEFS="-DSMALLCLUE_WITH_DVTM"
+fi
+
+if [ "$SMALLCLUE_WITH_LIBGIT2" = "1" ]; then
+    LIBGIT2_DIR="third-party/libgit2"
+    LIBGIT2_BUILD_DIR="${LIBGIT2_DIR}/.pscal-build"
+    LIBGIT2_ARCHIVE=""
+    if [ ! -d "$LIBGIT2_DIR" ] || [ ! -f "$LIBGIT2_DIR/CMakeLists.txt" ] || [ ! -f "$LIBGIT2_DIR/include/git2.h" ]; then
+        echo "Error: libgit2 source tree is missing required files."
+        echo "Run ./fetch_dependencies.sh and retry."
+        exit 1
+    fi
+    if ! command -v cmake >/dev/null 2>&1; then
+        echo "Error: cmake is required to build libgit2."
+        exit 1
+    fi
+    CMAKE_GENERATOR_ARGS=""
+    if command -v ninja >/dev/null 2>&1; then
+        CMAKE_GENERATOR_ARGS="-G Ninja"
+    fi
+    echo "Building libgit2 applet support..."
+    cmake -S "$LIBGIT2_DIR" -B "$LIBGIT2_BUILD_DIR" $CMAKE_GENERATOR_ARGS \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DBUILD_TESTS=OFF \
+        -DBUILD_BENCHMARKS=OFF \
+        -DBUILD_CLI=OFF \
+        -DBUILD_EXAMPLES=OFF \
+        -DBUILD_FUZZERS=OFF \
+        -DUSE_SSH=OFF \
+        -DUSE_HTTPS=ON \
+        -DUSE_SHA1=builtin \
+        -DUSE_SHA256=builtin \
+        -DUSE_HTTP_PARSER=builtin \
+        -DUSE_AUTH_NTLM=OFF \
+        -DUSE_AUTH_NEGOTIATE=OFF \
+        -DUSE_REGEX=builtin \
+        -DUSE_COMPRESSION=builtin \
+        -DUSE_I18N=OFF \
+        -DENABLE_WERROR=OFF
+    cmake --build "$LIBGIT2_BUILD_DIR" --target libgit2package -j4
+    if [ -f "$LIBGIT2_BUILD_DIR/libgit2.a" ]; then
+        LIBGIT2_ARCHIVE="$LIBGIT2_BUILD_DIR/libgit2.a"
+    else
+        LIBGIT2_ARCHIVE=$(find "$LIBGIT2_BUILD_DIR" -name "libgit2.a" -print | head -n 1 || true)
+    fi
+    if [ -z "$LIBGIT2_ARCHIVE" ] || [ ! -f "$LIBGIT2_ARCHIVE" ]; then
+        echo "Error: libgit2 static archive not produced."
+        exit 1
+    fi
+    LIBGIT2_EXTRA_DEFS="-DPSCAL_HAS_LIBGIT2"
+    LIBGIT2_EXTRA_CFLAGS="-I${LIBGIT2_DIR}/include"
+    LIBGIT2_LIBS="$LIBGIT2_ARCHIVE"
+fi
+
+gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${EXTRA_C_DEFS} ${DVTM_EXTRA_DEFS} ${LIBGIT2_EXTRA_DEFS} \
+    ${LIBGIT2_EXTRA_CFLAGS} \
     -I. -Isrc ${EXTRA_LD_FLAGS} -lpthread \
     src/main.c \
     src/core.c \
     src/runtime_support.c \
     src/micro_app.c \
+    src/dvtm_app.c \
     src/nextvi_app.c \
     ${NEXTVI_SRC} \
     ${OPENSSH_SRC} \
     ${OPENSSH_OBJS} \
+    ${DVTM_OBJS} \
     src/openssh_app.c \
     src/vproc_test_app.c \
     src/micro_app.c \
     ${OPENSSH_SHIM} \
     src/runtime_stubs_extra.c \
     ${OPENSSH_LIBS} \
+    ${DVTM_LIBS} \
+    ${LIBGIT2_LIBS} \
     -o smallclue
 
 if [ ! -f smallclue ]; then

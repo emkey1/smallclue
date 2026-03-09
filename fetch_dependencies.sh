@@ -111,6 +111,36 @@ if [ -f "$TERM_C" ]; then
     fi
 fi
 
+# --- dvtm ---
+reset_incomplete_repo "$THIRD_PARTY_DIR/dvtm" "1" "dvtm.c" "vt.c" "config.def.h"
+if [ ! -d "$THIRD_PARTY_DIR/dvtm" ]; then
+    if [ -d "../../third-party/dvtm/.git" ]; then
+        echo "Copying dvtm from ../../third-party/dvtm..."
+        cp -a "../../third-party/dvtm" "$THIRD_PARTY_DIR/dvtm"
+    elif [ -d "../third-party/dvtm/.git" ]; then
+        echo "Copying dvtm from ../third-party/dvtm..."
+        cp -a "../third-party/dvtm" "$THIRD_PARTY_DIR/dvtm"
+    else
+        echo "Cloning dvtm..."
+        git clone https://github.com/martanne/dvtm "$THIRD_PARTY_DIR/dvtm"
+    fi
+fi
+
+# --- libgit2 ---
+reset_incomplete_repo "$THIRD_PARTY_DIR/libgit2" "1" "CMakeLists.txt" "include/git2.h"
+if [ ! -d "$THIRD_PARTY_DIR/libgit2" ]; then
+    if [ -d "../../third-party/libgit2/.git" ]; then
+        echo "Copying libgit2 from ../../third-party/libgit2..."
+        cp -a "../../third-party/libgit2" "$THIRD_PARTY_DIR/libgit2"
+    elif [ -d "../third-party/libgit2/.git" ]; then
+        echo "Copying libgit2 from ../third-party/libgit2..."
+        cp -a "../third-party/libgit2" "$THIRD_PARTY_DIR/libgit2"
+    else
+        echo "Cloning libgit2..."
+        git clone https://github.com/libgit2/libgit2 "$THIRD_PARTY_DIR/libgit2"
+    fi
+fi
+
 # --- OpenSSH ---
 reset_incomplete_repo "$THIRD_PARTY_DIR/openssh" "0" "configure" "configure.ac" "ssh.c" "scp.c" "sftp.c"
 if [ -d "$THIRD_PARTY_DIR/openssh" ] && [ -f "$THIRD_PARTY_DIR/openssh/version.h" ]; then
