@@ -10639,7 +10639,11 @@ static int smallclueWatchCommand(int argc, char **argv) {
         /* Match the clear behavior of the standalone `clear` applet: clear
          * scrollback, home cursor, then clear the visible viewport. */
         fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
-        printf("Every %.2fs: %s\n\n", interval, cmdline ? cmdline : argv[idx]);
+        if (isatty(STDOUT_FILENO)) {
+            printf("\033[7mEvery %.2fs: %s\033[0m\n\n", interval, cmdline ? cmdline : argv[idx]);
+        } else {
+            printf("Every %.2fs: %s\n\n", interval, cmdline ? cmdline : argv[idx]);
+        }
         fflush(stdout);
 #if defined(PSCAL_TARGET_IOS)
         status = smallclueWatchRunCommand(cmd_argc, &argv[idx]);
