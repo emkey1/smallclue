@@ -8542,7 +8542,14 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
     char **subargv = &argv[action_index + 1];
 
     if (strcmp(sub, "add") == 0) {
+        enum {
+            SC_REMOTE_MIRROR_NONE = 0,
+            SC_REMOTE_MIRROR_FETCH = 1,
+            SC_REMOTE_MIRROR_PUSH = 2,
+            SC_REMOTE_MIRROR_BOTH = 3
+        };
         bool fetch = false;
+        int mirror_mode = SC_REMOTE_MIRROR_NONE;
         const char *tracks[128];
         size_t track_count = 0;
         const char *name = NULL;
@@ -8555,6 +8562,23 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
             if (strcmp(arg, "-f") == 0 || strcmp(arg, "--fetch") == 0) {
                 fetch = true;
                 continue;
+            }
+            if (strcmp(arg, "--mirror") == 0) {
+                mirror_mode = SC_REMOTE_MIRROR_BOTH;
+                continue;
+            }
+            if (smallclueGitStartsWith(arg, "--mirror=")) {
+                const char *which = arg + strlen("--mirror=");
+                if (strcmp(which, "fetch") == 0) {
+                    mirror_mode = SC_REMOTE_MIRROR_FETCH;
+                    continue;
+                }
+                if (strcmp(which, "push") == 0) {
+                    mirror_mode = SC_REMOTE_MIRROR_PUSH;
+                    continue;
+                }
+                smallclueGitPrintError("unsupported remote add mirror mode");
+                return 2;
             }
             if (strcmp(arg, "-t") == 0 || strcmp(arg, "--track") == 0) {
                 if ((i + 1) >= subargc || !subargv[i + 1] || !*subargv[i + 1]) {
@@ -8600,6 +8624,10 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
             smallclueGitPrintError("usage: git remote add [-f|--fetch] [-t|--track <branch>] <name> <url>");
             return 2;
         }
+        if (track_count > 0 && mirror_mode == SC_REMOTE_MIRROR_PUSH) {
+            fprintf(stderr, "fatal: specifying branches to track makes sense only with fetch mirrors\n");
+            return 128;
+        }
         char url_buf[PATH_MAX];
         const char *url = url_arg;
         if (smallclueGitResolveMaybePathFromCwd(url_arg, url_buf, sizeof(url_buf)) == 0) {
@@ -8610,7 +8638,7 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
             smallclueGitPrintLibgitError("remote add failed");
             return 1;
         }
-        if (track_count > 0) {
+        if (mirror_mode != SC_REMOTE_MIRROR_NONE || track_count > 0) {
             char key[512];
             if (snprintf(key, sizeof(key), "remote.%s.fetch", name) >= (int)sizeof(key)) {
                 git_remote_free(remote);
@@ -8630,18 +8658,58 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
                 smallclueGitPrintLibgitError("remote add --track failed");
                 return 1;
             }
-            for (size_t i = 0; i < track_count; ++i) {
-                char refspec[1024];
-                if (smallclueGitRemoteFormatFetchRefspec(name, tracks[i], refspec, sizeof(refspec)) != 0) {
-                    git_config_free(cfg);
-                    git_remote_free(remote);
-                    smallclueGitPrintError("remote add --track: invalid branch name");
-                    return 2;
+            if (mirror_mode == SC_REMOTE_MIRROR_PUSH) {
+                /* push mirrors intentionally do not configure a fetch refspec */
+            } else if (mirror_mode == SC_REMOTE_MIRROR_FETCH || mirror_mode == SC_REMOTE_MIRROR_BOTH) {
+                if (track_count == 0) {
+                    if (smallclueGitConfigAppendValue(cfg, key, "+refs/*:refs/*") != 0) {
+                        git_config_free(cfg);
+                        git_remote_free(remote);
+                        smallclueGitPrintLibgitError("remote add --mirror=fetch failed");
+                        return 1;
+                    }
+                } else {
+                    for (size_t i = 0; i < track_count; ++i) {
+                        char refspec[1024];
+                        if (!tracks[i] || !*tracks[i] || strchr(tracks[i], ':') != NULL ||
+                            snprintf(refspec, sizeof(refspec), "+refs/%s:refs/%s", tracks[i], tracks[i]) >= (int)sizeof(refspec)) {
+                            git_config_free(cfg);
+                            git_remote_free(remote);
+                            smallclueGitPrintError("remote add --track: invalid branch name");
+                            return 2;
+                        }
+                        if (smallclueGitConfigAppendValue(cfg, key, refspec) != 0) {
+                            git_config_free(cfg);
+                            git_remote_free(remote);
+                            smallclueGitPrintLibgitError("remote add --mirror=fetch failed");
+                            return 1;
+                        }
+                    }
                 }
-                if (smallclueGitConfigAppendValue(cfg, key, refspec) != 0) {
+            } else {
+                for (size_t i = 0; i < track_count; ++i) {
+                    char refspec[1024];
+                    if (smallclueGitRemoteFormatFetchRefspec(name, tracks[i], refspec, sizeof(refspec)) != 0) {
+                        git_config_free(cfg);
+                        git_remote_free(remote);
+                        smallclueGitPrintError("remote add --track: invalid branch name");
+                        return 2;
+                    }
+                    if (smallclueGitConfigAppendValue(cfg, key, refspec) != 0) {
+                        git_config_free(cfg);
+                        git_remote_free(remote);
+                        smallclueGitPrintLibgitError("remote add --track failed");
+                        return 1;
+                    }
+                }
+            }
+            if (mirror_mode == SC_REMOTE_MIRROR_PUSH || mirror_mode == SC_REMOTE_MIRROR_BOTH) {
+                char mirror_key[512];
+                if (snprintf(mirror_key, sizeof(mirror_key), "remote.%s.mirror", name) >= (int)sizeof(mirror_key) ||
+                    git_config_set_bool(cfg, mirror_key, 1) != 0) {
                     git_config_free(cfg);
                     git_remote_free(remote);
-                    smallclueGitPrintLibgitError("remote add --track failed");
+                    smallclueGitPrintLibgitError("remote add --mirror=push failed");
                     return 1;
                 }
             }
