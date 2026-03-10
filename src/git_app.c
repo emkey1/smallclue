@@ -5365,10 +5365,6 @@ static int smallclueGitCommandCheckoutCommon(git_repository *repo,
             force = true;
             continue;
         }
-        if (strcmp(arg, "--no-force") == 0) {
-            force = false;
-            continue;
-        }
         if (strcmp(arg, "--detach") == 0) {
             detach = true;
             continue;
@@ -10065,6 +10061,9 @@ static int smallclueGitCommandFetch(git_repository *repo, int argc, char **argv)
         if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0 || strcmp(arg, "--no-verbose") == 0) {
             continue;
         }
+        if (strcmp(arg, "--progress") == 0 || strcmp(arg, "--no-progress") == 0) {
+            continue;
+        }
         if (strcmp(arg, "-q") == 0 || strcmp(arg, "--quiet") == 0) {
             quiet = true;
             continue;
@@ -10185,6 +10184,12 @@ static int smallclueGitCommandPull(git_repository *repo, int argc, char **argv) 
         }
         if (strcmp(arg, "-q") == 0 || strcmp(arg, "--quiet") == 0) {
             quiet = true;
+            continue;
+        }
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0 || strcmp(arg, "--no-verbose") == 0) {
+            continue;
+        }
+        if (strcmp(arg, "--progress") == 0 || strcmp(arg, "--no-progress") == 0) {
             continue;
         }
         if (strcmp(arg, "--rebase") == 0) {
@@ -11891,8 +11896,18 @@ static int smallclueGitCommandPush(git_repository *repo, int argc, char **argv) 
             force = true;
             continue;
         }
+        if (strcmp(arg, "--no-force") == 0) {
+            force = false;
+            continue;
+        }
         if (strcmp(arg, "-q") == 0 || strcmp(arg, "--quiet") == 0) {
             quiet = true;
+            continue;
+        }
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0 || strcmp(arg, "--no-verbose") == 0) {
+            continue;
+        }
+        if (strcmp(arg, "--progress") == 0 || strcmp(arg, "--no-progress") == 0) {
             continue;
         }
         if (strcmp(arg, "--all") == 0) {
