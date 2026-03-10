@@ -9998,6 +9998,7 @@ static int smallclueGitCommandFetch(git_repository *repo, int argc, char **argv)
     bool fetch_all = false;
     bool prune = false;
     bool quiet = false;
+    git_remote_autotag_option_t download_tags = GIT_REMOTE_DOWNLOAD_TAGS_AUTO;
     char *refspecs[64];
     size_t refspec_count = 0;
     bool remote_set = false;
@@ -10011,6 +10012,14 @@ static int smallclueGitCommandFetch(git_repository *repo, int argc, char **argv)
         }
         if (strcmp(arg, "--all") == 0) {
             fetch_all = true;
+            continue;
+        }
+        if (strcmp(arg, "--tags") == 0 || strcmp(arg, "-t") == 0) {
+            download_tags = GIT_REMOTE_DOWNLOAD_TAGS_ALL;
+            continue;
+        }
+        if (strcmp(arg, "--no-tags") == 0) {
+            download_tags = GIT_REMOTE_DOWNLOAD_TAGS_NONE;
             continue;
         }
         if (strcmp(arg, "-q") == 0 || strcmp(arg, "--quiet") == 0) {
@@ -10040,6 +10049,7 @@ static int smallclueGitCommandFetch(git_repository *repo, int argc, char **argv)
 
     git_fetch_options opts = GIT_FETCH_OPTIONS_INIT;
     opts.prune = prune ? GIT_FETCH_PRUNE : GIT_FETCH_NO_PRUNE;
+    opts.download_tags = download_tags;
 
     if (fetch_all) {
         git_strarray names = {0};
