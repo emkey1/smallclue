@@ -5364,7 +5364,7 @@ static int smallclueGitCommandStatus(git_repository *repo, int argc, char **argv
 typedef struct SmallclueGitBranchEntry {
     char *name;
     bool current;
-    char short_oid[16];
+    char short_oid[GIT_OID_HEXSZ + 1];
     char *subject;
 } SmallclueGitBranchEntry;
 
@@ -6898,6 +6898,177 @@ static int smallclueGitDecorateCommit(git_repository *repo,
     return 0;
 }
 
+static int smallclueGitAppendLiteral(char *out, size_t out_sz, size_t *used, const char *value) {
+    if (!out || !used || !value) {
+        return -1;
+    }
+    size_t remain = (*used < out_sz) ? (out_sz - *used) : 0;
+    int n = snprintf(out + *used, remain, "%s", value);
+    if (n < 0 || (size_t)n >= remain) {
+        return -1;
+    }
+    *used += (size_t)n;
+    return 0;
+}
+
+static int smallclueGitAppendChar(char *out, size_t out_sz, size_t *used, char c) {
+    if (!out || !used || *used + 1 >= out_sz) {
+        return -1;
+    }
+    out[*used] = c;
+    (*used)++;
+    out[*used] = '\0';
+    return 0;
+}
+
+static const char *smallclueGitCommitBody(const git_commit *commit) {
+    const char *msg = git_commit_message(commit);
+    if (!msg) {
+        return "";
+    }
+    const char *nl = strchr(msg, '\n');
+    if (!nl) {
+        return "";
+    }
+    const char *body = nl + 1;
+    if (*body == '\n') {
+        body++;
+    }
+    return body;
+}
+
+static int smallclueGitFormatPrettyCommit(const git_commit *commit,
+                                          const git_oid *oid,
+                                          size_t abbrev_width,
+                                          const char *format_spec,
+                                          char *out,
+                                          size_t out_sz) {
+    if (!commit || !oid || !format_spec || !out || out_sz == 0) {
+        return -1;
+    }
+    out[0] = '\0';
+
+    char full_oid[GIT_OID_HEXSZ + 1];
+    if (!git_oid_tostr(full_oid, sizeof(full_oid), oid)) {
+        return -1;
+    }
+    char short_oid[16];
+    if (smallclueGitOidShort(oid, abbrev_width, short_oid, sizeof(short_oid)) != 0) {
+        return -1;
+    }
+    char subject[512];
+    smallclueGitCopySubjectLine(smallclueGitCommitSubject(commit), subject, sizeof(subject));
+    const git_signature *author = git_commit_author(commit);
+    const git_signature *committer = git_commit_committer(commit);
+    const char *body = smallclueGitCommitBody(commit);
+    const char *full_msg = git_commit_message(commit);
+    if (!full_msg) {
+        full_msg = "";
+    }
+
+    size_t used = 0;
+    for (size_t i = 0; format_spec[i] != '\0'; ++i) {
+        if (format_spec[i] != '%') {
+            if (smallclueGitAppendChar(out, out_sz, &used, format_spec[i]) != 0) {
+                return -1;
+            }
+            continue;
+        }
+        char next = format_spec[i + 1];
+        if (next == '\0') {
+            if (smallclueGitAppendChar(out, out_sz, &used, '%') != 0) {
+                return -1;
+            }
+            break;
+        }
+        if (next == '%') {
+            if (smallclueGitAppendChar(out, out_sz, &used, '%') != 0) {
+                return -1;
+            }
+            i++;
+            continue;
+        }
+        if (next == 'H') {
+            if (smallclueGitAppendLiteral(out, out_sz, &used, full_oid) != 0) {
+                return -1;
+            }
+            i++;
+            continue;
+        }
+        if (next == 'h') {
+            if (smallclueGitAppendLiteral(out, out_sz, &used, short_oid) != 0) {
+                return -1;
+            }
+            i++;
+            continue;
+        }
+        if (next == 's') {
+            if (smallclueGitAppendLiteral(out, out_sz, &used, subject) != 0) {
+                return -1;
+            }
+            i++;
+            continue;
+        }
+        if (next == 'b') {
+            if (smallclueGitAppendLiteral(out, out_sz, &used, body) != 0) {
+                return -1;
+            }
+            i++;
+            continue;
+        }
+        if (next == 'B') {
+            if (smallclueGitAppendLiteral(out, out_sz, &used, full_msg) != 0) {
+                return -1;
+            }
+            i++;
+            continue;
+        }
+        if ((next == 'a' || next == 'c') && format_spec[i + 2] != '\0') {
+            char suffix = format_spec[i + 2];
+            if (next == 'a' && suffix == 'n') {
+                const char *v = (author && author->name) ? author->name : "";
+                if (smallclueGitAppendLiteral(out, out_sz, &used, v) != 0) {
+                    return -1;
+                }
+                i += 2;
+                continue;
+            }
+            if (next == 'a' && suffix == 'e') {
+                const char *v = (author && author->email) ? author->email : "";
+                if (smallclueGitAppendLiteral(out, out_sz, &used, v) != 0) {
+                    return -1;
+                }
+                i += 2;
+                continue;
+            }
+            if (next == 'c' && suffix == 'n') {
+                const char *v = (committer && committer->name) ? committer->name : "";
+                if (smallclueGitAppendLiteral(out, out_sz, &used, v) != 0) {
+                    return -1;
+                }
+                i += 2;
+                continue;
+            }
+            if (next == 'c' && suffix == 'e') {
+                const char *v = (committer && committer->email) ? committer->email : "";
+                if (smallclueGitAppendLiteral(out, out_sz, &used, v) != 0) {
+                    return -1;
+                }
+                i += 2;
+                continue;
+            }
+        }
+
+        if (smallclueGitAppendChar(out, out_sz, &used, '%') != 0 ||
+            smallclueGitAppendChar(out, out_sz, &used, next) != 0) {
+            return -1;
+        }
+        i++;
+    }
+
+    return 0;
+}
+
 static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
     bool oneline = false;
     bool decorate = false;
@@ -6909,6 +7080,11 @@ static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
     char *rev_specs[64];
     int rev_spec_count = 0;
     bool parse_options = true;
+    const char *pretty_spec = NULL;
+    const char *format_spec = NULL;
+    bool format_with_terminator = false;
+    bool no_abbrev_commit = false;
+    size_t abbrev_width = 7;
 
     for (int i = 0; i < argc; ++i) {
         const char *arg = argv[i];
@@ -6929,8 +7105,63 @@ static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
             oneline = true;
             continue;
         }
+        if (strcmp(arg, "--abbrev-commit") == 0) {
+            no_abbrev_commit = false;
+            continue;
+        }
+        if (strcmp(arg, "--no-abbrev-commit") == 0) {
+            no_abbrev_commit = true;
+            continue;
+        }
+        if (strncmp(arg, "--abbrev=", 9) == 0) {
+            int n = atoi(arg + 9);
+            if (n <= 0) {
+                smallclueGitPrintError("invalid --abbrev value");
+                return 2;
+            }
+            abbrev_width = (size_t)n;
+            continue;
+        }
         if (strcmp(arg, "--all") == 0) {
             log_all = true;
+            continue;
+        }
+        if (strcmp(arg, "--no-decorate") == 0) {
+            decorate = false;
+            continue;
+        }
+        if (strncmp(arg, "--decorate=", 11) == 0) {
+            const char *mode = arg + 11;
+            if (strcmp(mode, "no") == 0 || strcmp(mode, "false") == 0) {
+                decorate = false;
+            } else if (strcmp(mode, "short") == 0 ||
+                       strcmp(mode, "full") == 0 ||
+                       strcmp(mode, "auto") == 0 ||
+                       strcmp(mode, "true") == 0 ||
+                       mode[0] == '\0') {
+                decorate = true;
+            } else {
+                smallclueGitPrintError("unsupported log --decorate mode");
+                return 2;
+            }
+            continue;
+        }
+        if (strcmp(arg, "--pretty") == 0 && i + 1 < argc) {
+            pretty_spec = argv[++i];
+            continue;
+        }
+        if (strncmp(arg, "--pretty=", 9) == 0) {
+            pretty_spec = arg + 9;
+            continue;
+        }
+        if (strcmp(arg, "--format") == 0 && i + 1 < argc) {
+            format_spec = argv[++i];
+            format_with_terminator = true;
+            continue;
+        }
+        if (strncmp(arg, "--format=", 9) == 0) {
+            format_spec = arg + 9;
+            format_with_terminator = true;
             continue;
         }
         if (strcmp(arg, "--decorate") == 0) {
@@ -6979,6 +7210,18 @@ static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
             return 2;
         }
         rev_specs[rev_spec_count++] = argv[i];
+    }
+
+    if (pretty_spec && *pretty_spec) {
+        if (strcmp(pretty_spec, "oneline") == 0) {
+            oneline = true;
+        } else if (strncmp(pretty_spec, "format:", 7) == 0) {
+            format_spec = pretty_spec + 7;
+            format_with_terminator = false;
+        } else {
+            smallclueGitPrintError("unsupported log --pretty mode");
+            return 2;
+        }
     }
 
     git_revwalk *walk = NULL;
@@ -7098,50 +7341,70 @@ static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
             }
         }
 
-        char short_oid[16];
-        (void)smallclueGitOidShort(&oid, 7, short_oid, sizeof(short_oid));
+        char short_oid[GIT_OID_HEXSZ + 1];
+        size_t oid_width = no_abbrev_commit ? GIT_OID_HEXSZ : abbrev_width;
+        (void)smallclueGitOidShort(&oid, oid_width, short_oid, sizeof(short_oid));
         char subject[512];
         smallclueGitCopySubjectLine(smallclueGitCommitSubject(commit), subject, sizeof(subject));
 
         char line[2048];
         line[0] = '\0';
-        if (oneline || !oneline) {
-            if (decorate) {
-                char deco[512];
-                smallclueGitDecorateCommit(repo,
-                                           &oid,
-                                           head_name,
-                                           have_head_target ? &head_target : NULL,
-                                           deco,
-                                           sizeof(deco));
-                if (deco[0]) {
-                    (void)snprintf(line, sizeof(line), "%s (%s) %s\n", short_oid, deco, subject);
+        if (format_spec && *format_spec) {
+            if (smallclueGitFormatPrettyCommit(commit, &oid, abbrev_width, format_spec, line, sizeof(line)) != 0) {
+                git_commit_free(commit);
+                if (reverse_lines) {
+                    for (size_t j = 0; j < reverse_count; ++j) {
+                        free(reverse_lines[j]);
+                    }
+                    free(reverse_lines);
+                }
+                if (head) git_reference_free(head);
+                git_revwalk_free(walk);
+                smallclueGitPrintError("log format output too long");
+                return 1;
+            }
+        } else {
+            if (oneline) {
+                if (decorate) {
+                    char deco[512];
+                    smallclueGitDecorateCommit(repo,
+                                               &oid,
+                                               head_name,
+                                               have_head_target ? &head_target : NULL,
+                                               deco,
+                                               sizeof(deco));
+                    if (deco[0]) {
+                        (void)snprintf(line, sizeof(line), "%s (%s) %s\n", short_oid, deco, subject);
+                    } else {
+                        (void)snprintf(line, sizeof(line), "%s %s\n", short_oid, subject);
+                    }
                 } else {
                     (void)snprintf(line, sizeof(line), "%s %s\n", short_oid, subject);
                 }
             } else {
-                (void)snprintf(line, sizeof(line), "%s %s\n", short_oid, subject);
-            }
-            if (reverse) {
-                if (reverse_count == reverse_capacity) {
-                    size_t new_capacity = reverse_capacity ? reverse_capacity * 2 : 16;
-                    char **grown = (char **)realloc(reverse_lines, new_capacity * sizeof(char *));
-                    if (!grown) {
-                        git_commit_free(commit);
-                        for (size_t j = 0; j < reverse_count; ++j) {
-                            free(reverse_lines[j]);
-                        }
-                        free(reverse_lines);
-                        if (head) git_reference_free(head);
-                        git_revwalk_free(walk);
-                        smallclueGitPrintError("out of memory");
-                        return 1;
+                if (decorate) {
+                    char deco[512];
+                    smallclueGitDecorateCommit(repo,
+                                               &oid,
+                                               head_name,
+                                               have_head_target ? &head_target : NULL,
+                                               deco,
+                                               sizeof(deco));
+                    if (deco[0]) {
+                        (void)snprintf(line, sizeof(line), "%s (%s) %s\n", short_oid, deco, subject);
+                    } else {
+                        (void)snprintf(line, sizeof(line), "%s %s\n", short_oid, subject);
                     }
-                    reverse_lines = grown;
-                    reverse_capacity = new_capacity;
+                } else {
+                    (void)snprintf(line, sizeof(line), "%s %s\n", short_oid, subject);
                 }
-                reverse_lines[reverse_count] = strdup(line);
-                if (!reverse_lines[reverse_count]) {
+            }
+        }
+        if (reverse) {
+            if (reverse_count == reverse_capacity) {
+                size_t new_capacity = reverse_capacity ? reverse_capacity * 2 : 16;
+                char **grown = (char **)realloc(reverse_lines, new_capacity * sizeof(char *));
+                if (!grown) {
                     git_commit_free(commit);
                     for (size_t j = 0; j < reverse_count; ++j) {
                         free(reverse_lines[j]);
@@ -7152,7 +7415,32 @@ static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
                     smallclueGitPrintError("out of memory");
                     return 1;
                 }
-                reverse_count++;
+                reverse_lines = grown;
+                reverse_capacity = new_capacity;
+            }
+            reverse_lines[reverse_count] = strdup(line);
+            if (!reverse_lines[reverse_count]) {
+                git_commit_free(commit);
+                for (size_t j = 0; j < reverse_count; ++j) {
+                    free(reverse_lines[j]);
+                }
+                free(reverse_lines);
+                if (head) git_reference_free(head);
+                git_revwalk_free(walk);
+                smallclueGitPrintError("out of memory");
+                return 1;
+            }
+            reverse_count++;
+        } else {
+            if (format_spec && *format_spec) {
+                if (!format_with_terminator && printed > 0) {
+                    /* pretty=format uses separators between commits, no trailing newline. */
+                    fputc('\n', stdout);
+                }
+                fputs(line, stdout);
+                if (format_with_terminator) {
+                    fputc('\n', stdout);
+                }
             } else {
                 fputs(line, stdout);
             }
@@ -7166,9 +7454,17 @@ static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
     }
 
     if (reverse && reverse_lines) {
+        bool first_output = true;
         for (size_t i = reverse_count; i > 0; --i) {
+            if (format_spec && *format_spec && !format_with_terminator && !first_output) {
+                fputc('\n', stdout);
+            }
             fputs(reverse_lines[i - 1], stdout);
+            if (format_spec && *format_spec && format_with_terminator) {
+                fputc('\n', stdout);
+            }
             free(reverse_lines[i - 1]);
+            first_output = false;
         }
         free(reverse_lines);
     }
