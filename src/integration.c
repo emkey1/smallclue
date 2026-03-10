@@ -362,6 +362,7 @@ DEFINE_SMALLCLUE_WRAPPER("su", su)
 DEFINE_SMALLCLUE_WRAPPER("sudo", sudo)
 DEFINE_SMALLCLUE_WRAPPER("scp", scp)
 DEFINE_SMALLCLUE_WRAPPER("sftp", sftp)
+DEFINE_SMALLCLUE_WRAPPER("rsync", rsync)
 DEFINE_SMALLCLUE_WRAPPER("script", script)
 DEFINE_SMALLCLUE_WRAPPER("ssh", ssh)
 DEFINE_SMALLCLUE_WRAPPER("ssh-keygen", sshkeygen)
@@ -516,6 +517,7 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("type", vmBuiltinSmallclue_type, "type");
     registerSmallclueBuiltin("scp", vmBuiltinSmallclue_scp, "scp");
     registerSmallclueBuiltin("sftp", vmBuiltinSmallclue_sftp, "sftp");
+    registerSmallclueBuiltin("rsync", vmBuiltinSmallclue_rsync, "rsync");
     registerSmallclueBuiltin("su", vmBuiltinSmallclue_su, "su");
     registerSmallclueBuiltin("sudo", vmBuiltinSmallclue_sudo, "sudo");
     registerSmallclueBuiltin("ssh", vmBuiltinSmallclue_ssh, "ssh");

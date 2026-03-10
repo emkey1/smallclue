@@ -952,6 +952,7 @@ static int smallclueClearCommand(int argc, char **argv);
 static int smallclueRmCommand(int argc, char **argv);
 static int smallclueCpCommand(int argc, char **argv);
 static int smallclueMvCommand(int argc, char **argv);
+static int smallclueRsyncCommand(int argc, char **argv);
 static int smallcluePwdCommand(int argc, char **argv);
 static int smallclueEnvCommand(int argc, char **argv);
 static int smallclueChmodCommand(int argc, char **argv);
@@ -1654,6 +1655,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"clear", smallclueClearCommand, "Clear the terminal"},
     {"cls", smallclueClearCommand, "Clear the terminal"},
     {"cp", smallclueCpCommand, "Copy files"},
+    {"rsync", smallclueRsyncCommand, "Synchronize files and directories"},
     {"curl", smallclueCurlCommand, "Transfer data from URLs"},
     {"cut", smallclueCutCommand, "Extract fields from lines"},
     {"date", smallclueDateCommand, "Display current date/time"},
@@ -16294,6 +16296,1061 @@ static int smallclueMvCommand(int argc, char **argv) {
         }
     }
     return status;
+}
+
+typedef struct {
+    bool recursive;
+    bool verbose;
+    bool compress;
+    bool preserve_mode;
+    bool preserve_times;
+    bool dry_run;
+    bool delete_extra;
+    bool update_only;
+    bool checksum;
+    char **include_patterns;
+    size_t include_count;
+    size_t include_capacity;
+    char **exclude_patterns;
+    size_t exclude_count;
+    size_t exclude_capacity;
+    const char *filter_root;
+    const char *filter_dest_root;
+} SmallclueRsyncOptions;
+
+static void smallclueRsyncUsage(FILE *out) {
+    if (!out) {
+        out = stderr;
+    }
+    fprintf(out,
+            "usage: rsync [options] <source>... <destination>\n"
+            "  -a, --archive          archive mode (implies -rpt)\n"
+            "  -r, --recursive        recurse into directories\n"
+            "  -p, --perms            preserve permissions\n"
+            "  -t, --times            preserve modification times\n"
+            "  -u, --update           skip files newer on receiver\n"
+            "  -c, --checksum         use checksum to detect changes\n"
+            "  -v, --verbose          verbose output\n"
+            "  -z, --compress         enable compression for remote transfer (scp -C)\n"
+            "  -n, --dry-run          show what would change without writing\n"
+            "      --delete           delete destination entries not present in source\n"
+            "      --include=PATTERN  include files matching pattern\n"
+            "      --exclude=PATTERN  exclude files matching pattern\n");
+}
+
+static int smallclueRsyncAddPattern(char ***patterns,
+                                    size_t *count,
+                                    size_t *capacity,
+                                    const char *value) {
+    if (!patterns || !count || !capacity || !value || value[0] == '\0') {
+        return -1;
+    }
+    if (*count == *capacity) {
+        size_t next_capacity = *capacity ? (*capacity * 2) : 8;
+        char **resized = (char **)realloc(*patterns, next_capacity * sizeof(char *));
+        if (!resized) {
+            return -1;
+        }
+        *patterns = resized;
+        *capacity = next_capacity;
+    }
+    (*patterns)[*count] = strdup(value);
+    if (!(*patterns)[*count]) {
+        return -1;
+    }
+    (*count)++;
+    return 0;
+}
+
+static void smallclueRsyncFreePatterns(char **patterns, size_t count) {
+    if (!patterns) {
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        free(patterns[i]);
+    }
+    free(patterns);
+}
+
+static bool smallclueRsyncHasTrailingSlash(const char *path) {
+    if (!path) {
+        return false;
+    }
+    size_t len = strlen(path);
+    return len > 1 && path[len - 1] == '/';
+}
+
+static bool smallclueRsyncLooksRemote(const char *path) {
+    if (!path || !*path) {
+        return false;
+    }
+    if (strncmp(path, "rsync://", 8) == 0) {
+        return true;
+    }
+    if (strstr(path, "://") != NULL) {
+        return false;
+    }
+    const char *colon = strchr(path, ':');
+    if (!colon || colon == path) {
+        return false;
+    }
+    const char *slash = strchr(path, '/');
+    if (slash && slash < colon) {
+        return false;
+    }
+    if (path[0] == '/' || path[0] == '.') {
+        return false;
+    }
+    return true;
+}
+
+static void smallclueRsyncStatTimes(const struct stat *st, struct timeval tv[2]) {
+    if (!st || !tv) {
+        return;
+    }
+#if defined(__APPLE__)
+    tv[0].tv_sec = st->st_atimespec.tv_sec;
+    tv[0].tv_usec = (suseconds_t)(st->st_atimespec.tv_nsec / 1000);
+    tv[1].tv_sec = st->st_mtimespec.tv_sec;
+    tv[1].tv_usec = (suseconds_t)(st->st_mtimespec.tv_nsec / 1000);
+#else
+    tv[0].tv_sec = st->st_atim.tv_sec;
+    tv[0].tv_usec = (suseconds_t)(st->st_atim.tv_nsec / 1000);
+    tv[1].tv_sec = st->st_mtim.tv_sec;
+    tv[1].tv_usec = (suseconds_t)(st->st_mtim.tv_nsec / 1000);
+#endif
+}
+
+static int smallclueRsyncCompareMtime(const struct stat *lhs, const struct stat *rhs) {
+#if defined(__APPLE__)
+    if (lhs->st_mtimespec.tv_sec != rhs->st_mtimespec.tv_sec) {
+        return (lhs->st_mtimespec.tv_sec < rhs->st_mtimespec.tv_sec) ? -1 : 1;
+    }
+    if (lhs->st_mtimespec.tv_nsec != rhs->st_mtimespec.tv_nsec) {
+        return (lhs->st_mtimespec.tv_nsec < rhs->st_mtimespec.tv_nsec) ? -1 : 1;
+    }
+#else
+    if (lhs->st_mtim.tv_sec != rhs->st_mtim.tv_sec) {
+        return (lhs->st_mtim.tv_sec < rhs->st_mtim.tv_sec) ? -1 : 1;
+    }
+    if (lhs->st_mtim.tv_nsec != rhs->st_mtim.tv_nsec) {
+        return (lhs->st_mtim.tv_nsec < rhs->st_mtim.tv_nsec) ? -1 : 1;
+    }
+#endif
+    return 0;
+}
+
+static bool smallclueRsyncSameMtime(const struct stat *a, const struct stat *b) {
+    return smallclueRsyncCompareMtime(a, b) == 0;
+}
+
+static int smallclueRsyncFileChecksum(const char *path, uint64_t *out_hash) {
+    if (!path || !out_hash) {
+        errno = EINVAL;
+        return -1;
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+    uint64_t hash = 1469598103934665603ULL;
+    unsigned char buffer[16384];
+    for (;;) {
+        ssize_t nread = read(fd, buffer, sizeof(buffer));
+        if (nread == 0) {
+            break;
+        }
+        if (nread < 0) {
+            int saved = errno;
+            close(fd);
+            errno = saved;
+            return -1;
+        }
+        for (ssize_t i = 0; i < nread; ++i) {
+            hash ^= (uint64_t)buffer[i];
+            hash *= 1099511628211ULL;
+        }
+    }
+    close(fd);
+    *out_hash = hash;
+    return 0;
+}
+
+static bool smallclueRsyncParentPath(const char *path, char *out, size_t out_size) {
+    if (!path || !out || out_size == 0) {
+        return false;
+    }
+    if (!smallclueCopyPath(out, out_size, path)) {
+        return false;
+    }
+    smallclueTrimTrailingSlashes(out);
+    char *slash = strrchr(out, '/');
+    if (!slash) {
+        if (out_size < 2) {
+            return false;
+        }
+        out[0] = '.';
+        out[1] = '\0';
+        return true;
+    }
+    if (slash == out) {
+        out[1] = '\0';
+        return true;
+    }
+    *slash = '\0';
+    return true;
+}
+
+static const char *smallclueRsyncLeafName(const char *path, char *scratch, size_t scratch_size) {
+    if (!path || !scratch || scratch_size == 0 || !smallclueCopyPath(scratch, scratch_size, path)) {
+        return path;
+    }
+    smallclueTrimTrailingSlashes(scratch);
+    return smallclueLeafName(scratch);
+}
+
+static const char *smallclueRsyncRelativePath(const char *root,
+                                              const char *path,
+                                              char *out,
+                                              size_t out_size) {
+    if (!path || !out || out_size == 0) {
+        return "";
+    }
+    out[0] = '\0';
+    if (!root || root[0] == '\0') {
+        const char *leaf = smallclueLeafName(path);
+        smallclueCopyPath(out, out_size, leaf ? leaf : path);
+        return out;
+    }
+    char root_buf[PATH_MAX];
+    if (!smallclueCopyPath(root_buf, sizeof(root_buf), root)) {
+        const char *leaf = smallclueLeafName(path);
+        smallclueCopyPath(out, out_size, leaf ? leaf : path);
+        return out;
+    }
+    smallclueTrimTrailingSlashes(root_buf);
+    size_t root_len = strlen(root_buf);
+    if (strncmp(path, root_buf, root_len) == 0 &&
+        (path[root_len] == '\0' || path[root_len] == '/')) {
+        const char *suffix = path + root_len;
+        if (*suffix == '/') {
+            suffix++;
+        }
+        if (*suffix == '\0') {
+            smallclueCopyPath(out, out_size, ".");
+        } else {
+            smallclueCopyPath(out, out_size, suffix);
+        }
+        return out;
+    }
+    const char *leaf = smallclueLeafName(path);
+    smallclueCopyPath(out, out_size, leaf ? leaf : path);
+    return out;
+}
+
+static bool smallclueRsyncPatternMatch(const char *pattern,
+                                       const char *relative_path,
+                                       const char *leaf_name,
+                                       bool is_dir) {
+    if (!pattern || !*pattern) {
+        return false;
+    }
+    if (relative_path && fnmatch(pattern, relative_path, FNM_PATHNAME) == 0) {
+        return true;
+    }
+    if (leaf_name && fnmatch(pattern, leaf_name, 0) == 0) {
+        return true;
+    }
+    if (is_dir && relative_path) {
+        char rel_dir[PATH_MAX];
+        int written = snprintf(rel_dir, sizeof(rel_dir), "%s/", relative_path);
+        if (written > 0 && (size_t)written < sizeof(rel_dir) &&
+            fnmatch(pattern, rel_dir, FNM_PATHNAME) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool smallclueRsyncMatchesAny(const char *relative_path,
+                                     const char *leaf_name,
+                                     bool is_dir,
+                                     char **patterns,
+                                     size_t pattern_count) {
+    for (size_t i = 0; i < pattern_count; ++i) {
+        if (smallclueRsyncPatternMatch(patterns[i], relative_path, leaf_name, is_dir)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool smallclueRsyncPathSelected(const SmallclueRsyncOptions *opts,
+                                       const char *path,
+                                       bool is_dir,
+                                       bool use_dest_root) {
+    if (!opts) {
+        return true;
+    }
+    if (opts->include_count == 0 && opts->exclude_count == 0) {
+        return true;
+    }
+    char relbuf[PATH_MAX];
+    char leafbuf[PATH_MAX];
+    const char *relative = smallclueRsyncRelativePath(use_dest_root ? opts->filter_dest_root : opts->filter_root,
+                                                      path,
+                                                      relbuf,
+                                                      sizeof(relbuf));
+    const char *leaf = smallclueRsyncLeafName(path, leafbuf, sizeof(leafbuf));
+    bool excluded = smallclueRsyncMatchesAny(relative, leaf, is_dir, opts->exclude_patterns, opts->exclude_count);
+    if (excluded) {
+        return false;
+    }
+    if (opts->include_count == 0) {
+        return true;
+    }
+    if (is_dir) {
+        return true;
+    }
+    return smallclueRsyncMatchesAny(relative, leaf, false, opts->include_patterns, opts->include_count);
+}
+
+static int smallclueRsyncApplyMetadata(const char *dst,
+                                       const struct stat *src_stat,
+                                       const SmallclueRsyncOptions *opts,
+                                       bool allow_chmod) {
+    if (!dst || !src_stat || !opts || opts->dry_run) {
+        return 0;
+    }
+    int status = 0;
+    if (opts->preserve_mode && allow_chmod) {
+        mode_t mode = src_stat->st_mode & 07777;
+        if (chmod(dst, mode) != 0) {
+            fprintf(stderr, "rsync: chmod %s: %s\n", dst, strerror(errno));
+            status = -1;
+        }
+    }
+    if (opts->preserve_times) {
+        struct timeval tv[2];
+        smallclueRsyncStatTimes(src_stat, tv);
+        if (utimes(dst, tv) != 0) {
+            fprintf(stderr, "rsync: utimes %s: %s\n", dst, strerror(errno));
+            status = -1;
+        }
+    }
+    return status;
+}
+
+static int smallclueRsyncEnsureDir(const char *path, mode_t mode, const SmallclueRsyncOptions *opts) {
+    struct stat st;
+    if (lstat(path, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            return 0;
+        }
+        if (opts->dry_run) {
+            if (opts->verbose) {
+                printf("delete %s\n", path);
+                printf("mkdir %s\n", path);
+            }
+            return 0;
+        }
+        if (smallclueRemovePathWithLabel("rsync", path, true, true, false) != 0) {
+            return -1;
+        }
+    } else if (errno != ENOENT) {
+        fprintf(stderr, "rsync: %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (opts->dry_run) {
+        if (opts->verbose) {
+            printf("mkdir %s\n", path);
+        }
+        return 0;
+    }
+    if (smallclueMkdirParents(path, mode, false) != 0) {
+        fprintf(stderr, "rsync: mkdir %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int smallclueRsyncEnsureParentDir(const char *path, const SmallclueRsyncOptions *opts) {
+    char parent[PATH_MAX];
+    if (!smallclueCopyPath(parent, sizeof(parent), path)) {
+        errno = ENAMETOOLONG;
+        fprintf(stderr, "rsync: %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (!smallclueChopParentDirectory(parent)) {
+        return 0;
+    }
+    return smallclueRsyncEnsureDir(parent, 0777, opts);
+}
+
+static int smallclueRsyncRemovePath(const char *path, const SmallclueRsyncOptions *opts) {
+    if (opts->dry_run) {
+        if (opts->verbose) {
+            printf("delete %s\n", path);
+        }
+        return 0;
+    }
+    return smallclueRemovePathWithLabel("rsync", path, true, true, false);
+}
+
+static int smallclueRsyncSyncEntry(const char *src, const char *dst, const SmallclueRsyncOptions *opts);
+
+static int smallclueRsyncDeleteExtraneous(const char *src_dir,
+                                          const char *dst_dir,
+                                          const SmallclueRsyncOptions *opts) {
+    DIR *dir = opendir(dst_dir);
+    if (!dir) {
+        fprintf(stderr, "rsync: %s: %s\n", dst_dir, strerror(errno));
+        return -1;
+    }
+    int status = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        char src_child[PATH_MAX];
+        char dst_child[PATH_MAX];
+        if (smallclueBuildPath(src_child, sizeof(src_child), src_dir, entry->d_name) != 0 ||
+            smallclueBuildPath(dst_child, sizeof(dst_child), dst_dir, entry->d_name) != 0) {
+            fprintf(stderr, "rsync: path too long while deleting '%s'\n", entry->d_name);
+            status = -1;
+            continue;
+        }
+        struct stat dst_st;
+        if (lstat(dst_child, &dst_st) != 0) {
+            continue;
+        }
+        if (!smallclueRsyncPathSelected(opts, dst_child, S_ISDIR(dst_st.st_mode), true)) {
+            continue;
+        }
+        struct stat src_st;
+        if (lstat(src_child, &src_st) == 0) {
+            continue;
+        }
+        if (errno != ENOENT) {
+            fprintf(stderr, "rsync: %s: %s\n", src_child, strerror(errno));
+            status = -1;
+            continue;
+        }
+        if (smallclueRsyncRemovePath(dst_child, opts) != 0) {
+            status = -1;
+        }
+    }
+    closedir(dir);
+    return status;
+}
+
+static int smallclueRsyncSyncDirectoryContents(const char *src_dir,
+                                               const char *dst_dir,
+                                               const SmallclueRsyncOptions *opts,
+                                               bool delete_extra) {
+    struct stat src_st;
+    if (lstat(src_dir, &src_st) != 0) {
+        fprintf(stderr, "rsync: %s: %s\n", src_dir, strerror(errno));
+        return -1;
+    }
+    if (smallclueRsyncEnsureDir(dst_dir, src_st.st_mode & 0777, opts) != 0) {
+        return -1;
+    }
+
+    DIR *dir = opendir(src_dir);
+    if (!dir) {
+        fprintf(stderr, "rsync: %s: %s\n", src_dir, strerror(errno));
+        return -1;
+    }
+
+    int status = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        char src_child[PATH_MAX];
+        char dst_child[PATH_MAX];
+        if (smallclueBuildPath(src_child, sizeof(src_child), src_dir, entry->d_name) != 0 ||
+            smallclueBuildPath(dst_child, sizeof(dst_child), dst_dir, entry->d_name) != 0) {
+            fprintf(stderr, "rsync: path too long while syncing '%s'\n", entry->d_name);
+            status = -1;
+            continue;
+        }
+        if (smallclueRsyncSyncEntry(src_child, dst_child, opts) != 0) {
+            status = -1;
+        }
+    }
+    closedir(dir);
+
+    if (delete_extra && opts->delete_extra) {
+        if (smallclueRsyncDeleteExtraneous(src_dir, dst_dir, opts) != 0) {
+            status = -1;
+        }
+    }
+    return status;
+}
+
+static int smallclueRsyncSyncEntry(const char *src, const char *dst, const SmallclueRsyncOptions *opts) {
+    struct stat src_st;
+    if (lstat(src, &src_st) != 0) {
+        fprintf(stderr, "rsync: %s: %s\n", src, strerror(errno));
+        return -1;
+    }
+    bool src_is_dir = S_ISDIR(src_st.st_mode);
+    if (!smallclueRsyncPathSelected(opts, src, src_is_dir, false)) {
+        if (opts->verbose) {
+            printf("exclude %s\n", src);
+        }
+        return 0;
+    }
+
+    if (src_is_dir) {
+        if (!opts->recursive) {
+            fprintf(stderr, "rsync: skipping directory '%s' (use -r)\n", src);
+            return -1;
+        }
+        int status = smallclueRsyncSyncDirectoryContents(src, dst, opts, true);
+        if (status == 0 && smallclueRsyncApplyMetadata(dst, &src_st, opts, true) != 0) {
+            status = -1;
+        }
+        return status;
+    }
+
+    if (S_ISLNK(src_st.st_mode)) {
+        char link_target[PATH_MAX];
+        ssize_t link_len = readlink(src, link_target, sizeof(link_target) - 1);
+        if (link_len < 0) {
+            fprintf(stderr, "rsync: readlink %s: %s\n", src, strerror(errno));
+            return -1;
+        }
+        link_target[link_len] = '\0';
+
+        bool needs_update = true;
+        struct stat dst_st;
+        if (lstat(dst, &dst_st) == 0 && S_ISLNK(dst_st.st_mode)) {
+            char existing_target[PATH_MAX];
+            ssize_t existing_len = readlink(dst, existing_target, sizeof(existing_target) - 1);
+            if (existing_len >= 0) {
+                existing_target[existing_len] = '\0';
+                if (strcmp(existing_target, link_target) == 0) {
+                    needs_update = false;
+                }
+            }
+        }
+
+        if (!needs_update) {
+            if (opts->verbose) {
+                printf("skip %s\n", dst);
+            }
+            return 0;
+        }
+
+        if (smallclueRsyncEnsureParentDir(dst, opts) != 0) {
+            return -1;
+        }
+
+        if (opts->verbose) {
+            printf("link %s -> %s\n", src, dst);
+        }
+        if (opts->dry_run) {
+            return 0;
+        }
+
+        if (lstat(dst, &dst_st) == 0) {
+            if (smallclueRemovePathWithLabel("rsync", dst, true, true, false) != 0) {
+                return -1;
+            }
+        } else if (errno != ENOENT) {
+            fprintf(stderr, "rsync: %s: %s\n", dst, strerror(errno));
+            return -1;
+        }
+
+        if (symlink(link_target, dst) != 0) {
+            fprintf(stderr, "rsync: symlink %s -> %s: %s\n", dst, link_target, strerror(errno));
+            return -1;
+        }
+        return 0;
+    }
+
+    if (!S_ISREG(src_st.st_mode)) {
+        if (opts->verbose) {
+            printf("skip %s (unsupported file type)\n", src);
+        }
+        return 0;
+    }
+
+    struct stat dst_st;
+    bool dst_exists = (lstat(dst, &dst_st) == 0);
+    bool needs_copy = true;
+    if (dst_exists && S_ISREG(dst_st.st_mode)) {
+        if (opts->update_only && smallclueRsyncCompareMtime(&dst_st, &src_st) > 0) {
+            needs_copy = false;
+        } else if (opts->checksum) {
+            if (src_st.st_size == dst_st.st_size) {
+                uint64_t src_hash = 0;
+                uint64_t dst_hash = 0;
+                if (smallclueRsyncFileChecksum(src, &src_hash) != 0 ||
+                    smallclueRsyncFileChecksum(dst, &dst_hash) != 0) {
+                    fprintf(stderr, "rsync: checksum failed for '%s' or '%s': %s\n", src, dst, strerror(errno));
+                    return -1;
+                }
+                if (src_hash == dst_hash) {
+                    needs_copy = false;
+                }
+            }
+        } else {
+            bool same_size = src_st.st_size == dst_st.st_size;
+            bool same_mtime = smallclueRsyncSameMtime(&src_st, &dst_st);
+            bool same_mode = ((src_st.st_mode & 07777) == (dst_st.st_mode & 07777));
+            if (same_size && same_mtime && (!opts->preserve_mode || same_mode)) {
+                needs_copy = false;
+            }
+        }
+    }
+
+    if (!needs_copy) {
+        if (opts->verbose) {
+            printf("skip %s\n", dst);
+        }
+        if (smallclueRsyncApplyMetadata(dst, &src_st, opts, true) != 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    if (smallclueRsyncEnsureParentDir(dst, opts) != 0) {
+        return -1;
+    }
+    if (opts->verbose) {
+        printf("copy %s -> %s\n", src, dst);
+    }
+    if (opts->dry_run) {
+        return 0;
+    }
+
+    if (dst_exists && !S_ISREG(dst_st.st_mode)) {
+        if (smallclueRemovePathWithLabel("rsync", dst, true, true, false) != 0) {
+            return -1;
+        }
+    }
+    if (smallclueCopyFile("rsync", src, dst) != 0) {
+        return -1;
+    }
+    return smallclueRsyncApplyMetadata(dst, &src_st, opts, true);
+}
+
+static char *smallclueRsyncBuildRemoteSourceArg(const char *arg, bool recursive) {
+    if (!arg) {
+        return NULL;
+    }
+    if (!recursive || !smallclueRsyncHasTrailingSlash(arg)) {
+        return strdup(arg);
+    }
+
+    size_t len = strlen(arg);
+    while (len > 1 && arg[len - 1] == '/') {
+        len--;
+    }
+
+    bool already_dot = false;
+    if (len >= 2 && arg[len - 2] == '/' && arg[len - 1] == '.') {
+        already_dot = true;
+    }
+    if (already_dot) {
+        return strdup(arg);
+    }
+
+    size_t out_len = len + 2; /* "/." */
+    char *out = (char *)malloc(out_len + 1);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, arg, len);
+    out[len] = '/';
+    out[len + 1] = '.';
+    out[len + 2] = '\0';
+    return out;
+}
+
+static int smallclueRsyncRemoteDryRun(int argc, char **argv, int operand_index) {
+    if (!argv || operand_index >= argc) {
+        return 1;
+    }
+    const char *dest = argv[argc - 1];
+    for (int i = operand_index; i < argc - 1; ++i) {
+        if (!argv[i]) {
+            continue;
+        }
+        printf("copy %s -> %s\n", argv[i], dest ? dest : "");
+    }
+    return 0;
+}
+
+static int smallclueRsyncRunRemoteScp(int argc,
+                                      char **argv,
+                                      int operand_index,
+                                      int remote_count,
+                                      const SmallclueRsyncOptions *opts) {
+    if (remote_count > 1) {
+        fprintf(stderr, "rsync: remote-to-remote copy is not supported\n");
+        return 1;
+    }
+    if (opts->delete_extra) {
+        fprintf(stderr, "rsync: --delete is only supported for local paths\n");
+        return 1;
+    }
+    if (opts->update_only || opts->checksum || opts->include_count > 0 || opts->exclude_count > 0) {
+        fprintf(stderr, "rsync: -u/-c/--include/--exclude are not supported for remote transfers yet\n");
+        return 1;
+    }
+    if (opts->dry_run) {
+        return smallclueRsyncRemoteDryRun(argc, argv, operand_index);
+    }
+
+    size_t max_args = (size_t)(argc - operand_index) + 8;
+    char **scp_argv = (char **)calloc(max_args + 1, sizeof(char *));
+    if (!scp_argv) {
+        fprintf(stderr, "rsync: out of memory\n");
+        return 1;
+    }
+
+    int scp_argc = 0;
+    scp_argv[scp_argc++] = strdup("scp");
+    if (opts->recursive) {
+        scp_argv[scp_argc++] = strdup("-r");
+    }
+    if (opts->preserve_mode || opts->preserve_times) {
+        scp_argv[scp_argc++] = strdup("-p");
+    }
+    if (opts->verbose) {
+        scp_argv[scp_argc++] = strdup("-v");
+    }
+    if (opts->compress) {
+        scp_argv[scp_argc++] = strdup("-C");
+    }
+    for (int i = operand_index; i < argc; ++i) {
+        if (i < argc - 1) {
+            scp_argv[scp_argc++] = smallclueRsyncBuildRemoteSourceArg(argv[i], opts->recursive);
+        } else {
+            scp_argv[scp_argc++] = strdup(argv[i]);
+        }
+    }
+
+    int rc = 0;
+    for (int i = 0; i < scp_argc; ++i) {
+        if (!scp_argv[i]) {
+            fprintf(stderr, "rsync: out of memory\n");
+            rc = 1;
+            goto rsync_remote_cleanup;
+        }
+    }
+
+    rc = smallclueRunScp(scp_argc, scp_argv);
+
+rsync_remote_cleanup:
+    for (int i = 0; i < scp_argc; ++i) {
+        free(scp_argv[i]);
+    }
+    free(scp_argv);
+    return rc;
+}
+
+static int smallclueRsyncCommand(int argc, char **argv) {
+    SmallclueRsyncOptions opts;
+    memset(&opts, 0, sizeof(opts));
+
+    int argi = 1;
+    while (argi < argc) {
+        const char *arg = argv[argi];
+        if (!arg || arg[0] != '-' || strcmp(arg, "-") == 0) {
+            break;
+        }
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        if (strcmp(arg, "--help") == 0) {
+            smallclueRsyncUsage(stdout);
+            smallclueRsyncFreePatterns(opts.include_patterns, opts.include_count);
+            smallclueRsyncFreePatterns(opts.exclude_patterns, opts.exclude_count);
+            return 0;
+        }
+        if (strcmp(arg, "--delete") == 0) {
+            opts.delete_extra = true;
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--dry-run") == 0) {
+            opts.dry_run = true;
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--archive") == 0) {
+            opts.recursive = true;
+            opts.preserve_mode = true;
+            opts.preserve_times = true;
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--recursive") == 0) {
+            opts.recursive = true;
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--verbose") == 0) {
+            opts.verbose = true;
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--compress") == 0) {
+            opts.compress = true;
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--perms") == 0) {
+            opts.preserve_mode = true;
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--times") == 0) {
+            opts.preserve_times = true;
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--update") == 0) {
+            opts.update_only = true;
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--checksum") == 0) {
+            opts.checksum = true;
+            argi++;
+            continue;
+        }
+        if (strncmp(arg, "--include=", 10) == 0) {
+            if (smallclueRsyncAddPattern(&opts.include_patterns,
+                                         &opts.include_count,
+                                         &opts.include_capacity,
+                                         arg + 10) != 0) {
+                fprintf(stderr, "rsync: unable to add include pattern\n");
+                goto rsync_parse_fail;
+            }
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--include") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "rsync: --include requires a pattern\n");
+                goto rsync_parse_fail;
+            }
+            if (smallclueRsyncAddPattern(&opts.include_patterns,
+                                         &opts.include_count,
+                                         &opts.include_capacity,
+                                         argv[argi + 1]) != 0) {
+                fprintf(stderr, "rsync: unable to add include pattern\n");
+                goto rsync_parse_fail;
+            }
+            argi += 2;
+            continue;
+        }
+        if (strncmp(arg, "--exclude=", 10) == 0) {
+            if (smallclueRsyncAddPattern(&opts.exclude_patterns,
+                                         &opts.exclude_count,
+                                         &opts.exclude_capacity,
+                                         arg + 10) != 0) {
+                fprintf(stderr, "rsync: unable to add exclude pattern\n");
+                goto rsync_parse_fail;
+            }
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--exclude") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "rsync: --exclude requires a pattern\n");
+                goto rsync_parse_fail;
+            }
+            if (smallclueRsyncAddPattern(&opts.exclude_patterns,
+                                         &opts.exclude_count,
+                                         &opts.exclude_capacity,
+                                         argv[argi + 1]) != 0) {
+                fprintf(stderr, "rsync: unable to add exclude pattern\n");
+                goto rsync_parse_fail;
+            }
+            argi += 2;
+            continue;
+        }
+        if (arg[1] == '-') {
+            fprintf(stderr, "rsync: unknown option '%s'\n", arg);
+            goto rsync_parse_fail;
+        }
+        for (const char *cursor = arg + 1; *cursor; ++cursor) {
+            switch (*cursor) {
+                case 'a':
+                    opts.recursive = true;
+                    opts.preserve_mode = true;
+                    opts.preserve_times = true;
+                    break;
+                case 'r':
+                    opts.recursive = true;
+                    break;
+                case 'v':
+                    opts.verbose = true;
+                    break;
+                case 'z':
+                    opts.compress = true;
+                    break;
+                case 'p':
+                    opts.preserve_mode = true;
+                    break;
+                case 't':
+                    opts.preserve_times = true;
+                    break;
+                case 'n':
+                    opts.dry_run = true;
+                    break;
+                case 'u':
+                    opts.update_only = true;
+                    break;
+                case 'c':
+                    opts.checksum = true;
+                    break;
+                default:
+                    fprintf(stderr, "rsync: invalid option -- %c\n", *cursor);
+                    goto rsync_parse_fail;
+            }
+        }
+        argi++;
+    }
+
+    {
+        int operand_count = argc - argi;
+        if (operand_count < 2) {
+            smallclueRsyncUsage(stderr);
+            goto rsync_parse_fail;
+        }
+
+        int source_count = operand_count - 1;
+        bool has_remote = false;
+        int remote_count = 0;
+        for (int i = argi; i < argc; ++i) {
+            if (strncmp(argv[i], "rsync://", 8) == 0) {
+                fprintf(stderr, "rsync: rsync:// URLs are not supported; use host:path syntax\n");
+                goto rsync_parse_fail;
+            }
+            if (smallclueRsyncLooksRemote(argv[i])) {
+                has_remote = true;
+                remote_count++;
+            }
+        }
+        if (has_remote) {
+            int rc = smallclueRsyncRunRemoteScp(argc, argv, argi, remote_count, &opts);
+            smallclueRsyncFreePatterns(opts.include_patterns, opts.include_count);
+            smallclueRsyncFreePatterns(opts.exclude_patterns, opts.exclude_count);
+            return rc;
+        }
+
+        if (opts.delete_extra && source_count != 1) {
+            fprintf(stderr, "rsync: --delete currently requires exactly one source\n");
+            goto rsync_parse_fail;
+        }
+
+        const char *dest_arg = argv[argc - 1];
+        char resolved_dest[PATH_MAX];
+        const char *dest = smallclueResolvePath(dest_arg, resolved_dest, sizeof(resolved_dest));
+        struct stat dest_st;
+        bool dest_exists = lstat(dest, &dest_st) == 0;
+        bool dest_is_dir = dest_exists && S_ISDIR(dest_st.st_mode);
+
+        if (source_count > 1) {
+            if (dest_exists && !dest_is_dir) {
+                fprintf(stderr, "rsync: destination '%s' is not a directory\n", dest_arg);
+                goto rsync_parse_fail;
+            }
+            if (!dest_exists) {
+                if (smallclueRsyncEnsureDir(dest, 0777, &opts) != 0) {
+                    goto rsync_parse_fail;
+                }
+                dest_exists = true;
+                dest_is_dir = true;
+            }
+        }
+
+        int status = 0;
+        for (int i = 0; i < source_count; ++i) {
+            const char *src_arg = argv[argi + i];
+            bool src_trailing_slash = smallclueRsyncHasTrailingSlash(src_arg);
+
+            char resolved_src[PATH_MAX];
+            const char *src = smallclueResolvePath(src_arg, resolved_src, sizeof(resolved_src));
+
+            struct stat src_st;
+            if (lstat(src, &src_st) != 0) {
+                fprintf(stderr, "rsync: %s: %s\n", src_arg, strerror(errno));
+                status = 1;
+                continue;
+            }
+
+            const char *target = dest;
+            char target_path[PATH_MAX];
+            bool copy_dir_contents = false;
+
+            if (source_count > 1 || dest_is_dir) {
+                if (S_ISDIR(src_st.st_mode) && src_trailing_slash) {
+                    copy_dir_contents = true;
+                    target = dest;
+                } else {
+                    char leaf_scratch[PATH_MAX];
+                    const char *leaf = smallclueRsyncLeafName(src_arg, leaf_scratch, sizeof(leaf_scratch));
+                    if (smallclueBuildPath(target_path, sizeof(target_path), dest, leaf) != 0) {
+                        fprintf(stderr, "rsync: %s/%s: %s\n", dest, leaf, strerror(errno));
+                        status = 1;
+                        continue;
+                    }
+                    target = target_path;
+                }
+            } else if (S_ISDIR(src_st.st_mode) && src_trailing_slash) {
+                copy_dir_contents = true;
+                target = dest;
+            }
+
+            char src_root_buf[PATH_MAX];
+            char dst_root_buf[PATH_MAX];
+            if (copy_dir_contents) {
+                opts.filter_root = src;
+                opts.filter_dest_root = target;
+            } else {
+                if (!smallclueRsyncParentPath(src, src_root_buf, sizeof(src_root_buf)) ||
+                    !smallclueRsyncParentPath(target, dst_root_buf, sizeof(dst_root_buf))) {
+                    fprintf(stderr, "rsync: unable to derive filter roots for '%s'\n", src_arg);
+                    status = 1;
+                    continue;
+                }
+                opts.filter_root = src_root_buf;
+                opts.filter_dest_root = dst_root_buf;
+            }
+
+            int rc;
+            if (copy_dir_contents) {
+                rc = smallclueRsyncSyncDirectoryContents(src, target, &opts, opts.delete_extra);
+            } else {
+                rc = smallclueRsyncSyncEntry(src, target, &opts);
+            }
+            if (rc != 0) {
+                status = 1;
+            }
+        }
+
+        smallclueRsyncFreePatterns(opts.include_patterns, opts.include_count);
+        smallclueRsyncFreePatterns(opts.exclude_patterns, opts.exclude_count);
+        return status;
+    }
+
+rsync_parse_fail:
+    smallclueRsyncFreePatterns(opts.include_patterns, opts.include_count);
+    smallclueRsyncFreePatterns(opts.exclude_patterns, opts.exclude_count);
+    return 1;
 }
 
 const SmallclueApplet *smallclueGetApplets(size_t *count) {

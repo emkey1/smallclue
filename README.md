@@ -18,6 +18,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 ### File Management
 * **ls**: List directory contents (supports colors, `-l`, `-h`, `-a`, `-t`).
 * **cp**: Copy files and directories (recursive).
+* **rsync**: Synchronize files/directories locally or over SSH (`-a`, `-r`, `-p`, `-t`, `-u`, `-c`, `-v`, `-z`, `-n`, `--delete`, `--include`, `--exclude`). Remote `host:path` transfers are routed through the OpenSSH `scp` backend (supports `-a/-r/-p/-t/-v/-z`, plus `-n` preview; remote `-u/-c/--include/--exclude/--delete` are not yet implemented).
 * **mv**: Move or rename files.
 * **rm**: Remove files and directories.
 * **mkdir** / **rmdir**: Create or remove directories.
