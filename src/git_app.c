@@ -5365,6 +5365,10 @@ static int smallclueGitCommandCheckoutCommon(git_repository *repo,
             force = true;
             continue;
         }
+        if (strcmp(arg, "--no-force") == 0) {
+            force = false;
+            continue;
+        }
         if (strcmp(arg, "--detach") == 0) {
             detach = true;
             continue;
@@ -11884,8 +11888,16 @@ static int smallclueGitCommandPush(git_repository *repo, int argc, char **argv) 
             push_tags = true;
             continue;
         }
+        if (strcmp(arg, "--no-tags") == 0) {
+            push_tags = false;
+            continue;
+        }
         if (strcmp(arg, "--follow-tags") == 0) {
             follow_tags = true;
+            continue;
+        }
+        if (strcmp(arg, "--no-follow-tags") == 0) {
+            follow_tags = false;
             continue;
         }
         if (strcmp(arg, "--delete") == 0) {
