@@ -7292,6 +7292,9 @@ static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
         } else if (strncmp(pretty_spec, "format:", 7) == 0) {
             format_spec = pretty_spec + 7;
             format_with_terminator = false;
+        } else if (pretty_spec[0] == '%') {
+            format_spec = pretty_spec;
+            format_with_terminator = true;
         } else {
             smallclueGitPrintError("unsupported log --pretty mode");
             return 2;
