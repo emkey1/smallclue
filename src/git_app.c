@@ -4501,7 +4501,15 @@ static int smallclueGitHardResetToHead(git_repository *repo, const char *context
 }
 
 static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv) {
+    typedef enum SmallclueGitCommitMessageMode {
+        SMALLCLUE_GIT_COMMIT_MESSAGE_NONE = 0,
+        SMALLCLUE_GIT_COMMIT_MESSAGE_EXPLICIT,
+        SMALLCLUE_GIT_COMMIT_MESSAGE_REUSE,
+    } SmallclueGitCommitMessageMode;
+
+    SmallclueGitCommitMessageMode message_mode = SMALLCLUE_GIT_COMMIT_MESSAGE_NONE;
     const char *message = NULL;
+    const char *reuse_message_spec = NULL;
     const char *author_override_spec = NULL;
     bool allow_empty = false;
     bool quiet = false;
@@ -4518,10 +4526,32 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
         }
         if ((strcmp(arg, "-m") == 0 || strcmp(arg, "--message") == 0) && i + 1 < argc) {
             message = argv[++i];
+            message_mode = SMALLCLUE_GIT_COMMIT_MESSAGE_EXPLICIT;
             continue;
         }
         if (strncmp(arg, "--message=", 10) == 0) {
             message = arg + 10;
+            message_mode = SMALLCLUE_GIT_COMMIT_MESSAGE_EXPLICIT;
+            continue;
+        }
+        if (strcmp(arg, "-C") == 0 || strcmp(arg, "--reuse-message") == 0 ||
+            strcmp(arg, "-c") == 0 || strcmp(arg, "--reedit-message") == 0) {
+            if (i + 1 >= argc) {
+                smallclueGitPrintError("commit --reuse-message requires a commit");
+                return 2;
+            }
+            reuse_message_spec = argv[++i];
+            message_mode = SMALLCLUE_GIT_COMMIT_MESSAGE_REUSE;
+            continue;
+        }
+        if (strncmp(arg, "--reuse-message=", 16) == 0) {
+            reuse_message_spec = arg + 16;
+            message_mode = SMALLCLUE_GIT_COMMIT_MESSAGE_REUSE;
+            continue;
+        }
+        if (strncmp(arg, "--reedit-message=", 17) == 0) {
+            reuse_message_spec = arg + 17;
+            message_mode = SMALLCLUE_GIT_COMMIT_MESSAGE_REUSE;
             continue;
         }
         if (strcmp(arg, "--author") == 0 && i + 1 < argc) {
@@ -4572,8 +4602,7 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
         smallclueGitPrintError("commit --reset-author requires --amend");
         return 2;
     }
-
-    if (!amend && (!message || !*message)) {
+    if (!amend && message_mode == SMALLCLUE_GIT_COMMIT_MESSAGE_NONE) {
         smallclueGitPrintError("commit requires -m/--message");
         return 2;
     }
@@ -4612,6 +4641,7 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
     }
 
     git_commit *head_commit = NULL;
+    git_commit *reuse_message_commit = NULL;
     git_reference *head_ref = NULL;
     if (git_repository_head(&head_ref, repo) == 0 && head_ref) {
         git_object *head_obj = NULL;
@@ -4625,6 +4655,17 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
         smallclueGitPrintError("commit --amend requires an existing commit");
         return 1;
     }
+    if (message_mode == SMALLCLUE_GIT_COMMIT_MESSAGE_REUSE) {
+        if (!reuse_message_spec || !*reuse_message_spec ||
+            smallclueGitResolveCommit(repo, reuse_message_spec, &reuse_message_commit) != 0 ||
+            !reuse_message_commit) {
+            git_reference_free(head_ref);
+            git_commit_free(head_commit);
+            git_tree_free(tree);
+            smallclueGitPrintLibgitError("commit: unable to resolve reuse message commit");
+            return 128;
+        }
+    }
 
     if (!allow_empty && !amend && head_commit) {
         git_tree *parent_tree = NULL;
@@ -4633,6 +4674,7 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
                 git_tree_free(parent_tree);
                 git_reference_free(head_ref);
                 git_commit_free(head_commit);
+                git_commit_free(reuse_message_commit);
                 git_tree_free(tree);
                 fputs("nothing to commit\n", stderr);
                 return 1;
@@ -4641,16 +4683,30 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
         }
     }
 
-    const char *final_message = message;
+    const char *final_message = NULL;
+    if (message_mode == SMALLCLUE_GIT_COMMIT_MESSAGE_EXPLICIT) {
+        final_message = message;
+    } else if (message_mode == SMALLCLUE_GIT_COMMIT_MESSAGE_REUSE && reuse_message_commit) {
+        final_message = git_commit_message(reuse_message_commit);
+    }
     if (amend && (!final_message || !*final_message)) {
         final_message = git_commit_message(head_commit);
-        if (!final_message || !*final_message) {
-            git_reference_free(head_ref);
-            git_commit_free(head_commit);
-            git_tree_free(tree);
-            smallclueGitPrintError("commit --amend requires -m/--message when HEAD has no message");
-            return 2;
-        }
+    }
+    if (!amend && (!final_message || !*final_message)) {
+        git_reference_free(head_ref);
+        git_commit_free(head_commit);
+        git_commit_free(reuse_message_commit);
+        git_tree_free(tree);
+        smallclueGitPrintError("commit requires -m/--message");
+        return 2;
+    }
+    if (amend && (!final_message || !*final_message)) {
+        git_reference_free(head_ref);
+        git_commit_free(head_commit);
+        git_commit_free(reuse_message_commit);
+        git_tree_free(tree);
+        smallclueGitPrintError("commit --amend requires -m/--message when HEAD has no message");
+        return 2;
     }
 
     git_signature *author = NULL;
@@ -4658,6 +4714,7 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
     if (smallclueGitCreateDefaultSignatures(repo, &author, &committer) != 0) {
         git_reference_free(head_ref);
         git_commit_free(head_commit);
+        git_commit_free(reuse_message_commit);
         git_tree_free(tree);
         smallclueGitPrintLibgitError("commit: signature creation failed");
         return 1;
@@ -4669,6 +4726,16 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
             if (git_signature_dup(&amend_author, existing_author) == 0 && amend_author) {
                 git_signature_free(author);
                 author = amend_author;
+            }
+        }
+    }
+    if (message_mode == SMALLCLUE_GIT_COMMIT_MESSAGE_REUSE && reuse_message_commit) {
+        const git_signature *existing_author = git_commit_author(reuse_message_commit);
+        if (existing_author && existing_author->name && existing_author->email) {
+            git_signature *reused_author = NULL;
+            if (git_signature_dup(&reused_author, existing_author) == 0 && reused_author) {
+                git_signature_free(author);
+                author = reused_author;
             }
         }
     }
@@ -4684,6 +4751,7 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
             git_signature_free(committer);
             git_reference_free(head_ref);
             git_commit_free(head_commit);
+            git_commit_free(reuse_message_commit);
             git_tree_free(tree);
             smallclueGitPrintError("commit --author expects 'Name <email>'");
             return 2;
@@ -4694,6 +4762,7 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
             git_signature_free(committer);
             git_reference_free(head_ref);
             git_commit_free(head_commit);
+            git_commit_free(reuse_message_commit);
             git_tree_free(tree);
             smallclueGitPrintLibgitError("commit: failed to create author signature");
             return 1;
@@ -4713,6 +4782,7 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
             git_signature_free(committer);
             git_reference_free(head_ref);
             git_commit_free(head_commit);
+            git_commit_free(reuse_message_commit);
             git_tree_free(tree);
             smallclueGitPrintError("commit signoff trailer too long");
             return 2;
@@ -4730,6 +4800,7 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
             git_signature_free(committer);
             git_reference_free(head_ref);
             git_commit_free(head_commit);
+            git_commit_free(reuse_message_commit);
             git_tree_free(tree);
             smallclueGitPrintError("out of memory");
             return 1;
@@ -4758,6 +4829,7 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
             git_signature_free(committer);
             git_reference_free(head_ref);
             git_commit_free(head_commit);
+            git_commit_free(reuse_message_commit);
             git_tree_free(tree);
             smallclueGitPrintLibgitError("commit --amend failed");
             return 1;
@@ -4783,6 +4855,7 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
             git_signature_free(committer);
             git_reference_free(head_ref);
             git_commit_free(head_commit);
+            git_commit_free(reuse_message_commit);
             git_tree_free(tree);
             smallclueGitPrintLibgitError("commit failed");
             return 1;
@@ -4808,6 +4881,7 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
     git_signature_free(committer);
     git_reference_free(head_ref);
     git_commit_free(head_commit);
+    git_commit_free(reuse_message_commit);
     git_tree_free(tree);
     return 0;
 }
