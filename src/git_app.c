@@ -8589,6 +8589,7 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
 
     if (strcmp(sub, "get-url") == 0) {
         bool push = false;
+        bool all = false;
         const char *name = NULL;
         for (int i = 0; i < subargc; ++i) {
             const char *arg = subargv[i];
@@ -8596,20 +8597,69 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
                 push = true;
                 continue;
             }
+            if (strcmp(arg, "--all") == 0) {
+                all = true;
+                continue;
+            }
             if (arg[0] == '-') {
                 smallclueGitPrintError("unsupported remote get-url option");
                 return 2;
             }
-            name = arg;
+            if (!name) {
+                name = arg;
+                continue;
+            }
+            smallclueGitPrintError("usage: git remote get-url [--push] [--all] <name>");
+            return 2;
         }
         if (!name) {
-            smallclueGitPrintError("usage: git remote get-url [--push] <name>");
+            smallclueGitPrintError("usage: git remote get-url [--push] [--all] <name>");
             return 2;
         }
         git_remote *remote = NULL;
         if (git_remote_lookup(&remote, repo, name) != 0 || !remote) {
             smallclueGitPrintLibgitError("remote get-url lookup failed");
             return 1;
+        }
+        if (all) {
+            char key[512];
+            if (snprintf(key, sizeof(key), "remote.%s.%s", name, push ? "pushurl" : "url") >= (int)sizeof(key)) {
+                git_remote_free(remote);
+                smallclueGitPrintError("remote get-url key too long");
+                return 2;
+            }
+            git_config *cfg = NULL;
+            if (git_repository_config(&cfg, repo) != 0 || !cfg) {
+                git_remote_free(remote);
+                smallclueGitPrintLibgitError("remote get-url config open failed");
+                return 1;
+            }
+            SmallclueGitConfigValueList values = {0};
+            int read_rc = smallclueGitConfigReadValues(cfg, key, &values);
+            if (read_rc == 1 && push) {
+                if (snprintf(key, sizeof(key), "remote.%s.url", name) >= (int)sizeof(key)) {
+                    git_config_free(cfg);
+                    git_remote_free(remote);
+                    smallclueGitPrintError("remote get-url key too long");
+                    return 2;
+                }
+                read_rc = smallclueGitConfigReadValues(cfg, key, &values);
+            }
+            git_config_free(cfg);
+            if (read_rc != 0 || values.count == 0) {
+                smallclueGitConfigValueListFree(&values);
+                git_remote_free(remote);
+                return 1;
+            }
+            for (size_t i = 0; i < values.count; ++i) {
+                const char *value = values.items[i] ? values.items[i] : "";
+                char display[PATH_MAX];
+                const char *shown = smallclueGitDisplayMaybePath(value, display, sizeof(display));
+                puts(shown ? shown : value);
+            }
+            smallclueGitConfigValueListFree(&values);
+            git_remote_free(remote);
+            return 0;
         }
         const char *url = push ? git_remote_pushurl(remote) : git_remote_url(remote);
         if ((!url || !*url) && push) {
