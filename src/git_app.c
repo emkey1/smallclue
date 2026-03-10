@@ -8743,6 +8743,127 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
         return 0;
     }
 
+    if (strcmp(sub, "prune") == 0) {
+        bool dry_run = false;
+        const char *name = NULL;
+        for (int i = 0; i < subargc; ++i) {
+            const char *arg = subargv[i];
+            if (!arg) {
+                continue;
+            }
+            if (strcmp(arg, "-n") == 0 || strcmp(arg, "--dry-run") == 0) {
+                dry_run = true;
+                continue;
+            }
+            if (arg[0] == '-') {
+                smallclueGitPrintError("unsupported remote prune option");
+                return 2;
+            }
+            if (name) {
+                smallclueGitPrintError("usage: git remote prune [--dry-run] <name>");
+                return 2;
+            }
+            name = arg;
+        }
+        if (!name || !*name) {
+            smallclueGitPrintError("usage: git remote prune [--dry-run] <name>");
+            return 2;
+        }
+        if (dry_run) {
+            smallclueGitPrintError("remote prune: --dry-run is not supported");
+            return 2;
+        }
+        git_remote *remote = NULL;
+        if (git_remote_lookup(&remote, repo, name) != 0 || !remote) {
+            smallclueGitPrintLibgitError("remote prune lookup failed");
+            return 1;
+        }
+        git_fetch_options fetch_opts = GIT_FETCH_OPTIONS_INIT;
+        fetch_opts.prune = GIT_FETCH_PRUNE;
+        int rc = git_remote_fetch(remote, NULL, &fetch_opts, NULL);
+        git_remote_free(remote);
+        if (rc != 0) {
+            smallclueGitPrintLibgitError("remote prune failed");
+            return 1;
+        }
+        return 0;
+    }
+
+    if (strcmp(sub, "update") == 0) {
+        bool prune = false;
+        const char *names[64];
+        size_t name_count = 0;
+        for (int i = 0; i < subargc; ++i) {
+            const char *arg = subargv[i];
+            if (!arg) {
+                continue;
+            }
+            if (strcmp(arg, "-p") == 0 || strcmp(arg, "--prune") == 0) {
+                prune = true;
+                continue;
+            }
+            if (arg[0] == '-') {
+                smallclueGitPrintError("unsupported remote update option");
+                return 2;
+            }
+            if (name_count >= (sizeof(names) / sizeof(names[0]))) {
+                smallclueGitPrintError("too many remotes for remote update");
+                return 2;
+            }
+            names[name_count++] = arg;
+        }
+
+        git_fetch_options fetch_opts = GIT_FETCH_OPTIONS_INIT;
+        fetch_opts.prune = prune ? GIT_FETCH_PRUNE : GIT_FETCH_NO_PRUNE;
+
+        int rc = 0;
+        if (name_count == 0) {
+            git_strarray remotes = {0};
+            if (git_remote_list(&remotes, repo) != 0) {
+                smallclueGitPrintLibgitError("remote update list failed");
+                return 1;
+            }
+            for (size_t i = 0; i < remotes.count; ++i) {
+                const char *name = remotes.strings[i];
+                if (!name || !*name) {
+                    continue;
+                }
+                git_remote *remote = NULL;
+                if (git_remote_lookup(&remote, repo, name) != 0 || !remote) {
+                    rc = -1;
+                    break;
+                }
+                if (git_remote_fetch(remote, NULL, &fetch_opts, NULL) != 0) {
+                    git_remote_free(remote);
+                    rc = -1;
+                    break;
+                }
+                git_remote_free(remote);
+            }
+            git_strarray_dispose(&remotes);
+            if (rc != 0) {
+                smallclueGitPrintLibgitError("remote update failed");
+                return 1;
+            }
+            return 0;
+        }
+
+        for (size_t i = 0; i < name_count; ++i) {
+            git_remote *remote = NULL;
+            if (git_remote_lookup(&remote, repo, names[i]) != 0 || !remote) {
+                smallclueGitPrintLibgitError("remote update lookup failed");
+                return 1;
+            }
+            if (git_remote_fetch(remote, NULL, &fetch_opts, NULL) != 0) {
+                git_remote_free(remote);
+                smallclueGitPrintLibgitError("remote update failed");
+                return 1;
+            }
+            git_remote_free(remote);
+        }
+        return 0;
+    }
+
     smallclueGitPrintError("unsupported remote subcommand");
     return 2;
 }
