@@ -10192,6 +10192,21 @@ static int smallclueGitCommandPull(git_repository *repo, int argc, char **argv) 
             rebase_specified = true;
             continue;
         }
+        if (smallclueGitStartsWith(arg, "--rebase=")) {
+            const char *value = arg + strlen("--rebase=");
+            if (strcmp(value, "true") == 0 || strcmp(value, "yes") == 0 || strcmp(value, "on") == 0 || strcmp(value, "1") == 0) {
+                rebase_mode = true;
+                rebase_specified = true;
+                continue;
+            }
+            if (strcmp(value, "false") == 0 || strcmp(value, "no") == 0 || strcmp(value, "off") == 0 || strcmp(value, "0") == 0) {
+                rebase_mode = false;
+                rebase_specified = true;
+                continue;
+            }
+            smallclueGitPrintError("unsupported pull rebase mode");
+            return 2;
+        }
         if (strcmp(arg, "--no-rebase") == 0) {
             rebase_mode = false;
             rebase_specified = true;
