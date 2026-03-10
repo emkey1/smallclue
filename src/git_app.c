@@ -10197,6 +10197,11 @@ static int smallclueGitCommandPull(git_repository *repo, int argc, char **argv) 
             rebase_specified = true;
             continue;
         }
+        if (strcmp(arg, "-r") == 0) {
+            rebase_mode = true;
+            rebase_specified = true;
+            continue;
+        }
         if (smallclueGitStartsWith(arg, "--rebase=")) {
             const char *value = arg + strlen("--rebase=");
             if (strcmp(value, "true") == 0 || strcmp(value, "yes") == 0 || strcmp(value, "on") == 0 || strcmp(value, "1") == 0) {
