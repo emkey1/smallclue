@@ -2787,9 +2787,16 @@ static int smallclueTopCommand(int argc, char **argv) {
         size_t mem_used_kb = 0, mem_free_kb = 0;
         if (smallclueReadMemStats(&mem_used_kb, &mem_free_kb)) {
             char mem_line[160];
-            int mn = snprintf(mem_line, sizeof(mem_line),
+            int mn;
+            if (isatty(STDOUT_FILENO)) {
+                mn = snprintf(mem_line, sizeof(mem_line),
+                              "\033[7mMem: %zuK used, %zuK free\033[0m\n",
+                              mem_used_kb, mem_free_kb);
+            } else {
+                mn = snprintf(mem_line, sizeof(mem_line),
                               "Mem: %zuK used, %zuK free\n",
                               mem_used_kb, mem_free_kb);
+            }
             if (mn > 0) {
                 (void)smallclueWriteAll(STDOUT_FILENO, mem_line, (size_t)mn);
             }
@@ -2797,9 +2804,16 @@ static int smallclueTopCommand(int argc, char **argv) {
         double cpu_usr = 0, cpu_sys = 0, cpu_nice = 0, cpu_idle = 0;
         if (smallclueReadCpuStats(&cpu_usr, &cpu_sys, &cpu_nice, &cpu_idle)) {
             char cpu_line[160];
-            int cn = snprintf(cpu_line, sizeof(cpu_line),
+            int cn;
+            if (isatty(STDOUT_FILENO)) {
+                cn = snprintf(cpu_line, sizeof(cpu_line),
+                              "\033[7mCPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\033[0m\n\n",
+                              cpu_usr, cpu_sys, cpu_nice, cpu_idle);
+            } else {
+                cn = snprintf(cpu_line, sizeof(cpu_line),
                               "CPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\n\n",
                               cpu_usr, cpu_sys, cpu_nice, cpu_idle);
+            }
             if (cn > 0) {
                 (void)smallclueWriteAll(STDOUT_FILENO, cpu_line, (size_t)cn);
             }
@@ -2810,7 +2824,7 @@ static int smallclueTopCommand(int argc, char **argv) {
         int hn;
         if (isatty(STDOUT_FILENO)) {
             hn = snprintf(header, sizeof(header),
-                          "\033[1m%6s %6s %6s %6s %-3s %-8s %-10s %6s %6s %s\033[0m\n",
+                          "\033[7m%6s %6s %6s %6s %-3s %-8s %-10s %6s %6s %s\033[0m\n",
                           "PID", "PPID", "PGID", "SID", "FG", "PTY", "STATE", "UTIME", "STIME", "CMD");
         } else {
             hn = snprintf(header, sizeof(header),
