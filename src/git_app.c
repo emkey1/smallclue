@@ -8552,6 +8552,7 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
         int mirror_mode = SC_REMOTE_MIRROR_NONE;
         const char *tracks[128];
         size_t track_count = 0;
+        const char *master_branch = NULL;
         const char *name = NULL;
         const char *url_arg = NULL;
         for (int i = 0; i < subargc; ++i) {
@@ -8579,6 +8580,23 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
                 }
                 smallclueGitPrintError("unsupported remote add mirror mode");
                 return 2;
+            }
+            if (strcmp(arg, "-m") == 0 || strcmp(arg, "--master") == 0) {
+                if ((i + 1) >= subargc || !subargv[i + 1] || !*subargv[i + 1]) {
+                    smallclueGitPrintError("usage: git remote add [-f|--fetch] [-t|--track <branch>] <name> <url>");
+                    return 2;
+                }
+                master_branch = subargv[++i];
+                continue;
+            }
+            if (smallclueGitStartsWith(arg, "--master=")) {
+                const char *branch = arg + strlen("--master=");
+                if (!*branch) {
+                    smallclueGitPrintError("usage: git remote add [-f|--fetch] [-t|--track <branch>] <name> <url>");
+                    return 2;
+                }
+                master_branch = branch;
+                continue;
             }
             if (strcmp(arg, "-t") == 0 || strcmp(arg, "--track") == 0) {
                 if ((i + 1) >= subargc || !subargv[i + 1] || !*subargv[i + 1]) {
@@ -8626,6 +8644,10 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
         }
         if (track_count > 0 && mirror_mode == SC_REMOTE_MIRROR_PUSH) {
             fprintf(stderr, "fatal: specifying branches to track makes sense only with fetch mirrors\n");
+            return 128;
+        }
+        if (master_branch && *master_branch && mirror_mode != SC_REMOTE_MIRROR_NONE) {
+            fprintf(stderr, "fatal: specifying a master branch makes no sense with --mirror\n");
             return 128;
         }
         char url_buf[PATH_MAX];
@@ -8714,6 +8736,28 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
                 }
             }
             git_config_free(cfg);
+        }
+        if (master_branch && *master_branch) {
+            char head_ref_name[512];
+            char target_ref_name[1024];
+            if (snprintf(head_ref_name, sizeof(head_ref_name), "refs/remotes/%s/HEAD", name) >= (int)sizeof(head_ref_name) ||
+                snprintf(target_ref_name, sizeof(target_ref_name), "refs/remotes/%s/%s", name, master_branch) >= (int)sizeof(target_ref_name)) {
+                git_remote_free(remote);
+                smallclueGitPrintError("remote add: master branch name too long");
+                return 2;
+            }
+            git_reference *new_ref = NULL;
+            if (git_reference_symbolic_create(&new_ref,
+                                              repo,
+                                              head_ref_name,
+                                              target_ref_name,
+                                              1,
+                                              "remote add --master") != 0) {
+                git_remote_free(remote);
+                smallclueGitPrintLibgitError("remote add --master failed");
+                return 1;
+            }
+            git_reference_free(new_ref);
         }
         if (fetch) {
             git_fetch_options fetch_opts = GIT_FETCH_OPTIONS_INIT;
