@@ -4104,6 +4104,23 @@ static int smallclueGitStashLookupCallback(size_t index,
     return 0;
 }
 
+static int smallclueGitPrintDiff(git_diff *diff, SmallclueGitDiffMode mode);
+
+static int smallclueGitStashLookupOid(git_repository *repo, size_t index, git_oid *out_oid) {
+    if (!repo || !out_oid) {
+        return -1;
+    }
+    SmallclueGitStashLookupContext lookup;
+    memset(&lookup, 0, sizeof(lookup));
+    lookup.target_index = index;
+    (void)git_stash_foreach(repo, smallclueGitStashLookupCallback, &lookup);
+    if (!lookup.found) {
+        return GIT_ENOTFOUND;
+    }
+    git_oid_cpy(out_oid, &lookup.oid);
+    return 0;
+}
+
 static int smallclueGitCommandStash(git_repository *repo, int argc, char **argv) {
     const char *subcmd = "push";
     int subargc = argc;
@@ -4114,6 +4131,7 @@ static int smallclueGitCommandStash(git_repository *repo, int argc, char **argv)
             strcmp(argv[0], "list") == 0 ||
             strcmp(argv[0], "apply") == 0 ||
             strcmp(argv[0], "pop") == 0 ||
+            strcmp(argv[0], "show") == 0 ||
             strcmp(argv[0], "drop") == 0 ||
             strcmp(argv[0], "clear") == 0) {
             subcmd = argv[0];
@@ -4246,6 +4264,98 @@ static int smallclueGitCommandStash(git_repository *repo, int argc, char **argv)
         }
         (void)quiet;
         return 0;
+    }
+
+    if (strcmp(subcmd, "show") == 0) {
+        SmallclueGitDiffMode mode = SMALLCLUE_GIT_DIFF_STAT;
+        const char *stash_spec = NULL;
+        for (int i = 0; i < subargc; ++i) {
+            const char *arg = subargv[i];
+            if (!arg) {
+                continue;
+            }
+            if (strcmp(arg, "--stat") == 0) {
+                mode = SMALLCLUE_GIT_DIFF_STAT;
+                continue;
+            }
+            if (strcmp(arg, "--name-only") == 0) {
+                mode = SMALLCLUE_GIT_DIFF_NAME_ONLY;
+                continue;
+            }
+            if (strcmp(arg, "--name-status") == 0) {
+                mode = SMALLCLUE_GIT_DIFF_NAME_STATUS;
+                continue;
+            }
+            if (strcmp(arg, "-p") == 0 || strcmp(arg, "--patch") == 0) {
+                mode = SMALLCLUE_GIT_DIFF_PATCH;
+                continue;
+            }
+            if (arg[0] == '-') {
+                smallclueGitPrintError("unsupported stash show option");
+                return 2;
+            }
+            if (stash_spec) {
+                smallclueGitPrintError("stash show accepts at most one stash reference");
+                return 2;
+            }
+            stash_spec = arg;
+        }
+
+        size_t index = 0;
+        if (smallclueGitParseStashIndex(stash_spec, &index) != 0) {
+            smallclueGitPrintError("invalid stash reference");
+            return 2;
+        }
+
+        git_oid stash_oid;
+        if (smallclueGitStashLookupOid(repo, index, &stash_oid) != 0) {
+            smallclueGitPrintError("No stash entries found.");
+            return 1;
+        }
+
+        int rc = 1;
+        git_commit *stash_commit = NULL;
+        git_commit *parent_commit = NULL;
+        git_tree *stash_tree = NULL;
+        git_tree *parent_tree = NULL;
+        git_diff *diff = NULL;
+
+        if (git_commit_lookup(&stash_commit, repo, &stash_oid) != 0 || !stash_commit) {
+            smallclueGitPrintLibgitError("stash show failed");
+            goto stash_show_cleanup;
+        }
+
+        if (git_commit_parentcount(stash_commit) == 0) {
+            smallclueGitPrintError("stash entry has no parent commit");
+            goto stash_show_cleanup;
+        }
+
+        if (git_commit_parent(&parent_commit, stash_commit, 0) != 0 || !parent_commit) {
+            smallclueGitPrintLibgitError("stash show failed");
+            goto stash_show_cleanup;
+        }
+
+        if (git_commit_tree(&stash_tree, stash_commit) != 0 || !stash_tree ||
+            git_commit_tree(&parent_tree, parent_commit) != 0 || !parent_tree) {
+            smallclueGitPrintLibgitError("stash show failed");
+            goto stash_show_cleanup;
+        }
+
+        git_diff_options diff_opts = GIT_DIFF_OPTIONS_INIT;
+        if (git_diff_tree_to_tree(&diff, repo, parent_tree, stash_tree, &diff_opts) != 0 || !diff) {
+            smallclueGitPrintLibgitError("stash show failed");
+            goto stash_show_cleanup;
+        }
+
+        rc = smallclueGitPrintDiff(diff, mode);
+
+stash_show_cleanup:
+        git_diff_free(diff);
+        git_tree_free(parent_tree);
+        git_tree_free(stash_tree);
+        git_commit_free(parent_commit);
+        git_commit_free(stash_commit);
+        return rc;
     }
 
     if (strcmp(subcmd, "push") == 0 || strcmp(subcmd, "save") == 0) {
