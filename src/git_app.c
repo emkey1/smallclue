@@ -8466,6 +8466,27 @@ static int smallclueGitCommandClone(const char *start_path, int argc, char **arg
     return 0;
 }
 
+static int smallclueGitRemoteFormatFetchRefspec(const char *remote_name,
+                                                const char *branch,
+                                                char *out,
+                                                size_t out_sz) {
+    if (!remote_name || !*remote_name || !branch || !*branch || !out || out_sz == 0) {
+        return -1;
+    }
+    if (strchr(branch, ':') != NULL) {
+        return -1;
+    }
+    if (snprintf(out,
+                 out_sz,
+                 "+refs/heads/%s:refs/remotes/%s/%s",
+                 branch,
+                 remote_name,
+                 branch) >= (int)out_sz) {
+        return -1;
+    }
+    return 0;
+}
+
 static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv) {
     bool verbose = false;
     const char *action = NULL;
@@ -8740,6 +8761,87 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
             smallclueGitPrintLibgitError("remote set-url failed");
             return 1;
         }
+        return 0;
+    }
+
+    if (strcmp(sub, "set-branches") == 0) {
+        bool add_mode = false;
+        const char *name = NULL;
+        const char *branches[128];
+        size_t branch_count = 0;
+        for (int i = 0; i < subargc; ++i) {
+            const char *arg = subargv[i];
+            if (!arg) {
+                continue;
+            }
+            if (strcmp(arg, "--add") == 0) {
+                add_mode = true;
+                continue;
+            }
+            if (arg[0] == '-') {
+                smallclueGitPrintError("unsupported remote set-branches option");
+                return 2;
+            }
+            if (!name) {
+                name = arg;
+                continue;
+            }
+            if (branch_count >= (sizeof(branches) / sizeof(branches[0]))) {
+                smallclueGitPrintError("too many branches for remote set-branches");
+                return 2;
+            }
+            branches[branch_count++] = arg;
+        }
+        if (!name || branch_count == 0) {
+            smallclueGitPrintError("usage: git remote set-branches [--add] <name> <branch>...");
+            return 2;
+        }
+
+        git_remote *remote = NULL;
+        if (git_remote_lookup(&remote, repo, name) != 0 || !remote) {
+            smallclueGitPrintLibgitError("remote set-branches lookup failed");
+            return 1;
+        }
+        git_remote_free(remote);
+
+        char key[512];
+        if (snprintf(key, sizeof(key), "remote.%s.fetch", name) >= (int)sizeof(key)) {
+            smallclueGitPrintError("remote set-branches key too long");
+            return 2;
+        }
+
+        git_config *cfg = NULL;
+        if (git_repository_config(&cfg, repo) != 0 || !cfg) {
+            smallclueGitPrintLibgitError("remote set-branches config open failed");
+            return 1;
+        }
+
+        int rc = 0;
+        if (!add_mode) {
+            rc = git_config_delete_multivar(cfg, key, ".*");
+            if (rc != 0 && rc != GIT_ENOTFOUND) {
+                git_config_free(cfg);
+                smallclueGitPrintLibgitError("remote set-branches failed");
+                return 1;
+            }
+        }
+
+        for (size_t i = 0; i < branch_count; ++i) {
+            char refspec[1024];
+            if (smallclueGitRemoteFormatFetchRefspec(name, branches[i], refspec, sizeof(refspec)) != 0) {
+                git_config_free(cfg);
+                smallclueGitPrintError("remote set-branches: invalid branch name");
+                return 2;
+            }
+            rc = smallclueGitConfigAppendValue(cfg, key, refspec);
+            if (rc != 0) {
+                git_config_free(cfg);
+                smallclueGitPrintLibgitError("remote set-branches failed");
+                return 1;
+            }
+        }
+
+        git_config_free(cfg);
         return 0;
     }
 
