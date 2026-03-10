@@ -10147,6 +10147,8 @@ static int smallclueGitCommandFetch(git_repository *repo, int argc, char **argv)
     return 0;
 }
 
+static int smallclueGitCommandRebase(git_repository *repo, int argc, char **argv);
+
 static int smallclueGitCommandPull(git_repository *repo, int argc, char **argv) {
     const char *remote_name = "origin";
     const char *branch_name = NULL;
@@ -10155,6 +10157,8 @@ static int smallclueGitCommandPull(git_repository *repo, int argc, char **argv) 
     bool ff_only = false;
     bool no_ff = false;
     bool quiet = false;
+    bool rebase_mode = false;
+    bool rebase_specified = false;
     bool remote_set = false;
     upstream_remote[0] = '\0';
     upstream_branch[0] = '\0';
@@ -10177,6 +10181,16 @@ static int smallclueGitCommandPull(git_repository *repo, int argc, char **argv) 
         }
         if (strcmp(arg, "-q") == 0 || strcmp(arg, "--quiet") == 0) {
             quiet = true;
+            continue;
+        }
+        if (strcmp(arg, "--rebase") == 0) {
+            rebase_mode = true;
+            rebase_specified = true;
+            continue;
+        }
+        if (strcmp(arg, "--no-rebase") == 0) {
+            rebase_mode = false;
+            rebase_specified = true;
             continue;
         }
         if (arg[0] == '-') {
@@ -10236,6 +10250,10 @@ static int smallclueGitCommandPull(git_repository *repo, int argc, char **argv) 
         smallclueGitPrintError("pull: --ff-only and --no-ff are mutually exclusive");
         return 2;
     }
+    if (rebase_specified && (ff_only || no_ff)) {
+        smallclueGitPrintError("pull: --rebase/--no-rebase cannot be combined with ff mode options");
+        return 2;
+    }
 
     char refspec_storage[512];
     if (snprintf(refspec_storage,
@@ -10266,6 +10284,15 @@ static int smallclueGitCommandPull(git_repository *repo, int argc, char **argv) 
     if (snprintf(remote_ref_name, sizeof(remote_ref_name), "refs/remotes/%s/%s", remote_name, branch_name) >= (int)sizeof(remote_ref_name)) {
         smallclueGitPrintError("pull remote ref name too long");
         return 1;
+    }
+    if (rebase_mode) {
+        char *rebase_argv[2];
+        int rebase_argc = 0;
+        if (quiet) {
+            rebase_argv[rebase_argc++] = "-q";
+        }
+        rebase_argv[rebase_argc++] = remote_ref_name;
+        return smallclueGitCommandRebase(repo, rebase_argc, rebase_argv);
     }
     git_reference *remote_ref = NULL;
     if (git_reference_lookup(&remote_ref, repo, remote_ref_name) != 0 || !remote_ref) {
