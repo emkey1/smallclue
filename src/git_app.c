@@ -8871,14 +8871,145 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
             smallclueGitPrintError("usage: git remote prune [--dry-run] <name>");
             return 2;
         }
-        if (dry_run) {
-            smallclueGitPrintError("remote prune: --dry-run is not supported");
-            return 2;
-        }
         git_remote *remote = NULL;
         if (git_remote_lookup(&remote, repo, name) != 0 || !remote) {
             smallclueGitPrintLibgitError("remote prune lookup failed");
             return 1;
+        }
+        if (dry_run) {
+            enum {
+                SC_GIT_REMOTE_PRUNE_MAX_BRANCHES = 512,
+                SC_GIT_REMOTE_PRUNE_MAX_NAME = 512
+            };
+            git_remote_connect_options connect_opts = GIT_REMOTE_CONNECT_OPTIONS_INIT;
+            int rc = git_remote_connect(remote, GIT_DIRECTION_FETCH, &connect_opts.callbacks, NULL, NULL);
+            if (rc != 0) {
+                git_remote_free(remote);
+                smallclueGitPrintLibgitError("remote prune --dry-run connect failed");
+                return 1;
+            }
+
+            const git_remote_head **remote_heads = NULL;
+            size_t remote_head_count = 0;
+            rc = git_remote_ls(&remote_heads, &remote_head_count, remote);
+            if (rc != 0) {
+                git_remote_disconnect(remote);
+                git_remote_free(remote);
+                smallclueGitPrintLibgitError("remote prune --dry-run list failed");
+                return 1;
+            }
+
+            char remote_branch_names[SC_GIT_REMOTE_PRUNE_MAX_BRANCHES][SC_GIT_REMOTE_PRUNE_MAX_NAME];
+            size_t remote_branch_count = 0;
+            for (size_t i = 0; i < remote_head_count; ++i) {
+                const git_remote_head *head = remote_heads[i];
+                if (!head || !head->name || !smallclueGitStartsWith(head->name, "refs/heads/")) {
+                    continue;
+                }
+                const char *branch = head->name + strlen("refs/heads/");
+                if (!branch || !*branch) {
+                    continue;
+                }
+                if (remote_branch_count >= SC_GIT_REMOTE_PRUNE_MAX_BRANCHES ||
+                    snprintf(remote_branch_names[remote_branch_count],
+                             sizeof(remote_branch_names[remote_branch_count]),
+                             "%s",
+                             branch) >= (int)sizeof(remote_branch_names[remote_branch_count])) {
+                    git_remote_disconnect(remote);
+                    git_remote_free(remote);
+                    smallclueGitPrintError("remote prune --dry-run: too many remote branches");
+                    return 2;
+                }
+                remote_branch_count++;
+            }
+
+            char stale_branch_names[SC_GIT_REMOTE_PRUNE_MAX_BRANCHES][SC_GIT_REMOTE_PRUNE_MAX_NAME];
+            size_t stale_count = 0;
+
+            char remote_ref_prefix[512];
+            char remote_head_ref[512];
+            if (snprintf(remote_ref_prefix, sizeof(remote_ref_prefix), "refs/remotes/%s/", name) >= (int)sizeof(remote_ref_prefix) ||
+                snprintf(remote_head_ref, sizeof(remote_head_ref), "refs/remotes/%s/HEAD", name) >= (int)sizeof(remote_head_ref)) {
+                git_remote_disconnect(remote);
+                git_remote_free(remote);
+                smallclueGitPrintError("remote prune --dry-run: remote name too long");
+                return 2;
+            }
+
+            git_reference_iterator *it = NULL;
+            if (git_reference_iterator_new(&it, repo) != 0 || !it) {
+                git_remote_disconnect(remote);
+                git_remote_free(remote);
+                smallclueGitPrintLibgitError("remote prune --dry-run iterator failed");
+                return 1;
+            }
+
+            git_reference *ref = NULL;
+            while ((rc = git_reference_next(&ref, it)) == 0) {
+                const char *ref_name = git_reference_name(ref);
+                if (!ref_name || !*ref_name || strcmp(ref_name, remote_head_ref) == 0 ||
+                    !smallclueGitStartsWith(ref_name, remote_ref_prefix)) {
+                    git_reference_free(ref);
+                    ref = NULL;
+                    continue;
+                }
+                const char *local_branch = ref_name + strlen(remote_ref_prefix);
+                bool exists_remote = false;
+                for (size_t i = 0; i < remote_branch_count; ++i) {
+                    if (strcmp(remote_branch_names[i], local_branch) == 0) {
+                        exists_remote = true;
+                        break;
+                    }
+                }
+                if (!exists_remote) {
+                    if (stale_count >= SC_GIT_REMOTE_PRUNE_MAX_BRANCHES ||
+                        snprintf(stale_branch_names[stale_count],
+                                 sizeof(stale_branch_names[stale_count]),
+                                 "%s",
+                                 local_branch) >= (int)sizeof(stale_branch_names[stale_count])) {
+                        git_reference_free(ref);
+                        git_reference_iterator_free(it);
+                        git_remote_disconnect(remote);
+                        git_remote_free(remote);
+                        smallclueGitPrintError("remote prune --dry-run: too many stale refs");
+                        return 2;
+                    }
+                    stale_count++;
+                }
+                git_reference_free(ref);
+                ref = NULL;
+            }
+            const char *url = git_remote_url(remote);
+            char url_copy[PATH_MAX];
+            const char *printed_url = NULL;
+            if (url && *url) {
+                if (snprintf(url_copy, sizeof(url_copy), "%s", url) < (int)sizeof(url_copy)) {
+                    printed_url = url_copy;
+                } else {
+                    printed_url = url;
+                }
+            }
+
+            git_reference_iterator_free(it);
+            git_remote_disconnect(remote);
+            git_remote_free(remote);
+            if (rc != GIT_ITEROVER) {
+                smallclueGitPrintLibgitError("remote prune --dry-run failed");
+                return 1;
+            }
+
+            if (stale_count > 0) {
+                char url_display[PATH_MAX];
+                const char *shown_url = printed_url ? smallclueGitDisplayMaybePath(printed_url, url_display, sizeof(url_display)) : NULL;
+                printf("Pruning %s\n", name);
+                if (shown_url && *shown_url) {
+                    printf("URL: %s\n", shown_url);
+                }
+                for (size_t i = 0; i < stale_count; ++i) {
+                    printf(" * [would prune] %s/%s\n", name, stale_branch_names[i]);
+                }
+            }
+            return 0;
         }
         git_fetch_options fetch_opts = GIT_FETCH_OPTIONS_INIT;
         fetch_opts.prune = GIT_FETCH_PRUNE;
