@@ -8553,6 +8553,7 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
         const char *tracks[128];
         size_t track_count = 0;
         const char *master_branch = NULL;
+        const char *tag_opt_value = NULL;
         const char *name = NULL;
         const char *url_arg = NULL;
         for (int i = 0; i < subargc; ++i) {
@@ -8580,6 +8581,14 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
                 }
                 smallclueGitPrintError("unsupported remote add mirror mode");
                 return 2;
+            }
+            if (strcmp(arg, "--tags") == 0) {
+                tag_opt_value = "--tags";
+                continue;
+            }
+            if (strcmp(arg, "--no-tags") == 0) {
+                tag_opt_value = "--no-tags";
+                continue;
             }
             if (strcmp(arg, "-m") == 0 || strcmp(arg, "--master") == 0) {
                 if ((i + 1) >= subargc || !subargv[i + 1] || !*subargv[i + 1]) {
@@ -8734,6 +8743,32 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
                     smallclueGitPrintLibgitError("remote add --mirror=push failed");
                     return 1;
                 }
+            }
+            if (tag_opt_value) {
+                char tagopt_key[512];
+                if (snprintf(tagopt_key, sizeof(tagopt_key), "remote.%s.tagOpt", name) >= (int)sizeof(tagopt_key) ||
+                    git_config_set_string(cfg, tagopt_key, tag_opt_value) != 0) {
+                    git_config_free(cfg);
+                    git_remote_free(remote);
+                    smallclueGitPrintLibgitError("remote add tag option failed");
+                    return 1;
+                }
+            }
+            git_config_free(cfg);
+        } else if (tag_opt_value) {
+            git_config *cfg = NULL;
+            if (git_repository_config(&cfg, repo) != 0 || !cfg) {
+                git_remote_free(remote);
+                smallclueGitPrintLibgitError("remote add config open failed");
+                return 1;
+            }
+            char tagopt_key[512];
+            if (snprintf(tagopt_key, sizeof(tagopt_key), "remote.%s.tagOpt", name) >= (int)sizeof(tagopt_key) ||
+                git_config_set_string(cfg, tagopt_key, tag_opt_value) != 0) {
+                git_config_free(cfg);
+                git_remote_free(remote);
+                smallclueGitPrintLibgitError("remote add tag option failed");
+                return 1;
             }
             git_config_free(cfg);
         }
