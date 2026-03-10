@@ -9351,6 +9351,10 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
                 prune = true;
                 continue;
             }
+            if (strcmp(arg, "--no-prune") == 0) {
+                prune = false;
+                continue;
+            }
             if (arg[0] == '-') {
                 smallclueGitPrintError("unsupported remote update option");
                 return 2;
