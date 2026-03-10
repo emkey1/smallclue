@@ -8565,8 +8565,16 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
                 fetch = true;
                 continue;
             }
+            if (strcmp(arg, "--no-fetch") == 0) {
+                fetch = false;
+                continue;
+            }
             if (strcmp(arg, "--mirror") == 0) {
                 mirror_mode = SC_REMOTE_MIRROR_BOTH;
+                continue;
+            }
+            if (strcmp(arg, "--no-mirror") == 0) {
+                mirror_mode = SC_REMOTE_MIRROR_NONE;
                 continue;
             }
             if (smallclueGitStartsWith(arg, "--mirror=")) {
@@ -8582,6 +8590,10 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
                 smallclueGitPrintError("unsupported remote add mirror mode");
                 return 2;
             }
+            if (smallclueGitStartsWith(arg, "--no-mirror=")) {
+                mirror_mode = SC_REMOTE_MIRROR_NONE;
+                continue;
+            }
             if (strcmp(arg, "--tags") == 0) {
                 tag_opt_value = "--tags";
                 continue;
@@ -8596,6 +8608,10 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
                     return 2;
                 }
                 master_branch = subargv[++i];
+                continue;
+            }
+            if (strcmp(arg, "--no-master") == 0) {
+                master_branch = NULL;
                 continue;
             }
             if (smallclueGitStartsWith(arg, "--master=")) {
@@ -8617,6 +8633,10 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
                     return 2;
                 }
                 tracks[track_count++] = subargv[++i];
+                continue;
+            }
+            if (strcmp(arg, "--no-track") == 0) {
+                track_count = 0;
                 continue;
             }
             if (smallclueGitStartsWith(arg, "--track=")) {
@@ -10010,20 +10030,39 @@ static int smallclueGitCommandFetch(git_repository *repo, int argc, char **argv)
             prune = true;
             continue;
         }
+        if (strcmp(arg, "--no-prune") == 0) {
+            prune = false;
+            continue;
+        }
+        if (strcmp(arg, "-p") == 0) {
+            prune = true;
+            continue;
+        }
         if (strcmp(arg, "--all") == 0) {
             fetch_all = true;
+            continue;
+        }
+        if (strcmp(arg, "--no-all") == 0) {
+            fetch_all = false;
             continue;
         }
         if (strcmp(arg, "--tags") == 0 || strcmp(arg, "-t") == 0) {
             download_tags = GIT_REMOTE_DOWNLOAD_TAGS_ALL;
             continue;
         }
-        if (strcmp(arg, "--no-tags") == 0) {
+        if (strcmp(arg, "--no-tags") == 0 || strcmp(arg, "-n") == 0) {
             download_tags = GIT_REMOTE_DOWNLOAD_TAGS_NONE;
+            continue;
+        }
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0 || strcmp(arg, "--no-verbose") == 0) {
             continue;
         }
         if (strcmp(arg, "-q") == 0 || strcmp(arg, "--quiet") == 0) {
             quiet = true;
+            continue;
+        }
+        if (strcmp(arg, "--no-quiet") == 0) {
+            quiet = false;
             continue;
         }
         if (arg[0] == '-') {
