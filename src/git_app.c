@@ -8542,19 +8542,54 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
     char **subargv = &argv[action_index + 1];
 
     if (strcmp(sub, "add") == 0) {
-        if (subargc != 2) {
-            smallclueGitPrintError("usage: git remote add <name> <url>");
+        bool fetch = false;
+        const char *name = NULL;
+        const char *url_arg = NULL;
+        for (int i = 0; i < subargc; ++i) {
+            const char *arg = subargv[i];
+            if (!arg) {
+                continue;
+            }
+            if (strcmp(arg, "-f") == 0 || strcmp(arg, "--fetch") == 0) {
+                fetch = true;
+                continue;
+            }
+            if (arg[0] == '-') {
+                smallclueGitPrintError("unsupported remote add option");
+                return 2;
+            }
+            if (!name) {
+                name = arg;
+                continue;
+            }
+            if (!url_arg) {
+                url_arg = arg;
+                continue;
+            }
+            smallclueGitPrintError("usage: git remote add [-f|--fetch] <name> <url>");
+            return 2;
+        }
+        if (!name || !url_arg) {
+            smallclueGitPrintError("usage: git remote add [-f|--fetch] <name> <url>");
             return 2;
         }
         char url_buf[PATH_MAX];
-        const char *url = subargv[1];
-        if (smallclueGitResolveMaybePathFromCwd(url, url_buf, sizeof(url_buf)) == 0) {
+        const char *url = url_arg;
+        if (smallclueGitResolveMaybePathFromCwd(url_arg, url_buf, sizeof(url_buf)) == 0) {
             url = url_buf;
         }
         git_remote *remote = NULL;
-        if (git_remote_create(&remote, repo, subargv[0], url) != 0) {
+        if (git_remote_create(&remote, repo, name, url) != 0) {
             smallclueGitPrintLibgitError("remote add failed");
             return 1;
+        }
+        if (fetch) {
+            git_fetch_options fetch_opts = GIT_FETCH_OPTIONS_INIT;
+            if (git_remote_fetch(remote, NULL, &fetch_opts, NULL) != 0) {
+                git_remote_free(remote);
+                smallclueGitPrintLibgitError("remote add --fetch failed");
+                return 1;
+            }
         }
         git_remote_free(remote);
         return 0;
