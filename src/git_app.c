@@ -4105,6 +4105,7 @@ static int smallclueGitStashLookupCallback(size_t index,
 }
 
 static int smallclueGitPrintDiff(git_diff *diff, SmallclueGitDiffMode mode);
+static int smallclueGitCommandStatus(git_repository *repo, int argc, char **argv);
 
 static int smallclueGitStashLookupOid(git_repository *repo, size_t index, git_oid *out_oid) {
     if (!repo || !out_oid) {
@@ -4131,6 +4132,7 @@ static int smallclueGitCommandStash(git_repository *repo, int argc, char **argv)
             strcmp(argv[0], "list") == 0 ||
             strcmp(argv[0], "apply") == 0 ||
             strcmp(argv[0], "pop") == 0 ||
+            strcmp(argv[0], "branch") == 0 ||
             strcmp(argv[0], "show") == 0 ||
             strcmp(argv[0], "drop") == 0 ||
             strcmp(argv[0], "clear") == 0) {
@@ -4353,6 +4355,126 @@ stash_show_cleanup:
         git_diff_free(diff);
         git_tree_free(parent_tree);
         git_tree_free(stash_tree);
+        git_commit_free(parent_commit);
+        git_commit_free(stash_commit);
+        return rc;
+    }
+
+    if (strcmp(subcmd, "branch") == 0) {
+        const char *branch_name = NULL;
+        const char *stash_spec = NULL;
+        for (int i = 0; i < subargc; ++i) {
+            const char *arg = subargv[i];
+            if (!arg) {
+                continue;
+            }
+            if (arg[0] == '-') {
+                smallclueGitPrintError("unsupported stash branch option");
+                return 2;
+            }
+            if (!branch_name) {
+                branch_name = arg;
+                continue;
+            }
+            if (!stash_spec) {
+                stash_spec = arg;
+                continue;
+            }
+            smallclueGitPrintError("stash branch accepts at most one stash reference");
+            return 2;
+        }
+        if (!branch_name || !*branch_name) {
+            smallclueGitPrintError("usage: git stash branch <branchname> [<stash>]");
+            return 2;
+        }
+
+        size_t index = 0;
+        if (smallclueGitParseStashIndex(stash_spec, &index) != 0) {
+            smallclueGitPrintError("invalid stash reference");
+            return 2;
+        }
+
+        git_oid stash_oid;
+        if (smallclueGitStashLookupOid(repo, index, &stash_oid) != 0) {
+            smallclueGitPrintError("No stash entries found.");
+            return 1;
+        }
+
+        int rc = 1;
+        git_commit *stash_commit = NULL;
+        git_commit *parent_commit = NULL;
+        git_reference *branch_ref = NULL;
+        git_reference *head_ref = NULL;
+
+        if (git_repository_head(&head_ref, repo) != 0 || !head_ref) {
+            smallclueGitPrintLibgitError("stash branch failed");
+            goto stash_branch_cleanup;
+        }
+        const char *old_head_name = git_reference_name(head_ref);
+        if (!old_head_name || !*old_head_name) {
+            smallclueGitPrintError("stash branch: unable to resolve HEAD");
+            goto stash_branch_cleanup;
+        }
+
+        if (git_commit_lookup(&stash_commit, repo, &stash_oid) != 0 || !stash_commit) {
+            smallclueGitPrintLibgitError("stash branch failed");
+            goto stash_branch_cleanup;
+        }
+        if (git_commit_parentcount(stash_commit) == 0) {
+            smallclueGitPrintError("stash entry has no parent commit");
+            goto stash_branch_cleanup;
+        }
+        if (git_commit_parent(&parent_commit, stash_commit, 0) != 0 || !parent_commit) {
+            smallclueGitPrintLibgitError("stash branch failed");
+            goto stash_branch_cleanup;
+        }
+
+        if (git_branch_create(&branch_ref, repo, branch_name, parent_commit, 0) != 0 || !branch_ref) {
+            smallclueGitPrintLibgitError("stash branch: unable to create branch");
+            goto stash_branch_cleanup;
+        }
+
+        const char *branch_refname = git_reference_name(branch_ref);
+        if (!branch_refname || !*branch_refname) {
+            smallclueGitPrintError("stash branch: invalid branch reference");
+            goto stash_branch_cleanup;
+        }
+        if (git_repository_set_head(repo, branch_refname) != 0) {
+            smallclueGitPrintLibgitError("stash branch: unable to update HEAD");
+            goto stash_branch_cleanup;
+        }
+
+        git_checkout_options checkout_opts = GIT_CHECKOUT_OPTIONS_INIT;
+        checkout_opts.checkout_strategy = GIT_CHECKOUT_SAFE | GIT_CHECKOUT_RECREATE_MISSING;
+        if (git_checkout_head(repo, &checkout_opts) != 0) {
+            smallclueGitPrintLibgitError("stash branch: checkout failed");
+            (void)git_repository_set_head(repo, old_head_name);
+            goto stash_branch_cleanup;
+        }
+
+        git_stash_apply_options apply_opts = GIT_STASH_APPLY_OPTIONS_INIT;
+        apply_opts.flags |= GIT_STASH_APPLY_REINSTATE_INDEX;
+        if (git_stash_apply(repo, index, &apply_opts) != 0) {
+            smallclueGitPrintLibgitError("stash branch: apply failed");
+            goto stash_branch_cleanup;
+        }
+        if (git_stash_drop(repo, index) != 0) {
+            smallclueGitPrintLibgitError("stash branch: drop failed");
+            goto stash_branch_cleanup;
+        }
+
+        if (smallclueGitCommandStatus(repo, 0, NULL) != 0) {
+            goto stash_branch_cleanup;
+        }
+        char oid_buf[GIT_OID_HEXSZ + 1];
+        if (git_oid_tostr(oid_buf, sizeof(oid_buf), &stash_oid)) {
+            printf("Dropped stash@{%zu} (%s)\n", index, oid_buf);
+        }
+        rc = 0;
+
+stash_branch_cleanup:
+        git_reference_free(head_ref);
+        git_reference_free(branch_ref);
         git_commit_free(parent_commit);
         git_commit_free(stash_commit);
         return rc;
