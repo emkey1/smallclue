@@ -8543,6 +8543,8 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
 
     if (strcmp(sub, "add") == 0) {
         bool fetch = false;
+        const char *tracks[128];
+        size_t track_count = 0;
         const char *name = NULL;
         const char *url_arg = NULL;
         for (int i = 0; i < subargc; ++i) {
@@ -8552,6 +8554,31 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
             }
             if (strcmp(arg, "-f") == 0 || strcmp(arg, "--fetch") == 0) {
                 fetch = true;
+                continue;
+            }
+            if (strcmp(arg, "-t") == 0 || strcmp(arg, "--track") == 0) {
+                if ((i + 1) >= subargc || !subargv[i + 1] || !*subargv[i + 1]) {
+                    smallclueGitPrintError("usage: git remote add [-f|--fetch] [-t|--track <branch>] <name> <url>");
+                    return 2;
+                }
+                if (track_count >= (sizeof(tracks) / sizeof(tracks[0]))) {
+                    smallclueGitPrintError("too many --track branches");
+                    return 2;
+                }
+                tracks[track_count++] = subargv[++i];
+                continue;
+            }
+            if (smallclueGitStartsWith(arg, "--track=")) {
+                const char *branch = arg + strlen("--track=");
+                if (!*branch) {
+                    smallclueGitPrintError("usage: git remote add [-f|--fetch] [-t|--track <branch>] <name> <url>");
+                    return 2;
+                }
+                if (track_count >= (sizeof(tracks) / sizeof(tracks[0]))) {
+                    smallclueGitPrintError("too many --track branches");
+                    return 2;
+                }
+                tracks[track_count++] = branch;
                 continue;
             }
             if (arg[0] == '-') {
@@ -8566,11 +8593,11 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
                 url_arg = arg;
                 continue;
             }
-            smallclueGitPrintError("usage: git remote add [-f|--fetch] <name> <url>");
+            smallclueGitPrintError("usage: git remote add [-f|--fetch] [-t|--track <branch>] <name> <url>");
             return 2;
         }
         if (!name || !url_arg) {
-            smallclueGitPrintError("usage: git remote add [-f|--fetch] <name> <url>");
+            smallclueGitPrintError("usage: git remote add [-f|--fetch] [-t|--track <branch>] <name> <url>");
             return 2;
         }
         char url_buf[PATH_MAX];
@@ -8582,6 +8609,43 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
         if (git_remote_create(&remote, repo, name, url) != 0) {
             smallclueGitPrintLibgitError("remote add failed");
             return 1;
+        }
+        if (track_count > 0) {
+            char key[512];
+            if (snprintf(key, sizeof(key), "remote.%s.fetch", name) >= (int)sizeof(key)) {
+                git_remote_free(remote);
+                smallclueGitPrintError("remote add key too long");
+                return 2;
+            }
+            git_config *cfg = NULL;
+            if (git_repository_config(&cfg, repo) != 0 || !cfg) {
+                git_remote_free(remote);
+                smallclueGitPrintLibgitError("remote add config open failed");
+                return 1;
+            }
+            int rc = git_config_delete_multivar(cfg, key, ".*");
+            if (rc != 0 && rc != GIT_ENOTFOUND) {
+                git_config_free(cfg);
+                git_remote_free(remote);
+                smallclueGitPrintLibgitError("remote add --track failed");
+                return 1;
+            }
+            for (size_t i = 0; i < track_count; ++i) {
+                char refspec[1024];
+                if (smallclueGitRemoteFormatFetchRefspec(name, tracks[i], refspec, sizeof(refspec)) != 0) {
+                    git_config_free(cfg);
+                    git_remote_free(remote);
+                    smallclueGitPrintError("remote add --track: invalid branch name");
+                    return 2;
+                }
+                if (smallclueGitConfigAppendValue(cfg, key, refspec) != 0) {
+                    git_config_free(cfg);
+                    git_remote_free(remote);
+                    smallclueGitPrintLibgitError("remote add --track failed");
+                    return 1;
+                }
+            }
+            git_config_free(cfg);
         }
         if (fetch) {
             git_fetch_options fetch_opts = GIT_FETCH_OPTIONS_INIT;
