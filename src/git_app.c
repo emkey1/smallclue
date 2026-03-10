@@ -9004,15 +9004,15 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
             smallclueGitPrintError("usage: git remote set-head <name> (-d|--delete|<branch>)");
             return 2;
         }
-        if (auto_mode) {
-            smallclueGitPrintError("remote set-head: --auto is not supported");
+        if (auto_mode && (delete_mode || (branch && *branch))) {
+            smallclueGitPrintError("remote set-head: cannot combine --auto with --delete or a branch name");
             return 2;
         }
         if (delete_mode && branch) {
             smallclueGitPrintError("remote set-head: cannot combine --delete with a branch name");
             return 2;
         }
-        if (!delete_mode && (!branch || !*branch)) {
+        if (!delete_mode && !auto_mode && (!branch || !*branch)) {
             smallclueGitPrintError("usage: git remote set-head <name> (-d|--delete|<branch>)");
             return 2;
         }
@@ -9021,6 +9021,40 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
         if (git_remote_lookup(&remote, repo, name) != 0 || !remote) {
             smallclueGitPrintLibgitError("remote set-head lookup failed");
             return 1;
+        }
+        char auto_branch[512];
+        if (auto_mode) {
+            git_remote_connect_options connect_opts = GIT_REMOTE_CONNECT_OPTIONS_INIT;
+            int rc = git_remote_connect(remote, GIT_DIRECTION_FETCH, &connect_opts.callbacks, NULL, NULL);
+            if (rc != 0) {
+                git_remote_free(remote);
+                smallclueGitPrintLibgitError("remote set-head auto connect failed");
+                return 1;
+            }
+
+            git_buf default_branch = {0};
+            rc = git_remote_default_branch(&default_branch, remote);
+            git_remote_disconnect(remote);
+            if (rc != 0 || default_branch.size == 0 || !default_branch.ptr || !*default_branch.ptr) {
+                git_buf_dispose(&default_branch);
+                git_remote_free(remote);
+                smallclueGitPrintLibgitError("remote set-head auto failed");
+                return 1;
+            }
+
+            const char *name_part = default_branch.ptr;
+            if (smallclueGitStartsWith(default_branch.ptr, "refs/heads/")) {
+                name_part = default_branch.ptr + strlen("refs/heads/");
+            }
+            if (!name_part || !*name_part ||
+                snprintf(auto_branch, sizeof(auto_branch), "%s", name_part) >= (int)sizeof(auto_branch)) {
+                git_buf_dispose(&default_branch);
+                git_remote_free(remote);
+                smallclueGitPrintError("remote set-head auto: default branch name too long");
+                return 2;
+            }
+            git_buf_dispose(&default_branch);
+            branch = auto_branch;
         }
         git_remote_free(remote);
 
