@@ -122,6 +122,60 @@ static size_t smallclueGitCopySubjectLine(const char *message, char *out, size_t
     return i;
 }
 
+static int smallclueGitParseAuthorIdentity(const char *spec,
+                                           char *name_out,
+                                           size_t name_out_sz,
+                                           char *email_out,
+                                           size_t email_out_sz) {
+    if (!spec || !name_out || name_out_sz == 0 || !email_out || email_out_sz == 0) {
+        return -1;
+    }
+    name_out[0] = '\0';
+    email_out[0] = '\0';
+
+    const char *lt = strrchr(spec, '<');
+    const char *gt = strrchr(spec, '>');
+    if (!lt || !gt || lt >= gt) {
+        return -1;
+    }
+
+    const char *name_start = spec;
+    while (*name_start && isspace((unsigned char)*name_start)) {
+        name_start++;
+    }
+    const char *name_end = lt;
+    while (name_end > name_start && isspace((unsigned char)name_end[-1])) {
+        name_end--;
+    }
+    if (name_end <= name_start) {
+        return -1;
+    }
+
+    const char *email_start = lt + 1;
+    while (email_start < gt && isspace((unsigned char)*email_start)) {
+        email_start++;
+    }
+    const char *email_end = gt;
+    while (email_end > email_start && isspace((unsigned char)email_end[-1])) {
+        email_end--;
+    }
+    if (email_end <= email_start) {
+        return -1;
+    }
+
+    size_t name_len = (size_t)(name_end - name_start);
+    size_t email_len = (size_t)(email_end - email_start);
+    if (name_len + 1 > name_out_sz || email_len + 1 > email_out_sz) {
+        return -1;
+    }
+
+    memcpy(name_out, name_start, name_len);
+    name_out[name_len] = '\0';
+    memcpy(email_out, email_start, email_len);
+    email_out[email_len] = '\0';
+    return 0;
+}
+
 static int smallclueGitOpenRepository(const char *start_path, git_repository **out_repo) {
     if (!out_repo) {
         return -1;
@@ -4101,11 +4155,28 @@ static int smallclueGitCommandStash(git_repository *repo, int argc, char **argv)
 
     if (strcmp(subcmd, "drop") == 0) {
         size_t index = 0;
-        if (subargc > 1) {
-            smallclueGitPrintError("stash drop accepts at most one stash reference");
-            return 2;
+        bool quiet = false;
+        const char *stash_spec = NULL;
+        for (int i = 0; i < subargc; ++i) {
+            const char *arg = subargv[i];
+            if (!arg) {
+                continue;
+            }
+            if (strcmp(arg, "-q") == 0 || strcmp(arg, "--quiet") == 0) {
+                quiet = true;
+                continue;
+            }
+            if (arg[0] == '-') {
+                smallclueGitPrintError("unsupported stash option");
+                return 2;
+            }
+            if (stash_spec) {
+                smallclueGitPrintError("stash drop accepts at most one stash reference");
+                return 2;
+            }
+            stash_spec = arg;
         }
-        if (subargc == 1 && smallclueGitParseStashIndex(subargv[0], &index) != 0) {
+        if (stash_spec && smallclueGitParseStashIndex(stash_spec, &index) != 0) {
             smallclueGitPrintError("invalid stash reference");
             return 2;
         }
@@ -4117,7 +4188,7 @@ static int smallclueGitCommandStash(git_repository *repo, int argc, char **argv)
             smallclueGitPrintLibgitError("stash drop failed");
             return 1;
         }
-        if (lookup.found) {
+        if (!quiet && lookup.found) {
             char oid_buf[GIT_OID_HEXSZ + 1];
             if (git_oid_tostr(oid_buf, sizeof(oid_buf), &lookup.oid)) {
                 printf("Dropped stash@{%zu} (%s)\n", index, oid_buf);
@@ -4431,9 +4502,14 @@ static int smallclueGitHardResetToHead(git_repository *repo, const char *context
 
 static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv) {
     const char *message = NULL;
+    const char *author_override_spec = NULL;
     bool allow_empty = false;
     bool quiet = false;
+    bool signoff = false;
     bool stage_all = false;
+    bool amend = false;
+    bool no_edit = false;
+    bool reset_author = false;
 
     for (int i = 0; i < argc; ++i) {
         const char *arg = argv[i];
@@ -4448,6 +4524,14 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
             message = arg + 10;
             continue;
         }
+        if (strcmp(arg, "--author") == 0 && i + 1 < argc) {
+            author_override_spec = argv[++i];
+            continue;
+        }
+        if (strncmp(arg, "--author=", 9) == 0) {
+            author_override_spec = arg + 9;
+            continue;
+        }
         if (strcmp(arg, "--allow-empty") == 0) {
             allow_empty = true;
             continue;
@@ -4456,15 +4540,40 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
             quiet = true;
             continue;
         }
+        if (strcmp(arg, "-s") == 0 || strcmp(arg, "--signoff") == 0) {
+            signoff = true;
+            continue;
+        }
         if (strcmp(arg, "-a") == 0 || strcmp(arg, "--all") == 0) {
             stage_all = true;
+            continue;
+        }
+        if (strcmp(arg, "--amend") == 0) {
+            amend = true;
+            continue;
+        }
+        if (strcmp(arg, "--no-edit") == 0) {
+            no_edit = true;
+            continue;
+        }
+        if (strcmp(arg, "--reset-author") == 0) {
+            reset_author = true;
             continue;
         }
         smallclueGitPrintError("unsupported commit option");
         return 2;
     }
 
-    if (!message || !*message) {
+    if (no_edit && !amend) {
+        smallclueGitPrintError("commit --no-edit requires --amend");
+        return 2;
+    }
+    if (reset_author && !amend) {
+        smallclueGitPrintError("commit --reset-author requires --amend");
+        return 2;
+    }
+
+    if (!amend && (!message || !*message)) {
         smallclueGitPrintError("commit requires -m/--message");
         return 2;
     }
@@ -4502,22 +4611,28 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
         return 1;
     }
 
-    git_commit *parent = NULL;
+    git_commit *head_commit = NULL;
     git_reference *head_ref = NULL;
     if (git_repository_head(&head_ref, repo) == 0 && head_ref) {
         git_object *head_obj = NULL;
         if (git_reference_peel(&head_obj, head_ref, GIT_OBJECT_COMMIT) == 0 && head_obj) {
-            parent = (git_commit *)head_obj;
+            head_commit = (git_commit *)head_obj;
         }
     }
+    if (amend && !head_commit) {
+        git_reference_free(head_ref);
+        git_tree_free(tree);
+        smallclueGitPrintError("commit --amend requires an existing commit");
+        return 1;
+    }
 
-    if (!allow_empty && parent) {
+    if (!allow_empty && !amend && head_commit) {
         git_tree *parent_tree = NULL;
-        if (git_commit_tree(&parent_tree, parent) == 0 && parent_tree) {
+        if (git_commit_tree(&parent_tree, head_commit) == 0 && parent_tree) {
             if (git_oid_equal(git_tree_id(parent_tree), &tree_oid)) {
                 git_tree_free(parent_tree);
                 git_reference_free(head_ref);
-                git_commit_free(parent);
+                git_commit_free(head_commit);
                 git_tree_free(tree);
                 fputs("nothing to commit\n", stderr);
                 return 1;
@@ -4526,53 +4641,173 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
         }
     }
 
+    const char *final_message = message;
+    if (amend && (!final_message || !*final_message)) {
+        final_message = git_commit_message(head_commit);
+        if (!final_message || !*final_message) {
+            git_reference_free(head_ref);
+            git_commit_free(head_commit);
+            git_tree_free(tree);
+            smallclueGitPrintError("commit --amend requires -m/--message when HEAD has no message");
+            return 2;
+        }
+    }
+
     git_signature *author = NULL;
     git_signature *committer = NULL;
     if (smallclueGitCreateDefaultSignatures(repo, &author, &committer) != 0) {
         git_reference_free(head_ref);
-        git_commit_free(parent);
+        git_commit_free(head_commit);
         git_tree_free(tree);
         smallclueGitPrintLibgitError("commit: signature creation failed");
         return 1;
     }
+    if (amend && head_commit && !reset_author) {
+        const git_signature *existing_author = git_commit_author(head_commit);
+        if (existing_author && existing_author->name && existing_author->email) {
+            git_signature *amend_author = NULL;
+            if (git_signature_dup(&amend_author, existing_author) == 0 && amend_author) {
+                git_signature_free(author);
+                author = amend_author;
+            }
+        }
+    }
+    if (author_override_spec && *author_override_spec) {
+        char author_name[256];
+        char author_email[256];
+        if (smallclueGitParseAuthorIdentity(author_override_spec,
+                                            author_name,
+                                            sizeof(author_name),
+                                            author_email,
+                                            sizeof(author_email)) != 0) {
+            git_signature_free(author);
+            git_signature_free(committer);
+            git_reference_free(head_ref);
+            git_commit_free(head_commit);
+            git_tree_free(tree);
+            smallclueGitPrintError("commit --author expects 'Name <email>'");
+            return 2;
+        }
+        git_signature *override_author = NULL;
+        if (git_signature_now(&override_author, author_name, author_email) != 0 || !override_author) {
+            git_signature_free(author);
+            git_signature_free(committer);
+            git_reference_free(head_ref);
+            git_commit_free(head_commit);
+            git_tree_free(tree);
+            smallclueGitPrintLibgitError("commit: failed to create author signature");
+            return 1;
+        }
+        git_signature_free(author);
+        author = override_author;
+    }
 
-    const git_commit *parents[1];
-    size_t parent_count = 0;
-    if (parent) {
-        parents[parent_count++] = parent;
+    char *owned_final_message = NULL;
+    if (signoff) {
+        const char *co_name = (committer && committer->name) ? committer->name : "PSCAL User";
+        const char *co_email = (committer && committer->email) ? committer->email : "pscal@example.com";
+        char trailer[512];
+        int tn = snprintf(trailer, sizeof(trailer), "Signed-off-by: %s <%s>", co_name, co_email);
+        if (tn < 0 || (size_t)tn >= sizeof(trailer)) {
+            git_signature_free(author);
+            git_signature_free(committer);
+            git_reference_free(head_ref);
+            git_commit_free(head_commit);
+            git_tree_free(tree);
+            smallclueGitPrintError("commit signoff trailer too long");
+            return 2;
+        }
+
+        size_t base_len = final_message ? strlen(final_message) : 0;
+        bool has_trailing_nl = (base_len > 0 && final_message[base_len - 1] == '\n');
+        const char *joiner = has_trailing_nl ? "\n" : "\n\n";
+        size_t joiner_len = strlen(joiner);
+        size_t trailer_len = (size_t)tn;
+        size_t total_len = base_len + joiner_len + trailer_len;
+        owned_final_message = (char *)malloc(total_len + 1);
+        if (!owned_final_message) {
+            git_signature_free(author);
+            git_signature_free(committer);
+            git_reference_free(head_ref);
+            git_commit_free(head_commit);
+            git_tree_free(tree);
+            smallclueGitPrintError("out of memory");
+            return 1;
+        }
+        if (base_len > 0) {
+            memcpy(owned_final_message, final_message, base_len);
+        }
+        memcpy(owned_final_message + base_len, joiner, joiner_len);
+        memcpy(owned_final_message + base_len + joiner_len, trailer, trailer_len);
+        owned_final_message[total_len] = '\0';
+        final_message = owned_final_message;
     }
 
     git_oid commit_oid;
-    if (git_commit_create(&commit_oid,
-                          repo,
-                          "HEAD",
-                          author,
-                          committer,
-                          NULL,
-                          message,
-                          tree,
-                          parent_count,
-                          parents) != 0) {
-        git_signature_free(author);
-        git_signature_free(committer);
-        git_reference_free(head_ref);
-        git_commit_free(parent);
-        git_tree_free(tree);
-        smallclueGitPrintLibgitError("commit failed");
-        return 1;
+    if (amend) {
+        if (git_commit_amend(&commit_oid,
+                             head_commit,
+                             "HEAD",
+                             author,
+                             committer,
+                             NULL,
+                             final_message,
+                             tree) != 0) {
+            free(owned_final_message);
+            git_signature_free(author);
+            git_signature_free(committer);
+            git_reference_free(head_ref);
+            git_commit_free(head_commit);
+            git_tree_free(tree);
+            smallclueGitPrintLibgitError("commit --amend failed");
+            return 1;
+        }
+    } else {
+        const git_commit *parents[1];
+        size_t parent_count = 0;
+        if (head_commit) {
+            parents[parent_count++] = head_commit;
+        }
+        if (git_commit_create(&commit_oid,
+                              repo,
+                              "HEAD",
+                              author,
+                              committer,
+                              NULL,
+                              final_message,
+                              tree,
+                              parent_count,
+                              parent_count > 0 ? parents : NULL) != 0) {
+            free(owned_final_message);
+            git_signature_free(author);
+            git_signature_free(committer);
+            git_reference_free(head_ref);
+            git_commit_free(head_commit);
+            git_tree_free(tree);
+            smallclueGitPrintLibgitError("commit failed");
+            return 1;
+        }
     }
 
     if (!quiet) {
         char short_oid[16];
         if (smallclueGitOidShort(&commit_oid, 7, short_oid, sizeof(short_oid)) == 0) {
-            printf("[%s] %s\n", short_oid, message);
+            char subject_line[256];
+            subject_line[0] = '\0';
+            (void)smallclueGitCopySubjectLine(final_message, subject_line, sizeof(subject_line));
+            if (subject_line[0] != '\0') {
+                printf("[%s] %s\n", short_oid, subject_line);
+            } else {
+                printf("[%s] %s\n", short_oid, final_message ? final_message : "");
+            }
         }
     }
 
+    free(owned_final_message);
     git_signature_free(author);
     git_signature_free(committer);
     git_reference_free(head_ref);
-    git_commit_free(parent);
+    git_commit_free(head_commit);
     git_tree_free(tree);
     return 0;
 }
@@ -4581,10 +4816,17 @@ static int smallclueGitCommandReset(git_repository *repo, int argc, char **argv)
     git_reset_t mode = GIT_RESET_MIXED;
     const char *revision = "HEAD";
     bool revision_set = false;
+    char *paths[128];
+    size_t path_count = 0;
+    bool after_double_dash = false;
 
     for (int i = 0; i < argc; ++i) {
         const char *arg = argv[i];
         if (!arg) {
+            continue;
+        }
+        if (!after_double_dash && strcmp(arg, "--") == 0) {
+            after_double_dash = true;
             continue;
         }
         if (strcmp(arg, "--soft") == 0) {
@@ -4606,13 +4848,16 @@ static int smallclueGitCommandReset(git_repository *repo, int argc, char **argv)
             smallclueGitPrintError("unsupported reset option");
             return 2;
         }
-        if (!revision_set) {
+        if (!after_double_dash && !revision_set) {
             revision = arg;
             revision_set = true;
             continue;
         }
-        smallclueGitPrintError("pathspec reset is not supported in this phase");
-        return 2;
+        if (path_count >= (sizeof(paths) / sizeof(paths[0]))) {
+            smallclueGitPrintError("too many reset pathspecs");
+            return 2;
+        }
+        paths[path_count++] = (char *)arg;
     }
 
     git_object *target = NULL;
@@ -4621,7 +4866,19 @@ static int smallclueGitCommandReset(git_repository *repo, int argc, char **argv)
         return 128;
     }
 
-    if (git_reset(repo, target, mode, NULL) != 0) {
+    if (path_count > 0) {
+        if (mode != GIT_RESET_MIXED) {
+            git_object_free(target);
+            smallclueGitPrintError("pathspec reset only supports --mixed mode");
+            return 2;
+        }
+        git_strarray pathspec = { paths, path_count };
+        if (git_reset_default(repo, target, &pathspec) != 0) {
+            git_object_free(target);
+            smallclueGitPrintLibgitError("reset pathspec failed");
+            return 1;
+        }
+    } else if (git_reset(repo, target, mode, NULL) != 0) {
         git_object_free(target);
         smallclueGitPrintLibgitError("reset failed");
         return 1;
@@ -4777,10 +5034,21 @@ static int smallclueGitCommandCheckoutCommon(git_repository *repo,
     bool create_force = false;
     const char *create_branch = NULL;
     const char *target_spec = NULL;
+    bool path_mode = false;
+    char *paths[128];
+    size_t path_count = 0;
 
     for (int i = 0; i < argc; ++i) {
         const char *arg = argv[i];
         if (!arg) {
+            continue;
+        }
+        if (path_mode) {
+            if (path_count >= (sizeof(paths) / sizeof(paths[0]))) {
+                smallclueGitPrintError("too many checkout paths");
+                return 2;
+            }
+            paths[path_count++] = (char *)arg;
             continue;
         }
         if (strcmp(arg, "-q") == 0 || strcmp(arg, "--quiet") == 0) {
@@ -4806,8 +5074,8 @@ static int smallclueGitCommandCheckoutCommon(git_repository *repo,
             continue;
         }
         if (strcmp(arg, "--") == 0) {
-            smallclueGitPrintError("path checkout is not supported in this phase (use restore)");
-            return 2;
+            path_mode = true;
+            continue;
         }
         if (arg[0] == '-') {
             smallclueGitPrintError("unsupported checkout option");
@@ -4819,6 +5087,52 @@ static int smallclueGitCommandCheckoutCommon(git_repository *repo,
         }
         smallclueGitPrintError("too many checkout operands");
         return 2;
+    }
+
+    if (path_mode) {
+        if (switch_style) {
+            smallclueGitPrintError("switch does not support path checkout");
+            return 2;
+        }
+        if (detach || create_branch) {
+            smallclueGitPrintError("path checkout does not support branch/detach options");
+            return 2;
+        }
+        if (path_count == 0) {
+            smallclueGitPrintError("checkout -- requires at least one path");
+            return 2;
+        }
+
+        git_strarray pathspec = { paths, path_count };
+        git_object *source_obj = NULL;
+        if (target_spec && *target_spec) {
+            if (git_revparse_single(&source_obj, repo, target_spec) != 0 || !source_obj) {
+                smallclueGitPrintLibgitError("checkout: invalid source revision");
+                return 128;
+            }
+            if (git_reset_default(repo, source_obj, &pathspec) != 0) {
+                git_object_free(source_obj);
+                smallclueGitPrintLibgitError("checkout: failed to update index");
+                return 1;
+            }
+        }
+
+        git_checkout_options checkout_opts = GIT_CHECKOUT_OPTIONS_INIT;
+        checkout_opts.checkout_strategy = GIT_CHECKOUT_FORCE | GIT_CHECKOUT_RECREATE_MISSING;
+        checkout_opts.paths = pathspec;
+        int rc = 0;
+        if (source_obj) {
+            rc = git_checkout_tree(repo, source_obj, &checkout_opts);
+        } else {
+            rc = git_checkout_index(repo, NULL, &checkout_opts);
+        }
+        git_object_free(source_obj);
+        if (rc != 0) {
+            smallclueGitPrintLibgitError("checkout path update failed");
+            return 1;
+        }
+        (void)quiet;
+        return 0;
     }
 
     if (create_branch && !target_spec) {
@@ -5079,9 +5393,68 @@ static int smallclueGitCommandBranchList(git_repository *repo,
                                          bool all,
                                          bool verbose,
                                          int pattern_count,
-                                         char **patterns) {
+                                         char **patterns,
+                                         bool filter_merged,
+                                         bool filter_no_merged,
+                                         const char *filter_target_spec,
+                                         bool filter_contains,
+                                         bool filter_no_contains,
+                                         const char *contains_target_spec,
+                                         bool filter_points_at,
+                                         const char *points_at_spec) {
     git_reference *head = NULL;
     const char *head_name = NULL;
+    git_commit *filter_target = NULL;
+    const git_oid *filter_target_oid = NULL;
+    git_commit *contains_target = NULL;
+    const git_oid *contains_target_oid = NULL;
+    git_commit *points_at_target = NULL;
+    const git_oid *points_at_oid = NULL;
+    int rc_out = 0;
+
+    if (filter_merged && filter_no_merged) {
+        smallclueGitPrintError("branch: --merged and --no-merged are mutually exclusive");
+        return 2;
+    }
+    if (filter_contains && filter_no_contains) {
+        smallclueGitPrintError("branch: --contains and --no-contains are mutually exclusive");
+        return 2;
+    }
+
+    if (filter_merged || filter_no_merged) {
+        const char *target_spec = (filter_target_spec && *filter_target_spec) ? filter_target_spec : "HEAD";
+        if (smallclueGitResolveCommit(repo, target_spec, &filter_target) != 0 || !filter_target) {
+            smallclueGitPrintLibgitError("branch: unable to resolve filter commit");
+            return 128;
+        }
+        filter_target_oid = git_commit_id(filter_target);
+    }
+    if (filter_contains || filter_no_contains) {
+        const char *target_spec = (contains_target_spec && *contains_target_spec) ? contains_target_spec : "HEAD";
+        if (smallclueGitResolveCommit(repo, target_spec, &contains_target) != 0 || !contains_target) {
+            if (filter_target) {
+                git_commit_free(filter_target);
+            }
+            smallclueGitPrintLibgitError("branch: unable to resolve contains commit");
+            return 128;
+        }
+        contains_target_oid = git_commit_id(contains_target);
+    }
+    if (filter_points_at) {
+        const char *target_spec = (points_at_spec && *points_at_spec) ? points_at_spec : "HEAD";
+        if (smallclueGitResolveCommit(repo, target_spec, &points_at_target) != 0 || !points_at_target) {
+            if (filter_target) {
+                git_commit_free(filter_target);
+            }
+            if (contains_target) {
+                git_commit_free(contains_target);
+            }
+            smallclueGitPrintLibgitError("branch: unable to resolve points-at commit");
+            return 128;
+        }
+        points_at_oid = git_commit_id(points_at_target);
+    }
+
     if (git_repository_head(&head, repo) == 0) {
         head_name = git_reference_shorthand(head);
     }
@@ -5090,6 +5463,7 @@ static int smallclueGitCommandBranchList(git_repository *repo,
     git_branch_iterator *it = NULL;
     if (git_branch_iterator_new(&it, repo, branch_flags) != 0) {
         if (head) git_reference_free(head);
+        if (filter_target) git_commit_free(filter_target);
         smallclueGitPrintLibgitError("branch listing failed");
         return 1;
     }
@@ -5131,11 +5505,108 @@ static int smallclueGitCommandBranchList(git_repository *repo,
         e->current = (head_name && strcmp(name, head_name) == 0);
 
         const git_oid *oid = git_reference_target(ref);
+        git_object *peeled_obj = NULL;
         if (!oid) {
-            git_reference *peeled = NULL;
-            if (git_reference_peel((git_object **)&peeled, ref, GIT_OBJECT_COMMIT) == 0 && peeled) {
-                oid = git_reference_target(peeled);
-                git_reference_free(peeled);
+            if (git_reference_peel(&peeled_obj, ref, GIT_OBJECT_COMMIT) == 0 && peeled_obj) {
+                oid = git_object_id(peeled_obj);
+            }
+        }
+
+        if ((filter_merged || filter_no_merged) && oid && filter_target_oid) {
+            bool merged = false;
+            if (git_oid_equal(oid, filter_target_oid)) {
+                merged = true;
+            } else {
+                int grc = git_graph_descendant_of(repo, filter_target_oid, oid);
+                if (grc < 0) {
+                    if (peeled_obj) {
+                        git_object_free(peeled_obj);
+                    }
+                    git_reference_free(ref);
+                    ref = NULL;
+                    rc_out = 1;
+                    smallclueGitPrintLibgitError("branch: merged-filter ancestry check failed");
+                    goto cleanup;
+                }
+                merged = (grc != 0);
+            }
+
+            if ((filter_merged && !merged) || (filter_no_merged && merged)) {
+                if (peeled_obj) {
+                    git_object_free(peeled_obj);
+                }
+                git_reference_free(ref);
+                ref = NULL;
+                count--;
+                free(e->name);
+                e->name = NULL;
+                continue;
+            }
+        } else if ((filter_merged || filter_no_merged) && !oid) {
+            if (peeled_obj) {
+                git_object_free(peeled_obj);
+            }
+            git_reference_free(ref);
+            ref = NULL;
+            count--;
+            free(e->name);
+            e->name = NULL;
+            continue;
+        }
+
+        if ((filter_contains || filter_no_contains) && oid && contains_target_oid) {
+            bool contains = false;
+            if (git_oid_equal(oid, contains_target_oid)) {
+                contains = true;
+            } else {
+                int grc = git_graph_descendant_of(repo, oid, contains_target_oid);
+                if (grc < 0) {
+                    if (peeled_obj) {
+                        git_object_free(peeled_obj);
+                    }
+                    git_reference_free(ref);
+                    ref = NULL;
+                    rc_out = 1;
+                    smallclueGitPrintLibgitError("branch: contains-filter ancestry check failed");
+                    goto cleanup;
+                }
+                contains = (grc != 0);
+            }
+
+            if ((filter_contains && !contains) || (filter_no_contains && contains)) {
+                if (peeled_obj) {
+                    git_object_free(peeled_obj);
+                }
+                git_reference_free(ref);
+                ref = NULL;
+                count--;
+                free(e->name);
+                e->name = NULL;
+                continue;
+            }
+        } else if ((filter_contains || filter_no_contains) && !oid) {
+            if (peeled_obj) {
+                git_object_free(peeled_obj);
+            }
+            git_reference_free(ref);
+            ref = NULL;
+            count--;
+            free(e->name);
+            e->name = NULL;
+            continue;
+        }
+
+        if (filter_points_at && points_at_oid) {
+            if (!oid || !git_oid_equal(oid, points_at_oid)) {
+                if (peeled_obj) {
+                    git_object_free(peeled_obj);
+                }
+                git_reference_free(ref);
+                ref = NULL;
+                count--;
+                free(e->name);
+                e->name = NULL;
+                continue;
             }
         }
 
@@ -5151,16 +5622,38 @@ static int smallclueGitCommandBranchList(git_repository *repo,
             }
         }
 
+        if (peeled_obj) {
+            git_object_free(peeled_obj);
+        }
         git_reference_free(ref);
         ref = NULL;
     }
 
+cleanup:
     if (ref) {
         git_reference_free(ref);
     }
     git_branch_iterator_free(it);
     if (head) {
         git_reference_free(head);
+    }
+    if (filter_target) {
+        git_commit_free(filter_target);
+    }
+    if (contains_target) {
+        git_commit_free(contains_target);
+    }
+    if (points_at_target) {
+        git_commit_free(points_at_target);
+    }
+
+    if (rc_out != 0) {
+        for (size_t i = 0; i < count; ++i) {
+            free(entries[i].name);
+            free(entries[i].subject);
+        }
+        free(entries);
+        return rc_out;
     }
 
     qsort(entries, count, sizeof(*entries), smallclueGitBranchEntryCompare);
@@ -5189,7 +5682,8 @@ static int smallclueGitCommandBranchList(git_repository *repo,
 
 static int smallclueGitCommandBranchCreate(git_repository *repo,
                                            const char *name,
-                                           const char *start_point) {
+                                           const char *start_point,
+                                           bool force) {
     if (!name || !*name) {
         smallclueGitPrintError("branch name is required");
         return 2;
@@ -5202,7 +5696,7 @@ static int smallclueGitCommandBranchCreate(git_repository *repo,
     }
 
     git_reference *created = NULL;
-    if (git_branch_create(&created, repo, name, target, 0) != 0) {
+    if (git_branch_create(&created, repo, name, target, force ? 1 : 0) != 0) {
         git_commit_free(target);
         smallclueGitPrintLibgitError("branch create failed");
         return 1;
@@ -5328,20 +5822,214 @@ static int smallclueGitCommandBranchRename(git_repository *repo,
     return 0;
 }
 
+static int smallclueGitCommandBranchCopy(git_repository *repo,
+                                         int operand_count,
+                                         char **operands,
+                                         bool force) {
+    const char *old_name = NULL;
+    const char *new_name = NULL;
+
+    if (operand_count == 1) {
+        new_name = operands[0];
+        git_reference *head = NULL;
+        if (git_repository_head(&head, repo) != 0 || !head) {
+            fprintf(stderr, "fatal: No branch to copy\n");
+            return 128;
+        }
+        old_name = git_reference_shorthand(head);
+        git_reference_free(head);
+    } else if (operand_count == 2) {
+        old_name = operands[0];
+        new_name = operands[1];
+    } else {
+        smallclueGitPrintError("branch copy expects one or two branch names");
+        return 2;
+    }
+
+    if (!old_name || !*old_name || !new_name || !*new_name) {
+        smallclueGitPrintError("branch copy expects valid branch names");
+        return 2;
+    }
+
+    git_reference *source = NULL;
+    if (git_branch_lookup(&source, repo, old_name, GIT_BRANCH_LOCAL) != 0 || !source) {
+        fprintf(stderr, "error: branch '%s' not found\n", old_name);
+        return 1;
+    }
+
+    git_object *obj = NULL;
+    if (git_reference_peel(&obj, source, GIT_OBJECT_COMMIT) != 0 || !obj) {
+        git_reference_free(source);
+        smallclueGitPrintLibgitError("branch copy failed");
+        return 1;
+    }
+    git_commit *target = (git_commit *)obj;
+
+    git_reference *created = NULL;
+    if (git_branch_create(&created, repo, new_name, target, force ? 1 : 0) != 0 || !created) {
+        git_commit_free(target);
+        git_reference_free(source);
+        smallclueGitPrintLibgitError("branch copy failed");
+        return 1;
+    }
+
+    git_buf upstream_name = GIT_BUF_INIT;
+    const char *source_ref_name = git_reference_name(source);
+    if (source_ref_name &&
+        git_branch_upstream_name(&upstream_name, repo, source_ref_name) == 0 &&
+        upstream_name.ptr &&
+        upstream_name.ptr[0] != '\0') {
+        const char *up_name = upstream_name.ptr;
+        if (strncmp(up_name, "refs/remotes/", 13) == 0 && up_name[13] != '\0') {
+            up_name += 13;
+        }
+        (void)git_branch_set_upstream(created, up_name);
+    }
+
+    git_buf_dispose(&upstream_name);
+    git_reference_free(created);
+    git_commit_free(target);
+    git_reference_free(source);
+    return 0;
+}
+
+static int smallclueGitCommandBranchSetUpstream(git_repository *repo,
+                                                const char *upstream_spec,
+                                                int operand_count,
+                                                char **operands) {
+    if (!upstream_spec || !*upstream_spec) {
+        smallclueGitPrintError("branch --set-upstream-to requires an upstream");
+        return 2;
+    }
+    if (operand_count > 1) {
+        smallclueGitPrintError("branch --set-upstream-to accepts at most one branch name");
+        return 2;
+    }
+
+    char current_branch[256];
+    const char *target_branch = NULL;
+    if (operand_count == 1) {
+        target_branch = operands[0];
+    } else if (smallclueGitCurrentBranchName(repo, current_branch, sizeof(current_branch)) == 0) {
+        target_branch = current_branch;
+    } else {
+        smallclueGitPrintError("could not set upstream: HEAD does not point to a branch");
+        return 1;
+    }
+
+    if (!target_branch || !*target_branch) {
+        smallclueGitPrintError("branch --set-upstream-to requires a valid branch name");
+        return 2;
+    }
+
+    git_reference *branch = NULL;
+    if (git_branch_lookup(&branch, repo, target_branch, GIT_BRANCH_LOCAL) != 0 || !branch) {
+        fprintf(stderr, "error: branch '%s' not found\n", target_branch);
+        return 1;
+    }
+
+    if (git_branch_set_upstream(branch, upstream_spec) != 0) {
+        git_reference_free(branch);
+        smallclueGitPrintLibgitError("branch set-upstream failed");
+        return 1;
+    }
+
+    char upstream_display[512];
+    const char *display = upstream_spec;
+    git_reference *upstream_ref = NULL;
+    if (git_branch_upstream(&upstream_ref, branch) == 0 && upstream_ref) {
+        const char *full = git_reference_name(upstream_ref);
+        if (full && strncmp(full, "refs/remotes/", 13) == 0 && full[13] != '\0') {
+            display = full + 13;
+        } else if (full && *full) {
+            display = full;
+        }
+    }
+    if (snprintf(upstream_display, sizeof(upstream_display), "%s", display ? display : upstream_spec) >= (int)sizeof(upstream_display)) {
+        if (upstream_ref) {
+            git_reference_free(upstream_ref);
+        }
+        git_reference_free(branch);
+        smallclueGitPrintError("upstream name too long");
+        return 2;
+    }
+
+    printf("branch '%s' set up to track '%s'.\n", target_branch, upstream_display);
+
+    if (upstream_ref) {
+        git_reference_free(upstream_ref);
+    }
+    git_reference_free(branch);
+    return 0;
+}
+
+static int smallclueGitCommandBranchUnsetUpstream(git_repository *repo,
+                                                  int operand_count,
+                                                  char **operands) {
+    if (operand_count > 1) {
+        smallclueGitPrintError("branch --unset-upstream accepts at most one branch name");
+        return 2;
+    }
+
+    char current_branch[256];
+    const char *target_branch = NULL;
+    if (operand_count == 1) {
+        target_branch = operands[0];
+    } else if (smallclueGitCurrentBranchName(repo, current_branch, sizeof(current_branch)) == 0) {
+        target_branch = current_branch;
+    } else {
+        smallclueGitPrintError("could not unset upstream: HEAD does not point to a branch");
+        return 1;
+    }
+
+    if (!target_branch || !*target_branch) {
+        smallclueGitPrintError("branch --unset-upstream requires a valid branch name");
+        return 2;
+    }
+
+    git_reference *branch = NULL;
+    if (git_branch_lookup(&branch, repo, target_branch, GIT_BRANCH_LOCAL) != 0 || !branch) {
+        fprintf(stderr, "error: branch '%s' not found\n", target_branch);
+        return 1;
+    }
+
+    if (git_branch_set_upstream(branch, NULL) != 0) {
+        git_reference_free(branch);
+        smallclueGitPrintLibgitError("branch unset-upstream failed");
+        return 1;
+    }
+
+    git_reference_free(branch);
+    return 0;
+}
+
 static int smallclueGitCommandBranch(git_repository *repo, int argc, char **argv) {
     enum {
         SMALLCLUE_BRANCH_LIST = 0,
         SMALLCLUE_BRANCH_CREATE,
         SMALLCLUE_BRANCH_DELETE,
         SMALLCLUE_BRANCH_RENAME,
+        SMALLCLUE_BRANCH_COPY,
         SMALLCLUE_BRANCH_SHOW_CURRENT,
+        SMALLCLUE_BRANCH_SET_UPSTREAM,
+        SMALLCLUE_BRANCH_UNSET_UPSTREAM,
     } action = SMALLCLUE_BRANCH_LIST;
 
     bool all = false;
     bool verbose = false;
     bool explicit_list = false;
     bool force = false;
+    bool create_force = false;
+    bool filter_merged = false;
+    bool filter_no_merged = false;
+    const char *filter_target_spec = NULL;
+    bool filter_contains = false;
+    bool filter_no_contains = false;
+    const char *contains_target_spec = NULL;
+    bool filter_points_at = false;
+    const char *points_at_spec = NULL;
     int operand_start = argc;
+    const char *set_upstream_to = NULL;
 
     for (int i = 0; i < argc; ++i) {
         const char *arg = argv[i];
@@ -5369,35 +6057,152 @@ static int smallclueGitCommandBranch(git_repository *repo, int argc, char **argv
             explicit_list = true;
             continue;
         }
-        if (strcmp(arg, "-d") == 0) {
-            action = SMALLCLUE_BRANCH_DELETE;
-            force = false;
+        if (strcmp(arg, "--merged") == 0) {
+            filter_merged = true;
+            action = SMALLCLUE_BRANCH_LIST;
+            explicit_list = true;
+            if (i + 1 < argc && argv[i + 1] && argv[i + 1][0] != '-') {
+                filter_target_spec = argv[++i];
+            }
+            continue;
+        }
+        if (strncmp(arg, "--merged=", 9) == 0) {
+            filter_merged = true;
+            action = SMALLCLUE_BRANCH_LIST;
+            explicit_list = true;
+            filter_target_spec = arg + 9;
+            continue;
+        }
+        if (strcmp(arg, "--no-merged") == 0) {
+            filter_no_merged = true;
+            action = SMALLCLUE_BRANCH_LIST;
+            explicit_list = true;
+            if (i + 1 < argc && argv[i + 1] && argv[i + 1][0] != '-') {
+                filter_target_spec = argv[++i];
+            }
+            continue;
+        }
+        if (strncmp(arg, "--no-merged=", 12) == 0) {
+            filter_no_merged = true;
+            action = SMALLCLUE_BRANCH_LIST;
+            explicit_list = true;
+            filter_target_spec = arg + 12;
+            continue;
+        }
+        if (strcmp(arg, "--contains") == 0) {
+            filter_contains = true;
+            action = SMALLCLUE_BRANCH_LIST;
+            explicit_list = true;
+            if (i + 1 < argc && argv[i + 1] && argv[i + 1][0] != '-') {
+                contains_target_spec = argv[++i];
+            }
+            continue;
+        }
+        if (strncmp(arg, "--contains=", 11) == 0) {
+            filter_contains = true;
+            action = SMALLCLUE_BRANCH_LIST;
+            explicit_list = true;
+            contains_target_spec = arg + 11;
+            continue;
+        }
+        if (strcmp(arg, "--no-contains") == 0) {
+            filter_no_contains = true;
+            action = SMALLCLUE_BRANCH_LIST;
+            explicit_list = true;
+            if (i + 1 < argc && argv[i + 1] && argv[i + 1][0] != '-') {
+                contains_target_spec = argv[++i];
+            }
+            continue;
+        }
+        if (strncmp(arg, "--no-contains=", 14) == 0) {
+            filter_no_contains = true;
+            action = SMALLCLUE_BRANCH_LIST;
+            explicit_list = true;
+            contains_target_spec = arg + 14;
+            continue;
+        }
+        if (strcmp(arg, "--points-at") == 0) {
+            filter_points_at = true;
+            action = SMALLCLUE_BRANCH_LIST;
+            explicit_list = true;
+            if (i + 1 < argc && argv[i + 1] && argv[i + 1][0] != '-') {
+                points_at_spec = argv[++i];
+            }
+            continue;
+        }
+        if (strncmp(arg, "--points-at=", 12) == 0) {
+            filter_points_at = true;
+            action = SMALLCLUE_BRANCH_LIST;
+            explicit_list = true;
+            points_at_spec = arg + 12;
+            continue;
+        }
+        if (strcmp(arg, "-f") == 0 || strcmp(arg, "--force") == 0) {
+            create_force = true;
+            force = true;
+            continue;
+        }
+        if (strcmp(arg, "-u") == 0 || strcmp(arg, "--set-upstream-to") == 0 || strcmp(arg, "--set-upstream") == 0) {
+            if (i + 1 >= argc) {
+                smallclueGitPrintError("branch --set-upstream-to requires an upstream");
+                return 2;
+            }
+            set_upstream_to = argv[++i];
+            action = SMALLCLUE_BRANCH_SET_UPSTREAM;
             operand_start = i + 1;
-            break;
+            continue;
+        }
+        if (strncmp(arg, "--set-upstream-to=", 18) == 0) {
+            set_upstream_to = arg + 18;
+            action = SMALLCLUE_BRANCH_SET_UPSTREAM;
+            operand_start = i + 1;
+            continue;
+        }
+        if (strcmp(arg, "--unset-upstream") == 0) {
+            action = SMALLCLUE_BRANCH_UNSET_UPSTREAM;
+            operand_start = i + 1;
+            continue;
+        }
+        if (strcmp(arg, "-d") == 0 || strcmp(arg, "--delete") == 0) {
+            action = SMALLCLUE_BRANCH_DELETE;
+            continue;
         }
         if (strcmp(arg, "-D") == 0) {
             action = SMALLCLUE_BRANCH_DELETE;
             force = true;
-            operand_start = i + 1;
-            break;
+            continue;
         }
-        if (strcmp(arg, "-m") == 0) {
+        if (strcmp(arg, "-m") == 0 || strcmp(arg, "--move") == 0) {
             action = SMALLCLUE_BRANCH_RENAME;
-            force = false;
-            operand_start = i + 1;
-            break;
+            continue;
         }
         if (strcmp(arg, "-M") == 0) {
             action = SMALLCLUE_BRANCH_RENAME;
             force = true;
-            operand_start = i + 1;
-            break;
+            continue;
+        }
+        if (strcmp(arg, "-c") == 0 || strcmp(arg, "--copy") == 0) {
+            action = SMALLCLUE_BRANCH_COPY;
+            continue;
+        }
+        if (strcmp(arg, "-C") == 0) {
+            action = SMALLCLUE_BRANCH_COPY;
+            force = true;
+            continue;
         }
         if (arg[0] == '-') {
             smallclueGitPrintError("unsupported branch option");
             return 2;
         }
 
+        if (action == SMALLCLUE_BRANCH_SET_UPSTREAM ||
+            action == SMALLCLUE_BRANCH_UNSET_UPSTREAM ||
+            action == SMALLCLUE_BRANCH_DELETE ||
+            action == SMALLCLUE_BRANCH_RENAME ||
+            action == SMALLCLUE_BRANCH_COPY) {
+            operand_start = i;
+            break;
+        }
         operand_start = i;
         action = explicit_list ? SMALLCLUE_BRANCH_LIST : SMALLCLUE_BRANCH_CREATE;
         break;
@@ -5410,7 +6215,19 @@ static int smallclueGitCommandBranch(git_repository *repo, int argc, char **argv
             pattern_count = argc - operand_start;
             patterns = &argv[operand_start];
         }
-        return smallclueGitCommandBranchList(repo, all, verbose, pattern_count, patterns);
+        return smallclueGitCommandBranchList(repo,
+                                             all,
+                                             verbose,
+                                             pattern_count,
+                                             patterns,
+                                             filter_merged,
+                                             filter_no_merged,
+                                             filter_target_spec,
+                                             filter_contains,
+                                             filter_no_contains,
+                                             contains_target_spec,
+                                             filter_points_at,
+                                             points_at_spec);
     }
 
     if (action == SMALLCLUE_BRANCH_CREATE) {
@@ -5421,7 +6238,7 @@ static int smallclueGitCommandBranch(git_repository *repo, int argc, char **argv
         }
         const char *name = argv[operand_start];
         const char *start_point = (count > 1) ? argv[operand_start + 1] : NULL;
-        return smallclueGitCommandBranchCreate(repo, name, start_point);
+        return smallclueGitCommandBranchCreate(repo, name, start_point, create_force);
     }
 
     if (action == SMALLCLUE_BRANCH_DELETE) {
@@ -5436,6 +6253,11 @@ static int smallclueGitCommandBranch(git_repository *repo, int argc, char **argv
     if (action == SMALLCLUE_BRANCH_RENAME) {
         int count = (operand_start < argc) ? (argc - operand_start) : 0;
         return smallclueGitCommandBranchRename(repo, count, &argv[operand_start], force);
+    }
+
+    if (action == SMALLCLUE_BRANCH_COPY) {
+        int count = (operand_start < argc) ? (argc - operand_start) : 0;
+        return smallclueGitCommandBranchCopy(repo, count, &argv[operand_start], force);
     }
 
     if (action == SMALLCLUE_BRANCH_SHOW_CURRENT) {
@@ -5460,6 +6282,16 @@ static int smallclueGitCommandBranch(git_repository *repo, int argc, char **argv
         }
         smallclueGitPrintLibgitError("branch --show-current failed");
         return 1;
+    }
+
+    if (action == SMALLCLUE_BRANCH_SET_UPSTREAM) {
+        int count = (operand_start < argc) ? (argc - operand_start) : 0;
+        return smallclueGitCommandBranchSetUpstream(repo, set_upstream_to, count, &argv[operand_start]);
+    }
+
+    if (action == SMALLCLUE_BRANCH_UNSET_UPSTREAM) {
+        int count = (operand_start < argc) ? (argc - operand_start) : 0;
+        return smallclueGitCommandBranchUnsetUpstream(repo, count, &argv[operand_start]);
     }
 
     smallclueGitPrintError("unsupported branch mode");
@@ -6070,15 +6902,35 @@ static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
     bool oneline = false;
     bool decorate = false;
     bool reverse = false;
+    bool log_all = false;
     int max_count = -1;
     const char *author_filter = NULL;
     const char *grep_filter = NULL;
+    char *rev_specs[64];
+    int rev_spec_count = 0;
+    bool parse_options = true;
 
     for (int i = 0; i < argc; ++i) {
         const char *arg = argv[i];
         if (!arg) continue;
+        if (parse_options && strcmp(arg, "--") == 0) {
+            parse_options = false;
+            continue;
+        }
+        if (!parse_options) {
+            if (rev_spec_count >= (int)(sizeof(rev_specs) / sizeof(rev_specs[0]))) {
+                smallclueGitPrintError("too many log revision arguments");
+                return 2;
+            }
+            rev_specs[rev_spec_count++] = argv[i];
+            continue;
+        }
         if (strcmp(arg, "--oneline") == 0) {
             oneline = true;
+            continue;
+        }
+        if (strcmp(arg, "--all") == 0) {
+            log_all = true;
             continue;
         }
         if (strcmp(arg, "--decorate") == 0) {
@@ -6122,6 +6974,11 @@ static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
             smallclueGitPrintError("unsupported log option");
             return 2;
         }
+        if (rev_spec_count >= (int)(sizeof(rev_specs) / sizeof(rev_specs[0]))) {
+            smallclueGitPrintError("too many log revision arguments");
+            return 2;
+        }
+        rev_specs[rev_spec_count++] = argv[i];
     }
 
     git_revwalk *walk = NULL;
@@ -6130,10 +6987,68 @@ static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
         return 1;
     }
     git_revwalk_sorting(walk, GIT_SORT_TOPOLOGICAL | GIT_SORT_TIME);
-    if (git_revwalk_push_head(walk) != 0) {
-        git_revwalk_free(walk);
-        smallclueGitPrintLibgitError("log push HEAD failed");
-        return 1;
+
+    if (log_all) {
+        int all_rc = git_revwalk_push_glob(walk, "refs/*");
+        if (all_rc != 0 && all_rc != GIT_ENOTFOUND) {
+            git_revwalk_free(walk);
+            smallclueGitPrintLibgitError("log --all failed");
+            return 1;
+        }
+    }
+
+    if (!log_all && rev_spec_count == 0) {
+        if (git_revwalk_push_head(walk) != 0) {
+            git_revwalk_free(walk);
+            smallclueGitPrintLibgitError("log push HEAD failed");
+            return 1;
+        }
+    }
+
+    for (int i = 0; i < rev_spec_count; ++i) {
+        const char *spec = rev_specs[i];
+        if (!spec || !*spec) {
+            continue;
+        }
+        if (strstr(spec, "..")) {
+            if (git_revwalk_push_range(walk, spec) != 0) {
+                git_revwalk_free(walk);
+                smallclueGitPrintLibgitError("log: unable to resolve revision range");
+                return 128;
+            }
+            continue;
+        }
+        if (spec[0] == '^' && spec[1] != '\0') {
+            git_commit *hide_commit = NULL;
+            if (smallclueGitResolveCommit(repo, spec + 1, &hide_commit) != 0 || !hide_commit) {
+                git_revwalk_free(walk);
+                smallclueGitPrintLibgitError("log: unable to resolve revision");
+                return 128;
+            }
+            const git_oid *hide_oid = git_commit_id(hide_commit);
+            int hrc = hide_oid ? git_revwalk_hide(walk, hide_oid) : -1;
+            git_commit_free(hide_commit);
+            if (hrc != 0) {
+                git_revwalk_free(walk);
+                smallclueGitPrintLibgitError("log: unable to hide revision");
+                return 128;
+            }
+            continue;
+        }
+        git_commit *push_commit = NULL;
+        if (smallclueGitResolveCommit(repo, spec, &push_commit) != 0 || !push_commit) {
+            git_revwalk_free(walk);
+            smallclueGitPrintLibgitError("log: unable to resolve revision");
+            return 128;
+        }
+        const git_oid *push_oid = git_commit_id(push_commit);
+        int prc = push_oid ? git_revwalk_push(walk, push_oid) : -1;
+        git_commit_free(push_commit);
+        if (prc != 0) {
+            git_revwalk_free(walk);
+            smallclueGitPrintLibgitError("log: unable to push revision");
+            return 128;
+        }
     }
 
     git_reference *head = NULL;
