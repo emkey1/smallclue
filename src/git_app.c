@@ -8864,6 +8864,106 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
         return 0;
     }
 
+    if (strcmp(sub, "set-head") == 0) {
+        const char *name = NULL;
+        const char *branch = NULL;
+        bool delete_mode = false;
+        bool auto_mode = false;
+        for (int i = 0; i < subargc; ++i) {
+            const char *arg = subargv[i];
+            if (!arg) {
+                continue;
+            }
+            if (strcmp(arg, "-d") == 0 || strcmp(arg, "--delete") == 0) {
+                delete_mode = true;
+                continue;
+            }
+            if (strcmp(arg, "-a") == 0 || strcmp(arg, "--auto") == 0) {
+                auto_mode = true;
+                continue;
+            }
+            if (arg[0] == '-') {
+                smallclueGitPrintError("unsupported remote set-head option");
+                return 2;
+            }
+            if (!name) {
+                name = arg;
+                continue;
+            }
+            if (!branch) {
+                branch = arg;
+                continue;
+            }
+            smallclueGitPrintError("usage: git remote set-head <name> (-d|--delete|<branch>)");
+            return 2;
+        }
+
+        if (!name || !*name) {
+            smallclueGitPrintError("usage: git remote set-head <name> (-d|--delete|<branch>)");
+            return 2;
+        }
+        if (auto_mode) {
+            smallclueGitPrintError("remote set-head: --auto is not supported");
+            return 2;
+        }
+        if (delete_mode && branch) {
+            smallclueGitPrintError("remote set-head: cannot combine --delete with a branch name");
+            return 2;
+        }
+        if (!delete_mode && (!branch || !*branch)) {
+            smallclueGitPrintError("usage: git remote set-head <name> (-d|--delete|<branch>)");
+            return 2;
+        }
+
+        git_remote *remote = NULL;
+        if (git_remote_lookup(&remote, repo, name) != 0 || !remote) {
+            smallclueGitPrintLibgitError("remote set-head lookup failed");
+            return 1;
+        }
+        git_remote_free(remote);
+
+        char head_ref_name[512];
+        if (snprintf(head_ref_name, sizeof(head_ref_name), "refs/remotes/%s/HEAD", name) >= (int)sizeof(head_ref_name)) {
+            smallclueGitPrintError("remote set-head: remote name too long");
+            return 2;
+        }
+
+        if (delete_mode) {
+            int rc = git_reference_remove(repo, head_ref_name);
+            if (rc != 0 && rc != GIT_ENOTFOUND) {
+                smallclueGitPrintLibgitError("remote set-head delete failed");
+                return 1;
+            }
+            return 0;
+        }
+
+        char target_ref_name[1024];
+        if (snprintf(target_ref_name, sizeof(target_ref_name), "refs/remotes/%s/%s", name, branch) >= (int)sizeof(target_ref_name)) {
+            smallclueGitPrintError("remote set-head: target reference too long");
+            return 2;
+        }
+
+        git_reference *target_ref = NULL;
+        if (git_reference_lookup(&target_ref, repo, target_ref_name) != 0 || !target_ref) {
+            smallclueGitPrintLibgitError("remote set-head: target branch not found");
+            return 1;
+        }
+        git_reference_free(target_ref);
+
+        git_reference *new_ref = NULL;
+        if (git_reference_symbolic_create(&new_ref,
+                                          repo,
+                                          head_ref_name,
+                                          target_ref_name,
+                                          1,
+                                          "remote set-head") != 0 || !new_ref) {
+            smallclueGitPrintLibgitError("remote set-head failed");
+            return 1;
+        }
+        git_reference_free(new_ref);
+        return 0;
+    }
+
     smallclueGitPrintError("unsupported remote subcommand");
     return 2;
 }
