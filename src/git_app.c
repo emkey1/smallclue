@@ -9316,6 +9316,229 @@ static int smallclueGitCommandRemote(git_repository *repo, int argc, char **argv
         return 0;
     }
 
+    if (strcmp(sub, "show") == 0) {
+        bool no_query = false;
+        const char *name = NULL;
+        for (int i = 0; i < subargc; ++i) {
+            const char *arg = subargv[i];
+            if (!arg) {
+                continue;
+            }
+            if (strcmp(arg, "-n") == 0 || strcmp(arg, "--no-query") == 0) {
+                no_query = true;
+                continue;
+            }
+            if (arg[0] == '-') {
+                smallclueGitPrintError("unsupported remote show option");
+                return 2;
+            }
+            if (!name) {
+                name = arg;
+                continue;
+            }
+            smallclueGitPrintError("usage: git remote show [-n] <name>");
+            return 2;
+        }
+        if (!name || !*name) {
+            smallclueGitPrintError("usage: git remote show [-n] <name>");
+            return 2;
+        }
+
+        git_remote *remote = NULL;
+        if (git_remote_lookup(&remote, repo, name) != 0 || !remote) {
+            smallclueGitPrintLibgitError("remote show lookup failed");
+            return 1;
+        }
+
+        const char *fetch_url = git_remote_url(remote);
+        const char *push_url = git_remote_pushurl(remote);
+        if (!push_url || !*push_url) {
+            push_url = fetch_url;
+        }
+        char display_fetch[PATH_MAX];
+        char display_push[PATH_MAX];
+        const char *shown_fetch = smallclueGitDisplayMaybePath(fetch_url, display_fetch, sizeof(display_fetch));
+        const char *shown_push = smallclueGitDisplayMaybePath(push_url, display_push, sizeof(display_push));
+
+        printf("* remote %s\n", name);
+        printf("  Fetch URL: %s\n", shown_fetch ? shown_fetch : "");
+        printf("  Push  URL: %s\n", shown_push ? shown_push : "");
+
+        SmallclueGitConfigValueList remote_branches = {0};
+        SmallclueGitConfigValueList pull_lines = {0};
+        char head_branch[512] = {0};
+
+        if (no_query) {
+            printf("  HEAD branch: (not queried)\n");
+            char prefix[512];
+            char head_ref[512];
+            if (snprintf(prefix, sizeof(prefix), "refs/remotes/%s/", name) >= (int)sizeof(prefix) ||
+                snprintf(head_ref, sizeof(head_ref), "refs/remotes/%s/HEAD", name) >= (int)sizeof(head_ref)) {
+                smallclueGitConfigValueListFree(&remote_branches);
+                smallclueGitConfigValueListFree(&pull_lines);
+                git_remote_free(remote);
+                smallclueGitPrintError("remote show: remote name too long");
+                return 2;
+            }
+            git_reference_iterator *it = NULL;
+            if (git_reference_iterator_new(&it, repo) == 0 && it) {
+                git_reference *ref = NULL;
+                while (git_reference_next(&ref, it) == 0) {
+                    const char *ref_name = git_reference_name(ref);
+                    if (ref_name && strcmp(ref_name, head_ref) != 0 && smallclueGitStartsWith(ref_name, prefix)) {
+                        const char *branch_name = ref_name + strlen(prefix);
+                        if (branch_name && *branch_name) {
+                            if (smallclueGitConfigValueListAppend(&remote_branches, branch_name) != 0) {
+                                git_reference_free(ref);
+                                git_reference_iterator_free(it);
+                                smallclueGitConfigValueListFree(&remote_branches);
+                                smallclueGitConfigValueListFree(&pull_lines);
+                                git_remote_free(remote);
+                                smallclueGitPrintError("remote show: out of memory");
+                                return 1;
+                            }
+                        }
+                    }
+                    git_reference_free(ref);
+                    ref = NULL;
+                }
+                git_reference_iterator_free(it);
+            }
+        } else {
+            git_remote_connect_options connect_opts = GIT_REMOTE_CONNECT_OPTIONS_INIT;
+            int rc = git_remote_connect(remote, GIT_DIRECTION_FETCH, &connect_opts.callbacks, NULL, NULL);
+            if (rc != 0) {
+                smallclueGitConfigValueListFree(&remote_branches);
+                smallclueGitConfigValueListFree(&pull_lines);
+                git_remote_free(remote);
+                smallclueGitPrintLibgitError("remote show connect failed");
+                return 1;
+            }
+
+            git_buf default_branch = {0};
+            if (git_remote_default_branch(&default_branch, remote) == 0 &&
+                default_branch.ptr && *default_branch.ptr) {
+                const char *branch_name = default_branch.ptr;
+                if (smallclueGitStartsWith(branch_name, "refs/heads/")) {
+                    branch_name += strlen("refs/heads/");
+                }
+                if (branch_name && *branch_name) {
+                    (void)snprintf(head_branch, sizeof(head_branch), "%s", branch_name);
+                }
+            }
+            git_buf_dispose(&default_branch);
+            printf("  HEAD branch: %s\n", head_branch[0] ? head_branch : "(unknown)");
+
+            const git_remote_head **remote_heads = NULL;
+            size_t remote_head_count = 0;
+            if (git_remote_ls(&remote_heads, &remote_head_count, remote) != 0) {
+                git_remote_disconnect(remote);
+                smallclueGitConfigValueListFree(&remote_branches);
+                smallclueGitConfigValueListFree(&pull_lines);
+                git_remote_free(remote);
+                smallclueGitPrintLibgitError("remote show listing failed");
+                return 1;
+            }
+            for (size_t i = 0; i < remote_head_count; ++i) {
+                const git_remote_head *head = remote_heads[i];
+                if (!head || !head->name || !smallclueGitStartsWith(head->name, "refs/heads/")) {
+                    continue;
+                }
+                const char *branch_name = head->name + strlen("refs/heads/");
+                if (!branch_name || !*branch_name) {
+                    continue;
+                }
+                if (smallclueGitConfigValueListAppend(&remote_branches, branch_name) != 0) {
+                    git_remote_disconnect(remote);
+                    smallclueGitConfigValueListFree(&remote_branches);
+                    smallclueGitConfigValueListFree(&pull_lines);
+                    git_remote_free(remote);
+                    smallclueGitPrintError("remote show: out of memory");
+                    return 1;
+                }
+            }
+            git_remote_disconnect(remote);
+        }
+
+        if (remote_branches.count > 1) {
+            qsort(remote_branches.items, remote_branches.count, sizeof(char *), smallclueGitCompareCStringPtr);
+        }
+        if (no_query) {
+            printf("  Remote branch: (status not queried)\n");
+            for (size_t i = 0; i < remote_branches.count; ++i) {
+                printf("    %s\n", remote_branches.items[i]);
+            }
+        } else if (remote_branches.count == 0) {
+            printf("  Remote branch: (none)\n");
+        } else {
+            printf("  %s:\n", (remote_branches.count == 1) ? "Remote branch" : "Remote branches");
+            for (size_t i = 0; i < remote_branches.count; ++i) {
+                printf("    %s tracked\n", remote_branches.items[i]);
+            }
+        }
+
+        char upstream_prefix[512];
+        if (snprintf(upstream_prefix, sizeof(upstream_prefix), "refs/remotes/%s/", name) >= (int)sizeof(upstream_prefix)) {
+            smallclueGitConfigValueListFree(&remote_branches);
+            smallclueGitConfigValueListFree(&pull_lines);
+            git_remote_free(remote);
+            smallclueGitPrintError("remote show: remote name too long");
+            return 2;
+        }
+        git_branch_iterator *bit = NULL;
+        if (git_branch_iterator_new(&bit, repo, GIT_BRANCH_LOCAL) == 0 && bit) {
+            git_reference *local_ref = NULL;
+            git_branch_t local_type = GIT_BRANCH_LOCAL;
+            while (git_branch_next(&local_ref, &local_type, bit) == 0) {
+                const char *local_name = NULL;
+                if (git_branch_name(&local_name, local_ref) == 0 && local_name && *local_name) {
+                    git_reference *upstream_ref = NULL;
+                    if (git_branch_upstream(&upstream_ref, local_ref) == 0 && upstream_ref) {
+                        const char *up_name = git_reference_name(upstream_ref);
+                        if (up_name && smallclueGitStartsWith(up_name, upstream_prefix)) {
+                            const char *remote_branch = up_name + strlen(upstream_prefix);
+                            char line[1024];
+                            if (remote_branch && *remote_branch &&
+                                snprintf(line, sizeof(line), "%s merges with remote %s", local_name, remote_branch) < (int)sizeof(line)) {
+                                if (smallclueGitConfigValueListAppend(&pull_lines, line) != 0) {
+                                    git_reference_free(upstream_ref);
+                                    git_reference_free(local_ref);
+                                    git_branch_iterator_free(bit);
+                                    smallclueGitConfigValueListFree(&remote_branches);
+                                    smallclueGitConfigValueListFree(&pull_lines);
+                                    git_remote_free(remote);
+                                    smallclueGitPrintError("remote show: out of memory");
+                                    return 1;
+                                }
+                            }
+                        }
+                        git_reference_free(upstream_ref);
+                    }
+                }
+                git_reference_free(local_ref);
+                local_ref = NULL;
+            }
+            git_branch_iterator_free(bit);
+        }
+        if (pull_lines.count > 1) {
+            qsort(pull_lines.items, pull_lines.count, sizeof(char *), smallclueGitCompareCStringPtr);
+        }
+        if (pull_lines.count > 0) {
+            printf("  %s for 'git pull':\n",
+                   (pull_lines.count == 1)
+                       ? "Local branch configured"
+                       : "Local branches configured");
+            for (size_t i = 0; i < pull_lines.count; ++i) {
+                printf("    %s\n", pull_lines.items[i]);
+            }
+        }
+
+        smallclueGitConfigValueListFree(&remote_branches);
+        smallclueGitConfigValueListFree(&pull_lines);
+        git_remote_free(remote);
+        return 0;
+    }
+
     smallclueGitPrintError("unsupported remote subcommand");
     return 2;
 }
