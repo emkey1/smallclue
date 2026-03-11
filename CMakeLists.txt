@@ -57,6 +57,11 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/third-party/ios_system/ssh_keygen/openbsd-compat
 )
 
+set(OPENRSYNC_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../third-party/openrsync)
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated/openrsync)
+configure_file(${OPENRSYNC_ROOT}/config_pscal.h
+    ${CMAKE_CURRENT_BINARY_DIR}/generated/openrsync/config.h COPYONLY)
+
 # Source files
 set(NEXTVI_SOURCES third-party/nextvi/vi.c)
 
@@ -95,6 +100,7 @@ list(APPEND OPENSSH_SOURCES
 set(SOURCES
     src/main.c
     src/core.c
+    src/openrsync_app.c
     src/micro_app.c
     src/nextvi_app.c
     src/openssh_app.c
@@ -104,6 +110,31 @@ set(SOURCES
     src/openssh_shim.c
     ${NEXTVI_SOURCES}
     ${OPENSSH_SOURCES}
+    ${OPENRSYNC_ROOT}/blocks.c
+    ${OPENRSYNC_ROOT}/client.c
+    ${OPENRSYNC_ROOT}/compats.c
+    ${OPENRSYNC_ROOT}/copy.c
+    ${OPENRSYNC_ROOT}/downloader.c
+    ${OPENRSYNC_ROOT}/fargs.c
+    ${OPENRSYNC_ROOT}/flist.c
+    ${OPENRSYNC_ROOT}/hash.c
+    ${OPENRSYNC_ROOT}/ids.c
+    ${OPENRSYNC_ROOT}/io.c
+    ${OPENRSYNC_ROOT}/log.c
+    ${OPENRSYNC_ROOT}/main.c
+    ${OPENRSYNC_ROOT}/md4.c
+    ${OPENRSYNC_ROOT}/misc.c
+    ${OPENRSYNC_ROOT}/mkpath.c
+    ${OPENRSYNC_ROOT}/mktemp.c
+    ${OPENRSYNC_ROOT}/receiver.c
+    ${OPENRSYNC_ROOT}/rmatch.c
+    ${OPENRSYNC_ROOT}/rules.c
+    ${OPENRSYNC_ROOT}/sender.c
+    ${OPENRSYNC_ROOT}/server.c
+    ${OPENRSYNC_ROOT}/session.c
+    ${OPENRSYNC_ROOT}/socket.c
+    ${OPENRSYNC_ROOT}/symlinks.c
+    ${OPENRSYNC_ROOT}/uploader.c
 )
 
 set_source_files_properties(${NEXTVI_SOURCES} PROPERTIES COMPILE_DEFINITIONS "main=nextvi_main_entry")
@@ -111,6 +142,42 @@ set_source_files_properties(third-party/ios_system/ssh_keygen/ssh.c PROPERTIES C
 set_source_files_properties(third-party/ios_system/ssh_keygen/scp.c PROPERTIES COMPILE_DEFINITIONS "scp_main=pscal_openssh_scp_main")
 set_source_files_properties(third-party/ios_system/ssh_keygen/sftp.c PROPERTIES COMPILE_DEFINITIONS "sftp_main=pscal_openssh_sftp_main")
 set_source_files_properties(third-party/ios_system/ssh_keygen/ssh-keygen.c PROPERTIES COMPILE_DEFINITIONS "sshkeygen_main=pscal_openssh_ssh_keygen_main")
+set_source_files_properties(${OPENRSYNC_ROOT}/main.c PROPERTIES COMPILE_DEFINITIONS "main=pscal_openrsync_main")
+set_source_files_properties(
+    ${OPENRSYNC_ROOT}/blocks.c
+    ${OPENRSYNC_ROOT}/client.c
+    ${OPENRSYNC_ROOT}/compats.c
+    ${OPENRSYNC_ROOT}/copy.c
+    ${OPENRSYNC_ROOT}/downloader.c
+    ${OPENRSYNC_ROOT}/fargs.c
+    ${OPENRSYNC_ROOT}/flist.c
+    ${OPENRSYNC_ROOT}/hash.c
+    ${OPENRSYNC_ROOT}/ids.c
+    ${OPENRSYNC_ROOT}/io.c
+    ${OPENRSYNC_ROOT}/log.c
+    ${OPENRSYNC_ROOT}/main.c
+    ${OPENRSYNC_ROOT}/md4.c
+    ${OPENRSYNC_ROOT}/misc.c
+    ${OPENRSYNC_ROOT}/mkpath.c
+    ${OPENRSYNC_ROOT}/mktemp.c
+    ${OPENRSYNC_ROOT}/receiver.c
+    ${OPENRSYNC_ROOT}/rmatch.c
+    ${OPENRSYNC_ROOT}/rules.c
+    ${OPENRSYNC_ROOT}/sender.c
+    ${OPENRSYNC_ROOT}/server.c
+    ${OPENRSYNC_ROOT}/session.c
+    ${OPENRSYNC_ROOT}/socket.c
+    ${OPENRSYNC_ROOT}/symlinks.c
+    ${OPENRSYNC_ROOT}/uploader.c
+    PROPERTIES
+    COMPILE_DEFINITIONS
+        "err=pscal_openrsync_err;errc=pscal_openrsync_errc;errx=pscal_openrsync_errx;warn=pscal_openrsync_warn;warnc=pscal_openrsync_warnc;warnx=pscal_openrsync_warnx;exit=pscal_openrsync_request_exit;getprogname=pscal_openrsync_getprogname"
+    COMPILE_OPTIONS
+        "-include${CMAKE_CURRENT_BINARY_DIR}/generated/openrsync/config.h"
+        "-include${CMAKE_CURRENT_SOURCE_DIR}/src/openrsync_hooks.h"
+    INCLUDE_DIRECTORIES
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/openrsync;${OPENRSYNC_ROOT}"
+)
 
 add_compile_definitions(HAVE_CONFIG_H)
 

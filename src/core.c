@@ -10,6 +10,7 @@
 #include "micro_app.h"
 #include "nextvi_app.h"
 #include "openssh_app.h"
+#include "openrsync_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -16322,6 +16323,31 @@ typedef struct {
     const char *filter_dest_root;
 } SmallclueRsyncOptions;
 
+static bool smallclueRsyncLegacyFallbackEnabled(void) {
+    int parsed = pagerParseEnvBool(getenv("PSCALI_RSYNC_LEGACY"));
+    return parsed == 1;
+}
+
+static int smallclueRunNativeRsyncCommand(int argc, char **argv) {
+    if (argc <= 0 || !argv || !argv[0]) {
+        return 1;
+    }
+
+    char exec_path[PATH_MAX];
+    if (!smallclueResolveCommandPathForExec("rsync", exec_path, sizeof(exec_path))) {
+        fprintf(stderr,
+                "rsync: no native rsync backend found in PATH; "
+                "install/provide a real rsync binary or set PSCALI_RSYNC_LEGACY=1\n");
+        return 127;
+    }
+
+    setenv("PSCALI_RSYNC_EXTERNAL_DELEGATE_ACTIVE", "1", 1);
+    execv(exec_path, argv);
+    int err = errno;
+    fprintf(stderr, "rsync: %s: %s\n", exec_path, strerror(err));
+    return (err == ENOENT) ? 127 : 126;
+}
+
 static void smallclueRsyncUsage(FILE *out) {
     if (!out) {
         out = stderr;
@@ -17028,9 +17054,6 @@ static int smallclueRsyncRunRemoteScp(int argc,
     if (opts->preserve_mode || opts->preserve_times) {
         scp_argv[scp_argc++] = strdup("-p");
     }
-    if (opts->verbose) {
-        scp_argv[scp_argc++] = strdup("-v");
-    }
     if (opts->compress) {
         scp_argv[scp_argc++] = strdup("-C");
     }
@@ -17051,7 +17074,19 @@ static int smallclueRsyncRunRemoteScp(int argc,
         }
     }
 
+    if (opts->verbose) {
+        const char *dest = argv[argc - 1];
+        for (int i = operand_index; i < argc - 1; ++i) {
+            if (!argv[i]) {
+                continue;
+            }
+            printf("copy %s -> %s\n", argv[i], dest ? dest : "");
+        }
+    }
+
+    setenv("PSCALI_SCP_NO_FOLLOW_SYMLINK_DIRS", "1", 1);
     rc = smallclueRunScp(scp_argc, scp_argv);
+    unsetenv("PSCALI_SCP_NO_FOLLOW_SYMLINK_DIRS");
 
 rsync_remote_cleanup:
     for (int i = 0; i < scp_argc; ++i) {
@@ -17062,6 +17097,10 @@ rsync_remote_cleanup:
 }
 
 static int smallclueRsyncCommand(int argc, char **argv) {
+    if (!smallclueRsyncLegacyFallbackEnabled()) {
+        return smallclueRunRsync(argc, argv);
+    }
+
     SmallclueRsyncOptions opts;
     memset(&opts, 0, sizeof(opts));
 
