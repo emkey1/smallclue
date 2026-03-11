@@ -11886,6 +11886,7 @@ static int smallclueGitCommandPush(git_repository *repo, int argc, char **argv) 
     bool push_tags = false;
     bool follow_tags = false;
     bool delete_mode = false;
+    bool dry_run = false;
     bool remote_set = false;
     char *user_refspecs[64];
     size_t user_refspec_count = 0;
@@ -11937,6 +11938,10 @@ static int smallclueGitCommandPush(git_repository *repo, int argc, char **argv) 
         }
         if (strcmp(arg, "--delete") == 0) {
             delete_mode = true;
+            continue;
+        }
+        if (strcmp(arg, "--dry-run") == 0 || strcmp(arg, "-n") == 0) {
+            dry_run = true;
             continue;
         }
         if (arg[0] == '-') {
@@ -12121,6 +12126,10 @@ static int smallclueGitCommandPush(git_repository *repo, int argc, char **argv) 
     }
 
     if (pushed_count == 0) {
+        (void)quiet;
+        return 0;
+    }
+    if (dry_run) {
         (void)quiet;
         return 0;
     }
