@@ -10573,6 +10573,7 @@ static int smallclueGitCommandMerge(git_repository *repo, int argc, char **argv)
     bool ff_only = false;
     bool no_ff = false;
     bool quiet = false;
+    bool abort_op = false;
     const char *target_spec = NULL;
 
     for (int i = 0; i < argc; ++i) {
@@ -10597,6 +10598,10 @@ static int smallclueGitCommandMerge(git_repository *repo, int argc, char **argv)
             quiet = true;
             continue;
         }
+        if (strcmp(arg, "--abort") == 0) {
+            abort_op = true;
+            continue;
+        }
         if (arg[0] == '-') {
             smallclueGitPrintError("unsupported merge option");
             return 2;
@@ -10607,6 +10612,26 @@ static int smallclueGitCommandMerge(git_repository *repo, int argc, char **argv)
         }
         smallclueGitPrintError("merge currently supports exactly one target");
         return 2;
+    }
+
+    if (abort_op) {
+        if (target_spec && *target_spec) {
+            smallclueGitPrintError("merge --abort does not take a target");
+            return 2;
+        }
+        git_repository_state_t st = git_repository_state(repo);
+        if (st != GIT_REPOSITORY_STATE_MERGE) {
+            fputs("fatal: There is no merge to abort (MERGE_HEAD missing).\n", stderr);
+            return 128;
+        }
+        if (git_repository_state_cleanup(repo) != 0) {
+            smallclueGitPrintLibgitError("merge --abort failed");
+            return 1;
+        }
+        if (smallclueGitHardResetToHead(repo, "merge --abort reset failed") != 0) {
+            return 1;
+        }
+        return 0;
     }
 
     if (!target_spec || !*target_spec) {
