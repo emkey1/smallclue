@@ -314,6 +314,7 @@ static int smallclueGitParseGlobalOptions(int argc,
 
 static const char *smallclueGitStatusPath(const git_status_entry *entry);
 static int smallclueGitResolveCommit(git_repository *repo, const char *spec, git_commit **out_commit);
+static int smallclueGitResolvePseudoRefCommit(git_repository *repo, const char *refname, git_commit **out_commit);
 static int smallclueGitCurrentBranchName(git_repository *repo, char *out, size_t out_sz);
 static int smallclueGitCreateDefaultSignatures(git_repository *repo,
                                                git_signature **out_author,
@@ -6723,6 +6724,25 @@ static int smallclueGitResolveCommit(git_repository *repo, const char *spec, git
     return 0;
 }
 
+static int smallclueGitResolvePseudoRefCommit(git_repository *repo, const char *refname, git_commit **out_commit) {
+    if (!repo || !refname || !*refname || !out_commit) {
+        return -1;
+    }
+    *out_commit = NULL;
+    git_object *obj = NULL;
+    if (git_revparse_single(&obj, repo, refname) != 0 || !obj) {
+        return -1;
+    }
+    git_commit *commit = NULL;
+    if (git_object_peel((git_object **)&commit, obj, GIT_OBJECT_COMMIT) != 0 || !commit) {
+        git_object_free(obj);
+        return -1;
+    }
+    git_object_free(obj);
+    *out_commit = commit;
+    return 0;
+}
+
 static int smallclueGitBuildDiff(git_repository *repo,
                                  bool cached,
                                  int rev_count,
@@ -10886,6 +10906,7 @@ static int smallclueGitCommandCherryPick(git_repository *repo, int argc, char **
     bool no_commit = false;
     bool add_trailer = false;
     bool abort_op = false;
+    bool continue_op = false;
     int mainline = 0;
     const char *target_spec = NULL;
 
@@ -10896,6 +10917,10 @@ static int smallclueGitCommandCherryPick(git_repository *repo, int argc, char **
         }
         if (strcmp(arg, "--abort") == 0) {
             abort_op = true;
+            continue;
+        }
+        if (strcmp(arg, "--continue") == 0) {
+            continue_op = true;
             continue;
         }
         if (strcmp(arg, "-q") == 0 || strcmp(arg, "--quiet") == 0) {
@@ -10932,6 +10957,11 @@ static int smallclueGitCommandCherryPick(git_repository *repo, int argc, char **
         return 2;
     }
 
+    if (abort_op && continue_op) {
+        smallclueGitPrintError("cherry-pick: --abort and --continue are mutually exclusive");
+        return 2;
+    }
+
     if (abort_op) {
         git_repository_state_t st = git_repository_state(repo);
         if (st != GIT_REPOSITORY_STATE_CHERRYPICK &&
@@ -10949,39 +10979,66 @@ static int smallclueGitCommandCherryPick(git_repository *repo, int argc, char **
         return 0;
     }
 
-    if (!target_spec || !*target_spec) {
+    if (continue_op) {
+        if (target_spec && *target_spec) {
+            smallclueGitPrintError("cherry-pick --continue does not take a commit");
+            return 2;
+        }
+        if (no_commit || add_trailer || mainline > 0) {
+            smallclueGitPrintError("cherry-pick --continue does not accept mode flags");
+            return 2;
+        }
+        git_repository_state_t st = git_repository_state(repo);
+        if (st != GIT_REPOSITORY_STATE_CHERRYPICK &&
+            st != GIT_REPOSITORY_STATE_CHERRYPICK_SEQUENCE) {
+            fputs("error: no cherry-pick or revert in progress\n", stderr);
+            fputs("fatal: cherry-pick failed\n", stderr);
+            return 128;
+        }
+    }
+
+    if (!continue_op && (!target_spec || !*target_spec)) {
         smallclueGitPrintError("cherry-pick requires a target commit");
         return 2;
     }
-    if (git_repository_state(repo) != GIT_REPOSITORY_STATE_NONE) {
+    if (!continue_op && git_repository_state(repo) != GIT_REPOSITORY_STATE_NONE) {
         smallclueGitPrintError("cherry-pick: repository has unfinished operation");
         return 1;
     }
 
-    int dirty = smallclueGitHasTrackedChanges(repo);
-    if (dirty < 0) {
-        smallclueGitPrintLibgitError("cherry-pick: unable to inspect working tree state");
-        return 1;
-    }
-    if (dirty > 0) {
-        fputs("error: Your local changes would be overwritten by cherry-pick.\n", stderr);
-        return 1;
+    if (!continue_op) {
+        int dirty = smallclueGitHasTrackedChanges(repo);
+        if (dirty < 0) {
+            smallclueGitPrintLibgitError("cherry-pick: unable to inspect working tree state");
+            return 1;
+        }
+        if (dirty > 0) {
+            fputs("error: Your local changes would be overwritten by cherry-pick.\n", stderr);
+            return 1;
+        }
     }
 
     git_commit *picked = NULL;
-    if (smallclueGitResolveCommit(repo, target_spec, &picked) != 0 || !picked) {
-        smallclueGitPrintLibgitError("cherry-pick: unable to resolve commit");
-        return 128;
-    }
+    if (continue_op) {
+        if (smallclueGitResolvePseudoRefCommit(repo, "CHERRY_PICK_HEAD", &picked) != 0 || !picked) {
+            smallclueGitPrintError("cherry-pick --continue: CHERRY_PICK_HEAD is missing");
+            return 1;
+        }
+    } else {
+        if (smallclueGitResolveCommit(repo, target_spec, &picked) != 0 || !picked) {
+            smallclueGitPrintLibgitError("cherry-pick: unable to resolve commit");
+            return 128;
+        }
 
-    git_cherrypick_options opts = GIT_CHERRYPICK_OPTIONS_INIT;
-    opts.mainline = mainline;
-    opts.checkout_opts.checkout_strategy = GIT_CHECKOUT_SAFE | GIT_CHECKOUT_RECREATE_MISSING;
+        git_cherrypick_options opts = GIT_CHERRYPICK_OPTIONS_INIT;
+        opts.mainline = mainline;
+        opts.checkout_opts.checkout_strategy = GIT_CHECKOUT_SAFE | GIT_CHECKOUT_RECREATE_MISSING;
 
-    if (git_cherrypick(repo, picked, &opts) != 0) {
-        git_commit_free(picked);
-        smallclueGitPrintLibgitError("cherry-pick failed");
-        return 1;
+        if (git_cherrypick(repo, picked, &opts) != 0) {
+            git_commit_free(picked);
+            smallclueGitPrintLibgitError("cherry-pick failed");
+            return 1;
+        }
     }
 
     git_index *index = NULL;
@@ -11148,6 +11205,7 @@ static int smallclueGitCommandRevert(git_repository *repo, int argc, char **argv
     bool quiet = false;
     bool no_commit = false;
     bool abort_op = false;
+    bool continue_op = false;
     int mainline = 0;
     const char *target_spec = NULL;
 
@@ -11158,6 +11216,10 @@ static int smallclueGitCommandRevert(git_repository *repo, int argc, char **argv
         }
         if (strcmp(arg, "--abort") == 0) {
             abort_op = true;
+            continue;
+        }
+        if (strcmp(arg, "--continue") == 0) {
+            continue_op = true;
             continue;
         }
         if (strcmp(arg, "-q") == 0 || strcmp(arg, "--quiet") == 0) {
@@ -11190,6 +11252,11 @@ static int smallclueGitCommandRevert(git_repository *repo, int argc, char **argv
         return 2;
     }
 
+    if (abort_op && continue_op) {
+        smallclueGitPrintError("revert: --abort and --continue are mutually exclusive");
+        return 2;
+    }
+
     if (abort_op) {
         git_repository_state_t st = git_repository_state(repo);
         if (st != GIT_REPOSITORY_STATE_REVERT &&
@@ -11207,39 +11274,66 @@ static int smallclueGitCommandRevert(git_repository *repo, int argc, char **argv
         return 0;
     }
 
-    if (!target_spec || !*target_spec) {
+    if (continue_op) {
+        if (target_spec && *target_spec) {
+            smallclueGitPrintError("revert --continue does not take a commit");
+            return 2;
+        }
+        if (no_commit || mainline > 0) {
+            smallclueGitPrintError("revert --continue does not accept mode flags");
+            return 2;
+        }
+        git_repository_state_t st = git_repository_state(repo);
+        if (st != GIT_REPOSITORY_STATE_REVERT &&
+            st != GIT_REPOSITORY_STATE_REVERT_SEQUENCE) {
+            fputs("error: no cherry-pick or revert in progress\n", stderr);
+            fputs("fatal: revert failed\n", stderr);
+            return 128;
+        }
+    }
+
+    if (!continue_op && (!target_spec || !*target_spec)) {
         smallclueGitPrintError("revert requires a target commit");
         return 2;
     }
-    if (git_repository_state(repo) != GIT_REPOSITORY_STATE_NONE) {
+    if (!continue_op && git_repository_state(repo) != GIT_REPOSITORY_STATE_NONE) {
         smallclueGitPrintError("revert: repository has unfinished operation");
         return 1;
     }
 
-    int dirty = smallclueGitHasTrackedChanges(repo);
-    if (dirty < 0) {
-        smallclueGitPrintLibgitError("revert: unable to inspect working tree state");
-        return 1;
-    }
-    if (dirty > 0) {
-        fputs("error: Your local changes would be overwritten by revert.\n", stderr);
-        return 1;
+    if (!continue_op) {
+        int dirty = smallclueGitHasTrackedChanges(repo);
+        if (dirty < 0) {
+            smallclueGitPrintLibgitError("revert: unable to inspect working tree state");
+            return 1;
+        }
+        if (dirty > 0) {
+            fputs("error: Your local changes would be overwritten by revert.\n", stderr);
+            return 1;
+        }
     }
 
     git_commit *reverted = NULL;
-    if (smallclueGitResolveCommit(repo, target_spec, &reverted) != 0 || !reverted) {
-        smallclueGitPrintLibgitError("revert: unable to resolve commit");
-        return 128;
-    }
+    if (continue_op) {
+        if (smallclueGitResolvePseudoRefCommit(repo, "REVERT_HEAD", &reverted) != 0 || !reverted) {
+            smallclueGitPrintError("revert --continue: REVERT_HEAD is missing");
+            return 1;
+        }
+    } else {
+        if (smallclueGitResolveCommit(repo, target_spec, &reverted) != 0 || !reverted) {
+            smallclueGitPrintLibgitError("revert: unable to resolve commit");
+            return 128;
+        }
 
-    git_revert_options opts = GIT_REVERT_OPTIONS_INIT;
-    opts.mainline = mainline;
-    opts.checkout_opts.checkout_strategy = GIT_CHECKOUT_SAFE | GIT_CHECKOUT_RECREATE_MISSING;
+        git_revert_options opts = GIT_REVERT_OPTIONS_INIT;
+        opts.mainline = mainline;
+        opts.checkout_opts.checkout_strategy = GIT_CHECKOUT_SAFE | GIT_CHECKOUT_RECREATE_MISSING;
 
-    if (git_revert(repo, reverted, &opts) != 0) {
-        git_commit_free(reverted);
-        smallclueGitPrintLibgitError("revert failed");
-        return 1;
+        if (git_revert(repo, reverted, &opts) != 0) {
+            git_commit_free(reverted);
+            smallclueGitPrintLibgitError("revert failed");
+            return 1;
+        }
     }
 
     git_index *index = NULL;
