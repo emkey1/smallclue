@@ -13,3 +13,7 @@
 ## 2024-11-20 - Fullscreen Applet Visual Hierarchy
 **Learning:** Fullscreen applets like `watch` lack visual separation between their status/header lines and the arbitrary command output they continuously render, making them harder to scan or distinguish from normal shell output.
 **Action:** Always wrap the header/status lines of fullscreen utilities in inverse video (`\033[7m`) to establish a clear visual hierarchy and separate the tool's UI from the command payload it displays.
+
+## 2025-02-12 - Interactive Prompts ANSI Guarding
+**Learning:** Interactive terminal prompts that print to `stderr` (like confirmation dialogs) often remember to check `isatty(STDIN_FILENO)` before prompting, but forget to independently check `isatty(STDERR_FILENO)` before emitting ANSI color codes. This results in log files filled with raw escape sequences when users redirect `stderr` but leave `stdin` interactive.
+**Action:** Always guard ANSI escape sequences printed to `stderr` with an `isatty(STDERR_FILENO)` check, even if the prompt logic itself is already guarded by an `isatty(STDIN_FILENO)` check.
