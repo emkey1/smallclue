@@ -14553,7 +14553,11 @@ static bool smallclueConfirmDelete(const char *label, const char *path) {
                 label, path);
         return false;
     }
-    fprintf(stderr, "%s: remove '\033[1;31m%s\033[0m'? [y/N] ", label, path);
+    if (isatty(STDERR_FILENO)) {
+        fprintf(stderr, "%s: remove '\033[1;31m%s\033[0m'? [y/N] ", label, path);
+    } else {
+        fprintf(stderr, "%s: remove '%s'? [y/N] ", label, path);
+    }
     fflush(stderr);
     int c = getchar();
     /* consume the rest of the line */
