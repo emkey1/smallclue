@@ -8479,6 +8479,21 @@ static bool smallclueGitClonePathspecMatches(const char *pathspec, const char *p
     return false;
 }
 
+static bool smallclueGitClonePathIsParentOfSpec(const char *path, const char *pathspec) {
+    if (!path || !*path || !pathspec || !*pathspec) {
+        return false;
+    }
+    size_t path_len = smallclueGitTrimTrailingSlashLen(path);
+    size_t spec_len = smallclueGitTrimTrailingSlashLen(pathspec);
+    if (path_len == 0 || spec_len == 0 || spec_len <= path_len) {
+        return false;
+    }
+    if (strncmp(path, pathspec, path_len) != 0) {
+        return false;
+    }
+    return pathspec[path_len] == '/';
+}
+
 static bool smallclueGitCloneShouldUpdateSubmodule(const SmallclueGitCloneSubmoduleSpec *spec,
                                                    const char *path) {
     if (!spec || !spec->enabled) {
@@ -8488,7 +8503,8 @@ static bool smallclueGitCloneShouldUpdateSubmodule(const SmallclueGitCloneSubmod
         return true;
     }
     for (size_t i = 0; i < spec->pathspec_count; ++i) {
-        if (smallclueGitClonePathspecMatches(spec->pathspecs[i], path)) {
+        if (smallclueGitClonePathspecMatches(spec->pathspecs[i], path) ||
+            smallclueGitClonePathIsParentOfSpec(path, spec->pathspecs[i])) {
             return true;
         }
     }
