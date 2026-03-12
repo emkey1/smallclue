@@ -1949,6 +1949,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  Remove empty directories\n"
               "  -p remove parents\n"
               "  -v verbose"},
+    {"rsync", "rsync [options] <source>... <destination>\n"
+              "  Synchronize files and directories (OpenRsync-compatible applet)\n"
+              "  Common: -a -v -z -r --delete --exclude PATTERN --include PATTERN\n"
+              "  Remote paths use host:path syntax over SSH"},
     {"runit", "runit\n"
              "  Service supervisor"},
     {"sed", "sed 's/old/new/g' [FILE...]\n"
@@ -1963,6 +1967,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"stty", "stty [reset] [sane]\n"
              "  Report terminal settings; apply reset/sane"},
 #if defined(SMALLCLUE_WITH_EXSH)
+    {"exsh", "exsh\n"
+             "  Launch PSCAL shell front end"},
     {"sh", "sh\n"
            "  Launch PSCAL shell front end"},
 #endif
@@ -2072,6 +2078,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
 #if defined(PSCAL_TARGET_IOS)
     {"addt", "addt\n"
              "  Open an additional shell tab"},
+    {"tabadd", "tabadd\n"
+               "  Alias for addt"},
+    {"tadd", "tadd\n"
+             "  Alias for addt"},
     {"smallclue-help", "smallclue-help [command]\n"
                        "  Without arguments: list all applets\n"
                        "  With a command: show usage if available"},
@@ -2085,7 +2095,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
 
 static size_t kSmallclueAppletCount = sizeof(kSmallclueApplets) / sizeof(kSmallclueApplets[0]);
 
-static const char * __attribute__((unused)) smallclueLookupHelp(const char *name) {
+const char *smallclueLookupAppletUsage(const char *name) {
+    if (!name) {
+        return NULL;
+    }
     for (const SmallclueAppletHelp *h = kSmallclueAppletHelp; h && h->name; ++h) {
         if (strcmp(h->name, name) == 0) {
             return h->usage;
@@ -10111,7 +10124,7 @@ static int smallclueHelpCommand(int argc, char **argv) {
                 status = 1;
                 continue;
             }
-            const char *usage = smallclueLookupHelp(applet->name);
+            const char *usage = smallclueLookupAppletUsage(applet->name);
             fprintf(mem, "%s - %s\n", applet->name, applet->description ? applet->description : "");
             if (usage) {
                 fprintf(mem, "Usage:\n%s\n", usage);

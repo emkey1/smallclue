@@ -31,6 +31,7 @@ int smallclueMain(int argc, char **argv);
 
 const SmallclueApplet *smallclueGetApplets(size_t *count);
 const SmallclueApplet *smallclueFindApplet(const char *name);
+const char *smallclueLookupAppletUsage(const char *name);
 int smallclueDispatchApplet(const SmallclueApplet *applet, int argc, char **argv);
 
 void smallclueRegisterBuiltins(void);

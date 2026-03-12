@@ -8379,9 +8379,89 @@ static int smallclueGitCurrentBranchName(git_repository *repo, char *out, size_t
     return rc;
 }
 
+typedef struct SmallclueGitCloneSubmoduleCtx {
+    bool quiet;
+    int failure;
+} SmallclueGitCloneSubmoduleCtx;
+
+static int smallclueGitCloneUpdateSubmodulesRecursive(git_repository *repo, bool quiet);
+
+static int smallclueGitCloneUpdateOneSubmodule(git_submodule *submodule,
+                                               const char *name,
+                                               bool quiet) {
+    (void)quiet;
+    if (!submodule) {
+        return 0;
+    }
+
+    git_submodule_update_options update_opts = GIT_SUBMODULE_UPDATE_OPTIONS_INIT;
+    update_opts.checkout_opts.checkout_strategy = GIT_CHECKOUT_SAFE | GIT_CHECKOUT_RECREATE_MISSING;
+    if (git_submodule_update(submodule, 1, &update_opts) != 0) {
+        char msg[256];
+        if (name && *name &&
+            snprintf(msg, sizeof(msg), "clone: submodule '%s' update failed", name) < (int)sizeof(msg)) {
+            smallclueGitPrintLibgitError(msg);
+        } else {
+            smallclueGitPrintLibgitError("clone: submodule update failed");
+        }
+        return 1;
+    }
+
+    git_repository *subrepo = NULL;
+    if (git_submodule_open(&subrepo, submodule) != 0 || !subrepo) {
+        char msg[256];
+        if (name && *name &&
+            snprintf(msg, sizeof(msg), "clone: submodule '%s' open failed", name) < (int)sizeof(msg)) {
+            smallclueGitPrintLibgitError(msg);
+        } else {
+            smallclueGitPrintLibgitError("clone: submodule open failed");
+        }
+        return 1;
+    }
+
+    int rc = smallclueGitCloneUpdateSubmodulesRecursive(subrepo, quiet);
+    git_repository_free(subrepo);
+    return rc;
+}
+
+static int smallclueGitCloneUpdateSubmoduleCallback(git_submodule *submodule,
+                                                    const char *name,
+                                                    void *payload) {
+    SmallclueGitCloneSubmoduleCtx *ctx = (SmallclueGitCloneSubmoduleCtx *)payload;
+    if (!ctx) {
+        return 0;
+    }
+    int rc = smallclueGitCloneUpdateOneSubmodule(submodule, name, ctx->quiet);
+    if (rc != 0) {
+        ctx->failure = rc;
+        return -1;
+    }
+    return 0;
+}
+
+static int smallclueGitCloneUpdateSubmodulesRecursive(git_repository *repo, bool quiet) {
+    if (!repo) {
+        return 0;
+    }
+    SmallclueGitCloneSubmoduleCtx ctx = {
+        .quiet = quiet,
+        .failure = 0,
+    };
+    int rc = git_submodule_foreach(repo, smallclueGitCloneUpdateSubmoduleCallback, &ctx);
+    if (ctx.failure != 0) {
+        return ctx.failure;
+    }
+    if (rc != 0) {
+        smallclueGitPrintLibgitError("clone: submodule traversal failed");
+        return 1;
+    }
+    return 0;
+}
+
 static int smallclueGitCommandClone(const char *start_path, int argc, char **argv) {
     bool bare = false;
     bool quiet = false;
+    bool recurse_submodules = false;
     const char *branch = NULL;
     const char *source = NULL;
     const char *dest_arg = NULL;
@@ -8397,6 +8477,18 @@ static int smallclueGitCommandClone(const char *start_path, int argc, char **arg
         }
         if (strcmp(arg, "-q") == 0 || strcmp(arg, "--quiet") == 0) {
             quiet = true;
+            continue;
+        }
+        if (strcmp(arg, "--recursive") == 0 || strcmp(arg, "--recurse-submodules") == 0) {
+            recurse_submodules = true;
+            continue;
+        }
+        if (strcmp(arg, "--no-recurse-submodules") == 0) {
+            recurse_submodules = false;
+            continue;
+        }
+        if (strncmp(arg, "--recurse-submodules=", 21) == 0) {
+            recurse_submodules = true;
             continue;
         }
         if ((strcmp(arg, "-b") == 0 || strcmp(arg, "--branch") == 0) && i + 1 < argc) {
@@ -8425,6 +8517,10 @@ static int smallclueGitCommandClone(const char *start_path, int argc, char **arg
 
     if (!source || !*source) {
         smallclueGitPrintError("clone requires a repository source");
+        return 2;
+    }
+    if (bare && recurse_submodules) {
+        smallclueGitPrintError("clone: --recurse-submodules is incompatible with --bare");
         return 2;
     }
 
@@ -8480,6 +8576,10 @@ static int smallclueGitCommandClone(const char *start_path, int argc, char **arg
     git_repository *cloned = NULL;
     if (git_clone(&cloned, clone_source, clone_dest, &clone_opts) != 0 || !cloned) {
         smallclueGitPrintLibgitError("clone failed");
+        return 1;
+    }
+    if (recurse_submodules && smallclueGitCloneUpdateSubmodulesRecursive(cloned, quiet) != 0) {
+        git_repository_free(cloned);
         return 1;
     }
     git_repository_free(cloned);
