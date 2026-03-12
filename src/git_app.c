@@ -8379,16 +8379,191 @@ static int smallclueGitCurrentBranchName(git_repository *repo, char *out, size_t
     return rc;
 }
 
+typedef struct SmallclueGitCloneSubmoduleSpec {
+    bool enabled;
+    char **pathspecs;
+    size_t pathspec_count;
+    size_t pathspec_capacity;
+} SmallclueGitCloneSubmoduleSpec;
+
 typedef struct SmallclueGitCloneSubmoduleCtx {
     bool quiet;
     int failure;
+    const SmallclueGitCloneSubmoduleSpec *selection;
+    const char *prefix;
 } SmallclueGitCloneSubmoduleCtx;
 
-static int smallclueGitCloneUpdateSubmodulesRecursive(git_repository *repo, bool quiet);
+static void smallclueGitCloneSubmoduleSpecInit(SmallclueGitCloneSubmoduleSpec *spec) {
+    if (!spec) {
+        return;
+    }
+    memset(spec, 0, sizeof(*spec));
+}
+
+static void smallclueGitCloneSubmoduleSpecClear(SmallclueGitCloneSubmoduleSpec *spec) {
+    if (!spec) {
+        return;
+    }
+    for (size_t i = 0; i < spec->pathspec_count; ++i) {
+        free(spec->pathspecs[i]);
+    }
+    free(spec->pathspecs);
+    memset(spec, 0, sizeof(*spec));
+}
+
+static int smallclueGitCloneSubmoduleSpecAppend(SmallclueGitCloneSubmoduleSpec *spec,
+                                                const char *pathspec) {
+    if (!spec || !pathspec || !*pathspec) {
+        return -1;
+    }
+    if (spec->pathspec_count == spec->pathspec_capacity) {
+        size_t next_cap = spec->pathspec_capacity ? spec->pathspec_capacity * 2 : 4;
+        char **next_items = (char **)realloc(spec->pathspecs, next_cap * sizeof(char *));
+        if (!next_items) {
+            return -1;
+        }
+        spec->pathspecs = next_items;
+        spec->pathspec_capacity = next_cap;
+    }
+    spec->pathspecs[spec->pathspec_count] = strdup(pathspec);
+    if (!spec->pathspecs[spec->pathspec_count]) {
+        return -1;
+    }
+    spec->pathspec_count++;
+    spec->enabled = true;
+    return 0;
+}
+
+static size_t smallclueGitTrimTrailingSlashLen(const char *value) {
+    size_t len = value ? strlen(value) : 0;
+    while (len > 0 && value[len - 1] == '/') {
+        len--;
+    }
+    return len;
+}
+
+static const char *smallclueGitFindLastCharInSpan(const char *value, size_t len, char needle) {
+    if (!value) {
+        return NULL;
+    }
+    while (len > 0) {
+        len--;
+        if (value[len] == needle) {
+            return value + len;
+        }
+    }
+    return NULL;
+}
+
+static bool smallclueGitClonePathspecMatches(const char *pathspec, const char *path) {
+    if (!pathspec || !*pathspec || !path || !*path) {
+        return false;
+    }
+    if (fnmatch(pathspec, path, FNM_PATHNAME) == 0) {
+        return true;
+    }
+
+    size_t spec_len = smallclueGitTrimTrailingSlashLen(pathspec);
+    size_t path_len = smallclueGitTrimTrailingSlashLen(path);
+    if (spec_len == 0 || path_len == 0) {
+        return false;
+    }
+    if (spec_len == path_len && strncmp(pathspec, path, spec_len) == 0) {
+        return true;
+    }
+    if (path_len > spec_len &&
+        strncmp(pathspec, path, spec_len) == 0 &&
+        path[spec_len] == '/') {
+        return true;
+    }
+    return false;
+}
+
+static bool smallclueGitCloneShouldUpdateSubmodule(const SmallclueGitCloneSubmoduleSpec *spec,
+                                                   const char *path) {
+    if (!spec || !spec->enabled) {
+        return false;
+    }
+    if (spec->pathspec_count == 0) {
+        return true;
+    }
+    for (size_t i = 0; i < spec->pathspec_count; ++i) {
+        if (smallclueGitClonePathspecMatches(spec->pathspecs[i], path)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int smallclueGitCloneComposeSubmodulePath(const char *prefix,
+                                                 const char *name,
+                                                 char *out,
+                                                 size_t out_sz) {
+    if (!name || !*name || !out || out_sz == 0) {
+        return -1;
+    }
+    if (prefix && *prefix) {
+        if (snprintf(out, out_sz, "%s/%s", prefix, name) >= (int)out_sz) {
+            return -1;
+        }
+    } else if (snprintf(out, out_sz, "%s", name) >= (int)out_sz) {
+        return -1;
+    }
+    return 0;
+}
+
+static int smallclueGitCloneDeriveDefaultDestName(const char *source,
+                                                  char *out,
+                                                  size_t out_sz) {
+    if (!source || !*source || !out || out_sz == 0) {
+        return -1;
+    }
+
+    size_t source_len = strlen(source);
+    while (source_len > 0 && source[source_len - 1] == '/') {
+        source_len--;
+    }
+    if (source_len == 0) {
+        return -1;
+    }
+
+    const char *tail = smallclueGitFindLastCharInSpan(source, source_len, '/');
+    if (tail) {
+        tail++;
+    } else {
+        const char *scheme = strstr(source, "://");
+        const char *colon = smallclueGitFindLastCharInSpan(source, source_len, ':');
+        if (colon && (!scheme || colon > scheme + 2)) {
+            tail = colon + 1;
+        } else {
+            tail = source;
+        }
+    }
+    if (!tail || tail >= source + source_len) {
+        return -1;
+    }
+
+    size_t tail_len = (size_t)((source + source_len) - tail);
+    if (tail_len > 4 && strncmp(tail + tail_len - 4, ".git", 4) == 0) {
+        tail_len -= 4;
+    }
+    if (tail_len == 0 || tail_len >= out_sz) {
+        return -1;
+    }
+    memcpy(out, tail, tail_len);
+    out[tail_len] = '\0';
+    return 0;
+}
+
+static int smallclueGitCloneUpdateSubmodulesRecursive(git_repository *repo,
+                                                      bool quiet,
+                                                      const SmallclueGitCloneSubmoduleSpec *selection,
+                                                      const char *prefix);
 
 static int smallclueGitCloneUpdateOneSubmodule(git_submodule *submodule,
                                                const char *name,
-                                               bool quiet) {
+                                               bool quiet,
+                                               const SmallclueGitCloneSubmoduleSpec *selection) {
     (void)quiet;
     if (!submodule) {
         return 0;
@@ -8419,7 +8594,7 @@ static int smallclueGitCloneUpdateOneSubmodule(git_submodule *submodule,
         return 1;
     }
 
-    int rc = smallclueGitCloneUpdateSubmodulesRecursive(subrepo, quiet);
+    int rc = smallclueGitCloneUpdateSubmodulesRecursive(subrepo, quiet, selection, name);
     git_repository_free(subrepo);
     return rc;
 }
@@ -8431,7 +8606,16 @@ static int smallclueGitCloneUpdateSubmoduleCallback(git_submodule *submodule,
     if (!ctx) {
         return 0;
     }
-    int rc = smallclueGitCloneUpdateOneSubmodule(submodule, name, ctx->quiet);
+    char full_name[PATH_MAX];
+    if (smallclueGitCloneComposeSubmodulePath(ctx->prefix, name, full_name, sizeof(full_name)) != 0) {
+        smallclueGitPrintError("clone: submodule path too long");
+        ctx->failure = 1;
+        return -1;
+    }
+    if (!smallclueGitCloneShouldUpdateSubmodule(ctx->selection, full_name)) {
+        return 0;
+    }
+    int rc = smallclueGitCloneUpdateOneSubmodule(submodule, full_name, ctx->quiet, ctx->selection);
     if (rc != 0) {
         ctx->failure = rc;
         return -1;
@@ -8439,13 +8623,18 @@ static int smallclueGitCloneUpdateSubmoduleCallback(git_submodule *submodule,
     return 0;
 }
 
-static int smallclueGitCloneUpdateSubmodulesRecursive(git_repository *repo, bool quiet) {
+static int smallclueGitCloneUpdateSubmodulesRecursive(git_repository *repo,
+                                                      bool quiet,
+                                                      const SmallclueGitCloneSubmoduleSpec *selection,
+                                                      const char *prefix) {
     if (!repo) {
         return 0;
     }
     SmallclueGitCloneSubmoduleCtx ctx = {
         .quiet = quiet,
         .failure = 0,
+        .selection = selection,
+        .prefix = prefix,
     };
     int rc = git_submodule_foreach(repo, smallclueGitCloneUpdateSubmoduleCallback, &ctx);
     if (ctx.failure != 0) {
@@ -8461,10 +8650,12 @@ static int smallclueGitCloneUpdateSubmodulesRecursive(git_repository *repo, bool
 static int smallclueGitCommandClone(const char *start_path, int argc, char **argv) {
     bool bare = false;
     bool quiet = false;
-    bool recurse_submodules = false;
+    int rc = 0;
     const char *branch = NULL;
     const char *source = NULL;
     const char *dest_arg = NULL;
+    SmallclueGitCloneSubmoduleSpec submodule_spec;
+    smallclueGitCloneSubmoduleSpecInit(&submodule_spec);
 
     for (int i = 0; i < argc; ++i) {
         const char *arg = argv[i];
@@ -8480,15 +8671,22 @@ static int smallclueGitCommandClone(const char *start_path, int argc, char **arg
             continue;
         }
         if (strcmp(arg, "--recursive") == 0 || strcmp(arg, "--recurse-submodules") == 0) {
-            recurse_submodules = true;
+            submodule_spec.enabled = true;
             continue;
         }
         if (strcmp(arg, "--no-recurse-submodules") == 0) {
-            recurse_submodules = false;
+            smallclueGitCloneSubmoduleSpecClear(&submodule_spec);
             continue;
         }
         if (strncmp(arg, "--recurse-submodules=", 21) == 0) {
-            recurse_submodules = true;
+            const char *value = arg + 21;
+            if (*value == '\0') {
+                submodule_spec.enabled = true;
+            } else if (smallclueGitCloneSubmoduleSpecAppend(&submodule_spec, value) != 0) {
+                smallclueGitPrintError("clone: failed to record recurse-submodules pathspec");
+                rc = 2;
+                goto clone_cleanup;
+            }
             continue;
         }
         if ((strcmp(arg, "-b") == 0 || strcmp(arg, "--branch") == 0) && i + 1 < argc) {
@@ -8501,7 +8699,8 @@ static int smallclueGitCommandClone(const char *start_path, int argc, char **arg
         }
         if (arg[0] == '-') {
             smallclueGitPrintError("unsupported clone option");
-            return 2;
+            rc = 2;
+            goto clone_cleanup;
         }
         if (!source) {
             source = arg;
@@ -8512,16 +8711,19 @@ static int smallclueGitCommandClone(const char *start_path, int argc, char **arg
             continue;
         }
         smallclueGitPrintError("too many clone arguments");
-        return 2;
+        rc = 2;
+        goto clone_cleanup;
     }
 
     if (!source || !*source) {
         smallclueGitPrintError("clone requires a repository source");
-        return 2;
+        rc = 2;
+        goto clone_cleanup;
     }
-    if (bare && recurse_submodules) {
+    if (bare && submodule_spec.enabled) {
         smallclueGitPrintError("clone: --recurse-submodules is incompatible with --bare");
-        return 2;
+        rc = 2;
+        goto clone_cleanup;
     }
 
     char source_buf[PATH_MAX];
@@ -8535,28 +8737,21 @@ static int smallclueGitCommandClone(const char *start_path, int argc, char **arg
     if (dest_arg && *dest_arg) {
         if (smallclueGitResolvePathFromBase(start_path, dest_arg, dest_buf, sizeof(dest_buf)) != 0) {
             smallclueGitPrintError("clone destination path too long");
-            return 2;
+            rc = 2;
+            goto clone_cleanup;
         }
         clone_dest = dest_buf;
     } else {
-        const char *tail = strrchr(source, '/');
-        tail = tail ? tail + 1 : source;
-        if (!tail || !*tail) {
-            smallclueGitPrintError("unable to derive destination directory from source");
-            return 2;
-        }
         char base_name[PATH_MAX];
-        if (snprintf(base_name, sizeof(base_name), "%s", tail) >= (int)sizeof(base_name)) {
-            smallclueGitPrintError("source basename too long");
-            return 2;
-        }
-        size_t blen = strlen(base_name);
-        if (blen > 4 && strcmp(base_name + blen - 4, ".git") == 0) {
-            base_name[blen - 4] = '\0';
+        if (smallclueGitCloneDeriveDefaultDestName(source, base_name, sizeof(base_name)) != 0) {
+            smallclueGitPrintError("unable to derive destination directory from source");
+            rc = 2;
+            goto clone_cleanup;
         }
         if (smallclueGitResolvePathFromBase(start_path, base_name, dest_buf, sizeof(dest_buf)) != 0) {
             smallclueGitPrintError("clone destination path too long");
-            return 2;
+            rc = 2;
+            goto clone_cleanup;
         }
         clone_dest = dest_buf;
     }
@@ -8576,14 +8771,21 @@ static int smallclueGitCommandClone(const char *start_path, int argc, char **arg
     git_repository *cloned = NULL;
     if (git_clone(&cloned, clone_source, clone_dest, &clone_opts) != 0 || !cloned) {
         smallclueGitPrintLibgitError("clone failed");
-        return 1;
+        rc = 1;
+        goto clone_cleanup;
     }
-    if (recurse_submodules && smallclueGitCloneUpdateSubmodulesRecursive(cloned, quiet) != 0) {
+    if (submodule_spec.enabled &&
+        smallclueGitCloneUpdateSubmodulesRecursive(cloned, quiet, &submodule_spec, NULL) != 0) {
         git_repository_free(cloned);
-        return 1;
+        rc = 1;
+        goto clone_cleanup;
     }
     git_repository_free(cloned);
-    return 0;
+    rc = 0;
+
+clone_cleanup:
+    smallclueGitCloneSubmoduleSpecClear(&submodule_spec);
+    return rc;
 }
 
 static int smallclueGitRemoteFormatFetchRefspec(const char *remote_name,
