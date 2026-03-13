@@ -73,6 +73,7 @@
 #include <stdatomic.h>
 #include <sys/select.h>
 #include <glob.h>
+#include <pthread.h>
 #include "common/pscal_hosts.h"
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -93,12 +94,20 @@ void PSCALRuntimeEndScriptCapture(void) __attribute__((weak));
 int PSCALRuntimeScriptCaptureActive(void) __attribute__((weak));
 int pscalRuntimeOpenShellTab(void) __attribute__((weak));
 char *pscalRuntimePickMountSourceDirectory(void) __attribute__((weak));
+extern void *PSCALRuntimeGetCurrentRuntimeContext(void) __attribute__((weak_import));
+extern void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) __attribute__((weak_import));
+#if !defined(__APPLE__)
+extern void *PSCALRuntimeGetCurrentRuntimeContext(void) __attribute__((weak));
+extern void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) __attribute__((weak));
+#endif
 #ifndef PSCAL_RUNTIME_CAPTURE_IMPL
 __attribute__((weak)) void PSCALRuntimeBeginScriptCapture(const char *path, int append) { (void)path; (void)append; }
 __attribute__((weak)) void PSCALRuntimeEndScriptCapture(void) {}
 __attribute__((weak)) int PSCALRuntimeScriptCaptureActive(void) { return 0; }
 __attribute__((weak)) int pscalRuntimeOpenShellTab(void) { errno = ENOSYS; return -1; }
 __attribute__((weak)) char *pscalRuntimePickMountSourceDirectory(void) { errno = ENOSYS; return NULL; }
+__attribute__((weak)) void *PSCALRuntimeGetCurrentRuntimeContext(void) { return NULL; }
+__attribute__((weak)) void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) { (void)ctx; }
 #endif
 __attribute__((weak)) char *pscalRuntimeCopyMarketingVersion(void) { return NULL; }
 #endif
@@ -367,9 +376,6 @@ static const char *smallclueDisplayPath(const char *path, char *buffer, size_t b
     return path;
 }
 
-static bool smallclueResolveCommandPathForExec(const char *name, char *resolved, size_t resolved_size);
-
-#if defined(PSCAL_TARGET_IOS)
 static bool smallcluePathHasShebang(const char *path) {
     if (!path || !*path) {
         return false;
@@ -384,6 +390,9 @@ static bool smallcluePathHasShebang(const char *path) {
     return n == 2 && header[0] == '#' && header[1] == '!';
 }
 
+static bool smallclueResolveCommandPathForExec(const char *name, char *resolved, size_t resolved_size);
+
+#if defined(PSCAL_TARGET_IOS)
 static bool smallclueReadShebangInterpreter(const char *path,
                                             char *interpreter,
                                             size_t interpreter_size,
@@ -439,6 +448,301 @@ static bool smallclueReadShebangInterpreter(const char *path,
         }
     }
     return true;
+}
+
+typedef int (*SmallclueToolEntryFn)(int argc, char **argv);
+
+static SmallclueToolEntryFn smallclueLookupToolEntrySymbol(const char *symbol_name) {
+    if (!symbol_name || !*symbol_name) {
+        return NULL;
+    }
+    return (SmallclueToolEntryFn)dlsym(RTLD_DEFAULT, symbol_name);
+}
+
+static const char *smallclueResolveShebangToolName(const char *interpreter) {
+    if (!interpreter || !*interpreter) {
+        return NULL;
+    }
+    const char *base = strrchr(interpreter, '/');
+    base = base ? (base + 1) : interpreter;
+    if (strcasecmp(base, "pascal") == 0) return "pascal";
+    if (strcasecmp(base, "clike") == 0) return "clike";
+    if (strcasecmp(base, "rea") == 0) return "rea";
+    if (strcasecmp(base, "pscalvm") == 0) return "pscalvm";
+    if (strcasecmp(base, "pscaljson2bc") == 0) return "pscaljson2bc";
+#ifdef BUILD_DASCAL
+    if (strcasecmp(base, "dascal") == 0) return "dascal";
+#endif
+#ifdef BUILD_PSCALD
+    if (strcasecmp(base, "pscald") == 0) return "pscald";
+    if (strcasecmp(base, "pscalasm") == 0) return "pscalasm";
+#endif
+#if defined(SMALLCLUE_WITH_EXSH)
+    if (strcasecmp(base, "sh") == 0) return "exsh";
+    if (strcasecmp(base, "exsh") == 0) return "exsh";
+#endif
+    return NULL;
+}
+
+static SmallclueToolEntryFn smallclueResolveShebangToolEntry(const char *tool_name) {
+    if (!tool_name || !*tool_name) {
+        return NULL;
+    }
+    if (strcmp(tool_name, "pascal") == 0) return smallclueLookupToolEntrySymbol("pascal_main");
+    if (strcmp(tool_name, "clike") == 0) return smallclueLookupToolEntrySymbol("clike_main");
+    if (strcmp(tool_name, "rea") == 0) return smallclueLookupToolEntrySymbol("rea_main");
+    if (strcmp(tool_name, "pscalvm") == 0) return smallclueLookupToolEntrySymbol("pscalvm_main");
+    if (strcmp(tool_name, "pscaljson2bc") == 0) return smallclueLookupToolEntrySymbol("pscaljson2bc_main");
+#ifdef BUILD_DASCAL
+    if (strcmp(tool_name, "dascal") == 0) return smallclueLookupToolEntrySymbol("dascal_main");
+#endif
+#ifdef BUILD_PSCALD
+    if (strcmp(tool_name, "pscald") == 0) return smallclueLookupToolEntrySymbol("pscald_main");
+    if (strcmp(tool_name, "pscalasm") == 0) return smallclueLookupToolEntrySymbol("pscalasm_main");
+#endif
+#if defined(SMALLCLUE_WITH_EXSH)
+    if (strcmp(tool_name, "exsh") == 0) return smallclueLookupToolEntrySymbol("exsh_main");
+#endif
+    return NULL;
+}
+
+#if defined(PSCAL_TARGET_IOS)
+#ifndef SMALLCLUE_TOOL_THREAD_STACK_SZ
+#define SMALLCLUE_TOOL_THREAD_STACK_SZ (8 * 1024 * 1024)
+#endif
+
+typedef struct SmallclueToolThreadContext {
+    SmallclueToolEntryFn entry;
+    int argc;
+    char **argv;
+    VProcSessionStdio *session_stdio;
+    VProc *session_vproc;
+    void *runtime_ctx;
+    int status;
+} SmallclueToolThreadContext;
+
+static bool smallclueShebangToolNeedsWorkerThread(const char *tool_name) {
+    if (!tool_name || !*tool_name) {
+        return false;
+    }
+    if (strcmp(tool_name, "exsh") == 0) {
+        return false;
+    }
+    return true;
+}
+
+static void *smallclueToolThreadMain(void *opaque) {
+    SmallclueToolThreadContext *ctx = (SmallclueToolThreadContext *)opaque;
+    if (!ctx || !ctx->entry) {
+        if (ctx) {
+            ctx->status = 127;
+        }
+        return NULL;
+    }
+
+    void *prev_runtime_ctx = NULL;
+    VProcSessionStdio *prev_stdio = vprocSessionStdioCurrent();
+    bool runtime_ctx_swapped = false;
+    bool vproc_active = false;
+    if (PSCALRuntimeGetCurrentRuntimeContext) {
+        prev_runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext();
+    }
+    if (PSCALRuntimeSetCurrentRuntimeContext && ctx->runtime_ctx) {
+        PSCALRuntimeSetCurrentRuntimeContext(ctx->runtime_ctx);
+        runtime_ctx_swapped = true;
+    }
+    if (ctx->session_stdio) {
+        vprocSessionStdioActivate(ctx->session_stdio);
+    }
+    if (ctx->session_vproc) {
+        vprocRegisterThread(ctx->session_vproc, pthread_self());
+        vprocActivate(ctx->session_vproc);
+        vproc_active = true;
+        int worker_pid = vprocPid(ctx->session_vproc);
+        if (worker_pid > 0) {
+            vprocSetStopUnsupported(worker_pid, false);
+            vprocSetCooperativeStopWait(worker_pid, false);
+        }
+    }
+
+    sigset_t unblock_mask;
+    sigemptyset(&unblock_mask);
+    sigaddset(&unblock_mask, SIGINT);
+    sigaddset(&unblock_mask, SIGTSTP);
+    (void)pthread_sigmask(SIG_UNBLOCK, &unblock_mask, NULL);
+
+    ctx->status = ctx->entry(ctx->argc, ctx->argv);
+
+    if (ctx->session_stdio) {
+        vprocSessionStdioActivate(prev_stdio);
+    }
+    if (vproc_active) {
+        vprocDeactivate();
+    }
+    if (runtime_ctx_swapped && PSCALRuntimeSetCurrentRuntimeContext) {
+        PSCALRuntimeSetCurrentRuntimeContext(prev_runtime_ctx);
+    }
+    return NULL;
+}
+
+static int smallclueRunToolEntryInWorkerThread(SmallclueToolEntryFn entry, int argc, char **argv) {
+    if (!entry) {
+        return 127;
+    }
+
+    SmallclueToolThreadContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.entry = entry;
+    ctx.argc = argc;
+    ctx.argv = argv;
+    ctx.status = 127;
+    ctx.session_stdio = vprocSessionStdioCurrent();
+    ctx.session_vproc = vprocCurrent();
+    ctx.runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext
+        ? PSCALRuntimeGetCurrentRuntimeContext()
+        : NULL;
+
+    struct termios stdin_termios;
+    bool stdin_termios_valid = (tcgetattr(STDIN_FILENO, &stdin_termios) == 0);
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    (void)pthread_attr_setstacksize(&attr, SMALLCLUE_TOOL_THREAD_STACK_SZ);
+    pthread_t worker_thread;
+    int create_rc = pthread_create(&worker_thread, &attr, smallclueToolThreadMain, &ctx);
+    pthread_attr_destroy(&attr);
+    if (create_rc != 0) {
+        return entry(argc, argv);
+    }
+
+    pthread_join(worker_thread, NULL);
+    if (stdin_termios_valid) {
+        (void)tcsetattr(STDIN_FILENO, TCSAFLUSH, &stdin_termios);
+    }
+    return ctx.status;
+}
+#endif
+
+static int smallclueRunShebangTool(const char *path, char *const *argv) {
+    if (!path || !*path) {
+        return -1;
+    }
+
+    char interpreter[PATH_MAX];
+    char interpreter_arg[PATH_MAX];
+    if (!smallclueReadShebangInterpreter(path,
+                                         interpreter,
+                                         sizeof(interpreter),
+                                         interpreter_arg,
+                                         sizeof(interpreter_arg))) {
+        return -1;
+    }
+
+    char arg_words[PATH_MAX];
+    arg_words[0] = '\0';
+    if (interpreter_arg[0]) {
+        snprintf(arg_words, sizeof(arg_words), "%s", interpreter_arg);
+    }
+    char *words[16];
+    size_t word_count = 0;
+    char *cursor = arg_words;
+    while (*cursor && word_count < (sizeof(words) / sizeof(words[0]))) {
+        while (*cursor && isspace((unsigned char)*cursor)) {
+            cursor++;
+        }
+        if (!*cursor) {
+            break;
+        }
+        words[word_count++] = cursor;
+        while (*cursor && !isspace((unsigned char)*cursor)) {
+            cursor++;
+        }
+        if (*cursor) {
+            *cursor++ = '\0';
+        }
+    }
+    const char *tool_name = NULL;
+    size_t shebang_arg_start = 0;
+    const char *base = strrchr(interpreter, '/');
+    base = base ? (base + 1) : interpreter;
+    if (strcmp(base, "env") == 0) {
+        if (word_count == 0) {
+            return -1;
+        }
+        tool_name = smallclueResolveShebangToolName(words[0]);
+        shebang_arg_start = 1;
+    } else {
+        tool_name = smallclueResolveShebangToolName(interpreter);
+        shebang_arg_start = 0;
+    }
+    SmallclueToolEntryFn entry = smallclueResolveShebangToolEntry(tool_name);
+    if (!tool_name || !entry) {
+        return -1;
+    }
+
+    size_t shebang_argc = (word_count > shebang_arg_start)
+                              ? (word_count - shebang_arg_start)
+                              : 0;
+    size_t script_argc = 0;
+    if (argv) {
+        while (argv[1 + script_argc]) {
+            script_argc++;
+        }
+    }
+
+    size_t total_args = 1 + shebang_argc + 1 + script_argc;
+    char **tool_argv = (char **)calloc(total_args + 1, sizeof(char *));
+    if (!tool_argv) {
+        return EXIT_FAILURE;
+    }
+
+    bool ok = true;
+    size_t idx = 0;
+    tool_argv[idx++] = strdup(tool_name);
+    if (!tool_argv[idx - 1]) {
+        ok = false;
+    }
+    for (size_t i = 0; ok && i < shebang_argc; ++i) {
+        tool_argv[idx++] = strdup(words[shebang_arg_start + i]);
+        if (!tool_argv[idx - 1]) {
+            ok = false;
+        }
+    }
+    if (ok) {
+        tool_argv[idx++] = strdup(path);
+        if (!tool_argv[idx - 1]) {
+            ok = false;
+        }
+    }
+    for (size_t i = 0; ok && i < script_argc; ++i) {
+        const char *arg = argv[1 + i];
+        tool_argv[idx++] = strdup(arg ? arg : "");
+        if (!tool_argv[idx - 1]) {
+            ok = false;
+        }
+    }
+    tool_argv[idx] = NULL;
+
+    int status = EXIT_FAILURE;
+    if (ok) {
+ #if defined(PSCAL_TARGET_IOS)
+        if (smallclueShebangToolNeedsWorkerThread(tool_name)) {
+            status = smallclueRunToolEntryInWorkerThread(entry, (int)total_args, tool_argv);
+        } else {
+            status = entry((int)total_args, tool_argv);
+        }
+ #else
+        status = entry((int)total_args, tool_argv);
+ #endif
+    } else {
+        fprintf(stderr, "%s: out of memory launching tool runner\n", tool_name);
+    }
+
+    for (size_t i = 0; i < idx; ++i) {
+        free(tool_argv[i]);
+    }
+    free(tool_argv);
+    return status;
 }
 
 static bool smallclueWatchExecViaShebang(const char *script_path, int argc, char **argv) {
@@ -10446,16 +10750,43 @@ static void smallclueTimePrintMetric(const char *label, double seconds) {
     printf("%s\t%ldm%.3fs\n", label, minutes, remainder);
 }
 
+static int smallclueTimeRunCommand(int argc, char **argv) {
+    if (argc <= 0 || !argv || !argv[0] || argv[0][0] == '\0') {
+        return 127;
+    }
+
+    const SmallclueApplet *applet = smallclueFindApplet(argv[0]);
+    if (applet) {
+        return smallclueDispatchApplet(applet, argc, argv);
+    }
+
+#if defined(PSCAL_TARGET_IOS)
+    char exec_path[PATH_MAX];
+    char shell_cwd[PATH_MAX];
+    const char *resolve_cwd = NULL;
+    if (vprocShellGetcwdShim(shell_cwd, sizeof(shell_cwd)) != NULL && shell_cwd[0] == '/') {
+        resolve_cwd = shell_cwd;
+    }
+    if (smallclueResolveExecutableFromBaseCwd(resolve_cwd,
+                                              argv[0],
+                                              exec_path,
+                                              sizeof(exec_path)) &&
+        smallcluePathHasShebang(exec_path)) {
+        int status = smallclueRunShebangTool(exec_path, argv);
+        if (status >= 0) {
+            return status;
+        }
+    }
+#endif
+
+    fprintf(stderr, "time: %s: command not found\n", argv[0]);
+    return 127;
+}
+
 static int smallclueTimeCommand(int argc, char **argv) {
     if (argc < 2 || !argv[1] || argv[1][0] == '\0') {
         fprintf(stderr, "usage: time command [args...]\n");
         return 1;
-    }
-
-    const SmallclueApplet *applet = smallclueFindApplet(argv[1]);
-    if (!applet) {
-        fprintf(stderr, "time: %s: command not found\n", argv[1]);
-        return 127;
     }
 
     struct timespec start_real = {0};
@@ -10465,7 +10796,7 @@ static int smallclueTimeCommand(int argc, char **argv) {
     bool have_real = (clock_gettime(CLOCK_MONOTONIC, &start_real) == 0);
     bool have_usage = (getrusage(RUSAGE_SELF, &start_usage) == 0);
 
-    int status = smallclueDispatchApplet(applet, argc - 1, &argv[1]);
+    int status = smallclueTimeRunCommand(argc - 1, &argv[1]);
 
     if (have_real) {
         have_real = (clock_gettime(CLOCK_MONOTONIC, &end_real) == 0);
