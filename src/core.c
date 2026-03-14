@@ -10128,7 +10128,15 @@ static uint16_t smallclueSysvSum(FILE *f, unsigned long long *out_blocks) {
     ssize_t n;
 
     while ((n = smallclueReadStream(f, buf, sizeof(buf), &read_err)) > 0) {
-        for (ssize_t i = 0; i < n; ++i) {
+        ssize_t i = 0;
+        /* Bolt optimization: Loop unrolling for SysV sum to reduce branching overhead */
+        for (; i + 15 < n; i += 16) {
+            sum += (uint8_t)buf[i] + (uint8_t)buf[i+1] + (uint8_t)buf[i+2] + (uint8_t)buf[i+3] +
+                   (uint8_t)buf[i+4] + (uint8_t)buf[i+5] + (uint8_t)buf[i+6] + (uint8_t)buf[i+7] +
+                   (uint8_t)buf[i+8] + (uint8_t)buf[i+9] + (uint8_t)buf[i+10] + (uint8_t)buf[i+11] +
+                   (uint8_t)buf[i+12] + (uint8_t)buf[i+13] + (uint8_t)buf[i+14] + (uint8_t)buf[i+15];
+        }
+        for (; i < n; ++i) {
             sum += (uint8_t)buf[i];
         }
         total += (unsigned long long)n;
