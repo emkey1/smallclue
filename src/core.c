@@ -94,9 +94,17 @@ void PSCALRuntimeEndScriptCapture(void) __attribute__((weak));
 int PSCALRuntimeScriptCaptureActive(void) __attribute__((weak));
 int pscalRuntimeOpenShellTab(void) __attribute__((weak));
 char *pscalRuntimePickMountSourceDirectory(void) __attribute__((weak));
+extern int PSCALRuntimePingHost(const char *host,
+    int count,
+    int timeout_ms,
+    char **out_output) __attribute__((weak_import));
 extern void *PSCALRuntimeGetCurrentRuntimeContext(void) __attribute__((weak_import));
 extern void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) __attribute__((weak_import));
 #if !defined(__APPLE__)
+extern int PSCALRuntimePingHost(const char *host,
+    int count,
+    int timeout_ms,
+    char **out_output) __attribute__((weak));
 extern void *PSCALRuntimeGetCurrentRuntimeContext(void) __attribute__((weak));
 extern void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) __attribute__((weak));
 #endif
@@ -2005,7 +2013,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"passwd", smallcluePasswdCommand, "Change user password"},
     {"pbcopy", smallcluePbcopyCommand, "Copy stdin to the system clipboard"},
     {"pbpaste", smallcluePbpasteCommand, "Paste the system clipboard to stdout"},
-    {"ping", smallcluePingCommand, "TCP ping utility"},
+    {"ping", smallcluePingCommand, "ICMP echo utility"},
     {"poweroff", smallclueHaltCommand, "Power off the system"},
     {"ps", smallcluePsCommand, "Show simple process information"},
     {"pwd", smallcluePwdCommand, "Print working directory"},
@@ -2233,8 +2241,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                "  Copy stdin to system clipboard"},
     {"pbpaste", "pbpaste\n"
                 "  Paste system clipboard to stdout"},
-    {"ping", "ping HOST [PORT]\n"
-             "  TCP ping (default port 80)"},
+    {"ping", "ping [-c count] [-t timeout_ms] HOST\n"
+             "  ICMP echo ping (IPv4)"},
     {"poweroff", "poweroff [-f]\n"
              "  Power off the system"},
     {"ps", "ps\n"
@@ -11614,99 +11622,177 @@ static int smallclueDfCommand(int argc, char **argv) {
     }
     return status;
 }
-static int smallcluePingAttempt(const struct sockaddr *addr, socklen_t addrlen, int family, int timeout_ms, double *out_ms, int probe_port) {
-    int sock = socket(family, SOCK_STREAM, IPPROTO_TCP);
+enum {
+    SMALLCLUE_PING_PAYLOAD_SIZE = 56
+};
+
+static uint16_t smallclueInternetChecksum(const void *data, size_t len) {
+    const uint8_t *bytes = (const uint8_t *)data;
+    uint32_t sum = 0;
+    while (len > 1) {
+        sum += (uint32_t)((bytes[0] << 8) | bytes[1]);
+        bytes += 2;
+        len -= 2;
+    }
+    if (len > 0) {
+        sum += (uint32_t)(bytes[0] << 8);
+    }
+    while ((sum >> 16) != 0) {
+        sum = (sum & 0xffffu) + (sum >> 16);
+    }
+    return (uint16_t)~sum;
+}
+
+static bool smallcluePingDecodeReply(const unsigned char *buf, size_t len,
+        uint16_t ident, uint16_t seq, size_t *out_reply_len) {
+    const struct icmp *icmp_hdr = NULL;
+    size_t reply_len = len;
+
+    if (len >= sizeof(struct ip)) {
+        const struct ip *ip_hdr = (const struct ip *)buf;
+        if (ip_hdr->ip_v == 4) {
+            size_t ip_len = (size_t)ip_hdr->ip_hl << 2;
+            if (ip_len >= sizeof(struct ip) && len >= ip_len + ICMP_MINLEN) {
+                icmp_hdr = (const struct icmp *)(buf + ip_len);
+                reply_len = len - ip_len;
+            }
+        }
+    }
+    if (!icmp_hdr && len >= ICMP_MINLEN) {
+        icmp_hdr = (const struct icmp *)buf;
+        reply_len = len;
+    }
+    if (!icmp_hdr) {
+        errno = EPROTO;
+        return false;
+    }
+    if (icmp_hdr->icmp_type != ICMP_ECHOREPLY) {
+        errno = EPROTO;
+        return false;
+    }
+    if (ntohs((uint16_t)icmp_hdr->icmp_seq) != seq) {
+        errno = EPROTO;
+        return false;
+    }
+    if (ntohs((uint16_t)icmp_hdr->icmp_id) != ident) {
+        errno = EPROTO;
+        return false;
+    }
+    if (out_reply_len) {
+        *out_reply_len = reply_len;
+    }
+    return true;
+}
+
+static int smallcluePingAttempt(const struct sockaddr_in *target_addr, int timeout_ms,
+        uint16_t ident, uint16_t seq, double *out_ms, size_t *out_reply_len) {
+    if (!target_addr) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
     if (sock < 0) {
         return -1;
     }
-    int flags = fcntl(sock, F_GETFL, 0);
-    if (flags >= 0) {
-        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-    }
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    int rc = -1;
-    // If a specific port was provided, override it in the sockaddr.
-    if (probe_port > 0) {
-        if (addr->sa_family == AF_INET && addrlen >= sizeof(struct sockaddr_in)) {
-            struct sockaddr_in tmp;
-            memcpy(&tmp, addr, sizeof(tmp));
-            tmp.sin_port = htons((uint16_t)probe_port);
-            rc = connect(sock, (struct sockaddr *)&tmp, sizeof(tmp));
-        } else if (addr->sa_family == AF_INET6 && addrlen >= sizeof(struct sockaddr_in6)) {
-            struct sockaddr_in6 tmp6;
-            memcpy(&tmp6, addr, sizeof(tmp6));
-            tmp6.sin6_port = htons((uint16_t)probe_port);
-            rc = connect(sock, (struct sockaddr *)&tmp6, sizeof(tmp6));
-        } else {
-            rc = connect(sock, addr, addrlen);
-        }
-    } else {
-        rc = connect(sock, addr, addrlen);
-    }
-    if (rc < 0 && errno == EINPROGRESS) {
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        FD_SET(sock, &wfds);
-        struct timeval tv;
-        tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-        rc = select(sock + 1, NULL, &wfds, NULL, &tv);
-        if (rc <= 0) {
-            close(sock);
-            errno = (rc == 0) ? ETIMEDOUT : errno;
-            return -1;
-        }
-        int so_error = 0;
-        socklen_t slen = sizeof(so_error);
-        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &slen) < 0 || so_error != 0) {
-            if (so_error != 0) {
-                errno = so_error;
-            }
-            close(sock);
-            return -1;
-        }
-    } else if (rc < 0) {
+
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
         close(sock);
         return -1;
     }
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    close(sock);
-    if (out_ms) {
-        double start_ms = (double)start.tv_sec * 1000.0 + (double)start.tv_nsec / 1e6;
-        double end_ms = (double)end.tv_sec * 1000.0 + (double)end.tv_nsec / 1e6;
-        *out_ms = end_ms - start_ms;
+
+    if (connect(sock, (const struct sockaddr *)target_addr, sizeof(*target_addr)) < 0) {
+        close(sock);
+        return -1;
     }
-    return 0;
+
+    unsigned char packet[ICMP_MINLEN + SMALLCLUE_PING_PAYLOAD_SIZE];
+    memset(packet, 0, sizeof(packet));
+    struct icmp *icmp_hdr = (struct icmp *)packet;
+    icmp_hdr->icmp_type = ICMP_ECHO;
+    icmp_hdr->icmp_code = 0;
+    icmp_hdr->icmp_id = htons(ident);
+    icmp_hdr->icmp_seq = htons(seq);
+    for (size_t i = ICMP_MINLEN; i < sizeof(packet); ++i) {
+        packet[i] = (unsigned char)(i & 0xffu);
+    }
+    icmp_hdr->icmp_cksum = 0;
+    icmp_hdr->icmp_cksum = smallclueInternetChecksum(packet, sizeof(packet));
+
+    struct timespec start;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        close(sock);
+        return -1;
+    }
+
+    ssize_t sent = send(sock, packet, sizeof(packet), 0);
+    if (sent != (ssize_t)sizeof(packet)) {
+        if (sent >= 0) {
+            errno = EIO;
+        }
+        close(sock);
+        return -1;
+    }
+
+    unsigned char reply[1500];
+    for (;;) {
+        ssize_t received = recv(sock, reply, sizeof(reply), 0);
+        if (received < 0) {
+            close(sock);
+            return -1;
+        }
+
+        struct timespec end;
+        if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+            close(sock);
+            return -1;
+        }
+
+        size_t reply_len = 0;
+        if (!smallcluePingDecodeReply(reply, (size_t)received, ident, seq, &reply_len)) {
+            continue;
+        }
+
+        if (out_ms) {
+            double start_ms = (double)start.tv_sec * 1000.0 + (double)start.tv_nsec / 1e6;
+            double end_ms = (double)end.tv_sec * 1000.0 + (double)end.tv_nsec / 1e6;
+            *out_ms = end_ms - start_ms;
+        }
+        if (out_reply_len) {
+            *out_reply_len = reply_len;
+        }
+        close(sock);
+        return 0;
+    }
 }
 
 static int smallcluePingCommand(int argc, char **argv) {
-    const char *usage = "usage: ping [-c count] [-p port] [-t timeout_ms] host\n";
+    const char *usage = "usage: ping [-c count] [-t timeout_ms] host\n";
     if (argc <= 1) {
         fputs(usage, stderr);
         return 1;
     }
+
     smallclueResetGetopt();
     int count = 4;
     int timeout_ms = 3000;
-    int probe_port = 80;
     int opt;
-    while ((opt = getopt(argc, argv, "c:p:t:")) != -1) {
+    while ((opt = getopt(argc, argv, "c:t:")) != -1) {
         switch (opt) {
             case 'c':
                 count = atoi(optarg);
-                if (count <= 0) count = 4;
-                break;
-            case 'p':
-                probe_port = atoi(optarg);
-                if (probe_port <= 0 || probe_port > 65535) {
-                    fprintf(stderr, "ping: invalid port '%s'\n", optarg);
-                    return 1;
+                if (count <= 0) {
+                    count = 4;
                 }
                 break;
             case 't':
                 timeout_ms = atoi(optarg);
-                if (timeout_ms <= 0) timeout_ms = 3000;
+                if (timeout_ms <= 0) {
+                    timeout_ms = 3000;
+                }
                 break;
             default:
                 fputs(usage, stderr);
@@ -11717,63 +11803,95 @@ static int smallcluePingCommand(int argc, char **argv) {
         fputs(usage, stderr);
         return 1;
     }
+
     const char *host = argv[optind];
+#if defined(PSCAL_TARGET_IOS)
+    if (PSCALRuntimePingHost) {
+        char *output = NULL;
+        int status = PSCALRuntimePingHost(host, count, timeout_ms, &output);
+        if (output) {
+            fputs(output, stdout);
+            free(output);
+        }
+        return status;
+    }
+#endif
+
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_family = AF_UNSPEC;
+
     struct addrinfo *res = NULL;
-    char portbuf[16];
-    snprintf(portbuf, sizeof(portbuf), "%d", probe_port);
-    int gai = pscalHostsGetAddrInfo(host, portbuf, &hints, &res);
+    int gai = pscalHostsGetAddrInfo(host, NULL, &hints, &res);
     if (gai != 0) {
         fprintf(stderr, "ping: %s: %s\n", host, gai_strerror(gai));
         return 1;
     }
-    struct addrinfo *selected = res;
+
+    struct addrinfo *selected = NULL;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        if (ai->ai_family == AF_INET && ai->ai_addrlen >= sizeof(struct sockaddr_in)) {
+            selected = ai;
+            break;
+        }
+    }
     if (!selected) {
-        fprintf(stderr, "ping: no addresses resolved for %s\n", host);
-        freeaddrinfo(res);
+        fprintf(stderr, "ping: %s: no IPv4 ICMP address resolved\n", host);
+        pscalHostsFreeAddrInfo(res);
         return 1;
     }
-    struct sockaddr_storage target_addr;
-    memcpy(&target_addr, selected->ai_addr, selected->ai_addrlen);
-    socklen_t target_len = (socklen_t)selected->ai_addrlen;
+
+    struct sockaddr_in target_addr;
+    memcpy(&target_addr, selected->ai_addr, sizeof(target_addr));
+
     char addrbuf[NI_MAXHOST];
-    if (getnameinfo((struct sockaddr *)&target_addr, target_len,
+    if (getnameinfo((struct sockaddr *)&target_addr, sizeof(target_addr),
             addrbuf, sizeof(addrbuf), NULL, 0, NI_NUMERICHOST) != 0) {
         strncpy(addrbuf, "unknown", sizeof(addrbuf));
         addrbuf[sizeof(addrbuf) - 1] = '\0';
     }
-    printf("PING %s (%s) TCP port %d, %d probes, timeout %d ms\n",
-        host, addrbuf, probe_port, count, timeout_ms);
+
+    printf("PING %s (%s): %d data bytes\n", host, addrbuf, SMALLCLUE_PING_PAYLOAD_SIZE);
+
     int successes = 0;
-    double min_ms = 0.0, max_ms = 0.0, total_ms = 0.0;
+    double min_ms = 0.0;
+    double max_ms = 0.0;
+    double total_ms = 0.0;
+    uint16_t ident = (uint16_t)(getpid() & 0xffff);
+
     for (int i = 0; i < count; ++i) {
-        double elapsed = 0.0;
-        int rc = smallcluePingAttempt((struct sockaddr *)&target_addr, target_len,
-            selected->ai_family, timeout_ms, &elapsed, probe_port);
+        double elapsed_ms = 0.0;
+        size_t reply_len = 0;
+        int rc = smallcluePingAttempt(&target_addr, timeout_ms, ident, (uint16_t)(i + 1),
+            &elapsed_ms, &reply_len);
         if (rc == 0) {
             successes++;
-            if (successes == 1 || elapsed < min_ms) min_ms = elapsed;
-            if (elapsed > max_ms) max_ms = elapsed;
-            total_ms += elapsed;
-            printf("attempt %d: connected in %.2f ms\n", i + 1, elapsed);
+            if (successes == 1 || elapsed_ms < min_ms) {
+                min_ms = elapsed_ms;
+            }
+            if (elapsed_ms > max_ms) {
+                max_ms = elapsed_ms;
+            }
+            total_ms += elapsed_ms;
+            printf("%zu bytes from %s: icmp_seq=%d time=%.3f ms\n",
+                reply_len, addrbuf, i + 1, elapsed_ms);
         } else {
-            printf("attempt %d: failed (%s)\n", i + 1, strerror(errno));
+            printf("Request timeout for icmp_seq %d (%s)\n", i + 1, strerror(errno));
         }
         fflush(stdout);
         if (i + 1 < count) {
-            usleep(500000);
+            usleep(1000000);
         }
     }
+
     printf("--- %s ping statistics ---\n", host);
-    printf("%d probes sent, %d successful, %d failed\n",
-        count, successes, count - successes);
+    printf("%d packets transmitted, %d packets received, %.1f%% packet loss\n",
+        count, successes, count > 0 ? ((double)(count - successes) * 100.0 / (double)count) : 0.0);
     if (successes > 0) {
-        printf("round-trip min/avg/max = %.2f/%.2f/%.2f ms (TCP port %d)\n",
-            min_ms, total_ms / successes, max_ms, probe_port);
+        printf("round-trip min/avg/max = %.3f/%.3f/%.3f ms\n",
+            min_ms, total_ms / (double)successes, max_ms);
     }
+
     pscalHostsFreeAddrInfo(res);
     return (successes > 0) ? 0 : 1;
 }
