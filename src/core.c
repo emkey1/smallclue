@@ -12057,6 +12057,10 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
         return 1;
     }
     const char *host = argv[optind];
+#if defined(PSCAL_TARGET_IOS)
+    pthread_t bypass_tid = pthread_self();
+    vprocRegisterInterposeBypassThread(bypass_tid);
+#endif
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -12068,6 +12072,9 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
     int gai = pscalHostsGetAddrInfo(host, portbuf, &hints, &res);
     if (gai != 0 || !res) {
         fprintf(stderr, "traceroute: %s: %s\n", host, gai_strerror(gai));
+#if defined(PSCAL_TARGET_IOS)
+        vprocUnregisterInterposeBypassThread(bypass_tid);
+#endif
         return 1;
     }
 
@@ -12075,6 +12082,9 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
     if (recv_sock < 0) {
         fprintf(stderr, "traceroute: unable to open ICMP socket: %s\n", strerror(errno));
         pscalHostsFreeAddrInfo(res);
+#if defined(PSCAL_TARGET_IOS)
+        vprocUnregisterInterposeBypassThread(bypass_tid);
+#endif
         return 1;
     }
 
@@ -12083,6 +12093,9 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
         fprintf(stderr, "traceroute: unable to open UDP socket: %s\n", strerror(errno));
         close(recv_sock);
         pscalHostsFreeAddrInfo(res);
+#if defined(PSCAL_TARGET_IOS)
+        vprocUnregisterInterposeBypassThread(bypass_tid);
+#endif
         return 1;
     }
 
@@ -12147,7 +12160,10 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
 
     close(send_sock);
     close(recv_sock);
-    freeaddrinfo(res);
+    pscalHostsFreeAddrInfo(res);
+#if defined(PSCAL_TARGET_IOS)
+    vprocUnregisterInterposeBypassThread(bypass_tid);
+#endif
     return reached ? 0 : 1;
 }
 
