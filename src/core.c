@@ -1670,6 +1670,7 @@ static int smallclueSudoCommand(int argc, char **argv) {
             if (!pass) return 1;
             char *encrypted = crypt(pass, sp->sp_pwdp);
             smallclueSecureMemzero(pass, strlen(pass));
+            free(pass);
             if (!encrypted || strcmp(encrypted, sp->sp_pwdp) != 0) {
                 fprintf(stderr, "sudo: authentication failure\n");
                 return 1;
@@ -1727,7 +1728,9 @@ static char *smallclueGetPass(const char *prompt) {
     if (len > 0 && buf[len - 1] == '\n') {
         buf[len - 1] = '\0';
     }
-    return buf;
+    char *result = strdup(buf);
+    smallclueSecureMemzero(buf, sizeof(buf));
+    return result;
 }
 #endif
 
@@ -1779,6 +1782,7 @@ static int smallcluePasswdCommand(int argc, char **argv) {
         }
         char *encrypted = crypt(pass, sp->sp_pwdp);
         smallclueSecureMemzero(pass, strlen(pass));
+        free(pass);
         if (!encrypted || strcmp(encrypted, sp->sp_pwdp) != 0) {
             fprintf(stderr, "passwd: authentication failure\n");
             ulckpwdf();
@@ -1788,12 +1792,14 @@ static int smallcluePasswdCommand(int argc, char **argv) {
 
     char *new_pass = smallclueGetPass("New password: ");
     if (!new_pass || !*new_pass) {
+        if (new_pass) free(new_pass);
         fprintf(stderr, "passwd: password unchanged\n");
         ulckpwdf();
         return 1;
     }
     char *new_pass_copy = strdup(new_pass);
-    smallclueSecureMemzero(new_pass, strlen(new_pass)); // Clear static buffer immediately
+    smallclueSecureMemzero(new_pass, strlen(new_pass));
+    free(new_pass);
     if (!new_pass_copy) {
         fprintf(stderr, "passwd: out of memory\n");
         ulckpwdf();
@@ -1803,13 +1809,19 @@ static int smallcluePasswdCommand(int argc, char **argv) {
     char *confirm_pass = smallclueGetPass("Retype new password: ");
     if (!confirm_pass || strcmp(new_pass_copy, confirm_pass) != 0) {
         fprintf(stderr, "passwd: passwords do not match\n");
-        if (confirm_pass) smallclueSecureMemzero(confirm_pass, strlen(confirm_pass));
+        if (confirm_pass) {
+            smallclueSecureMemzero(confirm_pass, strlen(confirm_pass));
+            free(confirm_pass);
+        }
         smallclueSecureMemzero(new_pass_copy, strlen(new_pass_copy));
         free(new_pass_copy);
         ulckpwdf();
         return 1;
     }
-    if (confirm_pass) smallclueSecureMemzero(confirm_pass, strlen(confirm_pass));
+    if (confirm_pass) {
+        smallclueSecureMemzero(confirm_pass, strlen(confirm_pass));
+        free(confirm_pass);
+    }
 
     // Generate salt
     char salt[64];
