@@ -4,3 +4,7 @@
 ## 2024-05-19 - Optimization of sum applet block read
 **Learning:** The `sum` applet processes inputs byte-by-byte using `fgetc`. For an algorithm like BSD or SysV checksums which calculate quickly, IO reading is a significant bottleneck. Reading in blocks (like `smallclueReadStream(f, buf, sizeof(buf), &read_err)`) can improve throughput significantly and eliminates function call overhead for every byte.
 **Action:** Replace `fgetc` with `smallclueReadStream` block reading in `sum` implementations (`smallclueBsdSum` and `smallclueSysvSum`) and similarly when scanning files.
+
+## 2025-05-15 - Unrolling loops for SysV Checksums
+**Learning:** By analyzing performance hotspots in sequence processing, unrolling a tightly bounded loop manually when summing large arrays significantly reduces branching and condition evaluation overhead in compiler environments with default or basic optimization layers (`gcc`).
+**Action:** Unroll hot loops manually or ensure compilers can auto-vectorize performance-critical iterative functions for faster sequential checksums, block parsing, or text streaming operations, aiming to do 16 or 32 elements simultaneously.
