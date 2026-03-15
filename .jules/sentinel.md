@@ -16,3 +16,8 @@
 **Vulnerability:** When wiping passwords in `sudo` and `passwd` applets, the caller only zeroed the buffer up to `strlen(pass)`. Because the `smallclueGetPass` function used a shared static buffer, shorter passwords entered subsequently did not overwrite the remnants of previous longer passwords in the buffer, leading to potential data leakage.
 **Learning:** Zeroing a dynamically-sized subset (like `strlen`) of a fixed-size static buffer leaves the rest of the buffer intact, which may contain sensitive data from previous calls. Relying solely on the caller to manage static buffer clearing is error-prone.
 **Prevention:** Always securely zero out the entire static buffer (`sizeof(buf)`) at the beginning of the function and on failure before returning, instead of relying on the caller to zero the buffer based on the string length.
+
+## 2024-03-15 - Memory Leak in `smallclueGetPass`
+**Vulnerability:** A static buffer in `smallclueGetPass` was returning a pointer to the buffer directly without being freed. Later callers expected it to be cleared and freed, leading to memory leaks and incomplete sensitive data clearance because callers zero'd their pointer to the static buffer, leaving the copy unsanitized. Also `smallclueGetPass` failed to explicitly free it.
+**Learning:** Static buffers returning sensitive info shouldn't be zeroed and returned without an allocation; if a caller assumes ownership, it leads to leaks and improper security. The memory zeroing must occur on the correct scope.
+**Prevention:** Return an allocated buffer with `strdup` after securing it in the static area, and ensure callers properly securely free this allocated memory.
