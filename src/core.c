@@ -14710,7 +14710,39 @@ static int smallclueWcProcessFile(const char *path, SmallclueWcCounts *counts) {
 
     while ((n = smallclueReadStream(fp, buf, sizeof(buf), &read_err)) > 0) {
         bytes += (uint64_t)n;
-        for (ssize_t i = 0; i < n; ++i) {
+        ssize_t i = 0;
+        /* Bolt optimization: loop unrolling for wc */
+        #define PROCESS_CHAR(idx) do { \
+            unsigned char c = (unsigned char)buf[idx]; \
+            lines += (c == '\n'); \
+            if ((c == ' ') || (c >= '\t' && c <= '\r')) { \
+                in_word = 0; \
+            } else if (!in_word) { \
+                words++; \
+                in_word = 1; \
+            } \
+        } while (0)
+
+        for (; i + 15 < n; i += 16) {
+            PROCESS_CHAR(i);
+            PROCESS_CHAR(i+1);
+            PROCESS_CHAR(i+2);
+            PROCESS_CHAR(i+3);
+            PROCESS_CHAR(i+4);
+            PROCESS_CHAR(i+5);
+            PROCESS_CHAR(i+6);
+            PROCESS_CHAR(i+7);
+            PROCESS_CHAR(i+8);
+            PROCESS_CHAR(i+9);
+            PROCESS_CHAR(i+10);
+            PROCESS_CHAR(i+11);
+            PROCESS_CHAR(i+12);
+            PROCESS_CHAR(i+13);
+            PROCESS_CHAR(i+14);
+            PROCESS_CHAR(i+15);
+        }
+        #undef PROCESS_CHAR
+        for (; i < n; ++i) {
             unsigned char c = (unsigned char)buf[i];
             if (c == '\n') {
                 lines++;
