@@ -14358,9 +14358,36 @@ static int smallclueTrCommand(int argc, char **argv) {
     int read_err = 0;
 
     while ((n = smallclueReadStream(stdin, buf, sizeof(buf), &read_err)) > 0) {
+        ssize_t i = 0;
         if (delete_only) {
             size_t out_idx = 0;
-            for (ssize_t i = 0; i < n; ++i) {
+            #define PROCESS_DELETE(idx) do { \
+                unsigned char c = (unsigned char)buf[idx]; \
+                if (!delete_map[c]) { \
+                    out_buf[out_idx++] = c; \
+                } \
+            } while (0)
+
+            for (; i + 15 < n; i += 16) {
+                PROCESS_DELETE(i);
+                PROCESS_DELETE(i+1);
+                PROCESS_DELETE(i+2);
+                PROCESS_DELETE(i+3);
+                PROCESS_DELETE(i+4);
+                PROCESS_DELETE(i+5);
+                PROCESS_DELETE(i+6);
+                PROCESS_DELETE(i+7);
+                PROCESS_DELETE(i+8);
+                PROCESS_DELETE(i+9);
+                PROCESS_DELETE(i+10);
+                PROCESS_DELETE(i+11);
+                PROCESS_DELETE(i+12);
+                PROCESS_DELETE(i+13);
+                PROCESS_DELETE(i+14);
+                PROCESS_DELETE(i+15);
+            }
+            #undef PROCESS_DELETE
+            for (; i < n; ++i) {
                 unsigned char c = (unsigned char)buf[i];
                 if (!delete_map[c]) {
                     out_buf[out_idx++] = c;
@@ -14370,7 +14397,31 @@ static int smallclueTrCommand(int argc, char **argv) {
                 fwrite(out_buf, 1, out_idx, stdout);
             }
         } else {
-            for (ssize_t i = 0; i < n; ++i) {
+            #define PROCESS_MAP(idx) do { \
+                unsigned char c = (unsigned char)buf[idx]; \
+                buf[idx] = map[c]; \
+            } while (0)
+
+            for (; i + 15 < n; i += 16) {
+                PROCESS_MAP(i);
+                PROCESS_MAP(i+1);
+                PROCESS_MAP(i+2);
+                PROCESS_MAP(i+3);
+                PROCESS_MAP(i+4);
+                PROCESS_MAP(i+5);
+                PROCESS_MAP(i+6);
+                PROCESS_MAP(i+7);
+                PROCESS_MAP(i+8);
+                PROCESS_MAP(i+9);
+                PROCESS_MAP(i+10);
+                PROCESS_MAP(i+11);
+                PROCESS_MAP(i+12);
+                PROCESS_MAP(i+13);
+                PROCESS_MAP(i+14);
+                PROCESS_MAP(i+15);
+            }
+            #undef PROCESS_MAP
+            for (; i < n; ++i) {
                 unsigned char c = (unsigned char)buf[i];
                 buf[i] = map[c];
             }

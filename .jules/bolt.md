@@ -11,3 +11,6 @@
 ## 2025-05-19 - Optimization of wc block read
 **Learning:** When counting lines and words, processing bytes individually with branch checks adds large overhead. Unrolling the loop, similarly done in SysV and BSD checksum loops, improves wc execution speeds.
 **Action:** Unroll loops that iterate character by character over loaded smallclueReadStream buffers. Used 16-unroll factor for wc and sum routines in smallclueWcProcessFile and smallclueBsdSum.
+## 2025-05-19 - Optimization of tr block read
+**Learning:** Similar to `wc` and `sum`, character-by-character operations in `tr` have a large overhead from branch evaluation and iteration.
+**Action:** Unroll loops that iterate character by character over loaded `smallclueReadStream` buffers. Used a 16-unroll factor for `tr` routines in `smallclueTrCommand`.
