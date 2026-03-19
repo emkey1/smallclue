@@ -12951,7 +12951,8 @@ static int smallclueHeadCommand(int argc, char **argv) {
     }
 
     int status = 0;
-    if (index >= argc) {
+    int file_count = argc - index;
+    if (file_count <= 0) {
         status = smallclueHeadStream(stdin, "(stdin)", lines);
     } else {
         for (int i = index; i < argc; ++i) {
@@ -12961,6 +12962,12 @@ static int smallclueHeadCommand(int argc, char **argv) {
                 fprintf(stderr, "head: %s: %s\n", path, strerror(errno));
                 status = 1;
                 continue;
+            }
+            if (file_count > 1) {
+                if (i > index) {
+                    putchar('\n');
+                }
+                printf("==> %s <==\n", path);
             }
             status |= smallclueHeadStream(fp, path, lines);
             fclose(fp);
@@ -13202,7 +13209,8 @@ static int smallclueTailCommand(int argc, char **argv) {
         return 1;
     }
     int status = 0;
-    if (index >= argc) {
+    int file_count = argc - index;
+    if (file_count <= 0) {
         status = follow ? smallclueTailFollow(stdin, "(stdin)", lines)
                         : smallclueTailStream(stdin, "(stdin)", lines);
     } else {
@@ -13214,6 +13222,12 @@ static int smallclueTailCommand(int argc, char **argv) {
                 fprintf(stderr, "tail: %s: %s\n", path, strerror(errno));
                 status = 1;
                 continue;
+            }
+            if (file_count > 1) {
+                if (i > index) {
+                    putchar('\n');
+                }
+                printf("==> %s <==\n", path);
             }
             if (follow) {
                 status |= smallclueTailFollow(fp, path, lines);
