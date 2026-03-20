@@ -1727,6 +1727,14 @@ static char *smallclueGetPass(const char *prompt) {
     size_t len = strlen(buf);
     if (len > 0 && buf[len - 1] == '\n') {
         buf[len - 1] = '\0';
+    } else if (len == sizeof(buf) - 1) {
+        /* Sentinel: If the password exceeded the buffer size, flush the remaining
+         * input up to the newline to prevent residual password fragments from
+         * leaking into subsequent stdin reads. */
+        int c;
+        while ((c = fgetc(stdin)) != '\n' && c != EOF) {
+            /* discard */
+        }
     }
     char *result = strdup(buf);
     smallclueSecureMemzero(buf, sizeof(buf));
