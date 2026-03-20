@@ -10127,7 +10127,35 @@ static uint16_t smallclueBsdSum(FILE *f, unsigned long long *out_blocks) {
     ssize_t n;
 
     while ((n = smallclueReadStream(f, buf, sizeof(buf), &read_err)) > 0) {
-        for (ssize_t i = 0; i < n; ++i) {
+        ssize_t i = 0;
+        /* Bolt optimization: Loop unrolling for BSD sum to reduce branching overhead */
+        #define PROCESS_BSD_CHAR(idx) do { \
+            unsigned char c = (unsigned char)buf[idx]; \
+            sum = (uint16_t)((sum >> 1) | ((sum & 1) << 15)); \
+            sum = (uint16_t)((sum + (uint16_t)c) & 0xFFFF); \
+        } while (0)
+
+        for (; i + 15 < n; i += 16) {
+            PROCESS_BSD_CHAR(i);
+            PROCESS_BSD_CHAR(i+1);
+            PROCESS_BSD_CHAR(i+2);
+            PROCESS_BSD_CHAR(i+3);
+            PROCESS_BSD_CHAR(i+4);
+            PROCESS_BSD_CHAR(i+5);
+            PROCESS_BSD_CHAR(i+6);
+            PROCESS_BSD_CHAR(i+7);
+            PROCESS_BSD_CHAR(i+8);
+            PROCESS_BSD_CHAR(i+9);
+            PROCESS_BSD_CHAR(i+10);
+            PROCESS_BSD_CHAR(i+11);
+            PROCESS_BSD_CHAR(i+12);
+            PROCESS_BSD_CHAR(i+13);
+            PROCESS_BSD_CHAR(i+14);
+            PROCESS_BSD_CHAR(i+15);
+        }
+        #undef PROCESS_BSD_CHAR
+
+        for (; i < n; ++i) {
             unsigned char c = (unsigned char)buf[i];
             sum = (uint16_t)((sum >> 1) | ((sum & 1) << 15));
             sum = (uint16_t)((sum + (uint16_t)c) & 0xFFFF);

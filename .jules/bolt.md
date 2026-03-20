@@ -14,3 +14,6 @@
 ## 2025-05-19 - Optimization of tr block read
 **Learning:** Similar to `wc` and `sum`, character-by-character operations in `tr` have a large overhead from branch evaluation and iteration.
 **Action:** Unroll loops that iterate character by character over loaded `smallclueReadStream` buffers. Used a 16-unroll factor for `tr` routines in `smallclueTrCommand`.
+## 2025-05-19 - Optimization of smallclueBsdSum block read
+**Learning:** The `smallclueBsdSum` loop was processing inputs byte-by-byte which adds branching overhead.
+**Action:** Unroll loops that iterate character by character over loaded `smallclueReadStream` buffers. Used 16-unroll factor for `smallclueBsdSum`.
