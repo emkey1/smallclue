@@ -5988,6 +5988,20 @@ static int markdownTermWidth(void) {
     return MARKDOWN_WRAP_WIDTH;
 }
 
+static int markdownPreferredWrapWidth(void) {
+    int width = markdownTermWidth();
+    if (width <= 20) {
+        return MARKDOWN_WRAP_WIDTH;
+    }
+    if (width > 2) {
+        width -= 2;
+    }
+    if (width < 20) {
+        return MARKDOWN_WRAP_WIDTH;
+    }
+    return width;
+}
+
 static char *markdownTrimInline(char *str) {
     if (!str) return str;
     while (*str && isspace((unsigned char)*str)) {
@@ -6230,14 +6244,14 @@ static char markdownFenceMarker(const char *text) {
     return '\0';
 }
 
-static void markdownWriteHeading(FILE *out, const char *text, int level) {
+static void markdownWriteHeading(FILE *out, const char *text, int level, int wrap_width) {
     if (!text || !*text) return;
     char *formatted = markdownSimplifyInline(text);
     if (!formatted) return;
     fprintf(out, "%s\n", formatted);
     char underline = (level == 1) ? '=' : '-';
     size_t len = strlen(formatted);
-    size_t underline_len = len > MARKDOWN_WRAP_WIDTH ? MARKDOWN_WRAP_WIDTH : len;
+    size_t underline_len = len > (size_t)wrap_width ? (size_t)wrap_width : len;
     for (size_t i = 0; i < underline_len; ++i) {
         fputc(underline, out);
     }
@@ -6319,7 +6333,7 @@ static bool markdownExtractListItem(char *line, char **content, char *firstPrefi
     return false;
 }
 
-static void markdownFlushParagraph(FILE *out, char **paragraph, size_t *length) {
+static void markdownFlushParagraph(FILE *out, char **paragraph, size_t *length, int wrap_width) {
     if (!paragraph || !*paragraph || !length || *length == 0) {
         return;
     }
@@ -6338,7 +6352,7 @@ static void markdownFlushParagraph(FILE *out, char **paragraph, size_t *length) 
     } else {
         char *formatted = markdownSimplifyInline(text);
         if (formatted) {
-            markdownWrapAndWrite(out, formatted, "", "", MARKDOWN_WRAP_WIDTH);
+            markdownWrapAndWrite(out, formatted, "", "", wrap_width);
             free(formatted);
         }
         fputc('\n', out);
@@ -7279,15 +7293,18 @@ static bool markdownLooksLikeWebNoiseLine(const char *line) {
         return true;
     }
     if (len > 8 && probe[len - 1] == ',' &&
+        !strstr(probe, ". ") &&
         (strchr(probe, '.') || strchr(probe, '[') || strchr(probe, ':'))) {
         return true;
     }
     if (len > 1 && len <= 6 && probe[len - 1] == ',' &&
-        isalpha((unsigned char)probe[0]) && !strstr(probe, "://")) {
+        (probe[0] == '.' || probe[0] == '#' || probe[0] == '[' || probe[0] == ':' || probe[0] == '@') &&
+        !strstr(probe, "://")) {
         bool tiny_selector = true;
         for (size_t i = 0; i + 1 < len; ++i) {
             unsigned char ch = (unsigned char)probe[i];
-            if (!(isalnum(ch) || ch == '-' || ch == '_')) {
+            if (!(isalnum(ch) || ch == '-' || ch == '_' ||
+                  ch == '.' || ch == '#' || ch == '[' || ch == ']' || ch == ':')) {
                 tiny_selector = false;
                 break;
             }
@@ -7303,6 +7320,7 @@ static bool markdownLooksLikeWebNoiseLine(const char *line) {
         }
     }
     if (comma_count >= 2 &&
+        !strstr(probe, ". ") &&
         (strchr(probe, '.') || strchr(probe, '[') || strchr(probe, ':') || strstr(probe, "button") || strstr(probe, "html"))) {
         return true;
     }
@@ -7477,12 +7495,13 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
     bool fragmented_link_label_locked = false;
     char fragmented_link_meta[512] = {0};
     bool paragraph_link_only_chain = false;
+    int render_width = markdownPreferredWrapWidth();
 
     if (label && *label) {
         fprintf(output, "%s\n", label);
         size_t underline_len = strlen(label);
-        if (underline_len > MARKDOWN_WRAP_WIDTH) {
-            underline_len = MARKDOWN_WRAP_WIDTH;
+        if (underline_len > (size_t)render_width) {
+            underline_len = (size_t)render_width;
         }
         for (size_t i = 0; i < underline_len; ++i) {
             fputc('=', output);
@@ -7549,7 +7568,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                             paragraph_link_only_chain = false;
                         }
                         if (paragraph_len > 0) {
-                            markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
                             has_blank_separator = true;
                             paragraph_link_only_chain = false;
                         }
@@ -7681,7 +7700,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             if (paragraph_len > 0) {
-                markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
@@ -7699,7 +7718,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             if (paragraph_len > 0) {
-                markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
@@ -7716,7 +7735,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             if (paragraph_len > 0) {
-                markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
@@ -7737,7 +7756,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             if (paragraph_len > 0) {
-                markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
@@ -7748,7 +7767,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
         char fence = markdownFenceMarker(trimmed);
         if (fence != '\0') {
             bool had_paragraph = paragraph_len > 0;
-            markdownFlushParagraph(output, &paragraph, &paragraph_len);
+            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
             if (had_paragraph) {
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
@@ -7780,7 +7799,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             if (paragraph_len > 0) {
-                markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             } else if (!has_blank_separator) {
@@ -7803,7 +7822,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             paragraph[paragraph_len] = '\0';
             char *heading_text = markdownTrimInline(paragraph);
             if (heading_text && *heading_text) {
-                markdownWriteHeading(output, heading_text, setext_heading);
+                markdownWriteHeading(output, heading_text, setext_heading, render_width);
                 has_blank_separator = true;
             }
             paragraph_len = 0;
@@ -7814,12 +7833,12 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
 
         if (markdownIsHorizontalRule(trimmed)) {
             bool had_paragraph = paragraph_len > 0;
-            markdownFlushParagraph(output, &paragraph, &paragraph_len);
+            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
             if (had_paragraph) {
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
-            for (int i = 0; i < MARKDOWN_WRAP_WIDTH; ++i) {
+            for (int i = 0; i < render_width; ++i) {
                 fputc('-', output);
             }
             fputc('\n', output);
@@ -7838,14 +7857,14 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             bool had_paragraph = paragraph_len > 0;
-            markdownFlushParagraph(output, &paragraph, &paragraph_len);
+            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
             if (had_paragraph) {
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
             const char *heading_text = trimmed + heading;
             while (*heading_text == ' ' || *heading_text == '\t') heading_text++;
-            markdownWriteHeading(output, heading_text, heading);
+            markdownWriteHeading(output, heading_text, heading, render_width);
             has_blank_separator = true;
             continue;
         }
@@ -7859,7 +7878,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             bool had_paragraph = paragraph_len > 0;
-            markdownFlushParagraph(output, &paragraph, &paragraph_len);
+            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
             if (had_paragraph) {
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
@@ -7868,7 +7887,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             while (*quote == ' ' || *quote == '\t') quote++;
             char *formatted = markdownSimplifyInline(quote);
             if (formatted) {
-                markdownWrapAndWrite(output, formatted, "> ", "> ", MARKDOWN_WRAP_WIDTH);
+                markdownWrapAndWrite(output, formatted, "> ", "> ", render_width);
                 free(formatted);
             }
             has_blank_separator = true;
@@ -7884,7 +7903,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
         if (pipe_count >= 2) {
             if (!in_table) {
                 bool had_paragraph = paragraph_len > 0;
-                markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
                 if (had_paragraph) {
                     has_blank_separator = true;
                     paragraph_link_only_chain = false;
@@ -7914,14 +7933,14 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
         char prefix_sub[32];
         if (markdownExtractListItem(line, &list_text, prefix_first, sizeof(prefix_first), prefix_sub, sizeof(prefix_sub))) {
             bool had_paragraph = paragraph_len > 0;
-            markdownFlushParagraph(output, &paragraph, &paragraph_len);
+            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
             if (had_paragraph) {
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
             char *formatted = markdownSimplifyInline(list_text);
             if (formatted) {
-                markdownWrapAndWrite(output, formatted, prefix_first, prefix_sub, MARKDOWN_WRAP_WIDTH);
+                markdownWrapAndWrite(output, formatted, prefix_first, prefix_sub, render_width);
                 free(formatted);
             }
             has_blank_separator = false;
@@ -7939,7 +7958,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
     }
 
     bool had_paragraph = paragraph_len > 0;
-    markdownFlushParagraph(output, &paragraph, &paragraph_len);
+    markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
     if (had_paragraph) {
         has_blank_separator = true;
         paragraph_link_only_chain = false;
