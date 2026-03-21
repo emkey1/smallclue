@@ -17,3 +17,6 @@
 ## 2025-05-19 - Optimization of smallclueBsdSum block read
 **Learning:** The `smallclueBsdSum` loop was processing inputs byte-by-byte which adds branching overhead.
 **Action:** Unroll loops that iterate character by character over loaded `smallclueReadStream` buffers. Used 16-unroll factor for `smallclueBsdSum`.
+## 2025-05-19 - Optimization of smallclueReadTokensFromStdin tokenizing
+**Learning:** `smallclueReadTokensFromStdin` processes stream buffers character-by-character and uses a function call (`isspace`) in the inner loop. This creates significant overhead when applets like `xargs` are reading large amounts of input. Avoiding function calls and inlining the checks increases processing speed substantially.
+**Action:** Use manual equivalent inline bounds checking (`(ch == ' ') || (ch >= '\t' && ch <= '\r')`) instead of external function calls like `isspace()` when tokenizing standard stream block processing to avoid overhead.
