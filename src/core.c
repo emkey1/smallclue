@@ -2734,7 +2734,8 @@ static bool smallclueReadTokensFromStdin(SmallclueLineVector *vec) {
     while ((n = smallclueReadStream(stdin, buf, sizeof(buf), &read_err)) > 0) {
         for (ssize_t i = 0; i < n; ++i) {
             int ch = (unsigned char)buf[i];
-            if (isspace(ch)) {
+            /* Bolt optimization: inline isspace equivalent to reduce function call overhead */
+            if ((ch == ' ') || (ch >= '\t' && ch <= '\r')) {
                 if (toklen > 0) {
                     if (!smallclueLineVectorAppend(vec, token, toklen)) {
                         free(token);
