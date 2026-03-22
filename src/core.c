@@ -3826,16 +3826,24 @@ static size_t pagerMaxTop(const PagerBuffer *buffer, int page_rows) {
     return buffer->line_count - page;
 }
 
-static int pagerPromptAndRead(const char *cmd_name) {
+static int pagerPromptAndRead(const char *cmd_name, const char *detail) {
     const char *label = pager_command_name(cmd_name);
     bool md_mode = (label && strcmp(label, "md") == 0);
     bool color = isatty(STDOUT_FILENO);
     const char *inv = color ? "\033[7m" : "";
     const char *rst = color ? "\033[0m" : "";
-    if (md_mode) {
-        fprintf(stdout, "\r%s--%s-- (Space=next, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)%s ", inv, label, rst);
+    if (detail && *detail) {
+        if (md_mode) {
+            fprintf(stdout, "\r%s--%s %s-- (Space=advance, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)%s ",
+                    inv, label, detail, rst);
+        } else {
+            fprintf(stdout, "\r%s--%s %s-- (Space=advance, b=prev, arrows=scroll, q=next file, Q=exit)%s ",
+                    inv, label, detail, rst);
+        }
+    } else if (md_mode) {
+        fprintf(stdout, "\r%s--%s-- (Space=advance, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)%s ", inv, label, rst);
     } else {
-        fprintf(stdout, "\r%s--%s-- (Space=next, b=prev, arrows=scroll, q=quit)%s ", inv, label, rst);
+        fprintf(stdout, "\r%s--%s-- (Space=advance, b=prev, arrows=scroll, q=quit)%s ", inv, label, rst);
     }
     fflush(stdout);
     int key = pager_read_key();
@@ -4012,7 +4020,10 @@ static void pagerSigwinchHandler(int signo) {
 static int pager_terminal_rows(void);
 static int pager_terminal_cols(void);
 
-static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, int page_rows) {
+static int pagerInteractiveSession(const char *cmd_name,
+                                   const char *detail,
+                                   PagerBuffer *buffer,
+                                   int page_rows) {
     if (!buffer || buffer->line_count == 0) {
         pager_last_exit_key = 'q';
         pager_last_md_link_index = -1;
@@ -4054,7 +4065,7 @@ static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, in
             free(highlight);
             redraw = false;
         }
-        int key = pagerPromptAndRead(cmd_name);
+        int key = pagerPromptAndRead(cmd_name, detail);
         switch (key) {
             case PAGER_KEY_RESIZE:
                 g_pager_sigwinch_received = 0;
@@ -4087,6 +4098,10 @@ static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, in
                     }
                     top = new_top;
                     redraw = true;
+                } else if (key == ' ') {
+                    pager_last_exit_key = ' ';
+                    pager_last_md_link_index = -1;
+                    goto done;
                 } else {
                     pagerBell();
                 }
@@ -4845,7 +4860,11 @@ static bool pagerStreamIsInteractive(FILE *stream) {
     return isatty(fd) != 0;
 }
 
-static int pager_file(const char *cmd_name, const char *path, FILE *stream, bool raw_mode) {
+static int pager_file(const char *cmd_name,
+                      const char *path,
+                      const char *detail,
+                      FILE *stream,
+                      bool raw_mode) {
     pager_control_fd_reset();
     pager_last_exit_key = 'q';
     pager_last_md_link_index = -1;
@@ -4946,10 +4965,10 @@ static int pager_file(const char *cmd_name, const char *path, FILE *stream, bool
 #if defined(PSCAL_TARGET_IOS)
     bool prev_session_queue = pager_session_queue_enabled;
     pager_session_queue_enabled = true;
-    status = pagerInteractiveSession(cmd_name, &buffer, page_rows);
+    status = pagerInteractiveSession(cmd_name, detail, &buffer, page_rows);
     pager_session_queue_enabled = prev_session_queue;
 #else
-    status = pagerInteractiveSession(cmd_name, &buffer, page_rows);
+    status = pagerInteractiveSession(cmd_name, detail, &buffer, page_rows);
 #endif
     pagerBufferFree(&buffer);
     pager_control_fd_reset();
@@ -8118,7 +8137,7 @@ static int smallclueMarkdownDisplayDataEx(const char *label,
     rewind(buffer);
     const MarkdownLinkList *prev_active_links = pager_active_md_links;
     pagerSetActiveMarkdownLinks(links_out);
-    int status = pager_file("md", label ? label : "(stdin)", buffer, false);
+    int status = pager_file("md", label ? label : "(stdin)", NULL, buffer, false);
     pagerSetActiveMarkdownLinks(prev_active_links);
     if (exit_key_out) {
         *exit_key_out = pagerLastExitKey();
@@ -10544,7 +10563,7 @@ static int smallclueHelpCommand(int argc, char **argv) {
                 if (*p == '\n') line_count++;
             }
             if (line_count >= rows) {
-                pager_file("smallclue-help", "(internal)", r, false);
+                pager_file("smallclue-help", "(internal)", NULL, r, false);
             } else {
                 // Print directly if it fits on one screen
                 fwrite(buffer, 1, buflen, stdout);
@@ -12400,6 +12419,17 @@ static int smallclueCatCommand(int argc, char **argv) {
     return status ? 1 : 0;
 }
 
+static const char *smallcluePagerDisplayName(const char *path) {
+    if (!path || !*path || strcmp(path, "(stdin)") == 0) {
+        return "(stdin)";
+    }
+    const char *slash = strrchr(path, '/');
+    if (slash && slash[1] != '\0') {
+        return slash + 1;
+    }
+    return path;
+}
+
 static int smallcluePagerCommand(int argc, char **argv) {
     const char *cmd_name = pager_command_name(argv && argc > 0 ? argv[0] : NULL);
     smallclueResetGetopt();
@@ -12418,17 +12448,31 @@ static int smallcluePagerCommand(int argc, char **argv) {
     }
 
     int status = 0;
+    int file_count = argc - optind;
     if (optind >= argc) {
         if (pscalRuntimeStdinIsInteractive()) {
             fprintf(stderr, "%s: missing filename\n", cmd_name);
             return 1;
         }
-        return pager_file(cmd_name, "(stdin)", stdin, raw_mode);
+        return pager_file(cmd_name, "(stdin)", NULL, stdin, raw_mode);
     }
     for (int i = optind; i < argc; ++i) {
         const char *path = argv[i];
+        char detail[PATH_MAX + 32];
+        const char *detail_ptr = NULL;
+        if (file_count > 1) {
+            snprintf(detail, sizeof(detail), "%s (%d/%d)",
+                     smallcluePagerDisplayName(path && strcmp(path, "-") != 0 ? path : "(stdin)"),
+                     (i - optind) + 1,
+                     file_count);
+            detail_ptr = detail;
+        }
         if (!path || strcmp(path, "-") == 0) {
-            status |= pager_file(cmd_name, "(stdin)", stdin, raw_mode);
+            status |= pager_file(cmd_name, "(stdin)", detail_ptr, stdin, raw_mode);
+            int exit_key = pagerLastExitKey();
+            if (exit_key == 'Q' || exit_key == 3 || exit_key == 4) {
+                break;
+            }
             continue;
         }
         FILE *fp = fopen(path, "r");
@@ -12437,8 +12481,14 @@ static int smallcluePagerCommand(int argc, char **argv) {
             status = 1;
             continue;
         }
-        status |= pager_file(cmd_name, path, fp, raw_mode);
+        status |= pager_file(cmd_name, path, detail_ptr, fp, raw_mode);
         fclose(fp);
+        {
+            int exit_key = pagerLastExitKey();
+            if (exit_key == 'Q' || exit_key == 3 || exit_key == 4) {
+                break;
+            }
+        }
     }
     return status ? 1 : 0;
 }
