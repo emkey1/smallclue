@@ -12928,26 +12928,60 @@ static int smallclueHeadStream(FILE *fp, const char *label, long lines) {
     if (lines <= 0) {
         return 0;
     }
-    char *line = NULL;
-    size_t cap = 0;
     long remaining = lines;
     int status = 0;
-    while (remaining > 0) {
-        int read_err = 0;
-        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
-        if (len < 0) {
-            if (read_err) {
-                fprintf(stderr, "head: %s: %s\n",
-                        label ? label : "(stdin)",
-                        strerror(read_err));
-                status = 1;
-            }
-            break;
+    char buf[16384];
+    int read_err = 0;
+    ssize_t n;
+
+    while (remaining > 0 && (n = smallclueReadStream(fp, buf, sizeof(buf), &read_err)) > 0) {
+        ssize_t end_idx = 0;
+        /* Bolt optimization: loop unrolling to count newlines quickly */
+        #define PROCESS_CHAR(idx) do { \
+            if (remaining == 0) break; \
+            if (buf[idx] == '\n') remaining--; \
+            if (remaining == 0) { end_idx = idx + 1; break; } \
+            end_idx = idx + 1; \
+        } while (0)
+
+        for (ssize_t i = 0; i + 15 < n && remaining > 0; i += 16) {
+            PROCESS_CHAR(i);
+            PROCESS_CHAR(i+1);
+            PROCESS_CHAR(i+2);
+            PROCESS_CHAR(i+3);
+            PROCESS_CHAR(i+4);
+            PROCESS_CHAR(i+5);
+            PROCESS_CHAR(i+6);
+            PROCESS_CHAR(i+7);
+            PROCESS_CHAR(i+8);
+            PROCESS_CHAR(i+9);
+            PROCESS_CHAR(i+10);
+            PROCESS_CHAR(i+11);
+            PROCESS_CHAR(i+12);
+            PROCESS_CHAR(i+13);
+            PROCESS_CHAR(i+14);
+            PROCESS_CHAR(i+15);
         }
-        fwrite(line, 1, (size_t)len, stdout);
-        remaining--;
+        #undef PROCESS_CHAR
+
+        for (; end_idx < n && remaining > 0; ++end_idx) {
+            if (buf[end_idx] == '\n') {
+                remaining--;
+                if (remaining == 0) {
+                    end_idx++;
+                    break;
+                }
+            }
+        }
+
+        fwrite(buf, 1, (size_t)end_idx, stdout);
     }
-    free(line);
+    if (read_err) {
+        fprintf(stderr, "head: %s: %s\n",
+                label ? label : "(stdin)",
+                strerror(read_err));
+        status = 1;
+    }
     return status;
 }
 
