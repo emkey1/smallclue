@@ -20,3 +20,6 @@
 ## 2025-05-19 - Optimization of smallclueReadTokensFromStdin tokenizing
 **Learning:** `smallclueReadTokensFromStdin` processes stream buffers character-by-character and uses a function call (`isspace`) in the inner loop. This creates significant overhead when applets like `xargs` are reading large amounts of input. Avoiding function calls and inlining the checks increases processing speed substantially.
 **Action:** Use manual equivalent inline bounds checking (`(ch == ' ') || (ch >= '\t' && ch <= '\r')`) instead of external function calls like `isspace()` when tokenizing standard stream block processing to avoid overhead.
+## 2025-05-19 - Optimization of head stream block read
+**Learning:** The `head` applet (`smallclueHeadStream` in `src/core.c`) is optimized by replacing line-by-line dynamic allocations (`smallclueGetlineStream`) with 16KB block processing (`smallclueReadStream`) and a manually unrolled loop to scan for newlines, significantly reducing system call and heap allocation overhead.
+**Action:** For sequential parsing, use 16KB block reads with `smallclueReadStream` rather than byte-by-byte or line-by-line dynamic allocations (`smallclueGetlineStream`), and unroll inner loops to eliminate branching overhead.
