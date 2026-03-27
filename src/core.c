@@ -1541,6 +1541,12 @@ static int smallclueSuCommand(int argc, char **argv) {
     const char *command = NULL;
     bool login = false;
 
+    /* Sentinel: Sanitize environment to prevent privilege escalation via LD_PRELOAD/PATH injection */
+    unsetenv("LD_PRELOAD");
+    unsetenv("LD_LIBRARY_PATH");
+    unsetenv("LD_DEBUG");
+    unsetenv("IFS");
+
     int arg_idx = 1;
     if (arg_idx < argc && strcmp(argv[arg_idx], "-") == 0) {
         login = true;
