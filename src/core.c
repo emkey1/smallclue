@@ -12538,7 +12538,14 @@ static int smallclueMarkdownCommand(int argc, char **argv) {
         return smallclueMarkdownListDocuments();
     }
     int status = 0;
+    int file_count = argc - optind;
     for (int i = optind; i < argc; ++i) {
+        if (file_count > 1) {
+            if (i > optind) {
+                putchar('\n');
+            }
+            printf("==> %s <==\n", argv[i]);
+        }
         status |= smallclueMarkdownBrowseTarget(argv[i], output_raw);
     }
     return status ? 1 : 0;
