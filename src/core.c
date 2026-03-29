@@ -4199,8 +4199,10 @@ done:
 }
 
 static int print_file(const char *path, FILE *stream) {
-    char buffer[4096];
+    char buffer[65536];
     bool dbg = getenv("PSCALI_PIPE_DEBUG") != NULL;
+    /* Bolt optimization: Use direct write calls for 'cat' to bypass stdio overhead */
+    fflush(stdout); /* flush any previously buffered stdout data to prevent interleaving */
     while (true) {
         int read_err = 0;
         ssize_t n = smallclueReadStream(stream, buffer, sizeof(buffer), &read_err);
@@ -4213,9 +4215,15 @@ static int print_file(const char *path, FILE *stream) {
         if (n == 0) {
             break;
         }
-        if (fwrite(buffer, 1, (size_t)n, stdout) != (size_t)n) {
-            perror("cat: write error");
-            return 1;
+        size_t total_written = 0;
+        while (total_written < (size_t)n) {
+            ssize_t nw = write(STDOUT_FILENO, buffer + total_written, (size_t)n - total_written);
+            if (nw < 0) {
+                if (errno == EINTR) continue;
+                perror("cat: write error");
+                return 1;
+            }
+            total_written += (size_t)nw;
         }
         if (dbg) {
             fprintf(stderr, "[cat] wrote chunk=%zu bytes\n", (size_t)n);

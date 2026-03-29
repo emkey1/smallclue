@@ -23,3 +23,7 @@
 ## 2025-05-19 - Optimization of head stream block read
 **Learning:** The `head` applet (`smallclueHeadStream` in `src/core.c`) is optimized by replacing line-by-line dynamic allocations (`smallclueGetlineStream`) with 16KB block processing (`smallclueReadStream`) and a manually unrolled loop to scan for newlines, significantly reducing system call and heap allocation overhead.
 **Action:** For sequential parsing, use 16KB block reads with `smallclueReadStream` rather than byte-by-byte or line-by-line dynamic allocations (`smallclueGetlineStream`), and unroll inner loops to eliminate branching overhead.
+
+## $(date +%Y-%m-%d) - Optimize Cat throughput via syscall bypass
+**Learning:** For file stream utilities like `cat`, wrapping the stream through stdio `fwrite()` imposes unneeded overhead due to buffering memory copies and lock acquisition compared to raw direct POSIX `write()` loops. By upgrading `cat_file`/`print_file` to use direct `write(STDOUT_FILENO)` with a large stack buffer (64K), we avoid stdio bottlenecking.
+**Action:** When implementing tools meant to shovel bytes quickly (cat, yes, dd), use unbuffered direct system calls like `read` and `write` wrapped in retry loops for `EINTR`, and manually ensure `fflush()` is called on stdio streams beforehand if intermixing could occur.
