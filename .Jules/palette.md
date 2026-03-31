@@ -21,3 +21,7 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+
+## 2025-05-15 - Terminal Clear ANSI Guarding
+**Learning:** Terminal utilities that clear the screen (like `watch` or `clear`) often hardcode ANSI escape sequences (e.g., `\x1b[3J\x1b[H\x1b[2J`) to standard output. If this output is redirected to a file or pipe, the resulting stream is polluted with unreadable control characters, creating a frustrating UX for users trying to log or parse the output.
+**Action:** Always guard terminal-clearing ANSI escape sequences printed to `stdout` with an `isatty(STDOUT_FILENO)` check to ensure they are only emitted when interacting with a live terminal.
