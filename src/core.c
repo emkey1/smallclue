@@ -11325,6 +11325,8 @@ static int smallclueTeeCommand(int argc, char **argv) {
     }
     int status = 0;
     char buffer[4096];
+    /* Bolt optimization: Use direct write calls for 'tee' to bypass stdio overhead for stdout */
+    fflush(stdout); /* flush any previously buffered stdout data to prevent interleaving */
     while (true) {
         int read_err = 0;
         ssize_t nread = smallclueReadStream(stdin, buffer, sizeof(buffer), &read_err);
@@ -11336,11 +11338,20 @@ static int smallclueTeeCommand(int argc, char **argv) {
         if (nread == 0) {
             break;
         }
-        if (fwrite(buffer, 1, (size_t)nread, stdout) != (size_t)nread) {
-            perror("tee");
-            status = 1;
-            break;
+
+        size_t total_written = 0;
+        while (total_written < (size_t)nread) {
+            ssize_t nw = write(STDOUT_FILENO, buffer + total_written, (size_t)nread - total_written);
+            if (nw < 0) {
+                if (errno == EINTR) continue;
+                perror("tee");
+                status = 1;
+                break;
+            }
+            total_written += (size_t)nw;
         }
+        if (status) break;
+
         for (int i = 0; i < file_count; ++i) {
             if (!files[i]) {
                 continue;
