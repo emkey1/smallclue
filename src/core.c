@@ -3853,7 +3853,11 @@ static int pagerPromptAndRead(const char *cmd_name, const char *detail) {
     }
     fflush(stdout);
     int key = pager_read_key();
-    fputs("\r\x1b[K", stdout);
+    if (color) {
+        fputs("\r\x1b[K", stdout);
+    } else {
+        fputs("\r", stdout);
+    }
     fflush(stdout);
     return key;
 }
@@ -11132,8 +11136,8 @@ static int smallclueWatchCommand(int argc, char **argv) {
         }
         /* Match the clear behavior of the standalone `clear` applet: clear
          * scrollback, home cursor, then clear the visible viewport. */
-        fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
         if (isatty(STDOUT_FILENO)) {
+            fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
             printf("\033[7mEvery %.2fs: %s\033[0m\n\n", interval, cmdline ? cmdline : argv[idx]);
         } else {
             printf("Every %.2fs: %s\n\n", interval, cmdline ? cmdline : argv[idx]);
