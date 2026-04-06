@@ -30,3 +30,8 @@
 **Vulnerability:** The `su` command (`smallclueSuCommand` in `src/core.c`) did not sanitize environment variables (such as `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_DEBUG`, `IFS`) before spawning the target shell, unlike the `sudo` command.
 **Learning:** This oversight in a setuid-like applet could allow privilege escalation by enabling a malicious user to inject code into the target user's shell session via environment variables. The architecture missed applying the sanitization consistently across all privilege-boundary-crossing applets.
 **Prevention:** Always sanitize the environment (`unsetenv`) for critical variables before calling `execl` or `execv` in applets that transition user context (e.g., `su`, `sudo`, `login`).
+
+## 2024-05-23 - [HIGH] Environment variable injection in su command
+**Vulnerability:** The `su` command (`smallclueSuCommand` in `src/core.c`) did not sanitize the `PATH` environment variable before spawning the target shell or executing commands, unlike the `sudo` command.
+**Learning:** This oversight in a setuid-like applet could allow privilege escalation by enabling a malicious user to inject code into the target user's shell session via `PATH` manipulation. The architecture missed applying complete sanitization consistently across all privilege-boundary-crossing applets.
+**Prevention:** Always reset `PATH` to a safe default in addition to sanitizing other critical environment variables (`unsetenv`) before calling `execl` or `execv` in applets that transition user context (e.g., `su`, `sudo`, `login`).
