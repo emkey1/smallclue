@@ -21,3 +21,6 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+## 2024-05-24 - Guard ANSI Escape Sequences for Better UX in Redirected Logs
+**Learning:** Hardcoded ANSI escape sequences (like `\x1b[3J` for clear screen or `\x1b[K` for erase line) cause severe log pollution and garbled text when the output of interactive commands like `watch` or `pager` is piped or redirected to a file.
+**Action:** Always conditionally emit interactive ANSI escape sequences using an `isatty` check (e.g., `isatty(STDOUT_FILENO)`). When disabled, provide a clean text-based fallback (e.g., printing a newline) to ensure log legibility.
