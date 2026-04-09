@@ -27,3 +27,6 @@
 ## $(date +%Y-%m-%d) - Optimize Cat throughput via syscall bypass
 **Learning:** For file stream utilities like `cat`, wrapping the stream through stdio `fwrite()` imposes unneeded overhead due to buffering memory copies and lock acquisition compared to raw direct POSIX `write()` loops. By upgrading `cat_file`/`print_file` to use direct `write(STDOUT_FILENO)` with a large stack buffer (64K), we avoid stdio bottlenecking.
 **Action:** When implementing tools meant to shovel bytes quickly (cat, yes, dd), use unbuffered direct system calls like `read` and `write` wrapped in retry loops for `EINTR`, and manually ensure `fflush()` is called on stdio streams beforehand if intermixing could occur.
+## 2024-05-18 - Fast IO via direct POSIX writes
+**Learning:** For high-throughput stream utilities like `tee` (and `cat`), bypassing buffered stdio (`fwrite`) in favor of direct POSIX `write(STDOUT_FILENO)` with a large stack buffer (64KB) significantly improves performance by avoiding memory copies and lock acquisition overhead.
+**Action:** Always call `fflush(stdout)` before transitioning to raw file descriptor writes to prevent output interleaving. Use a retry loop to handle partial writes and `EINTR`.
