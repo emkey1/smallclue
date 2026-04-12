@@ -11308,23 +11308,27 @@ static int smallclueTeeCommand(int argc, char **argv) {
         }
     }
     int file_count = argc - optind;
-    FILE **files = NULL;
+    int *files = NULL;
     if (file_count > 0) {
-        files = (FILE **)calloc((size_t)file_count, sizeof(FILE *));
+        files = (int *)calloc((size_t)file_count, sizeof(int));
         if (!files) {
             perror("tee");
             return 1;
         }
         for (int i = 0; i < file_count; ++i) {
-            const char *mode = append ? "ab" : "wb";
-            files[i] = fopen(argv[optind + i], mode);
-            if (!files[i]) {
+            int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
+            files[i] = open(argv[optind + i], flags, 0666);
+            if (files[i] < 0) {
                 fprintf(stderr, "tee: %s: %s\n", argv[optind + i], strerror(errno));
             }
         }
     }
     int status = 0;
-    char buffer[4096];
+    char buffer[65536];
+
+    /* Bolt optimization: Use direct write calls to bypass stdio overhead */
+    fflush(stdout); /* flush any previously buffered stdout data */
+
     while (true) {
         int read_err = 0;
         ssize_t nread = smallclueReadStream(stdin, buffer, sizeof(buffer), &read_err);
@@ -11336,20 +11340,36 @@ static int smallclueTeeCommand(int argc, char **argv) {
         if (nread == 0) {
             break;
         }
-        if (fwrite(buffer, 1, (size_t)nread, stdout) != (size_t)nread) {
-            perror("tee");
-            status = 1;
-            break;
+
+        size_t total_written = 0;
+        while (total_written < (size_t)nread) {
+            ssize_t nw = write(STDOUT_FILENO, buffer + total_written, (size_t)nread - total_written);
+            if (nw < 0) {
+                if (errno == EINTR) continue;
+                perror("tee: write error");
+                status = 1;
+                break;
+            }
+            total_written += (size_t)nw;
         }
+        if (status) break;
+
         for (int i = 0; i < file_count; ++i) {
-            if (!files[i]) {
+            if (files[i] < 0) {
                 continue;
             }
-            if (fwrite(buffer, 1, (size_t)nread, files[i]) != (size_t)nread) {
-                fprintf(stderr, "tee: %s: %s\n", argv[optind + i], strerror(errno));
-                fclose(files[i]);
-                files[i] = NULL;
-                status = 1;
+            total_written = 0;
+            while (total_written < (size_t)nread) {
+                ssize_t nw = write(files[i], buffer + total_written, (size_t)nread - total_written);
+                if (nw < 0) {
+                    if (errno == EINTR) continue;
+                    fprintf(stderr, "tee: %s: %s\n", argv[optind + i], strerror(errno));
+                    close(files[i]);
+                    files[i] = -1;
+                    status = 1;
+                    break;
+                }
+                total_written += (size_t)nw;
             }
         }
         if (read_err) {
@@ -11360,8 +11380,8 @@ static int smallclueTeeCommand(int argc, char **argv) {
     }
     if (files) {
         for (int i = 0; i < file_count; ++i) {
-            if (files[i]) {
-                fclose(files[i]);
+            if (files[i] >= 0) {
+                close(files[i]);
             }
         }
         free(files);
