@@ -21,3 +21,6 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+## 2025-05-12 - Watch Applet Output Logging Polish
+**Learning:** Continuous output applets (like `watch`) rely on screen-clearing ANSI escape sequences to provide a stable UI in the terminal. However, when users redirect this output to a file or pipe (e.g., `watch cmd > out.log`), these same sequences pollute the file, making it unreadable.
+**Action:** Always conditionally replace UI-centric screen-clearing ANSI codes with a simple newline (`\n`) separator on subsequent iterations when outputting to a non-TTY environment (`!isatty(STDOUT_FILENO)`). This maintains cleanly separated, chronologically readable iteration logs.
