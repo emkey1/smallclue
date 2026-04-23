@@ -21,3 +21,7 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+
+## 2025-04-23 - Guard ANSI Terminal Control Sequences in Watch Logs
+**Learning:** Terminal control sequences used for UI features (like `\x1b[3J\x1b[H\x1b[2J` for clearing the screen in `watch`) can pollute logs with raw escape characters when stdout is redirected (not a TTY), leading to unreadable outputs and loss of iteration context.
+**Action:** Always wrap terminal UI-specific ANSI sequences in an `isatty` check (e.g., `if (isatty(STDOUT_FILENO))`) and provide a graceful fallback, such as a newline `\n` separator, to maintain visual structure when output is piped or redirected to a file.
