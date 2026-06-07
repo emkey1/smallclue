@@ -3153,7 +3153,11 @@ static int smallclueTopCommand(int argc, char **argv) {
         size_t snapshot_count = snapshots ? vprocSnapshot(snapshots, snapshot_cap) : 0;
 
         /* Clear and render. */
-        fputs("\x1b[2J\x1b[H", stdout);
+        if (isatty(STDOUT_FILENO)) {
+            fputs("\x1b[2J\x1b[H", stdout);
+        } else {
+            fputc('\n', stdout);
+        }
 
 #if defined(__APPLE__)
         size_t mem_used_kb = 0, mem_free_kb = 0;
@@ -3770,7 +3774,11 @@ static void pagerRenderPage(const PagerBuffer *buffer, size_t start, int page_ro
     if (page_rows < 1) {
         page_rows = 1;
     }
-    fputs("\x1b[2J\x1b[H", stdout);
+    if (isatty(STDOUT_FILENO)) {
+        fputs("\x1b[2J\x1b[H", stdout);
+    } else {
+        fputc('\n', stdout);
+    }
     size_t end = start + (size_t)page_rows;
     if (end > buffer->line_count) {
         end = buffer->line_count;
@@ -8448,8 +8456,10 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
                 break;
             case '\n':
             case '\r':
-                printf("\x1b[2J\x1b[H");
-                fflush(stdout);
+                if (isatty(STDOUT_FILENO)) {
+                    printf("\x1b[2J\x1b[H");
+                    fflush(stdout);
+                }
 #if defined(PSCAL_TARGET_IOS)
                 pager_session_queue_enabled = prev_session_queue;
 #endif
@@ -8457,8 +8467,10 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
             case 'q':
             case 'Q':
             case 3:
-                printf("\x1b[2J\x1b[H");
-                fflush(stdout);
+                if (isatty(STDOUT_FILENO)) {
+                    printf("\x1b[2J\x1b[H");
+                    fflush(stdout);
+                }
 #if defined(PSCAL_TARGET_IOS)
                 pager_session_queue_enabled = prev_session_queue;
 #endif
@@ -8731,11 +8743,15 @@ static void smallclueMenuStartFrameTo(FILE *out, bool *first_frame) {
         out = stdout;
     }
     if (first_frame && *first_frame) {
-        fputs("\x1b[2J\x1b[H", out);
+        if (isatty(fileno(out))) {
+            fputs("\x1b[2J\x1b[H", out);
+        }
         *first_frame = false;
         return;
     }
-    fputs("\x1b[H\x1b[J", out);
+    if (isatty(fileno(out))) {
+        fputs("\x1b[H\x1b[J", out);
+    }
 }
 
 static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
@@ -8947,8 +8963,10 @@ static int markdownInteractiveSelectDocument(void) {
         }
     }
 
-    printf("\x1b[2J\x1b[H");
-    fflush(stdout);
+    if (isatty(STDOUT_FILENO)) {
+        printf("\x1b[2J\x1b[H");
+        fflush(stdout);
+    }
     pager_control_fd_reset();
 #if defined(PSCAL_TARGET_IOS)
     pager_session_queue_enabled = prev_session_queue;
@@ -10513,8 +10531,10 @@ static int smallclueLicensesCommand(int argc, char **argv) {
                 break;
         }
     }
-    printf("\033[2J\033[H");
-    fflush(stdout);
+    if (isatty(STDOUT_FILENO)) {
+        printf("\033[2J\033[H");
+        fflush(stdout);
+    }
     pager_control_fd_reset();
 #if defined(PSCAL_TARGET_IOS)
     pager_session_queue_enabled = prev_session_queue;
