@@ -21,3 +21,7 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+
+## 2025-05-12 - Continuous Output Applet Screen Clearing
+**Learning:** Continuous output applets (like `top`) often use screen-clearing ANSI escape sequences (e.g., `\x1b[2J\x1b[H`) to maintain an interactive display. If these sequences are not guarded by an `isatty(STDOUT_FILENO)` check, they will severely pollute logs and break readability when the output is redirected to a file.
+**Action:** Always wrap screen-clearing ANSI escape sequences in continuous/fullscreen utilities with an `isatty(STDOUT_FILENO)` check. If it is not a TTY (i.e. redirected), fallback to a simple newline (`\n`) to cleanly separate iterations in the log.
