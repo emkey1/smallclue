@@ -13148,11 +13148,16 @@ static int smallclueHeadCommand(int argc, char **argv) {
     return status ? 1 : 0;
 }
 
+typedef struct {
+    char *data;
+    size_t cap;
+} SmallclueTailLine;
+
 static int smallclueTailStream(FILE *fp, const char *label, long lines) {
     if (lines <= 0) {
         return 0;
     }
-    char **ring = (char **)calloc((size_t)lines, sizeof(char *));
+    SmallclueTailLine *ring = (SmallclueTailLine *)calloc((size_t)lines, sizeof(SmallclueTailLine));
     if (!ring) {
         fprintf(stderr, "tail: %s: out of memory\n", label ? label : "(stdin)");
         return 1;
@@ -13173,23 +13178,28 @@ static int smallclueTailStream(FILE *fp, const char *label, long lines) {
             }
             break;
         }
-        char *copy = (char *)malloc((size_t)len + 1);
-        if (!copy) {
-            fprintf(stderr, "tail: %s: out of memory\n", label ? label : "(stdin)");
-            status = 1;
-            break;
-        }
-        memcpy(copy, line, (size_t)len);
-        copy[len] = '\0';
+
         long slot = count % lines;
-        free(ring[slot]);
-        ring[slot] = copy;
+        size_t required_cap = (size_t)len + 1;
+        /* Bolt optimization: reuse allocated capacity in the ring buffer */
+        if (ring[slot].cap < required_cap) {
+            char *new_data = (char *)realloc(ring[slot].data, required_cap);
+            if (!new_data) {
+                fprintf(stderr, "tail: %s: out of memory\n", label ? label : "(stdin)");
+                status = 1;
+                break;
+            }
+            ring[slot].data = new_data;
+            ring[slot].cap = required_cap;
+        }
+        memcpy(ring[slot].data, line, (size_t)len);
+        ring[slot].data[len] = '\0';
         count++;
     }
     if (status == 0) {
         long start = count > lines ? count - lines : 0;
         for (long i = start; i < count; ++i) {
-            char *entry = ring[i % lines];
+            char *entry = ring[i % lines].data;
             if (entry) {
                 fputs(entry, stdout);
             }
@@ -13197,7 +13207,7 @@ static int smallclueTailStream(FILE *fp, const char *label, long lines) {
     }
     free(line);
     for (long i = 0; i < lines; ++i) {
-        free(ring[i]);
+        free(ring[i].data);
     }
     free(ring);
     return status;
