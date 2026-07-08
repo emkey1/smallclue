@@ -29,6 +29,9 @@
 #include "nl_app.h"
 #include "tac_app.h"
 #include "rev_app.h"
+#include "fold_app.h"
+#include "paste_app.h"
+#include "split_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -2088,6 +2091,9 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"nl", smallclueNlCommand, "Number lines of files"},
     {"tac", smallclueTacCommand, "Concatenate and print files in reverse"},
     {"rev", smallclueRevCommand, "Reverse the characters of each line"},
+    {"fold", smallclueFoldCommand, "Wrap each line to a given width"},
+    {"paste", smallcluePasteCommand, "Merge lines of files"},
+    {"split", smallclueSplitCommand, "Split a file into pieces"},
     {"nslookup", smallclueNslookupCommand, "DNS lookup utility"},
     {"no", smallclueNoCommand, "Repeatedly print strings (exit 1)"},
     {"nohup", smallclueNohupCommand, "Run a command immune to hangups"},
@@ -2443,6 +2449,16 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  Concatenate and print FILE/stdin with lines in reverse order"},
     {"rev", "rev [FILE...]\n"
             "  Reverse the characters of each line of FILE/stdin"},
+    {"fold", "fold [-w WIDTH] [-s] [FILE...]\n"
+             "  Wrap each line to WIDTH characters (default 80);\n"
+             "  -s breaks at the last whitespace before the width"},
+    {"paste", "paste [-d LIST] [-s] [FILE...]\n"
+              "  Merge corresponding lines of FILE/stdin side by side\n"
+              "  (default delimiter: tab, cycles through -d LIST's chars);\n"
+              "  -s: join each file's own lines serially instead"},
+    {"split", "split [-l LINES | -b BYTES] [FILE [PREFIX]]\n"
+              "  Split FILE/stdin into PREFIXaa, PREFIXab, ... (default\n"
+              "  PREFIX: x); -l 1000 lines/chunk by default, or -b BYTES"},
     {"nextvi", "nextvi [FILE]\n"
                "  Full-screen text editor"},
     {"passwd", "passwd [username]\n"

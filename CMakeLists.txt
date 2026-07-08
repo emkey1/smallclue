@@ -191,6 +191,9 @@ set(SOURCES
     src/nl_app.c
     src/tac_app.c
     src/rev_app.c
+    src/fold_app.c
+    src/paste_app.c
+    src/split_app.c
     ${NEXTVI_SOURCES}
     ${OPENSSH_SOURCES}
     ${OPENRSYNC_ROOT}/blocks.c
