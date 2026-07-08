@@ -8759,10 +8759,113 @@ static int smallclueGitCloneUpdateSubmodulesRecursive(git_repository *repo,
     return 0;
 }
 
+/* `git submodule status` callback: prints one line per submodule in the
+ * conventional " <sha> path" / "-<sha> path" (uninitialized) /
+ * "+<sha> path" (checked-out commit differs from the superproject's
+ * recorded pointer) format. */
+static int smallclueGitSubmoduleStatusCallback(git_submodule *submodule, const char *name, void *payload) {
+    (void)payload;
+    const git_oid *indexId = git_submodule_index_id(submodule);
+    char indexHex[GIT_OID_MAX_HEXSIZE + 1];
+    if (indexId) {
+        git_oid_tostr(indexHex, sizeof(indexHex), indexId);
+    } else {
+        snprintf(indexHex, sizeof(indexHex), "%040d", 0);
+    }
+
+    git_repository *subrepo = NULL;
+    char marker = ' ';
+    char shownHex[GIT_OID_MAX_HEXSIZE + 1];
+    snprintf(shownHex, sizeof(shownHex), "%s", indexHex);
+
+    if (git_submodule_open(&subrepo, submodule) != 0 || !subrepo) {
+        marker = '-';
+    } else {
+        git_oid headOid;
+        if (git_reference_name_to_id(&headOid, subrepo, "HEAD") == 0) {
+            git_oid_tostr(shownHex, sizeof(shownHex), &headOid);
+            if (!indexId || git_oid_cmp(&headOid, indexId) != 0) {
+                marker = '+';
+            }
+        }
+        git_repository_free(subrepo);
+    }
+
+    printf("%c%s %s\n", marker, shownHex, name ? name : "?");
+    return 0;
+}
+
+static int smallclueGitCommandSubmodule(git_repository *repo, int argc, char **argv) {
+    const char *action = (argc > 0 && argv[0] && argv[0][0] != '-') ? argv[0] : "status";
+    int argi = (argc > 0 && argv[0] && argv[0][0] != '-') ? 1 : 0;
+
+    if (strcmp(action, "status") == 0) {
+        int rc = git_submodule_foreach(repo, smallclueGitSubmoduleStatusCallback, NULL);
+        if (rc != 0) {
+            smallclueGitPrintLibgitError("submodule: status traversal failed");
+            return 1;
+        }
+        return 0;
+    }
+
+    if (strcmp(action, "update") == 0 || strcmp(action, "init") == 0) {
+        /* Both are implemented as init-if-needed + update + recurse into
+         * nested submodules (via the already-recursive
+         * smallclueGitCloneUpdateSubmodulesRecursive) -- git_submodule_
+         * update's own `init` argument (passed as 1 below) covers a bare
+         * "init" reasonably for this applet's scope: real git's `init`
+         * (populate .git/config from .gitmodules, no fetch/checkout) and
+         * `update` (fetch + checkout) are distinct steps, but the
+         * overwhelmingly common real invocation is `update --init
+         * --recursive` doing both at once, which is what every path here
+         * produces regardless of which of the two action names is given. */
+        bool quiet = false;
+        SmallclueGitCloneSubmoduleSpec selection;
+        smallclueGitCloneSubmoduleSpecInit(&selection);
+        selection.enabled = true; /* select-all unless pathspecs are appended below */
+
+        for (int i = argi; i < argc; ++i) {
+            const char *arg = argv[i];
+            if (!arg) continue;
+            if (strcmp(arg, "--init") == 0 || strcmp(arg, "--recursive") == 0 ||
+                strcmp(arg, "--force") == 0) {
+                continue; /* accepted, already the only mode implemented */
+            }
+            if (strcmp(arg, "-q") == 0 || strcmp(arg, "--quiet") == 0) {
+                quiet = true;
+                continue;
+            }
+            if (arg[0] == '-') {
+                smallclueGitPrintError("submodule: unsupported option");
+                smallclueGitCloneSubmoduleSpecClear(&selection);
+                return 2;
+            }
+            if (smallclueGitCloneSubmoduleSpecAppend(&selection, arg) != 0) {
+                smallclueGitPrintError("submodule: failed to record pathspec");
+                smallclueGitCloneSubmoduleSpecClear(&selection);
+                return 2;
+            }
+        }
+
+        int rc = smallclueGitCloneUpdateSubmodulesRecursive(repo, quiet, &selection, NULL);
+        smallclueGitCloneSubmoduleSpecClear(&selection);
+        return rc;
+    }
+
+    if (strcmp(action, "sync") == 0 || strcmp(action, "foreach") == 0 || strcmp(action, "deinit") == 0) {
+        smallclueGitPrintError("submodule: this subcommand is not implemented");
+        return 2;
+    }
+
+    smallclueGitPrintError("submodule: unsupported subcommand (supported: status, update, init)");
+    return 2;
+}
+
 static int smallclueGitCommandClone(const char *start_path, int argc, char **argv) {
     bool bare = false;
     bool quiet = false;
     int rc = 0;
+    int depth = 0; /* 0 = GIT_FETCH_DEPTH_FULL (full history), matching git_clone_options's own default */
     const char *branch = NULL;
     const char *source = NULL;
     const char *dest_arg = NULL;
@@ -8807,6 +8910,14 @@ static int smallclueGitCommandClone(const char *start_path, int argc, char **arg
         }
         if (strncmp(arg, "--branch=", 9) == 0) {
             branch = arg + 9;
+            continue;
+        }
+        if (strcmp(arg, "--depth") == 0 && i + 1 < argc) {
+            depth = atoi(argv[++i]);
+            continue;
+        }
+        if (strncmp(arg, "--depth=", 8) == 0) {
+            depth = atoi(arg + 8);
             continue;
         }
         if (arg[0] == '-') {
@@ -8876,6 +8987,9 @@ static int smallclueGitCommandClone(const char *start_path, int argc, char **arg
 
     git_clone_options clone_opts = GIT_CLONE_OPTIONS_INIT;
     smallclueGitApplyCredentials(&clone_opts.fetch_opts.callbacks);
+    if (depth > 0) {
+        clone_opts.fetch_opts.depth = depth;
+    }
     clone_opts.bare = bare ? 1 : 0;
     if (branch && *branch) {
         clone_opts.checkout_branch = branch;
@@ -12833,6 +12947,9 @@ static int smallclueGitCommandMain(git_repository *repo, const char *subcmd, int
     }
     if (strcmp(subcmd, "status") == 0) {
         return smallclueGitCommandStatus(repo, subargc, subargv);
+    }
+    if (strcmp(subcmd, "submodule") == 0) {
+        return smallclueGitCommandSubmodule(repo, subargc, subargv);
     }
     if (strcmp(subcmd, "branch") == 0) {
         return smallclueGitCommandBranch(repo, subargc, subargv);
