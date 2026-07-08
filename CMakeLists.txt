@@ -187,6 +187,10 @@ set(SOURCES
     src/cmp_app.c
     src/dd_app.c
     src/od_app.c
+    src/seq_app.c
+    src/nl_app.c
+    src/tac_app.c
+    src/rev_app.c
     ${NEXTVI_SOURCES}
     ${OPENSSH_SOURCES}
     ${OPENRSYNC_ROOT}/blocks.c

@@ -25,6 +25,10 @@
 #include "cmp_app.h"
 #include "dd_app.h"
 #include "od_app.h"
+#include "seq_app.h"
+#include "nl_app.h"
+#include "tac_app.h"
+#include "rev_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -2080,6 +2084,10 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"sha1sum", smallclueSha1sumCommand, "Compute or check SHA-1 digests"},
     {"sha256sum", smallclueSha256sumCommand, "Compute or check SHA-256 digests"},
     {"od", smallclueOdCommand, "Dump files in octal/hex/decimal/character format"},
+    {"seq", smallclueSeqCommand, "Print a sequence of numbers"},
+    {"nl", smallclueNlCommand, "Number lines of files"},
+    {"tac", smallclueTacCommand, "Concatenate and print files in reverse"},
+    {"rev", smallclueRevCommand, "Reverse the characters of each line"},
     {"nslookup", smallclueNslookupCommand, "DNS lookup utility"},
     {"no", smallclueNoCommand, "Repeatedly print strings (exit 1)"},
     {"nohup", smallclueNohupCommand, "Run a command immune to hangups"},
@@ -2425,6 +2433,16 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "           u1/u2/u4 (unsigned decimal), c (character)\n"
            "  -c: shorthand for -t c\n"
            "  -v: accepted for compatibility (repeated lines are never collapsed)"},
+    {"seq", "seq [-w] [-s SEP] [FIRST [INCREMENT]] LAST\n"
+            "  Print a sequence of numbers; -w zero-pads to equal width,\n"
+            "  -s SEP sets the separator (default newline)"},
+    {"nl", "nl [-b a|t] [-w WIDTH] [-s SEP] [FILE]\n"
+           "  Number lines of FILE/stdin; -b t (default) numbers non-blank\n"
+           "  lines only, -b a numbers every line"},
+    {"tac", "tac [FILE...]\n"
+            "  Concatenate and print FILE/stdin with lines in reverse order"},
+    {"rev", "rev [FILE...]\n"
+            "  Reverse the characters of each line of FILE/stdin"},
     {"nextvi", "nextvi [FILE]\n"
                "  Full-screen text editor"},
     {"passwd", "passwd [username]\n"
