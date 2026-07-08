@@ -1375,8 +1375,17 @@ static int smallclueMarkdownCommand(int argc, char **argv);
 static int smallclueCurlCommand(int argc, char **argv);
 static int smallclueWgetCommand(int argc, char **argv);
 static int smallclueWhichCommand(int argc, char **argv);
-static int smallclueHttpFetch(const char *cmd_name, const char *url, const char *destinationPath);
-static int smallclueHttpFetchToMemory(const char *cmd_name, const char *url, char **data_out, size_t *len_out);
+typedef struct {
+    const char *method;   /* NULL = default (GET, or POST if postData is set) */
+    char **headers;       /* array of "Key: Value" strings */
+    int headerCount;
+    const char *postData; /* NULL = no request body */
+} SmallclueHttpRequestOptions;
+
+static int smallclueHttpFetch(const char *cmd_name, const char *url, const char *destinationPath,
+                              const SmallclueHttpRequestOptions *reqOpts);
+static int smallclueHttpFetchToMemory(const char *cmd_name, const char *url, char **data_out, size_t *len_out,
+                                      const SmallclueHttpRequestOptions *reqOpts);
 static int smallclueTelnetCommand(int argc, char **argv);
 static int smallclueTracerouteCommand(int argc, char **argv);
 static int smallclueNslookupCommand(int argc, char **argv);
@@ -2185,8 +2194,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Common: -o FILE,\n"
              "  -O (remote name)\n"
              "  -L (follow)\n"
-             "  -d DATA\n"
-             "  -H HEADER"},
+             "  -X METHOD\n"
+             "  -d DATA (repeatable, joined with '&')\n"
+             "  -H HEADER (repeatable)"},
     {"cut", "cut -f LIST [-d DELIM] [-s] [FILE...]\n"
             "       cut -c LIST [FILE...]\n"
             "  -f fields, -c characters/bytes: LIST is N, N-M, N-, or -M,\n"
@@ -2624,8 +2634,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  Count lines/words/bytes"},
     {"wget", "wget [options] URL...\n"
              "  Common: -O FILE\n"
-             "  --header\n"
-             "  --post-data\n"
+             "  --method=METHOD\n"
+             "  --header=HEADER (repeatable)\n"
+             "  --post-data=DATA\n"
              "  -q\n"
              "  -nv"},
     {"which", "which [-a] program ...\n"
@@ -9551,7 +9562,7 @@ static int markdownFetchUrlToMemory(const char *url, char **data_out, size_t *le
     }
     *data_out = NULL;
     *len_out = 0;
-    if (smallclueHttpFetchToMemory("md", url, data_out, len_out) != 0) {
+    if (smallclueHttpFetchToMemory("md", url, data_out, len_out, NULL) != 0) {
         if (*data_out) {
             free(*data_out);
             *data_out = NULL;
@@ -10328,6 +10339,28 @@ static void smallclueCurlApplyCommonOptions(CURL *curl, const char *url) {
 #endif
 }
 
+/* Applies -X/-H/-d (method override, custom headers, POST body) onto a
+ * CURL handle. Returns the built curl_slist (or NULL if no headers were
+ * given) -- caller must curl_slist_free_all() it after curl_easy_perform. */
+static struct curl_slist *smallclueCurlApplyRequestOptions(CURL *curl, const SmallclueHttpRequestOptions *reqOpts) {
+    if (!curl || !reqOpts) return NULL;
+    struct curl_slist *headerList = NULL;
+    for (int i = 0; i < reqOpts->headerCount; ++i) {
+        headerList = curl_slist_append(headerList, reqOpts->headers[i]);
+    }
+    if (headerList) {
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
+    }
+    if (reqOpts->postData) {
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, reqOpts->postData);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(reqOpts->postData));
+    }
+    if (reqOpts->method && *reqOpts->method) {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, reqOpts->method);
+    }
+    return headerList;
+}
+
 static size_t smallclueCurlWriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     FILE *dest = (FILE *)userp;
     size_t bytes = size * nmemb;
@@ -10401,8 +10434,10 @@ static void smallclueUrlSuggestFilename(const char *url, char *buffer, size_t bu
     buffer[len] = '\0';
 }
 
-static int smallclueHttpFetch(const char *cmd_name, const char *url, const char *destinationPath) {
+static int smallclueHttpFetch(const char *cmd_name, const char *url, const char *destinationPath,
+                              const SmallclueHttpRequestOptions *reqOpts) {
 #if !defined(PSCAL_HAS_LIBCURL)
+    (void)reqOpts;
     fprintf(stderr, "%s: networking support is unavailable in this build.\n", cmd_name ? cmd_name : "curl");
     return 1;
 #else
@@ -10427,6 +10462,7 @@ static int smallclueHttpFetch(const char *cmd_name, const char *url, const char 
         close_dest = true;
     }
     smallclueCurlApplyCommonOptions(curl, url);
+    struct curl_slist *headerList = smallclueCurlApplyRequestOptions(curl, reqOpts);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, smallclueCurlWriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, dest);
     CURLcode res = curl_easy_perform(curl);
@@ -10435,6 +10471,7 @@ static int smallclueHttpFetch(const char *cmd_name, const char *url, const char 
     } else {
         fflush(dest);
     }
+    if (headerList) curl_slist_free_all(headerList);
     if (res != CURLE_OK) {
         fprintf(stderr, "%s: %s: %s\n", cmd_name ? cmd_name : "curl", url, curl_easy_strerror(res));
         curl_easy_cleanup(curl);
@@ -10445,10 +10482,12 @@ static int smallclueHttpFetch(const char *cmd_name, const char *url, const char 
 #endif
 }
 
-static int smallclueHttpFetchToMemory(const char *cmd_name, const char *url, char **data_out, size_t *len_out) {
+static int smallclueHttpFetchToMemory(const char *cmd_name, const char *url, char **data_out, size_t *len_out,
+                                      const SmallclueHttpRequestOptions *reqOpts) {
 #if !defined(PSCAL_HAS_LIBCURL)
     (void)data_out;
     (void)len_out;
+    (void)reqOpts;
     fprintf(stderr, "%s: networking support is unavailable in this build.\n", cmd_name ? cmd_name : "curl");
     return 1;
 #else
@@ -10468,6 +10507,7 @@ static int smallclueHttpFetchToMemory(const char *cmd_name, const char *url, cha
     }
     SmallclueCurlMemory buffer = {0};
     smallclueCurlApplyCommonOptions(curl, url);
+    struct curl_slist *headerList = smallclueCurlApplyRequestOptions(curl, reqOpts);
     bool is_md_fetch = (cmd_name && strcmp(cmd_name, "md") == 0);
     if (is_md_fetch) {
         /* Keep md browsing responsive on problematic endpoints. */
@@ -10479,6 +10519,7 @@ static int smallclueHttpFetchToMemory(const char *cmd_name, const char *url, cha
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, smallclueCurlWriteMemoryCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
     CURLcode res = curl_easy_perform(curl);
+    if (headerList) curl_slist_free_all(headerList);
     if (res != CURLE_OK) {
         fprintf(stderr, "%s: %s: %s\n", cmd_name ? cmd_name : "curl", url, curl_easy_strerror(res));
         curl_easy_cleanup(curl);
@@ -14522,8 +14563,13 @@ static int smallclueCurlCommand(int argc, char **argv) {
     smallclueResetGetopt();
     const char *output_path = NULL;
     int use_remote_name = 0;
+    const char *method = NULL;
+    char **headers = NULL;
+    int headerCount = 0, headerCap = 0;
+    char *postData = NULL;
+    size_t postDataLen = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "o:O")) != -1) {
+    while ((opt = getopt(argc, argv, "o:OX:H:d:")) != -1) {
         switch (opt) {
             case 'o':
                 output_path = optarg;
@@ -14531,23 +14577,75 @@ static int smallclueCurlCommand(int argc, char **argv) {
             case 'O':
                 use_remote_name = 1;
                 break;
+            case 'X':
+                method = optarg;
+                break;
+            case 'H': {
+                if (headerCount == headerCap) {
+                    headerCap = headerCap ? headerCap * 2 : 8;
+                    char **resized = (char **)realloc(headers, (size_t)headerCap * sizeof(char *));
+                    if (!resized) {
+                        fprintf(stderr, "curl: out of memory\n");
+                        free(headers);
+                        free(postData);
+                        return 1;
+                    }
+                    headers = resized;
+                }
+                headers[headerCount++] = optarg;
+                break;
+            }
+            case 'd': {
+                /* Real curl joins repeated -d values with '&', like
+                 * concatenating form fields. */
+                size_t addLen = strlen(optarg);
+                size_t sepLen = (postDataLen > 0) ? 1 : 0;
+                char *resized = (char *)realloc(postData, postDataLen + sepLen + addLen + 1);
+                if (!resized) {
+                    fprintf(stderr, "curl: out of memory\n");
+                    free(headers);
+                    free(postData);
+                    return 1;
+                }
+                postData = resized;
+                if (sepLen) postData[postDataLen++] = '&';
+                memcpy(postData + postDataLen, optarg, addLen);
+                postDataLen += addLen;
+                postData[postDataLen] = '\0';
+                break;
+            }
             default:
-                fprintf(stderr, "usage: curl [-o file | -O] url...\n");
+                fprintf(stderr, "usage: curl [-o file | -O] [-X METHOD] [-H HEADER]... [-d DATA]... url...\n");
+                free(headers);
+                free(postData);
                 return 1;
         }
     }
     if (output_path && use_remote_name) {
         fprintf(stderr, "curl: -o and -O may not be used together\n");
+        free(headers);
+        free(postData);
         return 1;
     }
     if (optind >= argc) {
         fprintf(stderr, "curl: missing URL\n");
+        free(headers);
+        free(postData);
         return 1;
     }
     if (output_path && (argc - optind) != 1) {
         fprintf(stderr, "curl: -o is only supported with a single URL\n");
+        free(headers);
+        free(postData);
         return 1;
     }
+    SmallclueHttpRequestOptions reqOpts;
+    memset(&reqOpts, 0, sizeof(reqOpts));
+    reqOpts.method = method;
+    reqOpts.headers = headers;
+    reqOpts.headerCount = headerCount;
+    reqOpts.postData = postData;
+
     int status = 0;
     for (int i = optind; i < argc; ++i) {
         const char *url = argv[i];
@@ -14559,12 +14657,57 @@ static int smallclueCurlCommand(int argc, char **argv) {
             smallclueUrlSuggestFilename(url, derived, sizeof(derived));
             destination = derived;
         }
-        status |= smallclueHttpFetch("curl", url, destination);
+        status |= smallclueHttpFetch("curl", url, destination, &reqOpts);
     }
+    free(headers);
+    free(postData);
     return status ? 1 : 0;
 }
 
 static int smallclueWgetCommand(int argc, char **argv) {
+    const char *method = NULL;
+    char **headers = NULL;
+    int headerCount = 0, headerCap = 0;
+    char *postData = NULL;
+
+    /* Real wget has no short forms for these, only --header=/--post-data=/
+     * --method= (repeated GNU long options with no getopt()-friendly short
+     * equivalent) -- strip them out before calling getopt(), matching the
+     * convention used elsewhere in this file (e.g. stat's --format=). */
+    for (int i = 1; i < argc; ) {
+        if (strncmp(argv[i], "--header=", 9) == 0) {
+            if (headerCount == headerCap) {
+                headerCap = headerCap ? headerCap * 2 : 8;
+                char **resized = (char **)realloc(headers, (size_t)headerCap * sizeof(char *));
+                if (!resized) {
+                    fprintf(stderr, "wget: out of memory\n");
+                    free(headers);
+                    free(postData);
+                    return 1;
+                }
+                headers = resized;
+            }
+            headers[headerCount++] = argv[i] + 9;
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            argc--;
+            continue;
+        }
+        if (strncmp(argv[i], "--post-data=", 12) == 0) {
+            free(postData);
+            postData = strdup(argv[i] + 12);
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            argc--;
+            continue;
+        }
+        if (strncmp(argv[i], "--method=", 9) == 0) {
+            method = argv[i] + 9;
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            argc--;
+            continue;
+        }
+        i++;
+    }
+
     smallclueResetGetopt();
     const char *output_path = NULL;
     int opt;
@@ -14574,18 +14717,32 @@ static int smallclueWgetCommand(int argc, char **argv) {
                 output_path = optarg;
                 break;
             default:
-                fprintf(stderr, "usage: wget [-O file] url...\n");
+                fprintf(stderr, "usage: wget [-O file] [--method=METHOD] [--header=HEADER]... [--post-data=DATA] url...\n");
+                free(headers);
+                free(postData);
                 return 1;
         }
     }
     if (optind >= argc) {
         fprintf(stderr, "wget: missing URL\n");
+        free(headers);
+        free(postData);
         return 1;
     }
     if (output_path && (argc - optind) != 1) {
         fprintf(stderr, "wget: -O is only supported with a single URL\n");
+        free(headers);
+        free(postData);
         return 1;
     }
+
+    SmallclueHttpRequestOptions reqOpts;
+    memset(&reqOpts, 0, sizeof(reqOpts));
+    reqOpts.method = method;
+    reqOpts.headers = headers;
+    reqOpts.headerCount = headerCount;
+    reqOpts.postData = postData;
+
     int status = 0;
     for (int i = optind; i < argc; ++i) {
         const char *url = argv[i];
@@ -14595,12 +14752,14 @@ static int smallclueWgetCommand(int argc, char **argv) {
             smallclueUrlSuggestFilename(url, derived, sizeof(derived));
             destination = derived;
         }
-        int rc = smallclueHttpFetch("wget", url, destination);
+        int rc = smallclueHttpFetch("wget", url, destination, &reqOpts);
         if (rc == 0) {
             printf("Saved %s -> %s\n", url, destination ? destination : "(stdout)");
         }
         status |= rc;
     }
+    free(headers);
+    free(postData);
     return status ? 1 : 0;
 }
 
