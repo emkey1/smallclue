@@ -2361,7 +2361,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"traceroute", "traceroute HOST [PORT]\n"
                    "  Trace network path using the system traceroute command"},
     {"test", "test EXPRESSION\n"
-             "  File: -f -d -e; String: = != -z; Int: -eq -ne -lt -le -gt -ge"},
+             "  File: -f -d -e -r -w -x -s -L/-h\n"
+             "  File compare: -nt -ot -ef\n"
+             "  String: = != -z -n; Int: -eq -ne -lt -le -gt -ge\n"
+             "  Combine: ! (not), -a (and), -o (or) -- -a binds tighter than -o"},
     {"time", "time command [args...]\n"
              "  Run a smallclue applet and print real/user/sys timing"},
     {"tset", "tset [-IQqs] [-e CH] [-i CH] [-k CH] [-r] [TERM]\n"
@@ -18916,6 +18919,9 @@ static bool smallclueIsInteger(const char *s, long long *out) {
     return true;
 }
 
+/* Evaluates a single atomic expression: no -a/-o splitting (that's handled
+ * one level up, by smallclueTestEvaluateOr/And below), just !expr, a bare
+ * string, a unary op + operand, or a binary op between two operands. */
 static bool smallclueTestEvaluate(int argc, char **argv) {
     if (argc <= 0) {
         return false;
@@ -18952,6 +18958,17 @@ static bool smallclueTestEvaluate(int argc, char **argv) {
         if (strcmp(op, "-w") == 0) {
             return access(arg, W_OK) == 0;
         }
+        if (strcmp(op, "-x") == 0) {
+            return access(arg, X_OK) == 0;
+        }
+        if (strcmp(op, "-s") == 0) {
+            struct stat st;
+            return stat(arg, &st) == 0 && st.st_size > 0;
+        }
+        if (strcmp(op, "-L") == 0 || strcmp(op, "-h") == 0) {
+            struct stat st;
+            return lstat(arg, &st) == 0 && S_ISLNK(st.st_mode);
+        }
     }
     if (argc == 3) {
         const char *left = argv[0];
@@ -18962,6 +18979,22 @@ static bool smallclueTestEvaluate(int argc, char **argv) {
         }
         if (strcmp(op, "!=") == 0) {
             return strcmp(left, right) != 0;
+        }
+        if (strcmp(op, "-nt") == 0 || strcmp(op, "-ot") == 0) {
+            struct stat lst, rst;
+            bool haveLeft = stat(left, &lst) == 0;
+            bool haveRight = stat(right, &rst) == 0;
+            if (!haveLeft || !haveRight) {
+                /* POSIX: -nt is true if left exists and right doesn't. */
+                return strcmp(op, "-nt") == 0 && haveLeft && !haveRight;
+            }
+            if (strcmp(op, "-nt") == 0) return lst.st_mtime > rst.st_mtime;
+            return lst.st_mtime < rst.st_mtime;
+        }
+        if (strcmp(op, "-ef") == 0) {
+            struct stat lst, rst;
+            return stat(left, &lst) == 0 && stat(right, &rst) == 0 &&
+                   lst.st_dev == rst.st_dev && lst.st_ino == rst.st_ino;
         }
         long long lhs, rhs;
         if (smallclueIsInteger(left, &lhs) && smallclueIsInteger(right, &rhs)) {
@@ -18977,11 +19010,38 @@ static bool smallclueTestEvaluate(int argc, char **argv) {
     return false;
 }
 
+/* -a/-o support: scans for the first top-level "-a"/"-o" token and splits
+ * there, recursing on each side. -o has lower precedence than -a (matches
+ * POSIX: "expr1 -a expr2 -o expr3" groups as "(expr1 -a expr2) -o expr3"),
+ * so the OR-split happens first/outermost and the AND-split is tried only
+ * within an OR-free segment. Neither operator is looked for as the very
+ * first or very last token (that position can only be a genuine operand,
+ * e.g. `test -a foo` bare-unary-checks "foo" being non-empty via the
+ * single-arg fallback in smallclueTestEvaluate, not an empty left-hand AND
+ * side) -- this matches how real test(1) resolves the ambiguity. */
+static bool smallclueTestEvaluateAnd(int argc, char **argv) {
+    for (int i = 1; i < argc - 1; ++i) {
+        if (strcmp(argv[i], "-a") == 0) {
+            return smallclueTestEvaluateAnd(i, argv) && smallclueTestEvaluateAnd(argc - i - 1, argv + i + 1);
+        }
+    }
+    return smallclueTestEvaluate(argc, argv);
+}
+
+static bool smallclueTestEvaluateOr(int argc, char **argv) {
+    for (int i = 1; i < argc - 1; ++i) {
+        if (strcmp(argv[i], "-o") == 0) {
+            return smallclueTestEvaluateOr(i, argv) || smallclueTestEvaluateOr(argc - i - 1, argv + i + 1);
+        }
+    }
+    return smallclueTestEvaluateAnd(argc, argv);
+}
+
 static int smallclueTestWithArgs(int argc, char **argv) {
     if (argc <= 0) {
         return 1;
     }
-    bool result = smallclueTestEvaluate(argc, argv);
+    bool result = smallclueTestEvaluateOr(argc, argv);
     return result ? 0 : 1;
 }
 
