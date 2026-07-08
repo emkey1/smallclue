@@ -3153,7 +3153,11 @@ static int smallclueTopCommand(int argc, char **argv) {
         size_t snapshot_count = snapshots ? vprocSnapshot(snapshots, snapshot_cap) : 0;
 
         /* Clear and render. */
-        fputs("\x1b[2J\x1b[H", stdout);
+        if (isatty(STDOUT_FILENO)) {
+            fputs("\x1b[2J\x1b[H", stdout);
+        } else {
+            putchar('\n');
+        }
 
 #if defined(__APPLE__)
         size_t mem_used_kb = 0, mem_free_kb = 0;
