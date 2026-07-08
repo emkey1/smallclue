@@ -16,6 +16,7 @@
 #include "readlink_app.h"
 #include "checksum_app.h"
 #include "diff_app.h"
+#include "patch_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -2053,6 +2054,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"nslookup", smallclueNslookupCommand, "DNS lookup utility"},
     {"no", smallclueNoCommand, "Repeatedly print strings (exit 1)"},
     {"passwd", smallcluePasswdCommand, "Change user password"},
+    {"patch", smallcluePatchCommand, "Apply a unified diff to files"},
     {"pbcopy", smallcluePbcopyCommand, "Copy stdin to the system clipboard"},
     {"pbpaste", smallcluePbpasteCommand, "Paste the system clipboard to stdout"},
     {"ping", smallcluePingCommand, "ICMP echo utility"},
@@ -2304,6 +2306,11 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                "  Full-screen text editor"},
     {"passwd", "passwd [username]\n"
                "  Change user password"},
+    {"patch", "patch [-p N] [-i PATCHFILE] [FILE]\n"
+              "  Apply a unified diff (from stdin, or -i PATCHFILE)\n"
+              "  -p N strip N leading path components (default 1)\n"
+              "  FILE overrides the target path for a single-file patch\n"
+              "  Context-diff/plain-diff formats are not supported, only unified"},
     {"host", "host [-4|-6] [-v] [-t TYPE] host [server]\n"
              "  -4 IPv4 only\n"
              "  -6 IPv6 only\n"
