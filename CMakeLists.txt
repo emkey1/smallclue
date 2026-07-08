@@ -180,6 +180,7 @@ set(SOURCES
     src/diff_app.c
     src/patch_app.c
     src/printf_app.c
+    src/expr_app.c
     ${NEXTVI_SOURCES}
     ${OPENSSH_SOURCES}
     ${OPENRSYNC_ROOT}/blocks.c

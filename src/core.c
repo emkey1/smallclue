@@ -18,6 +18,7 @@
 #include "diff_app.h"
 #include "patch_app.h"
 #include "printf_app.h"
+#include "expr_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -2018,6 +2019,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"micro", smallclueMicroCommand, "Micro text editor"},
     {"nextvi", smallclueEditorCommand, "Nextvi text editor"},
     {"env", smallclueEnvCommand, "Display or update environment"},
+    {"expr", smallclueExprCommand, "Evaluate expressions"},
     {"false", smallclueFalseCommand, "Do nothing, unsuccessfully"},
     {"file", smallclueFileCommand, "Identify file types"},
     {"find", smallclueFindCommand, "Search for files"},
@@ -2180,6 +2182,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Print arguments"},
     {"env", "env [-i] [NAME=VALUE ...] [command]\n"
             "  -i start with empty environment"},
+    {"expr", "expr EXPRESSION\n"
+             "  Evaluate an expression: arithmetic (+ - * / %), string\n"
+             "  comparison (= != < <= > >=), logical (& |), and string\n"
+             "  operators (STR : REGEXP, match, substr, index, length)\n"
+             "  Exit status: 0 if result is non-empty and non-zero, 1\n"
+             "  if null/zero, 2 on error"},
     {"false", "false\n"
               "  Exit with status 1"},
     {"file", "file FILE...\n"
