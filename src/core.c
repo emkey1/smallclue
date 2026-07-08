@@ -2249,7 +2249,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"file", "file FILE...\n"
              "  Identify file types"},
     {"find", "find PATH... [expression]\n"
-             "  Common: -name PATTERN -type f|d"},
+             "  Common: -name PATTERN -type f|d|l\n"
+             "  -mtime [+-]N: modified N days ago (+older, -newer)\n"
+             "  -newer FILE: modified more recently than FILE\n"
+             "  -size [+-]N[c|k|M|G|w]: size comparison (default unit: 512B blocks)\n"
+             "  -print0: NUL-separated output (pairs with xargs -0)\n"
+             "  No boolean logic (-a/-o/!/parens) yet: predicates are all ANDed"},
     {"gzip", "gzip [-c] [-k] [-f] [-d] FILE...\n"
              "  -c stdout  -k keep original  -f force overwrite  -d decompress"},
     {"gunzip", "gunzip [-c] [-k] [-f] FILE...\n"
@@ -18269,7 +18274,83 @@ typedef struct SmallclueFindOptions {
     char **execArgv;  /* NULL-terminated, {} not yet substituted */
     int execArgc;
     bool haveAction; /* -delete or -exec given: suppresses the implicit -print */
+    bool printNul;   /* -print0: NUL-terminate instead of newline */
+
+    bool haveMtime;
+    char mtimeSign; /* '+', '-', or '\0' for exact */
+    long long mtimeDays;
+
+    bool haveNewer;
+    time_t newerMtime;
+
+    bool haveSize;
+    char sizeSign;
+    long long sizeValue;  /* block count (bare/b) or byte threshold (c/k/M/G/w) */
+    bool sizeIsBlockUnit; /* bare N or Nb: compare against ceil(st_size/512) */
 } SmallclueFindOptions;
+
+/* Parses find's -size [+-]N[ckMGwb] spec. Confirmed against the real
+ * system find with /usr/bin/find explicitly (this shell has a `find`
+ * function that redirects to an unrelated bfs-based tool -- an earlier
+ * pass through that shadowed `find` produced self-contradictory
+ * results and had to be discarded and redone): only the bare/`b` form
+ * rounds the file's size UP to whole 512-byte blocks and compares that
+ * block COUNT to N. `c` compares the exact byte count to N. `k`/`M`/`G`/`w`
+ * compare the exact byte count to N scaled by the suffix -- NOT
+ * rounded to a block boundary (e.g. -size -1k matches a 1000-byte file
+ * directly against the 1024-byte threshold, no rounding involved). */
+static bool smallclueFindParseSize(const char *s, char *signOut, long long *valueOut, bool *isBlockUnit) {
+    if (!s || !*s) return false;
+    char sign = '\0';
+    const char *p = s;
+    if (*p == '+' || *p == '-') {
+        sign = *p;
+        p++;
+    }
+    char *end = NULL;
+    long long v = strtoll(p, &end, 10);
+    if (end == p) return false;
+    long long multiplier = 1; /* bare: block count itself, not bytes */
+    bool blockUnit = true;
+    if (*end != '\0') {
+        switch (*end) {
+            case 'c': multiplier = 1; blockUnit = false; break;
+            case 'k': multiplier = 1024; blockUnit = false; break;
+            case 'M': multiplier = 1024LL * 1024; blockUnit = false; break;
+            case 'G': multiplier = 1024LL * 1024 * 1024; blockUnit = false; break;
+            case 'w': multiplier = 2; blockUnit = false; break;
+            case 'b': multiplier = 1; blockUnit = true; break;
+            default: return false;
+        }
+        if (end[1] != '\0') return false;
+    }
+    *signOut = sign;
+    *valueOut = v * multiplier;
+    *isBlockUnit = blockUnit;
+    return true;
+}
+
+static bool smallclueFindParseSignedInt(const char *s, char *signOut, long long *valueOut) {
+    if (!s || !*s) return false;
+    char sign = '\0';
+    const char *p = s;
+    if (*p == '+' || *p == '-') {
+        sign = *p;
+        p++;
+    }
+    char *end = NULL;
+    long long v = strtoll(p, &end, 10);
+    if (!end || end == p || *end != '\0') return false;
+    *signOut = sign;
+    *valueOut = v;
+    return true;
+}
+
+static bool smallclueFindCompareSigned(char sign, long long actual, long long spec) {
+    if (sign == '+') return actual > spec;
+    if (sign == '-') return actual < spec;
+    return actual == spec;
+}
 
 static bool smallclueFindMatches(const char *path, const struct stat *st,
                                  const SmallclueFindOptions *opts, int depth) {
@@ -18293,6 +18374,24 @@ static bool smallclueFindMatches(const char *path, const struct stat *st,
             default: ok = true; break;
         }
         if (!ok) return false;
+    }
+    if (opts->haveMtime) {
+        long long ageSeconds = (long long)time(NULL) - (long long)st->st_mtime;
+        long long daysAgo = ageSeconds / 86400;
+        if (!smallclueFindCompareSigned(opts->mtimeSign, daysAgo, opts->mtimeDays)) {
+            return false;
+        }
+    }
+    if (opts->haveNewer) {
+        if (st->st_mtime <= opts->newerMtime) return false;
+    }
+    if (opts->haveSize) {
+        long long measure = opts->sizeIsBlockUnit
+            ? (((long long)st->st_size + 511) / 512)
+            : (long long)st->st_size;
+        if (!smallclueFindCompareSigned(opts->sizeSign, measure, opts->sizeValue)) {
+            return false;
+        }
     }
     return true;
 }
@@ -18386,7 +18485,8 @@ static int smallclueFindVisit(const char *path, const SmallclueFindOptions *opts
             }
         }
         if (!opts->haveAction) {
-            printf("%s\n", path);
+            fputs(path, stdout);
+            putchar(opts->printNul ? '\0' : '\n');
         }
     }
     return 0;
@@ -18439,11 +18539,48 @@ static int smallclueFindCommand(int argc, char **argv) {
                 return 1;
             }
             opts.minDepth = atoi(argv[index++]);
+        } else if (strcmp(arg, "-mtime") == 0) {
+            if (index >= argc) {
+                fprintf(stderr, "find: missing argument to -mtime\n");
+                return 1;
+            }
+            if (!smallclueFindParseSignedInt(argv[index++], &opts.mtimeSign, &opts.mtimeDays)) {
+                fprintf(stderr, "find: invalid -mtime argument\n");
+                return 1;
+            }
+            opts.haveMtime = true;
+        } else if (strcmp(arg, "-newer") == 0) {
+            if (index >= argc) {
+                fprintf(stderr, "find: missing argument to -newer\n");
+                return 1;
+            }
+            const char *refPath = argv[index++];
+            struct stat refSt;
+            if (stat(refPath, &refSt) != 0) {
+                fprintf(stderr, "find: %s: %s\n", refPath, strerror(errno));
+                return 1;
+            }
+            opts.newerMtime = refSt.st_mtime;
+            opts.haveNewer = true;
+        } else if (strcmp(arg, "-size") == 0) {
+            if (index >= argc) {
+                fprintf(stderr, "find: missing argument to -size\n");
+                return 1;
+            }
+            if (!smallclueFindParseSize(argv[index++], &opts.sizeSign, &opts.sizeValue, &opts.sizeIsBlockUnit)) {
+                fprintf(stderr, "find: invalid -size argument\n");
+                return 1;
+            }
+            opts.haveSize = true;
         } else if (strcmp(arg, "-delete") == 0) {
             opts.doDelete = true;
             opts.haveAction = true;
         } else if (strcmp(arg, "-print") == 0) {
             opts.haveAction = false;
+            opts.printNul = false;
+        } else if (strcmp(arg, "-print0") == 0) {
+            opts.haveAction = false;
+            opts.printNul = true;
         } else if (strcmp(arg, "-exec") == 0) {
             opts.execArgv = &argv[index];
             int execStart = index;
