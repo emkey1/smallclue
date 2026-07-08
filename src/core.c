@@ -2318,8 +2318,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"sort", "sort [-r] [-n]\n"
              "  -r reverse\n"
              "  -n numeric"},
-    {"stat", "stat [-L] FILE...\n"
-             "  -L follow symlinks"},
+    {"stat", "stat [-L] [-c FORMAT|--format=FORMAT] FILE...\n"
+             "  -L follow symlinks\n"
+             "  -c/--format FORMAT: %n name %s size %F type %a/%A perms\n"
+             "    %u/%g uid/gid %U/%G user/group %i inode %h links\n"
+             "    %d device %b blocks %B block-size %f raw mode(hex)\n"
+             "    %X/%Y/%Z atime/mtime/ctime (epoch seconds), %% literal %"},
     {"stty", "stty [reset] [sane]\n"
              "  Report terminal settings; apply reset/sane"},
 #if defined(SMALLCLUE_WITH_EXSH)
@@ -17320,17 +17324,102 @@ static int smallclueStatPath(const char *path, bool follow) {
     return 0;
 }
 
+/* GNU-stat-style custom format string (-c/--format), e.g. '%s' / '%Y' /
+ * '%n (%a)'. Directives: n=name s=size(bytes) b=blocks(512B units)
+ * B=block size(bytes) f=raw mode(hex) F=type description a=perms(octal)
+ * A=perms(rwx string) u/g=uid/gid U/G=user/group name i=inode h=hardlink
+ * count d=device X/Y/Z=atime/mtime/ctime(epoch seconds). %% is a literal
+ * '%'; \n and \t are recognized as escapes in the format string itself
+ * (matching GNU stat, which supports both since the format is usually
+ * passed already-interpreted by the shell, but a smallclue script/rc
+ * invocation may pass it raw). */
+static void smallclueStatPrintFormatted(const char *path, const struct stat *st, const char *format) {
+    for (const char *p = format; *p; ++p) {
+        if (*p == '\\' && p[1] == 'n') {
+            putchar('\n');
+            p++;
+        } else if (*p == '\\' && p[1] == 't') {
+            putchar('\t');
+            p++;
+        } else if (*p == '%' && p[1]) {
+            char directive = *++p;
+            switch (directive) {
+                case '%': putchar('%'); break;
+                case 'n': fputs(path, stdout); break;
+                case 's': printf("%lld", (long long)st->st_size); break;
+                case 'b': printf("%lld", (long long)st->st_blocks); break;
+                case 'B': printf("%ld", (long)st->st_blksize); break;
+                case 'f': printf("%x", (unsigned)st->st_mode); break;
+                case 'F': fputs(smallclueStatTypeLabel(st), stdout); break;
+                case 'a': printf("%03o", (unsigned)(st->st_mode & 07777)); break;
+                case 'A': {
+                    char perms[11];
+                    smallclueStatFormatPerms(perms, sizeof(perms), st->st_mode);
+                    fputs(perms, stdout);
+                    break;
+                }
+                case 'u': printf("%u", (unsigned)st->st_uid); break;
+                case 'g': printf("%u", (unsigned)st->st_gid); break;
+                case 'U': {
+                    struct passwd *pw = getpwuid(st->st_uid);
+                    fputs(pw ? pw->pw_name : "?", stdout);
+                    break;
+                }
+                case 'G': {
+                    struct group *gr = getgrgid(st->st_gid);
+                    fputs(gr ? gr->gr_name : "?", stdout);
+                    break;
+                }
+                case 'i': printf("%llu", (unsigned long long)st->st_ino); break;
+                case 'h': printf("%llu", (unsigned long long)st->st_nlink); break;
+                case 'd': printf("%llu", (unsigned long long)st->st_dev); break;
+                case 'X': printf("%lld", (long long)st->st_atime); break;
+                case 'Y': printf("%lld", (long long)st->st_mtime); break;
+                case 'Z': printf("%lld", (long long)st->st_ctime); break;
+                default:
+                    putchar('%');
+                    putchar(directive);
+                    break;
+            }
+        } else {
+            putchar(*p);
+        }
+    }
+    putchar('\n');
+}
+
 static int smallclueStatCommand(int argc, char **argv) {
-    smallclueResetGetopt();
     int follow = 0;
+    const char *format = NULL;
+
+    /* Strip out the GNU long form --format=FORMAT before getopt() ever
+     * sees it -- getopt() doesn't understand "--"-prefixed long options
+     * with an "=" value and hard-errors on it ("illegal option"), so this
+     * has to happen first, not as a post-getopt scan. */
+    for (int i = 1; i < argc; ) {
+        if (strncmp(argv[i], "--format=", 9) == 0) {
+            format = argv[i] + 9;
+            for (int j = i; j + 1 < argc; ++j) {
+                argv[j] = argv[j + 1];
+            }
+            argc--;
+            continue;
+        }
+        i++;
+    }
+
+    smallclueResetGetopt();
     int opt;
-    while ((opt = getopt(argc, argv, "L")) != -1) {
+    while ((opt = getopt(argc, argv, "Lc:")) != -1) {
         switch (opt) {
             case 'L':
                 follow = 1;
                 break;
+            case 'c':
+                format = optarg;
+                break;
             default:
-                fprintf(stderr, "stat: usage: stat [-L] FILE...\n");
+                fprintf(stderr, "stat: usage: stat [-L] [-c FORMAT] FILE...\n");
                 return 1;
         }
     }
@@ -17340,6 +17429,21 @@ static int smallclueStatCommand(int argc, char **argv) {
     }
     int status = 0;
     for (int i = optind; i < argc; ++i) {
+        char resolved[PATH_MAX];
+        const char *target = smallclueResolvePath(argv[i], resolved, sizeof(resolved));
+        if (!target || *target == '\0') {
+            target = argv[i];
+        }
+        if (format) {
+            struct stat st;
+            if ((follow ? stat(target, &st) : lstat(target, &st)) != 0) {
+                fprintf(stderr, "stat: %s: %s\n", argv[i], strerror(errno));
+                status = 1;
+                continue;
+            }
+            smallclueStatPrintFormatted(argv[i], &st, format);
+            continue;
+        }
         if (smallclueStatPath(argv[i], follow) != 0) {
             status = 1;
         } else if (i + 1 < argc) {
