@@ -12258,10 +12258,42 @@ static int smallclueTimeRunCommand(int argc, char **argv) {
             return status;
         }
     }
-#endif
 
     fprintf(stderr, "time: %s: command not found\n", argv[0]);
     return 127;
+#else
+    /* Not a built-in applet -- fork+execvp it like a real shell would,
+     * instead of just reporting "command not found". The iOS build has
+     * its own shebang-aware resolver above; on Linux/generic Unix,
+     * execvp already handles PATH search and the kernel handles
+     * shebangs directly, so a plain fork+execvp is sufficient (same
+     * pattern already used by xargs's external-binary fallback and by
+     * timeout's child). */
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "time: fork: %s\n", strerror(errno));
+        return 126;
+    }
+    if (pid == 0) {
+        execvp(argv[0], argv);
+        int err = errno;
+        fprintf(stderr, "time: %s: %s\n", argv[0], strerror(err));
+        _exit((err == ENOENT) ? 127 : 126);
+    }
+    int wait_status = 0;
+    while (waitpid(pid, &wait_status, 0) < 0) {
+        if (errno == EINTR) continue;
+        fprintf(stderr, "time: waitpid: %s\n", strerror(errno));
+        return 126;
+    }
+    if (WIFEXITED(wait_status)) {
+        return WEXITSTATUS(wait_status);
+    }
+    if (WIFSIGNALED(wait_status)) {
+        return 128 + WTERMSIG(wait_status);
+    }
+    return 1;
+#endif
 }
 
 static int smallclueTimeCommand(int argc, char **argv) {
