@@ -33,7 +33,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **file**: Determine file type.
 * **stat**: Display file status.
 * **basename** / **dirname**: Parse path components (multi-operand support; `basename` supports a `SUFFIX` operand).
-* **find**: Search for files and directories (`-name`, `-type`, `-exec`, `-delete`, `-maxdepth`/`-mindepth`, `-mtime`/`-newer`, `-size`, `-print0`).
+* **find**: Search for files and directories (`-name`, `-type`, `-exec`, `-delete`, `-maxdepth`/`-mindepth`, `-mtime`/`-newer`, `-size`, `-print0`, and full boolean logic: `-a`/`-and` (implicit between adjacent terms), `-o`/`-or`, `!`/`-not`, `\( \)` grouping).
 * **readlink** / **realpath**: Print resolved symbolic links or canonicalized absolute paths.
 * **install**: Copy files and set attributes (or create directories), like `make install`'s underlying tool.
 * **diff**: Compare files line by line (`-u` unified, `-q`).
