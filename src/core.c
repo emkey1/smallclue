@@ -2515,11 +2515,14 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  -v version\n"
               "  -m machine\n"
               "  -p processor"},
-    {"uniq", "uniq [-c] [-d] [-u] [-i] [FILE]\n"
+    {"uniq", "uniq [-c] [-d] [-u] [-i] [-f N] [-s N] [-w N] [FILE]\n"
              "  -c count\n"
              "  -d duplicates only\n"
              "  -u unique only\n"
-             "  -i ignore case when comparing"},
+             "  -i ignore case when comparing\n"
+             "  -f N: skip the first N whitespace-separated fields\n"
+             "  -s N: additionally skip the first N characters\n"
+             "  -w N: compare at most N characters (default: rest of line)"},
     {"uptime", "uptime [-s]\n"
                "  Show app uptime since launch\n"
                "  -s show system uptime"},
@@ -16059,10 +16062,46 @@ typedef struct {
     bool duplicatesOnly; /* -d: only print lines that had at least one repeat */
     bool uniquesOnly;    /* -u: only print lines that had NO repeats */
     bool ignoreCase;     /* -i */
+    int skipFields;      /* -f N: skip N leading whitespace-separated fields */
+    int skipChars;       /* -s N: additionally skip N leading characters */
+    int maxChars;         /* -w N: compare at most N characters (0 = rest of line) */
 } SmallclueUniqOptions;
 
+/* Skips `fields` leading whitespace-separated fields (blanks before each
+ * field, then the field's non-blank run), matching GNU uniq -f: blanks
+ * strictly between the skipped fields and the next one are NOT skipped
+ * further, they just become part of the comparison key. */
+static const char *smallclueUniqSkipFields(const char *line, int fields) {
+    const char *p = line;
+    for (int i = 0; i < fields; ++i) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        while (*p && *p != ' ' && *p != '\t') p++;
+    }
+    return p;
+}
+
+static const char *smallclueUniqComparisonKey(const SmallclueUniqOptions *opts, const char *line) {
+    const char *key = line;
+    if (opts->skipFields > 0) {
+        key = smallclueUniqSkipFields(key, opts->skipFields);
+    }
+    if (opts->skipChars > 0) {
+        size_t len = strlen(key);
+        size_t skip = (size_t)opts->skipChars;
+        key += (skip < len) ? skip : len;
+    }
+    return key;
+}
+
 static int smallclueUniqCompareLines(const SmallclueUniqOptions *opts, const char *a, const char *b) {
-    return opts->ignoreCase ? strcasecmp(a, b) : strcmp(a, b);
+    const char *ka = smallclueUniqComparisonKey(opts, a);
+    const char *kb = smallclueUniqComparisonKey(opts, b);
+    if (opts->maxChars > 0) {
+        return opts->ignoreCase ? strncasecmp(ka, kb, (size_t)opts->maxChars)
+                                 : strncmp(ka, kb, (size_t)opts->maxChars);
+    }
+    return opts->ignoreCase ? strcasecmp(ka, kb) : strcmp(ka, kb);
 }
 
 static void smallclueUniqEmit(const SmallclueUniqOptions *opts, const char *line, long count) {
@@ -16147,6 +16186,63 @@ static int smallclueUniqCommand(int argc, char **argv) {
         }
         if (strcmp(arg, "-i") == 0) {
             opts.ignoreCase = true;
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-f") == 0 || strcmp(arg, "--skip-fields") == 0) {
+            if (index + 1 >= argc) {
+                fprintf(stderr, "uniq: option '%s' requires an argument\n", arg);
+                return 1;
+            }
+            opts.skipFields = atoi(argv[++index]);
+            index++;
+            continue;
+        }
+        if (strncmp(arg, "-f", 2) == 0 && isdigit((unsigned char)arg[2])) {
+            opts.skipFields = atoi(arg + 2);
+            index++;
+            continue;
+        }
+        if (strncmp(arg, "--skip-fields=", 14) == 0) {
+            opts.skipFields = atoi(arg + 14);
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-s") == 0 || strcmp(arg, "--skip-chars") == 0) {
+            if (index + 1 >= argc) {
+                fprintf(stderr, "uniq: option '%s' requires an argument\n", arg);
+                return 1;
+            }
+            opts.skipChars = atoi(argv[++index]);
+            index++;
+            continue;
+        }
+        if (strncmp(arg, "-s", 2) == 0 && isdigit((unsigned char)arg[2])) {
+            opts.skipChars = atoi(arg + 2);
+            index++;
+            continue;
+        }
+        if (strncmp(arg, "--skip-chars=", 13) == 0) {
+            opts.skipChars = atoi(arg + 13);
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-w") == 0 || strcmp(arg, "--check-chars") == 0) {
+            if (index + 1 >= argc) {
+                fprintf(stderr, "uniq: option '%s' requires an argument\n", arg);
+                return 1;
+            }
+            opts.maxChars = atoi(argv[++index]);
+            index++;
+            continue;
+        }
+        if (strncmp(arg, "-w", 2) == 0 && isdigit((unsigned char)arg[2])) {
+            opts.maxChars = atoi(arg + 2);
+            index++;
+            continue;
+        }
+        if (strncmp(arg, "--check-chars=", 14) == 0) {
+            opts.maxChars = atoi(arg + 14);
             index++;
             continue;
         }
