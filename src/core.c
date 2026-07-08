@@ -2169,8 +2169,13 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "     comma-separated (e.g. 1,3-5)\n"
             "  -d delimiter (default tab)\n"
             "  -s suppress lines with no delimiter (default: print unchanged)"},
-    {"date", "date [+FORMAT]\n"
-             "  Show date/time"},
+    {"date", "date [-u] [-d STRING] [-s STRING] [+FORMAT]\n"
+             "  Show (or set) date/time\n"
+             "  -u: use UTC instead of local time\n"
+             "  -d/--date=STRING: display STRING's time instead of now\n"
+             "  -s/--set=STRING: set the system clock to STRING, then display it\n"
+             "  STRING accepts \"YYYY-MM-DD[ HH:MM[:SS]]\" (also T-separated\n"
+             "  and '/'-separated) -- not full natural-language date parsing"},
     {"diff", "diff [-u] [-q] FILE1 FILE2\n"
              "  Unified diff (only mode implemented); -q brief \"differ\" message\n"
              "  Exit status: 0 same, 1 differ, 2 error. No directory comparison."},
@@ -14099,15 +14104,51 @@ static int smallclueClearCommand(int argc, char **argv) {
     return 0;
 }
 
+/* Forward declaration: the ISO-8601-ish string parser was originally
+ * written for `touch -d`, but the same shapes are exactly what `date -d`
+ * / `date -s` need too -- defined later in this file (touch's section),
+ * reused here rather than duplicated. */
+static bool smallclueTouchParseDashD(const char *spec, struct tm *out);
+
 static int smallclueDateCommand(int argc, char **argv) {
     int arg_index = 1;
     int use_utc = 0;
     const char *format = "%a %b %e %T %Z %Y";
+    const char *date_spec = NULL;
+    const char *set_spec = NULL;
 
     while (arg_index < argc && argv[arg_index] && argv[arg_index][0] == '-') {
         const char *opt = argv[arg_index];
         if (strcmp(opt, "-u") == 0 || strcmp(opt, "--utc") == 0 || strcmp(opt, "--universal") == 0) {
             use_utc = 1;
+            arg_index++;
+            continue;
+        }
+        if (strcmp(opt, "-d") == 0 || strcmp(opt, "--date") == 0) {
+            if (arg_index + 1 >= argc) {
+                fprintf(stderr, "date: option '%s' requires an argument\n", opt);
+                return 1;
+            }
+            date_spec = argv[arg_index + 1];
+            arg_index += 2;
+            continue;
+        }
+        if (strncmp(opt, "--date=", 7) == 0) {
+            date_spec = opt + 7;
+            arg_index++;
+            continue;
+        }
+        if (strcmp(opt, "-s") == 0 || strcmp(opt, "--set") == 0) {
+            if (arg_index + 1 >= argc) {
+                fprintf(stderr, "date: option '%s' requires an argument\n", opt);
+                return 1;
+            }
+            set_spec = argv[arg_index + 1];
+            arg_index += 2;
+            continue;
+        }
+        if (strncmp(opt, "--set=", 6) == 0) {
+            set_spec = opt + 6;
             arg_index++;
             continue;
         }
@@ -14135,12 +14176,36 @@ static int smallclueDateCommand(int argc, char **argv) {
         return 1;
     }
 
-    time_t now = time(NULL);
-    if (now == (time_t)-1) {
-        perror("date");
-        return 1;
-    }
     struct tm tm_buf;
+    memset(&tm_buf, 0, sizeof(tm_buf));
+    time_t now;
+
+    const char *parse_spec = set_spec ? set_spec : date_spec;
+    if (parse_spec) {
+        if (!smallclueTouchParseDashD(parse_spec, &tm_buf)) {
+            fprintf(stderr, "date: invalid date '%s'\n", parse_spec);
+            return 1;
+        }
+        now = use_utc ? timegm(&tm_buf) : mktime(&tm_buf);
+        if (now == (time_t)-1) {
+            fprintf(stderr, "date: invalid date '%s'\n", parse_spec);
+            return 1;
+        }
+        if (set_spec) {
+            struct timespec ts = {.tv_sec = now, .tv_nsec = 0};
+            if (clock_settime(CLOCK_REALTIME, &ts) != 0) {
+                fprintf(stderr, "date: cannot set date: %s\n", strerror(errno));
+                return 1;
+            }
+        }
+    } else {
+        now = time(NULL);
+        if (now == (time_t)-1) {
+            perror("date");
+            return 1;
+        }
+    }
+
     struct tm *tm_val = use_utc ? gmtime(&now) : localtime(&now);
     if (!tm_val) {
         perror("date");
