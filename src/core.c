@@ -2356,8 +2356,13 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  ICMP echo ping (IPv4)"},
     {"poweroff", "poweroff [-f]\n"
              "  Power off the system"},
-    {"ps", "ps\n"
-           "  Show simple process list"},
+    {"ps", "ps [-e|-A|-a] [-f] [-p PID[,PID...]] [-u USER[,USER...]]\n"
+           "  Show process list (all processes are always shown; -e/-A/-a\n"
+           "  are accepted for compatibility). Also accepts bundled BSD-style\n"
+           "  flags without a leading dash, e.g. `ps aux`, `ps ef`.\n"
+           "  -f: full format, adds a STAT (state) column\n"
+           "  -p PID[,PID...]: only show the given PID(s)\n"
+           "  -u USER[,USER...]: only show processes owned by the given user(s)"},
     {"pwd", "pwd\n"
             "  Print working directory"},
     {"reboot", "reboot [-f]\n"
@@ -3033,6 +3038,7 @@ typedef struct {
     int pid;
     int ppid;
     uid_t uid;
+    char state;
     char *command;
 } SmallcluePsEntry;
 
@@ -3042,12 +3048,111 @@ static int smallcluePsCompare(const void *a, const void *b) {
     const SmallcluePsEntry *pb = (const SmallcluePsEntry *)b;
     return pa->pid - pb->pid;
 }
+
+static bool smallcluePsParsePidList(const char *s, int **out, size_t *out_count) {
+    size_t cap = 8, count = 0;
+    int *arr = (int *)malloc(cap * sizeof(int));
+    if (!arr) return false;
+    const char *p = s;
+    while (*p) {
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p) {
+            free(arr);
+            return false;
+        }
+        if (count == cap) {
+            cap *= 2;
+            int *resized = (int *)realloc(arr, cap * sizeof(int));
+            if (!resized) {
+                free(arr);
+                return false;
+            }
+            arr = resized;
+        }
+        arr[count++] = (int)v;
+        p = end;
+        if (*p == ',') {
+            p++;
+        } else if (*p != '\0') {
+            free(arr);
+            return false;
+        }
+    }
+    if (count == 0) {
+        free(arr);
+        return false;
+    }
+    *out = arr;
+    *out_count = count;
+    return true;
+}
+
+static bool smallcluePsParseUserList(const char *s, uid_t **out, size_t *out_count) {
+    char *copy = strdup(s);
+    if (!copy) return false;
+    size_t cap = 8, count = 0;
+    uid_t *arr = (uid_t *)malloc(cap * sizeof(uid_t));
+    if (!arr) {
+        free(copy);
+        return false;
+    }
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(copy, ",", &saveptr); tok; tok = strtok_r(NULL, ",", &saveptr)) {
+        uid_t uid;
+        bool resolved = false;
+        if (*tok && strspn(tok, "0123456789") == strlen(tok)) {
+            uid = (uid_t)strtoul(tok, NULL, 10);
+            resolved = true;
+        } else {
+            struct passwd *pw = getpwnam(tok);
+            if (pw) {
+                uid = pw->pw_uid;
+                resolved = true;
+            }
+        }
+        if (!resolved) continue;
+        if (count == cap) {
+            cap *= 2;
+            uid_t *resized = (uid_t *)realloc(arr, cap * sizeof(uid_t));
+            if (!resized) {
+                free(arr);
+                free(copy);
+                return false;
+            }
+            arr = resized;
+        }
+        arr[count++] = uid;
+    }
+    free(copy);
+    if (count == 0) {
+        free(arr);
+        return false;
+    }
+    *out = arr;
+    *out_count = count;
+    return true;
+}
+
+static bool smallcluePsPidMatches(const int *pids, size_t count, int pid) {
+    for (size_t i = 0; i < count; ++i) {
+        if (pids[i] == pid) return true;
+    }
+    return false;
+}
+
+static bool smallcluePsUidMatches(const uid_t *uids, size_t count, uid_t uid) {
+    for (size_t i = 0; i < count; ++i) {
+        if (uids[i] == uid) return true;
+    }
+    return false;
+}
 #endif
 
 static int smallcluePsCommand(int argc, char **argv) {
+#if defined(PSCAL_TARGET_IOS)
     (void)argc;
     (void)argv;
-#if defined(PSCAL_TARGET_IOS)
     size_t cap = vprocSnapshot(NULL, 0);
     VProcSnapshot *snaps = (cap > 0) ? (VProcSnapshot *)calloc(cap, sizeof(VProcSnapshot)) : NULL;
     size_t count = snaps ? vprocSnapshot(snaps, cap) : 0;
@@ -3095,6 +3200,83 @@ static int smallcluePsCommand(int argc, char **argv) {
     free(snaps);
     return 0;
 #else
+    bool fullFormat = false;
+    int *filterPids = NULL;
+    size_t filterPidCount = 0;
+    uid_t *filterUids = NULL;
+    size_t filterUidCount = 0;
+
+    for (int i = 1; i < argc; ++i) {
+        const char *arg = argv[i];
+        if (!arg || !*arg) continue;
+        if (strcmp(arg, "-p") == 0 || strcmp(arg, "--pid") == 0) {
+            if (i + 1 >= argc || !smallcluePsParsePidList(argv[i + 1], &filterPids, &filterPidCount)) {
+                fprintf(stderr, "ps: invalid or missing argument to -p\n");
+                free(filterPids);
+                free(filterUids);
+                return 1;
+            }
+            i++;
+            continue;
+        }
+        if (strncmp(arg, "-p", 2) == 0 && isdigit((unsigned char)arg[2])) {
+            if (!smallcluePsParsePidList(arg + 2, &filterPids, &filterPidCount)) {
+                fprintf(stderr, "ps: invalid argument to -p\n");
+                free(filterPids);
+                free(filterUids);
+                return 1;
+            }
+            continue;
+        }
+        if (strcmp(arg, "-u") == 0 || strcmp(arg, "--user") == 0) {
+            if (i + 1 >= argc || !smallcluePsParseUserList(argv[i + 1], &filterUids, &filterUidCount)) {
+                fprintf(stderr, "ps: invalid or missing argument to -u\n");
+                free(filterPids);
+                free(filterUids);
+                return 1;
+            }
+            i++;
+            continue;
+        }
+        if (strncmp(arg, "-u", 2) == 0 && arg[2] != '\0') {
+            if (!smallcluePsParseUserList(arg + 2, &filterUids, &filterUidCount)) {
+                fprintf(stderr, "ps: invalid argument to -u\n");
+                free(filterPids);
+                free(filterUids);
+                return 1;
+            }
+            continue;
+        }
+        /* Bundled single-char flags, with or without a leading '-' -- real
+         * ps accepts both `ps -ef` and the BSD-legacy `ps aux` spelling,
+         * and the latter is arguably the single most common invocation
+         * in the wild. */
+        const char *flags = (arg[0] == '-') ? arg + 1 : arg;
+        bool recognized = (*flags != '\0');
+        for (const char *fc = flags; recognized && *fc; ++fc) {
+            switch (*fc) {
+                case 'e': case 'E':
+                case 'A': case 'a':
+                case 'x': case 'w': case 'W':
+                    break; /* show-all / no-controlling-tty / wide -- already the default here */
+                case 'f':
+                    fullFormat = true;
+                    break;
+                case 'u': case 'U':
+                    break; /* user-oriented format -- USER column is always shown */
+                default:
+                    recognized = false;
+                    break;
+            }
+        }
+        if (!recognized) {
+            fprintf(stderr, "ps: unsupported option '%s'\n", arg);
+            free(filterPids);
+            free(filterUids);
+            return 1;
+        }
+    }
+
     DIR *dir = opendir("/proc");
     if (dir) {
         SmallcluePsEntry *entries = NULL;
@@ -3106,6 +3288,9 @@ static int smallcluePsCommand(int argc, char **argv) {
             if (!isdigit(ent->d_name[0])) continue;
 
             int pid = atoi(ent->d_name);
+            if (filterPidCount > 0 && !smallcluePsPidMatches(filterPids, filterPidCount, pid)) {
+                continue;
+            }
             char path[PATH_MAX];
 
             snprintf(path, sizeof(path), "/proc/%s/stat", ent->d_name);
@@ -3130,7 +3315,7 @@ static int smallcluePsCommand(int argc, char **argv) {
             char *rest = close_paren + 1;
 
             int ppid = 0;
-            char state_char;
+            char state_char = '?';
             if (sscanf(rest, " %c %d", &state_char, &ppid) != 2) {
                 ppid = 0;
             }
@@ -3140,6 +3325,10 @@ static int smallcluePsCommand(int argc, char **argv) {
             snprintf(path, sizeof(path), "/proc/%s", ent->d_name);
             if (stat(path, &st) == 0) {
                 uid = st.st_uid;
+            }
+            if (filterUidCount > 0 && filterPidCount == 0 &&
+                !smallcluePsUidMatches(filterUids, filterUidCount, uid)) {
+                continue;
             }
 
             char *command = NULL;
@@ -3181,6 +3370,7 @@ static int smallcluePsCommand(int argc, char **argv) {
                 entries[count].pid = pid;
                 entries[count].ppid = ppid;
                 entries[count].uid = uid;
+                entries[count].state = state_char;
                 entries[count].command = command;
                 count++;
             }
@@ -3191,10 +3381,11 @@ static int smallcluePsCommand(int argc, char **argv) {
             qsort(entries, count, sizeof(SmallcluePsEntry), smallcluePsCompare);
         }
 
+        const char *header = fullFormat ? "  PID   PPID USER     S COMMAND" : "  PID   PPID USER     COMMAND";
         if (isatty(STDOUT_FILENO)) {
-            printf("\033[1m  PID   PPID USER     COMMAND\033[0m\n");
+            printf("\033[1m%s\033[0m\n", header);
         } else {
-            printf("  PID   PPID USER     COMMAND\n");
+            printf("%s\n", header);
         }
         for (size_t i = 0; i < count; ++i) {
             struct passwd *pw = getpwuid(entries[i].uid);
@@ -3204,7 +3395,12 @@ static int smallcluePsCommand(int argc, char **argv) {
             } else {
                 snprintf(user_buf, sizeof(user_buf), "%d", (int)entries[i].uid);
             }
-            printf("%5d %6d %-8s %s\n", entries[i].pid, entries[i].ppid, user_buf, entries[i].command);
+            if (fullFormat) {
+                printf("%5d %6d %-8s %c %s\n", entries[i].pid, entries[i].ppid, user_buf,
+                       entries[i].state, entries[i].command);
+            } else {
+                printf("%5d %6d %-8s %s\n", entries[i].pid, entries[i].ppid, user_buf, entries[i].command);
+            }
             free(entries[i].command);
         }
         free(entries);
@@ -3227,6 +3423,8 @@ static int smallcluePsCommand(int argc, char **argv) {
         }
         printf("%5d %6d %-8s %s\n", (int)pid, (int)ppid, user_buf, cmd);
     }
+    free(filterPids);
+    free(filterUids);
     return 0;
 #endif
 }
