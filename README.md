@@ -82,7 +82,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **sftp**: Secure file transfer (OpenSSH).
 * **ssh-keygen**: Generate authentication keys.
 * **ssh-copy-id**: Install SSH public keys on a remote host.
-* **ping**: ICMP echo request/reply utility (real `IPPROTO_ICMP` socket with a checksummed ICMP header; IPv4 only, no IPv6 path yet).
+* **ping**: ICMP echo request/reply utility, IPv4 and IPv6 (`-4`/`-6` to force a family).
 * **curl** / **wget**: libcurl-backed HTTP(S) client wrappers (`-o`/`-O`, `-X`/`--method`, `-H`/`--header`, `-d`/`--post-data`, `-u`/`--user`+`--password` basic auth, `-k`/`--no-check-certificate` insecure TLS).
 * **telnet**: Simple Telnet client.
 * **nslookup** / **host**: DNS lookup utilities.
