@@ -2291,7 +2291,7 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  -s symbolic link  -f force overwrite\n"
            "  When the last operand is a directory, each target's basename\n"
            "  is created inside it"},
-    {"ls", "ls [-a] [-A] [-l] [-n] [-1] [-C] [-t] [-S] [-X] [-r] [-R] [-h] [-d]\n"
+    {"ls", "ls [-a] [-A] [-l] [-n] [-1] [-C] [-t] [-S] [-X] [-v] [-r] [-R] [-h] [-d] [-i]\n"
            "     [--color[=auto|always|never]] [path ...]\n"
            "  -a show entries starting with '.' (including . and ..)\n"
            "  -A show entries starting with '.' (excluding . and ..)\n"
@@ -2300,9 +2300,11 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  -1 list one file per line\n"
            "  -C list entries by columns\n"
            "  -t sort by modification time  -S sort by size  -X sort by extension\n"
+           "  -v natural/version sort (e.g. file2 before file10)\n"
            "  -r reverse sort order  -R recurse into subdirectories\n"
            "  -h human-readable sizes (with -l)\n"
-           "  -d list directories themselves, not their contents"},
+           "  -d list directories themselves, not their contents\n"
+           "  -i show each entry's inode number as a leading column"},
     {"md", "md [-i] [-c] [FILE|URL]\n"
            "  View Markdown/HTML document; press 'o' to open links in-page\n"
            "  -i interactive mode.  Makes ~/Docs browsable\n"
@@ -10540,7 +10542,10 @@ static void print_permissions(mode_t mode) {
     putchar(mode & S_IXOTH ? 'x' : '-');
 }
 
-static void print_long_listing(const char *filename, const struct stat *s, bool human, bool numeric_ids, const char *color) {
+static void print_long_listing(const char *filename, const struct stat *s, bool human, bool numeric_ids, bool show_inode, const char *color) {
+    if (show_inode) {
+        printf("%8llu ", (unsigned long long)s->st_ino);
+    }
     print_permissions(s->st_mode);
     printf(" %2llu", (unsigned long long)s->st_nlink);
 
@@ -10597,7 +10602,8 @@ static int print_path_entry_with_stat(const char *path,
                                       bool numeric_ids,
                                       const struct stat *stat_buf,
                                       int color_mode,
-                                      int classify) {
+                                      int classify,
+                                      bool show_inode) {
     struct stat local_stat;
     const struct stat *st = stat_buf;
     if (!st) {
@@ -10630,8 +10636,11 @@ static int print_path_entry_with_stat(const char *path,
         }
     }
     if (long_format) {
-        print_long_listing(out, st, human, numeric_ids, color);
+        print_long_listing(out, st, human, numeric_ids, show_inode, color);
     } else {
+        if (show_inode) {
+            printf("%8llu ", (unsigned long long)st->st_ino);
+        }
         if (color)
             printf("\033[%sm%s\033[0m\n", color, out);
         else
@@ -10660,7 +10669,7 @@ static char *join_path(const char *base, const char *name) {
 }
 
 static __attribute__((unused)) int print_path_entry(const char *path, const char *label, bool long_format, bool human, int color_mode, int classify) {
-    return print_path_entry_with_stat(path, label, long_format, human, false, NULL, color_mode, classify);
+    return print_path_entry_with_stat(path, label, long_format, human, false, NULL, color_mode, classify, false);
 }
 
 typedef struct {
@@ -10747,12 +10756,51 @@ static int compare_ls_entries_by_extension(const void *lhs, const void *rhs) {
     return strcmp(a->name, b->name);
 }
 
+/* Natural/version sort (GNU ls -v): compares runs of digits numerically
+ * so "file2" sorts before "file10", falling back to plain lexical
+ * comparison for non-digit runs. Implemented by hand rather than via
+ * glibc's strverscmp(3) since that's not available on macOS (this
+ * project builds here for dev even though the deploy target is Linux). */
+static int smallclueNaturalCompare(const char *a, const char *b) {
+    while (*a && *b) {
+        if (isdigit((unsigned char)*a) && isdigit((unsigned char)*b)) {
+            const char *a_start = a, *b_start = b;
+            while (*a == '0') a++;
+            while (*b == '0') b++;
+            const char *a_digits = a, *b_digits = b;
+            while (isdigit((unsigned char)*a)) a++;
+            while (isdigit((unsigned char)*b)) b++;
+            size_t a_len = (size_t)(a - a_digits);
+            size_t b_len = (size_t)(b - b_digits);
+            if (a_len != b_len) return (a_len < b_len) ? -1 : 1;
+            int cmp = strncmp(a_digits, b_digits, a_len);
+            if (cmp != 0) return cmp;
+            /* Equal numeric value: fewer leading zeros sorts first
+             * (matches GNU strverscmp's own tie-break convention). */
+            size_t a_zeros = (size_t)(a_digits - a_start);
+            size_t b_zeros = (size_t)(b_digits - b_start);
+            if (a_zeros != b_zeros) return (a_zeros < b_zeros) ? -1 : 1;
+            continue;
+        }
+        if (*a != *b) return (unsigned char)*a - (unsigned char)*b;
+        a++;
+        b++;
+    }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
+static int compare_ls_entries_by_version(const void *lhs, const void *rhs) {
+    const SmallclueLsEntry *a = (const SmallclueLsEntry *)lhs;
+    const SmallclueLsEntry *b = (const SmallclueLsEntry *)rhs;
+    return smallclueNaturalCompare(a->name, b->name);
+}
+
 #define LS_FORMAT_AUTO 0
 #define LS_FORMAT_LONG 1
 #define LS_FORMAT_COLUMNS 2
 #define LS_FORMAT_SINGLE 3
 
-static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int color_mode, int classify) {
+static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int color_mode, int classify, bool show_inode) {
     if (count == 0) {
         return;
     }
@@ -10762,9 +10810,23 @@ static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int 
         term_cols = 80;
     }
 
+    size_t inode_width = 0;
+    if (show_inode) {
+        for (size_t i = 0; i < count; ++i) {
+            char inobuf[32];
+            int w = snprintf(inobuf, sizeof(inobuf), "%llu", (unsigned long long)entries[i].stat_buf.st_ino);
+            if (w > 0 && (size_t)w > inode_width) {
+                inode_width = (size_t)w;
+            }
+        }
+    }
+
     size_t max_len = 0;
     for (size_t i = 0; i < count; ++i) {
         size_t len = strlen(entries[i].name);
+        if (show_inode) {
+            len += inode_width + 1; /* inode digits + one separating space */
+        }
         if (len > max_len) {
             max_len = len;
         }
@@ -10789,8 +10851,15 @@ static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int 
             }
             const struct stat *st = &entries[idx].stat_buf;
             const char *name = entries[idx].name;
+            char withInode[PATH_MAX];
+            const char *base = name;
+            if (show_inode) {
+                snprintf(withInode, sizeof(withInode), "%*llu %s",
+                         (int)inode_width, (unsigned long long)st->st_ino, name);
+                base = withInode;
+            }
             char decorated[PATH_MAX];
-            const char *out = name;
+            const char *out = base;
             if (classify) {
                 char suffix = '\0';
                 if (S_ISDIR(st->st_mode)) suffix = '/';
@@ -10799,7 +10868,7 @@ static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int 
                 else if (S_ISFIFO(st->st_mode)) suffix = '|';
                 else if (st->st_mode & S_IXUSR) suffix = '*';
                 if (suffix != '\0') {
-                    snprintf(decorated, sizeof(decorated), "%s%c", name, suffix);
+                    snprintf(decorated, sizeof(decorated), "%s%c", base, suffix);
                     decorated[sizeof(decorated) - 1] = '\0';
                     out = decorated;
                 }
@@ -10832,7 +10901,9 @@ static int list_directory(const char *path,
                           bool sort_by_size,
                           bool sort_by_extension,
                           bool reverse_sort,
-                          bool recursive) {
+                          bool recursive,
+                          bool show_inode,
+                          bool sort_by_version) {
     DIR *d = opendir(path);
     if (!d) {
         fprintf(stderr, "ls: %s: %s\n", path, strerror(errno));
@@ -10917,6 +10988,8 @@ static int list_directory(const char *path,
             comparator = compare_ls_entries_by_size;
         } else if (sort_by_extension) {
             comparator = compare_ls_entries_by_extension;
+        } else if (sort_by_version) {
+            comparator = compare_ls_entries_by_version;
         }
         qsort(entries, count, sizeof(entries[0]), comparator);
         if (reverse_sort) {
@@ -10937,7 +11010,8 @@ static int list_directory(const char *path,
                                                  numeric_ids,
                                                  &entries[i].stat_buf,
                                                  color_mode,
-                                                 classify);
+                                                 classify,
+                                                 show_inode);
         }
     } else if (format_mode == LS_FORMAT_SINGLE) {
         for (size_t i = 0; i < count; ++i) {
@@ -10948,10 +11022,11 @@ static int list_directory(const char *path,
                                                  numeric_ids,
                                                  &entries[i].stat_buf,
                                                  color_mode,
-                                                 classify);
+                                                 classify,
+                                                 show_inode);
         }
     } else {
-        print_ls_columns(entries, count, color_mode, classify);
+        print_ls_columns(entries, count, color_mode, classify, show_inode);
     }
 
     if (recursive) {
@@ -10962,7 +11037,7 @@ static int list_directory(const char *path,
             status |= list_directory(entries[i].full_path, show_all, show_almost_all, format_mode,
                                      sort_by_time, group_directories_first, human, numeric_ids,
                                      color_mode, classify, sort_by_size, sort_by_extension,
-                                     reverse_sort, recursive);
+                                     reverse_sort, recursive, show_inode, sort_by_version);
         }
     }
 
@@ -11112,7 +11187,9 @@ static bool smallclueLsValidateShortOptions(const char *arg,
                                             int *sort_by_size,
                                             int *sort_by_extension,
                                             int *reverse_sort,
-                                            int *recursive) {
+                                            int *recursive,
+                                            int *show_inode,
+                                            int *sort_by_version) {
     if (!arg) {
         return true;
     }
@@ -11163,6 +11240,12 @@ static bool smallclueLsValidateShortOptions(const char *arg,
                 break;
             case 'R':
                 *recursive = 1;
+                break;
+            case 'i':
+                *show_inode = 1;
+                break;
+            case 'v':
+                *sort_by_version = 1;
                 break;
             default:
                 fprintf(stderr, "ls: invalid option -- '%c'\n", *cursor);
@@ -11228,6 +11311,8 @@ static int smallclueLsCommand(int argc, char **argv) {
     int sort_by_extension = 0;
     int reverse_sort = 0;
     int recursive = 0;
+    int show_inode = 0;
+    int sort_by_version = 0;
     smallclueResetGetopt();
 
     int idx = 1;
@@ -11274,7 +11359,9 @@ static int smallclueLsCommand(int argc, char **argv) {
                                              &sort_by_size,
                                              &sort_by_extension,
                                              &reverse_sort,
-                                             &recursive)) {
+                                             &recursive,
+                                             &show_inode,
+                                             &sort_by_version)) {
             return 1;
         }
         idx++;
@@ -11296,11 +11383,11 @@ static int smallclueLsCommand(int argc, char **argv) {
     int paths_start = idx;
     if (paths_start >= argc) {
         if (list_dirs_only) {
-            return print_path_entry_with_stat(".", ".", format == LS_FORMAT_LONG, human_sizes, numeric_ids, NULL, color_mode, classify) ? 1 : 0;
+            return print_path_entry_with_stat(".", ".", format == LS_FORMAT_LONG, human_sizes, numeric_ids, NULL, color_mode, classify, show_inode) ? 1 : 0;
         }
         return list_directory(".", show_all, show_almost_all, format,
                               sort_by_time, group_directories_first, human_sizes, numeric_ids, color_mode, classify,
-                              sort_by_size, sort_by_extension, reverse_sort, recursive);
+                              sort_by_size, sort_by_extension, reverse_sort, recursive, show_inode, sort_by_version);
     }
 
     int remaining = argc - paths_start;
@@ -11322,9 +11409,9 @@ static int smallclueLsCommand(int argc, char **argv) {
             }
             status |= list_directory(path, show_all, show_almost_all, format,
                                      sort_by_time, group_directories_first, human_sizes, numeric_ids, color_mode, classify,
-                                     sort_by_size, sort_by_extension, reverse_sort, recursive);
+                                     sort_by_size, sort_by_extension, reverse_sort, recursive, show_inode, sort_by_version);
         } else {
-            status |= print_path_entry_with_stat(path, path, format == LS_FORMAT_LONG, human_sizes, numeric_ids, &stat_buf, color_mode, classify);
+            status |= print_path_entry_with_stat(path, path, format == LS_FORMAT_LONG, human_sizes, numeric_ids, &stat_buf, color_mode, classify, show_inode);
         }
     }
     return status ? 1 : 0;
