@@ -1380,8 +1380,8 @@ static int smallclueHostnameCommand(int argc, char **argv);
 static int smallclueIpAddrCommand(int argc, char **argv);
 #endif
 static int smallclueDfCommand(int argc, char **argv);
-#if defined(PSCAL_TARGET_IOS)
 static int smallclueTopCommand(int argc, char **argv);
+#if defined(PSCAL_TARGET_IOS)
 static int smallclueHelpCommand(int argc, char **argv);
 static int smallclueAddTabCommand(int argc, char **argv);
 #endif
@@ -2128,6 +2128,8 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"smallclue-help", smallclueHelpCommand, "List available smallclue applets"},
     {"licenses", smallclueLicensesCommand, "View third-party licenses"},
     {"top", smallclueTopCommand, "Show PSCAL virtual processes"},
+#else
+    {"top", smallclueTopCommand, "Show running processes (sorted by %CPU)"},
 #endif
 };
 
@@ -2558,6 +2560,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                  "  Browse PSCAL and third-party licenses; use arrows/enter to view"},
     {"top", "top\n"
             "  Show PSCAL virtual processes and CPU ticks"},
+#else
+    {"top", "top [-d SECONDS] [-n COUNT] [-b]\n"
+            "  Show real system processes from /proc, sorted by %CPU\n"
+            "  -d SECONDS refresh delay (default 3)\n"
+            "  -n COUNT   exit after COUNT frames (default: run until interrupted)\n"
+            "  -b         batch mode: never clear the screen, print every frame"},
 #endif
     {NULL, NULL}
 };
@@ -3549,6 +3557,392 @@ static int smallclueTopCommand(int argc, char **argv) {
 
     free(snapshots);
     return 0;
+}
+#else
+/* Real /proc-based top for the Linux/aarch64 guest target (and any other
+ * non-iOS build with a /proc filesystem). Reuses the same /proc/[pid]/stat
+ * parsing approach as smallcluePsCommand's non-iOS branch, extended to
+ * also pull utime/stime/rss so per-process %CPU/%MEM can be computed. */
+typedef struct {
+    int pid;
+    int ppid;
+    uid_t uid;
+    char state;
+    unsigned long long cpu_ticks;
+    long rss_kb;
+    char *command;
+    double cpu_percent;
+    double mem_percent;
+} SmallclueTopEntry;
+
+typedef struct {
+    int pid;
+    unsigned long long cpu_ticks;
+} SmallclueTopPrevTicks;
+
+static bool smallclueTopReadProcStatTotal(unsigned long long *total_out, unsigned long long *idle_out) {
+    FILE *fp = fopen("/proc/stat", "r");
+    if (!fp) return false;
+    char line[512];
+    bool ok = false;
+    if (fgets(line, sizeof(line), fp)) {
+        unsigned long long user = 0, nice_ = 0, system_ = 0, idle = 0;
+        unsigned long long iowait = 0, irq = 0, softirq = 0, steal = 0;
+        int n = sscanf(line, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+                        &user, &nice_, &system_, &idle, &iowait, &irq, &softirq, &steal);
+        if (n >= 4) {
+            if (total_out) {
+                *total_out = user + nice_ + system_ + idle + iowait + irq + softirq + steal;
+            }
+            if (idle_out) *idle_out = idle + iowait;
+            ok = true;
+        }
+    }
+    fclose(fp);
+    return ok;
+}
+
+static bool smallclueTopReadMemInfo(size_t *total_kb, size_t *used_kb) {
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) return false;
+    char line[256];
+    unsigned long long total = 0, avail = 0, free_ = 0, buffers = 0, cached = 0;
+    bool haveAvail = false;
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned long long val = 0;
+        if (sscanf(line, "MemTotal: %llu kB", &val) == 1) total = val;
+        else if (sscanf(line, "MemAvailable: %llu kB", &val) == 1) { avail = val; haveAvail = true; }
+        else if (sscanf(line, "MemFree: %llu kB", &val) == 1) free_ = val;
+        else if (sscanf(line, "Buffers: %llu kB", &val) == 1) buffers = val;
+        else if (sscanf(line, "Cached: %llu kB", &val) == 1) cached = val;
+    }
+    fclose(fp);
+    if (total == 0) return false;
+    unsigned long long availTotal = haveAvail ? avail : (free_ + buffers + cached);
+    if (total_kb) *total_kb = (size_t)total;
+    if (used_kb) *used_kb = (size_t)(total > availTotal ? total - availTotal : 0);
+    return true;
+}
+
+static bool smallclueTopReadLoadAvg(double load[3]) {
+    FILE *fp = fopen("/proc/loadavg", "r");
+    if (!fp) return false;
+    bool ok = (fscanf(fp, "%lf %lf %lf", &load[0], &load[1], &load[2]) == 3);
+    fclose(fp);
+    return ok;
+}
+
+static int smallclueTopCompareEntries(const void *a, const void *b) {
+    const SmallclueTopEntry *ea = (const SmallclueTopEntry *)a;
+    const SmallclueTopEntry *eb = (const SmallclueTopEntry *)b;
+    if (ea->cpu_percent != eb->cpu_percent) {
+        return (ea->cpu_percent > eb->cpu_percent) ? -1 : 1;
+    }
+    return ea->pid - eb->pid;
+}
+
+static size_t smallclueTopCollect(SmallclueTopEntry **out_entries) {
+    *out_entries = NULL;
+    DIR *dir = opendir("/proc");
+    if (!dir) return 0;
+
+    SmallclueTopEntry *entries = NULL;
+    size_t count = 0, capacity = 0;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (!isdigit((unsigned char)ent->d_name[0])) continue;
+        int pid = atoi(ent->d_name);
+        char path[PATH_MAX];
+
+        snprintf(path, sizeof(path), "/proc/%s/stat", ent->d_name);
+        FILE *fp = fopen(path, "r");
+        if (!fp) continue;
+        char buf[1024];
+        if (!fgets(buf, sizeof(buf), fp)) {
+            fclose(fp);
+            continue;
+        }
+        fclose(fp);
+
+        char *open_paren = strchr(buf, '(');
+        char *close_paren = strrchr(buf, ')');
+        if (!open_paren || !close_paren || close_paren <= open_paren) continue;
+        *close_paren = '\0';
+        char *comm_short = open_paren + 1;
+        char *rest = close_paren + 1;
+
+        char state = '?';
+        int ppid = 0;
+        unsigned long utime = 0, stime = 0;
+        long rss_pages = 0;
+        int n = sscanf(rest,
+                       " %c %d %*d %*d %*d %*d %*u %*lu %*lu %*lu %*lu"
+                       " %lu %lu %*ld %*ld %*ld %*ld %*ld %*ld %*llu %*lu %ld",
+                       &state, &ppid, &utime, &stime, &rss_pages);
+        if (n < 5) continue;
+
+        struct stat st;
+        uid_t uid = 0;
+        snprintf(path, sizeof(path), "/proc/%s", ent->d_name);
+        if (stat(path, &st) == 0) uid = st.st_uid;
+
+        char *command = NULL;
+        snprintf(path, sizeof(path), "/proc/%s/cmdline", ent->d_name);
+        fp = fopen(path, "r");
+        if (fp) {
+            char cmdline[1024];
+            size_t len = fread(cmdline, 1, sizeof(cmdline) - 1, fp);
+            fclose(fp);
+            if (len > 0) {
+                cmdline[len] = '\0';
+                for (size_t i = 0; i < len; ++i) {
+                    if (cmdline[i] == '\0') cmdline[i] = ' ';
+                }
+                if (cmdline[len - 1] == ' ') cmdline[len - 1] = '\0';
+                if (cmdline[0] != '\0') command = strdup(cmdline);
+            }
+        }
+        if (!command) command = strdup(comm_short);
+        if (!command) continue;
+
+        if (count == capacity) {
+            size_t new_cap = capacity ? capacity * 2 : 32;
+            SmallclueTopEntry *resized = (SmallclueTopEntry *)realloc(entries, new_cap * sizeof(SmallclueTopEntry));
+            if (!resized) {
+                free(command);
+                break;
+            }
+            entries = resized;
+            capacity = new_cap;
+        }
+        entries[count].pid = pid;
+        entries[count].ppid = ppid;
+        entries[count].uid = uid;
+        entries[count].state = state;
+        entries[count].cpu_ticks = (unsigned long long)utime + (unsigned long long)stime;
+        long page_kb = sysconf(_SC_PAGESIZE) / 1024;
+        if (page_kb <= 0) page_kb = 4;
+        entries[count].rss_kb = rss_pages * page_kb;
+        entries[count].command = command;
+        entries[count].cpu_percent = 0.0;
+        entries[count].mem_percent = 0.0;
+        count++;
+    }
+    closedir(dir);
+    *out_entries = entries;
+    return count;
+}
+
+static unsigned long long smallclueTopPrevTicksFor(const SmallclueTopPrevTicks *prev, size_t prev_count, int pid) {
+    for (size_t i = 0; i < prev_count; ++i) {
+        if (prev[i].pid == pid) return prev[i].cpu_ticks;
+    }
+    return 0;
+}
+
+static int smallclueTopCommand(int argc, char **argv) {
+    smallclueResetGetopt();
+    smallclueClearPendingSignals();
+    double delay = 3.0;
+    int max_iterations = -1;
+    bool batch = !isatty(STDOUT_FILENO);
+
+    for (int i = 1; i < argc; ++i) {
+        const char *arg = argv[i];
+        if (strcmp(arg, "-d") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "top: option requires an argument -- 'd'\n");
+                return 1;
+            }
+            char *end = NULL;
+            delay = strtod(argv[++i], &end);
+            if (!end || *end != '\0' || delay <= 0.0) {
+                fprintf(stderr, "top: invalid delay '%s'\n", argv[i]);
+                return 1;
+            }
+        } else if (strcmp(arg, "-n") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "top: option requires an argument -- 'n'\n");
+                return 1;
+            }
+            char *end = NULL;
+            long count = strtol(argv[++i], &end, 10);
+            if (!end || *end != '\0' || count <= 0 || count > INT_MAX) {
+                fprintf(stderr, "top: invalid count '%s'\n", argv[i]);
+                return 1;
+            }
+            max_iterations = (int)count;
+        } else if (strcmp(arg, "-b") == 0) {
+            batch = true;
+        } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+            fputs("top [-d SECONDS] [-n COUNT] [-b]\n"
+                  "  Show real system processes, sorted by %CPU.\n"
+                  "  -d SECONDS refresh delay (default 3)\n"
+                  "  -n COUNT   exit after COUNT frames (default: run until interrupted)\n"
+                  "  -b         batch mode: never clear the screen, print every frame\n",
+                  stdout);
+            return 0;
+        } else {
+            fprintf(stderr, "top: unsupported option '%s'\n", arg);
+            return 1;
+        }
+    }
+
+    long ticks_per_sec = sysconf(_SC_CLK_TCK);
+    if (ticks_per_sec <= 0) ticks_per_sec = 100;
+
+    /* Take a throwaway baseline sample so the first displayed frame has a
+     * meaningful (non-zero) %CPU instead of always reading 0.0 -- matters
+     * for the common single-shot `top -b -n 1` scripted invocation, which
+     * would otherwise never get a second sample to diff against. */
+    SmallclueTopPrevTicks *prev = NULL;
+    size_t prev_count = 0;
+    unsigned long long prev_total_ticks = 0, prev_idle_ticks = 0;
+    struct timespec prev_wall = {0, 0};
+    {
+        SmallclueTopEntry *baseline = NULL;
+        size_t baseline_count = smallclueTopCollect(&baseline);
+        prev = (SmallclueTopPrevTicks *)calloc(baseline_count ? baseline_count : 1, sizeof(SmallclueTopPrevTicks));
+        if (prev) {
+            for (size_t i = 0; i < baseline_count; ++i) {
+                prev[i].pid = baseline[i].pid;
+                prev[i].cpu_ticks = baseline[i].cpu_ticks;
+            }
+            prev_count = baseline_count;
+        }
+        for (size_t i = 0; i < baseline_count; ++i) free(baseline[i].command);
+        free(baseline);
+        smallclueTopReadProcStatTotal(&prev_total_ticks, &prev_idle_ticks);
+        clock_gettime(CLOCK_MONOTONIC, &prev_wall);
+        struct timespec primeSleep = {0, 200 * 1000 * 1000};
+        nanosleep(&primeSleep, NULL);
+    }
+
+    int status = 0;
+    int iterations = 0;
+    while (1) {
+        int abort_status = 0;
+        if (smallclueShouldAbort(&abort_status)) {
+            status = abort_status;
+            break;
+        }
+
+        SmallclueTopEntry *entries = NULL;
+        size_t count = smallclueTopCollect(&entries);
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double wall_delta = (double)(now.tv_sec - prev_wall.tv_sec) +
+                             (double)(now.tv_nsec - prev_wall.tv_nsec) / 1e9;
+        if (wall_delta <= 0.0) wall_delta = 0.001;
+
+        unsigned long long total_ticks = 0, idle_ticks = 0;
+        smallclueTopReadProcStatTotal(&total_ticks, &idle_ticks);
+        unsigned long long total_delta = (total_ticks > prev_total_ticks) ? (total_ticks - prev_total_ticks) : 0;
+        unsigned long long idle_delta = (idle_ticks > prev_idle_ticks) ? (idle_ticks - prev_idle_ticks) : 0;
+        double aggregate_cpu_pct = (total_delta > 0)
+            ? 100.0 * (double)(total_delta - idle_delta) / (double)total_delta
+            : 0.0;
+
+        size_t mem_total_kb = 0, mem_used_kb = 0;
+        bool haveMem = smallclueTopReadMemInfo(&mem_total_kb, &mem_used_kb);
+
+        for (size_t i = 0; i < count; ++i) {
+            unsigned long long prevTicks = smallclueTopPrevTicksFor(prev, prev_count, entries[i].pid);
+            unsigned long long deltaTicks = (entries[i].cpu_ticks > prevTicks) ? (entries[i].cpu_ticks - prevTicks) : 0;
+            /* %CPU relative to a single core over the elapsed wall-clock
+             * interval -- a fully busy single-threaded process reads
+             * ~100%, matching real top/ps convention (can exceed 100% for
+             * multi-threaded processes spanning multiple cores). */
+            entries[i].cpu_percent = 100.0 * (double)deltaTicks / ((double)ticks_per_sec * wall_delta);
+            if (haveMem && mem_total_kb > 0) {
+                entries[i].mem_percent = 100.0 * (double)entries[i].rss_kb / (double)mem_total_kb;
+            }
+        }
+
+        qsort(entries, count, sizeof(SmallclueTopEntry), smallclueTopCompareEntries);
+
+        if (!batch && isatty(STDOUT_FILENO)) {
+            fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
+        }
+
+        double load[3] = {0, 0, 0};
+        bool haveLoad = smallclueTopReadLoadAvg(load);
+        if (haveLoad) {
+            printf("Tasks: %zu total   load average: %.2f, %.2f, %.2f\n", count, load[0], load[1], load[2]);
+        } else {
+            printf("Tasks: %zu total\n", count);
+        }
+        printf("Cpu(s): %.1f%% used, %.1f%% idle\n", aggregate_cpu_pct, 100.0 - aggregate_cpu_pct);
+        if (haveMem) {
+            printf("Mem: %zuK total, %zuK used, %zuK free\n", mem_total_kb,
+                   mem_used_kb, mem_total_kb > mem_used_kb ? mem_total_kb - mem_used_kb : 0);
+        }
+        printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+
+        int rows = -1, cols = -1;
+        if (!batch && isatty(STDOUT_FILENO)) {
+            smallclueGetTerminalSize(&rows, &cols);
+        }
+        size_t visible = count;
+        if (rows > 6) {
+            size_t cap = (size_t)(rows - 6);
+            if (cap < visible) visible = cap;
+        }
+        for (size_t i = 0; i < visible; ++i) {
+            struct passwd *pw = getpwuid(entries[i].uid);
+            char user_buf[32];
+            if (pw) {
+                snprintf(user_buf, sizeof(user_buf), "%s", pw->pw_name);
+            } else {
+                snprintf(user_buf, sizeof(user_buf), "%d", (int)entries[i].uid);
+            }
+            printf("  %5d %5d %-8s %c %7.1f %6.1f %s\n",
+                   entries[i].pid, entries[i].ppid, user_buf, entries[i].state,
+                   entries[i].cpu_percent, entries[i].mem_percent, entries[i].command);
+        }
+        fflush(stdout);
+
+        /* Build next iteration's prev-ticks table directly from the
+         * entries we already have in hand -- no need to re-walk /proc. */
+        free(prev);
+        prev = (SmallclueTopPrevTicks *)calloc(count ? count : 1, sizeof(SmallclueTopPrevTicks));
+        if (prev) {
+            for (size_t i = 0; i < count; ++i) {
+                prev[i].pid = entries[i].pid;
+                prev[i].cpu_ticks = entries[i].cpu_ticks;
+            }
+            prev_count = count;
+        } else {
+            prev_count = 0;
+        }
+        prev_total_ticks = total_ticks;
+        prev_idle_ticks = idle_ticks;
+        prev_wall = now;
+
+        for (size_t i = 0; i < count; ++i) free(entries[i].command);
+        free(entries);
+
+        if (max_iterations > 0) {
+            iterations++;
+            if (iterations >= max_iterations) break;
+        }
+
+        struct timespec ts;
+        ts.tv_sec = (time_t)delay;
+        ts.tv_nsec = (long)((delay - (double)ts.tv_sec) * 1e9);
+        if (ts.tv_nsec < 0) ts.tv_nsec = 0;
+        while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
+            if (smallclueShouldAbort(&abort_status)) {
+                status = abort_status;
+                free(prev);
+                return status;
+            }
+        }
+    }
+
+    free(prev);
+    return status;
 }
 #endif
 
