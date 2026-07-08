@@ -17,6 +17,7 @@
 #include "checksum_app.h"
 #include "diff_app.h"
 #include "patch_app.h"
+#include "printf_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -2055,6 +2056,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"no", smallclueNoCommand, "Repeatedly print strings (exit 1)"},
     {"passwd", smallcluePasswdCommand, "Change user password"},
     {"patch", smallcluePatchCommand, "Apply a unified diff to files"},
+    {"printf", smallcluePrintfCommand, "Format and print data"},
     {"pbcopy", smallcluePbcopyCommand, "Copy stdin to the system clipboard"},
     {"pbpaste", smallcluePbpasteCommand, "Paste the system clipboard to stdout"},
     {"ping", smallcluePingCommand, "ICMP echo utility"},
@@ -2321,6 +2323,11 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  -p N strip N leading path components (default 1)\n"
               "  FILE overrides the target path for a single-file patch\n"
               "  Context-diff/plain-diff formats are not supported, only unified"},
+    {"printf", "printf FORMAT [ARGUMENT...]\n"
+               "  Format and print ARGUMENTs per FORMAT (like the shell builtin)\n"
+               "  Conversions: %d %i %o %u %x %X %e %f %g %c %s %b %%\n"
+               "  FORMAT escapes: \\n \\t \\r \\a \\b \\f \\v \\\\\n"
+               "  If more ARGUMENTs remain than FORMAT consumes, FORMAT is reused"},
     {"host", "host [-4|-6] [-v] [-t TYPE] host [server]\n"
              "  -4 IPv4 only\n"
              "  -6 IPv6 only\n"

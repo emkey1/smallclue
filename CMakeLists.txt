@@ -179,6 +179,7 @@ set(SOURCES
     src/checksum_app.c
     src/diff_app.c
     src/patch_app.c
+    src/printf_app.c
     ${NEXTVI_SOURCES}
     ${OPENSSH_SOURCES}
     ${OPENRSYNC_ROOT}/blocks.c
