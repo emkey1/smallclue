@@ -19,6 +19,7 @@
 #include "patch_app.h"
 #include "printf_app.h"
 #include "expr_app.h"
+#include "chown_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -2003,6 +2004,8 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"cal", smallclueCalCommand, "Show a simple calendar"},
     {"cat", smallclueCatCommand, "Concatenate files"},
     {"chmod", smallclueChmodCommand, "Change file permissions"},
+    {"chown", smallclueChownCommand, "Change file owner and group"},
+    {"chgrp", smallclueChgrpCommand, "Change file group ownership"},
     {"clear", smallclueClearCommand, "Clear the terminal"},
     {"cls", smallclueClearCommand, "Clear the terminal"},
     {"cp", smallclueCpCommand, "Copy files and directories"},
@@ -2152,6 +2155,14 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"chmod", "chmod [-R] MODE FILE ...\n"
               "  MODE forms: u+rwx,g-w,o=r, a-wx, 755, 0644\n"
               "  -R recursive"},
+    {"chown", "chown [-R] [-h] OWNER[:[GROUP]] FILE ...\n"
+              "  Change owner (and optionally group) of each FILE\n"
+              "  OWNER[:GROUP]: both numeric IDs and names accepted\n"
+              "  \"user:\" changes owner only; \":group\" changes group only\n"
+              "  -R recursive  -h affect symlinks themselves, not their targets"},
+    {"chgrp", "chgrp [-R] [-h] GROUP FILE ...\n"
+              "  Change group ownership of each FILE (numeric ID or name)\n"
+              "  -R recursive  -h affect symlinks themselves, not their targets"},
     {"clear", "clear\n"
               "  Clear the terminal"},
     {"cls", "cls\n"
