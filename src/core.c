@@ -87,6 +87,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/ip_icmp.h>
+#include <netinet/icmp6.h>
 #include <arpa/inet.h>
 #include <inttypes.h>
 #include <sys/ioctl.h>
@@ -2485,8 +2486,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                "  Copy stdin to system clipboard"},
     {"pbpaste", "pbpaste\n"
                 "  Paste system clipboard to stdout"},
-    {"ping", "ping [-c count] [-t timeout_ms] HOST\n"
-             "  ICMP echo ping (IPv4)"},
+    {"ping", "ping [-4|-6] [-c count] [-t timeout_ms] HOST\n"
+             "  ICMP echo ping (IPv4 and IPv6)"},
     {"poweroff", "poweroff [-f]\n"
              "  Power off the system"},
     {"ps", "ps [-e|-A|-a] [-f] [-p PID[,PID...]] [-u USER[,USER...]]\n"
@@ -13818,8 +13819,18 @@ static uint16_t smallclueInternetChecksum(const void *data, size_t len) {
     return (uint16_t)~sum;
 }
 
+/* Note on the `ident` parameter: Linux's unprivileged ICMP "ping socket"
+ * (SOCK_DGRAM + IPPROTO_ICMP/IPPROTO_ICMPV6) rewrites the packet's id
+ * field to the socket's kernel-assigned local port on send -- confirmed
+ * against a real Linux kernel in Docker, where the reply's id never
+ * matched the id we set. Validating the reply's id against our original
+ * value is therefore unreliable and was a real (if previously untriggered
+ * on this dev machine's non-Linux ping stack) bug. Each attempt already
+ * uses a freshly connected, exclusive socket for exactly one request/
+ * reply, so the OS itself guarantees this reply belongs to us; only the
+ * sequence number (which the kernel does NOT rewrite) is checked here. */
 static bool smallcluePingDecodeReply(const unsigned char *buf, size_t len,
-        uint16_t ident, uint16_t seq, size_t *out_reply_len) {
+        uint16_t seq, size_t *out_reply_len) {
     const struct icmp *icmp_hdr = NULL;
     size_t reply_len = len;
 
@@ -13849,24 +13860,46 @@ static bool smallcluePingDecodeReply(const unsigned char *buf, size_t len,
         errno = EPROTO;
         return false;
     }
-    if (ntohs((uint16_t)icmp_hdr->icmp_id) != ident) {
-        errno = EPROTO;
-        return false;
-    }
     if (out_reply_len) {
         *out_reply_len = reply_len;
     }
     return true;
 }
 
-static int smallcluePingAttempt(const struct sockaddr_in *target_addr, int timeout_ms,
-        uint16_t ident, uint16_t seq, double *out_ms, size_t *out_reply_len) {
+/* ICMPv6 "ping socket" (SOCK_DGRAM, IPPROTO_ICMPV6) replies deliver just
+ * the ICMPv6 payload with no IPv6 header prepended (unlike the IPv4 path
+ * above, which defensively handles both cases) -- verified against a real
+ * Linux kernel in Docker. See smallcluePingDecodeReply's comment on why
+ * the id field isn't checked. */
+static bool smallcluePing6DecodeReply(const unsigned char *buf, size_t len,
+        uint16_t seq, size_t *out_reply_len) {
+    if (len < sizeof(struct icmp6_hdr)) {
+        errno = EPROTO;
+        return false;
+    }
+    const struct icmp6_hdr *icmp6 = (const struct icmp6_hdr *)buf;
+    if (icmp6->icmp6_type != ICMP6_ECHO_REPLY) {
+        errno = EPROTO;
+        return false;
+    }
+    if (ntohs(icmp6->icmp6_seq) != seq) {
+        errno = EPROTO;
+        return false;
+    }
+    if (out_reply_len) {
+        *out_reply_len = len;
+    }
+    return true;
+}
+
+static int smallcluePingAttempt(int family, const struct sockaddr *target_addr, socklen_t target_len,
+        int timeout_ms, uint16_t ident, uint16_t seq, double *out_ms, size_t *out_reply_len) {
     if (!target_addr) {
         errno = EINVAL;
         return -1;
     }
 
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    int sock = socket(family, SOCK_DGRAM, family == AF_INET6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP);
     if (sock < 0) {
         return -1;
     }
@@ -13879,23 +13912,36 @@ static int smallcluePingAttempt(const struct sockaddr_in *target_addr, int timeo
         return -1;
     }
 
-    if (connect(sock, (const struct sockaddr *)target_addr, sizeof(*target_addr)) < 0) {
+    if (connect(sock, target_addr, target_len) < 0) {
         close(sock);
         return -1;
     }
 
-    unsigned char packet[ICMP_MINLEN + SMALLCLUE_PING_PAYLOAD_SIZE];
+    unsigned char packet[sizeof(struct icmp6_hdr) + SMALLCLUE_PING_PAYLOAD_SIZE];
+    size_t hdrLen = (family == AF_INET6) ? sizeof(struct icmp6_hdr) : ICMP_MINLEN;
+    size_t packetLen = hdrLen + SMALLCLUE_PING_PAYLOAD_SIZE;
     memset(packet, 0, sizeof(packet));
-    struct icmp *icmp_hdr = (struct icmp *)packet;
-    icmp_hdr->icmp_type = ICMP_ECHO;
-    icmp_hdr->icmp_code = 0;
-    icmp_hdr->icmp_id = htons(ident);
-    icmp_hdr->icmp_seq = htons(seq);
-    for (size_t i = ICMP_MINLEN; i < sizeof(packet); ++i) {
+    for (size_t i = hdrLen; i < packetLen; ++i) {
         packet[i] = (unsigned char)(i & 0xffu);
     }
-    icmp_hdr->icmp_cksum = 0;
-    icmp_hdr->icmp_cksum = smallclueInternetChecksum(packet, sizeof(packet));
+    if (family == AF_INET6) {
+        struct icmp6_hdr *icmp6 = (struct icmp6_hdr *)packet;
+        icmp6->icmp6_type = ICMP6_ECHO_REQUEST;
+        icmp6->icmp6_code = 0;
+        icmp6->icmp6_id = htons(ident);
+        icmp6->icmp6_seq = htons(seq);
+        /* icmp6_cksum is left at 0: the kernel computes it for ICMPv6
+         * ping sockets since only the kernel knows the real source
+         * address needed for the IPv6 pseudo-header. */
+    } else {
+        struct icmp *icmp_hdr = (struct icmp *)packet;
+        icmp_hdr->icmp_type = ICMP_ECHO;
+        icmp_hdr->icmp_code = 0;
+        icmp_hdr->icmp_id = htons(ident);
+        icmp_hdr->icmp_seq = htons(seq);
+        icmp_hdr->icmp_cksum = 0;
+        icmp_hdr->icmp_cksum = smallclueInternetChecksum(packet, packetLen);
+    }
 
     struct timespec start;
     if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
@@ -13903,8 +13949,8 @@ static int smallcluePingAttempt(const struct sockaddr_in *target_addr, int timeo
         return -1;
     }
 
-    ssize_t sent = send(sock, packet, sizeof(packet), 0);
-    if (sent != (ssize_t)sizeof(packet)) {
+    ssize_t sent = send(sock, packet, packetLen, 0);
+    if (sent != (ssize_t)packetLen) {
         if (sent >= 0) {
             errno = EIO;
         }
@@ -13927,7 +13973,10 @@ static int smallcluePingAttempt(const struct sockaddr_in *target_addr, int timeo
         }
 
         size_t reply_len = 0;
-        if (!smallcluePingDecodeReply(reply, (size_t)received, ident, seq, &reply_len)) {
+        bool ok = (family == AF_INET6)
+            ? smallcluePing6DecodeReply(reply, (size_t)received, seq, &reply_len)
+            : smallcluePingDecodeReply(reply, (size_t)received, seq, &reply_len);
+        if (!ok) {
             continue;
         }
 
@@ -13945,7 +13994,7 @@ static int smallcluePingAttempt(const struct sockaddr_in *target_addr, int timeo
 }
 
 static int smallcluePingCommand(int argc, char **argv) {
-    const char *usage = "usage: ping [-c count] [-t timeout_ms] host\n";
+    const char *usage = "usage: ping [-4|-6] [-c count] [-t timeout_ms] host\n";
     if (argc <= 1) {
         fputs(usage, stderr);
         return 1;
@@ -13954,9 +14003,16 @@ static int smallcluePingCommand(int argc, char **argv) {
     smallclueResetGetopt();
     int count = 4;
     int timeout_ms = 3000;
+    int forceFamily = AF_UNSPEC;
     int opt;
-    while ((opt = getopt(argc, argv, "c:t:")) != -1) {
+    while ((opt = getopt(argc, argv, "46c:t:")) != -1) {
         switch (opt) {
+            case '4':
+                forceFamily = AF_INET;
+                break;
+            case '6':
+                forceFamily = AF_INET6;
+                break;
             case 'c':
                 count = atoi(optarg);
                 if (count <= 0) {
@@ -14005,22 +14061,26 @@ static int smallcluePingCommand(int argc, char **argv) {
 
     struct addrinfo *selected = NULL;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
-        if (ai->ai_family == AF_INET && ai->ai_addrlen >= sizeof(struct sockaddr_in)) {
+        if (forceFamily != AF_UNSPEC && ai->ai_family != forceFamily) continue;
+        if ((ai->ai_family == AF_INET && ai->ai_addrlen >= sizeof(struct sockaddr_in)) ||
+            (ai->ai_family == AF_INET6 && ai->ai_addrlen >= sizeof(struct sockaddr_in6))) {
             selected = ai;
             break;
         }
     }
     if (!selected) {
-        fprintf(stderr, "ping: %s: no IPv4 ICMP address resolved\n", host);
+        fprintf(stderr, "ping: %s: no ICMP-capable address resolved\n", host);
         pscalHostsFreeAddrInfo(res);
         return 1;
     }
 
-    struct sockaddr_in target_addr;
-    memcpy(&target_addr, selected->ai_addr, sizeof(target_addr));
+    struct sockaddr_storage target_addr;
+    socklen_t target_len = (socklen_t)selected->ai_addrlen;
+    memcpy(&target_addr, selected->ai_addr, target_len);
+    int family = selected->ai_family;
 
     char addrbuf[NI_MAXHOST];
-    if (getnameinfo((struct sockaddr *)&target_addr, sizeof(target_addr),
+    if (getnameinfo((struct sockaddr *)&target_addr, target_len,
             addrbuf, sizeof(addrbuf), NULL, 0, NI_NUMERICHOST) != 0) {
         strncpy(addrbuf, "unknown", sizeof(addrbuf));
         addrbuf[sizeof(addrbuf) - 1] = '\0';
@@ -14037,8 +14097,8 @@ static int smallcluePingCommand(int argc, char **argv) {
     for (int i = 0; i < count; ++i) {
         double elapsed_ms = 0.0;
         size_t reply_len = 0;
-        int rc = smallcluePingAttempt(&target_addr, timeout_ms, ident, (uint16_t)(i + 1),
-            &elapsed_ms, &reply_len);
+        int rc = smallcluePingAttempt(family, (struct sockaddr *)&target_addr, target_len,
+            timeout_ms, ident, (uint16_t)(i + 1), &elapsed_ms, &reply_len);
         if (rc == 0) {
             successes++;
             if (successes == 1 || elapsed_ms < min_ms) {
