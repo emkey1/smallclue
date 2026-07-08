@@ -2268,8 +2268,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  describe"},
     {"halt", "halt [-f]\n"
              "  Halt the system"},
-    {"head", "head [-n N] [FILE...]\n"
-             "  Default N=10"},
+    {"head", "head [-n N|-n -N] [FILE...]\n"
+             "  Default N=10\n"
+             "  -n -N: print all but the last N lines instead of the first N"},
     {"history", "history\n"
                 "  Show command history"},
     {"id", "id\n"
@@ -2454,8 +2455,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  Change user ID or become superuser"},
     {"sudo", "sudo command [args...]\n"
              "  Execute a command as another user"},
-    {"tail", "tail [-n N] [FILE...]\n"
-             "  Default N=10"},
+    {"tail", "tail [-n N|-n +N] [-f] [FILE...]\n"
+             "  Default N=10\n"
+             "  -n +N: start output at line N (relative to the start) instead\n"
+             "  of printing the last N lines. Not combinable with -f."},
     {"tar", "tar -c|-x|-t -f archive [-v] [-z] [-C dir] [file...]\n"
             "  -c create  -x extract  -t list\n"
             "  -f archive path (or - for stdin/stdout)\n"
@@ -14774,6 +14777,28 @@ static bool smallclueParseDashLineCount(const char *arg, long *value) {
     return true;
 }
 
+/* Parses the value passed to `-n` when it may carry a leading sign with
+ * tool-specific meaning: BSD/GNU tail's "-n +NUM" starts output at line
+ * NUM (relative to the beginning), and GNU head's "-n -NUM" prints all
+ * but the last NUM lines. A bare "+NUM" for head has no special GNU
+ * meaning and is treated as an ordinary positive count. */
+static bool smallclueParseSignedLineCount(const char *text, char *signOut, long *valueOut) {
+    if (!text || !*text) return false;
+    char sign = '\0';
+    const char *p = text;
+    if (*p == '+' || *p == '-') {
+        sign = *p;
+        p++;
+    }
+    if (!*p) return false;
+    char *endptr = NULL;
+    long v = strtol(p, &endptr, 10);
+    if (!endptr || *endptr != '\0' || v < 0) return false;
+    if (signOut) *signOut = sign;
+    if (valueOut) *valueOut = v;
+    return true;
+}
+
 static int smallclueHeadStream(FILE *fp, const char *label, long lines) {
     if (lines <= 0) {
         return 0;
@@ -14834,8 +14859,81 @@ found:
     return status;
 }
 
+/* GNU head's "-n -NUM": print all but the last NUM lines. Since head
+ * doesn't know where the end is until EOF, this streams via a NUM-sized
+ * ring buffer of line contents -- a line is only printed once NUM more
+ * lines have arrived after it (proving it isn't among the final NUM),
+ * and whatever remains buffered at EOF (exactly the excluded trailing
+ * lines) is discarded rather than printed. */
+static int smallclueHeadStreamAllButLast(FILE *fp, const char *label, long excludeCount) {
+    if (excludeCount <= 0) {
+        char *line = NULL;
+        size_t cap = 0;
+        int status = 0;
+        while (1) {
+            int read_err = 0;
+            ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
+            if (len < 0) {
+                if (read_err) {
+                    fprintf(stderr, "head: %s: %s\n", label ? label : "(stdin)", strerror(read_err));
+                    status = 1;
+                }
+                break;
+            }
+            fwrite(line, 1, (size_t)len, stdout);
+        }
+        free(line);
+        return status;
+    }
+
+    char **ring = (char **)calloc((size_t)excludeCount, sizeof(char *));
+    if (!ring) {
+        fprintf(stderr, "head: %s: out of memory\n", label ? label : "(stdin)");
+        return 1;
+    }
+    char *line = NULL;
+    size_t cap = 0;
+    long count = 0;
+    int status = 0;
+    while (1) {
+        int read_err = 0;
+        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
+        if (len < 0) {
+            if (read_err) {
+                fprintf(stderr, "head: %s: %s\n", label ? label : "(stdin)", strerror(read_err));
+                status = 1;
+            }
+            break;
+        }
+        long slot = count % excludeCount;
+        if (count >= excludeCount && ring[slot]) {
+            fputs(ring[slot], stdout);
+            free(ring[slot]);
+            ring[slot] = NULL;
+        }
+        char *copy = (char *)malloc((size_t)len + 1);
+        if (!copy) {
+            fprintf(stderr, "head: %s: out of memory\n", label ? label : "(stdin)");
+            status = 1;
+            break;
+        }
+        memcpy(copy, line, (size_t)len);
+        copy[len] = '\0';
+        ring[slot] = copy;
+        count++;
+    }
+    free(line);
+    for (long i = 0; i < excludeCount; ++i) {
+        free(ring[i]);
+    }
+    free(ring);
+    return status;
+}
+
 static int smallclueHeadCommand(int argc, char **argv) {
     long lines = 10;
+    bool allButLast = false;
+    long excludeCount = 0;
     int index = 1;
     while (index < argc) {
         const char *arg = argv[index];
@@ -14851,18 +14949,43 @@ static int smallclueHeadCommand(int argc, char **argv) {
                 fprintf(stderr, "head: option requires an argument -- n\n");
                 return 1;
             }
-            char *endptr = NULL;
-            lines = strtol(argv[index + 1], &endptr, 10);
-            if (!endptr || *endptr != '\0') {
+            char sign = '\0';
+            long value = 0;
+            if (!smallclueParseSignedLineCount(argv[index + 1], &sign, &value)) {
                 fprintf(stderr, "head: invalid line count '%s'\n", argv[index + 1]);
                 return 1;
             }
+            if (sign == '-') {
+                allButLast = true;
+                excludeCount = value;
+            } else {
+                allButLast = false;
+                lines = value;
+            }
             index += 2;
+            continue;
+        }
+        if (strncmp(arg, "-n", 2) == 0 && arg[2] != '\0') {
+            char sign = '\0';
+            long value = 0;
+            if (!smallclueParseSignedLineCount(arg + 2, &sign, &value)) {
+                fprintf(stderr, "head: invalid line count '%s'\n", arg + 2);
+                return 1;
+            }
+            if (sign == '-') {
+                allButLast = true;
+                excludeCount = value;
+            } else {
+                allButLast = false;
+                lines = value;
+            }
+            index += 1;
             continue;
         }
         long dashLines = 0;
         if (smallclueParseDashLineCount(arg, &dashLines)) {
             lines = dashLines;
+            allButLast = false;
             index += 1;
             continue;
         }
@@ -14873,7 +14996,8 @@ static int smallclueHeadCommand(int argc, char **argv) {
     int status = 0;
     int file_count = argc - index;
     if (file_count <= 0) {
-        status = smallclueHeadStream(stdin, "(stdin)", lines);
+        status = allButLast ? smallclueHeadStreamAllButLast(stdin, "(stdin)", excludeCount)
+                             : smallclueHeadStream(stdin, "(stdin)", lines);
     } else {
         for (int i = index; i < argc; ++i) {
             const char *path = argv[i];
@@ -14889,7 +15013,8 @@ static int smallclueHeadCommand(int argc, char **argv) {
                 }
                 printf("==> %s <==\n", path);
             }
-            status |= smallclueHeadStream(fp, path, lines);
+            status |= allButLast ? smallclueHeadStreamAllButLast(fp, path, excludeCount)
+                                  : smallclueHeadStream(fp, path, lines);
             fclose(fp);
         }
     }
@@ -14948,6 +15073,37 @@ static int smallclueTailStream(FILE *fp, const char *label, long lines) {
         free(ring[i]);
     }
     free(ring);
+    return status;
+}
+
+/* BSD/GNU tail's "-n +NUM": start output at line NUM (1-based, relative
+ * to the start of input) rather than counting back from the end. Unlike
+ * the last-N-lines mode, this needs no buffering at all -- just count
+ * lines as they stream by and start printing once the target is hit. */
+static int smallclueTailStreamFromLine(FILE *fp, const char *label, long startLine) {
+    if (startLine < 1) {
+        startLine = 1;
+    }
+    char *line = NULL;
+    size_t cap = 0;
+    long count = 0;
+    int status = 0;
+    while (1) {
+        int read_err = 0;
+        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
+        if (len < 0) {
+            if (read_err) {
+                fprintf(stderr, "tail: %s: %s\n", label ? label : "(stdin)", strerror(read_err));
+                status = 1;
+            }
+            break;
+        }
+        count++;
+        if (count >= startLine) {
+            fwrite(line, 1, (size_t)len, stdout);
+        }
+    }
+    free(line);
     return status;
 }
 
@@ -15086,6 +15242,8 @@ static int smallclueTailCommand(int argc, char **argv) {
     smallclueClearPendingSignals();
     long lines = 10;
     bool follow = false;
+    bool fromLineStart = false;
+    long startLine = 1;
     int index = 1;
     while (index < argc) {
         const char *arg = argv[index];
@@ -15106,18 +15264,43 @@ static int smallclueTailCommand(int argc, char **argv) {
                 fprintf(stderr, "tail: option requires an argument -- n\n");
                 return 1;
             }
-            char *endptr = NULL;
-            lines = strtol(argv[index + 1], &endptr, 10);
-            if (!endptr || *endptr != '\0') {
+            char sign = '\0';
+            long value = 0;
+            if (!smallclueParseSignedLineCount(argv[index + 1], &sign, &value)) {
                 fprintf(stderr, "tail: invalid line count '%s'\n", argv[index + 1]);
                 return 1;
             }
+            if (sign == '+') {
+                fromLineStart = true;
+                startLine = value;
+            } else {
+                fromLineStart = false;
+                lines = value;
+            }
             index += 2;
+            continue;
+        }
+        if (strncmp(arg, "-n", 2) == 0 && arg[2] != '\0') {
+            char sign = '\0';
+            long value = 0;
+            if (!smallclueParseSignedLineCount(arg + 2, &sign, &value)) {
+                fprintf(stderr, "tail: invalid line count '%s'\n", arg + 2);
+                return 1;
+            }
+            if (sign == '+') {
+                fromLineStart = true;
+                startLine = value;
+            } else {
+                fromLineStart = false;
+                lines = value;
+            }
+            index += 1;
             continue;
         }
         long dashLines = 0;
         if (smallclueParseDashLineCount(arg, &dashLines)) {
             lines = dashLines;
+            fromLineStart = false;
             index += 1;
             continue;
         }
@@ -15128,10 +15311,15 @@ static int smallclueTailCommand(int argc, char **argv) {
         fprintf(stderr, "tail: -f currently supports a single input\n");
         return 1;
     }
+    if (follow && fromLineStart) {
+        fprintf(stderr, "tail: -f cannot be combined with -n +NUM\n");
+        return 1;
+    }
     int status = 0;
     int file_count = argc - index;
     if (file_count <= 0) {
         status = follow ? smallclueTailFollow(stdin, "(stdin)", lines)
+                : fromLineStart ? smallclueTailStreamFromLine(stdin, "(stdin)", startLine)
                         : smallclueTailStream(stdin, "(stdin)", lines);
     } else {
         for (int i = index; i < argc; ++i) {
@@ -15153,6 +15341,9 @@ static int smallclueTailCommand(int argc, char **argv) {
                 status |= smallclueTailFollow(fp, path, lines);
                 fclose(fp);
                 break;
+            } else if (fromLineStart) {
+                status |= smallclueTailStreamFromLine(fp, path, startLine);
+                fclose(fp);
             } else {
                 status |= smallclueTailStream(fp, path, lines);
                 fclose(fp);
