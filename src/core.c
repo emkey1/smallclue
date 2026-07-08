@@ -2151,9 +2151,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -L (follow)\n"
              "  -d DATA\n"
              "  -H HEADER"},
-    {"cut", "cut -d DELIM -f LIST [FILE...]\n"
+    {"cut", "cut -f LIST [-d DELIM] [-s] [FILE...]\n"
+            "       cut -c LIST [FILE...]\n"
+            "  -f fields, -c characters/bytes: LIST is N, N-M, N-, or -M,\n"
+            "     comma-separated (e.g. 1,3-5)\n"
             "  -d delimiter (default tab)\n"
-            "  -f fields (e.g. 1,3-5)"},
+            "  -s suppress lines with no delimiter (default: print unchanged)"},
     {"date", "date [+FORMAT]\n"
              "  Show date/time"},
     {"diff", "diff [-u] [-q] FILE1 FILE2\n"
@@ -15132,40 +15135,106 @@ static int smallclueSedCommand(int argc, char **argv) {
     return status;
 }
 
-static void smallclueCutPrintField(const char *line, char delim, int field) {
-    if (field <= 0) {
+#define SMALLCLUE_CUT_MAX_RANGES 64
+
+typedef struct {
+    int start; /* 1-based, inclusive */
+    int end;   /* 1-based, inclusive; -1 = unbounded ("N-") */
+} SmallclueCutRange;
+
+/* Parses a cut -f/-c LIST: comma-separated N, N-M, N-, or -M (meaning 1-M). */
+static bool smallclueCutParseList(const char *spec, SmallclueCutRange *ranges, size_t *count, size_t maxRanges) {
+    *count = 0;
+    const char *p = spec;
+    while (*p) {
+        while (*p == ',') p++;
+        if (!*p) break;
+        if (*count >= maxRanges) return false;
+        int start, end;
+        if (*p == '-') {
+            start = 1;
+            p++;
+            char *endp;
+            end = (int)strtol(p, &endp, 10);
+            if (endp == p) return false;
+            p = endp;
+        } else {
+            char *endp;
+            start = (int)strtol(p, &endp, 10);
+            if (endp == p || start <= 0) return false;
+            p = endp;
+            if (*p == '-') {
+                p++;
+                if (*p == '\0' || *p == ',') {
+                    end = -1; /* "N-" unbounded */
+                } else {
+                    char *endp2;
+                    end = (int)strtol(p, &endp2, 10);
+                    if (endp2 == p) return false;
+                    p = endp2;
+                }
+            } else {
+                end = start;
+            }
+        }
+        ranges[*count].start = start;
+        ranges[*count].end = end;
+        (*count)++;
+    }
+    return *count > 0;
+}
+
+static bool smallclueCutRangesContain(const SmallclueCutRange *ranges, size_t count, int pos) {
+    for (size_t i = 0; i < count; ++i) {
+        if (pos >= ranges[i].start && (ranges[i].end == -1 || pos <= ranges[i].end)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void smallclueCutPrintFields(const char *line, char delim, const SmallclueCutRange *ranges,
+                                    size_t rangeCount, bool suppressNoDelim) {
+    if (!strchr(line, delim)) {
+        if (!suppressNoDelim) {
+            printf("%s\n", line);
+        }
         return;
     }
-    int current = 1;
+    int fieldNo = 1;
     const char *start = line;
-    const char *ptr = line;
-    while (true) {
-        if (*ptr == delim || *ptr == '\0' || *ptr == '\n') {
-            if (current == field) {
-                size_t slice = (size_t)(ptr - start);
-                fwrite(start, 1, slice, stdout);
-                if (slice == 0 || start[slice - 1] != '\n') {
-                    putchar('\n');
-                }
-                return;
+    bool printedAny = false;
+    for (const char *p = line;; ++p) {
+        if (*p == delim || *p == '\0') {
+            if (smallclueCutRangesContain(ranges, rangeCount, fieldNo)) {
+                if (printedAny) putchar(delim);
+                fwrite(start, 1, (size_t)(p - start), stdout);
+                printedAny = true;
             }
-            if (*ptr == '\0') {
-                break;
-            }
-            current++;
-            start = ptr + 1;
+            if (*p == '\0') break;
+            fieldNo++;
+            start = p + 1;
         }
-        if (*ptr == '\0') {
-            break;
+    }
+    putchar('\n');
+}
+
+static void smallclueCutPrintChars(const char *line, const SmallclueCutRange *ranges, size_t rangeCount) {
+    size_t len = strlen(line);
+    for (size_t i = 0; i < len; ++i) {
+        if (smallclueCutRangesContain(ranges, rangeCount, (int)(i + 1))) {
+            putchar(line[i]);
         }
-        ptr++;
     }
     putchar('\n');
 }
 
 static int smallclueCutCommand(int argc, char **argv) {
     char delimiter = '\t';
-    int field = -1;
+    bool haveFieldList = false, haveCharList = false, suppressNoDelim = false;
+    SmallclueCutRange ranges[SMALLCLUE_CUT_MAX_RANGES];
+    size_t rangeCount = 0;
+
     int index = 1;
     while (index < argc) {
         const char *arg = argv[index];
@@ -15175,6 +15244,11 @@ static int smallclueCutCommand(int argc, char **argv) {
         if (strcmp(arg, "--") == 0) {
             index++;
             break;
+        }
+        if (strcmp(arg, "-s") == 0) {
+            suppressNoDelim = true;
+            index++;
+            continue;
         }
         if (strncmp(arg, "-d", 2) == 0) {
             if (arg[2] != '\0') {
@@ -15190,71 +15264,75 @@ static int smallclueCutCommand(int argc, char **argv) {
             index += 2;
             continue;
         }
-        if (strncmp(arg, "-f", 2) == 0) {
-            const char *val_str = NULL;
+        if (strncmp(arg, "-f", 2) == 0 || strncmp(arg, "-c", 2) == 0) {
+            bool isChar = (arg[1] == 'c');
+            const char *listStr = NULL;
             if (arg[2] != '\0') {
-                val_str = arg + 2;
+                listStr = arg + 2;
                 index++;
             } else {
                 if (index + 1 >= argc) {
-                    fprintf(stderr, "cut: missing field number\n");
+                    fprintf(stderr, "cut: missing %s list\n", isChar ? "-c" : "-f");
                     return 1;
                 }
-                val_str = argv[index + 1];
+                listStr = argv[index + 1];
                 index += 2;
             }
-            field = (int)smallclueParseLong(val_str);
-            if (field <= 0) {
-                fprintf(stderr, "cut: invalid field '%s'\n", val_str);
+            if (!smallclueCutParseList(listStr, ranges, &rangeCount, SMALLCLUE_CUT_MAX_RANGES)) {
+                fprintf(stderr, "cut: invalid %s list '%s'\n", isChar ? "-c" : "-f", listStr);
                 return 1;
             }
+            if (isChar) haveCharList = true; else haveFieldList = true;
             continue;
         }
         fprintf(stderr, "cut: unsupported option '%s'\n", arg);
         return 1;
     }
-    if (field <= 0) {
-        fprintf(stderr, "cut: missing -f option\n");
+    if (!haveFieldList && !haveCharList) {
+        fprintf(stderr, "cut: you must specify a list of -f fields or -c characters\n");
         return 1;
     }
+    if (haveFieldList && haveCharList) {
+        fprintf(stderr, "cut: only one of -f or -c may be given\n");
+        return 1;
+    }
+
     char *line = NULL;
     size_t cap = 0;
     int status = 0;
-    if (index >= argc) {
+    int fileCount = argc - index;
+    for (int fi = 0; fi < (fileCount > 0 ? fileCount : 1); ++fi) {
+        FILE *fp = stdin;
+        const char *label = "-";
+        if (fileCount > 0) {
+            label = argv[index + fi];
+            fp = fopen(label, "r");
+            if (!fp) {
+                fprintf(stderr, "cut: %s: %s\n", label, strerror(errno));
+                status = 1;
+                continue;
+            }
+        }
         while (true) {
             int read_err = 0;
-            ssize_t len = smallclueGetlineStream(&line, &cap, stdin, &read_err);
+            ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
             if (len < 0) {
                 if (read_err) {
-                    fprintf(stderr, "cut: %s\n", strerror(read_err));
+                    fprintf(stderr, "cut: %s: %s\n", label, strerror(read_err));
                     status = 1;
                 }
                 break;
             }
-            smallclueCutPrintField(line, delimiter, field);
-        }
-    } else {
-        for (int i = index; i < argc; ++i) {
-            FILE *fp = fopen(argv[i], "r");
-            if (!fp) {
-                fprintf(stderr, "cut: %s: %s\n", argv[i], strerror(errno));
-                status = 1;
-                continue;
+            if (len > 0 && line[len - 1] == '\n') {
+                line[len - 1] = '\0';
             }
-            while (true) {
-                int read_err = 0;
-                ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
-                if (len < 0) {
-                    if (read_err) {
-                        fprintf(stderr, "cut: %s: %s\n", argv[i], strerror(read_err));
-                        status = 1;
-                    }
-                    break;
-                }
-                smallclueCutPrintField(line, delimiter, field);
+            if (haveCharList) {
+                smallclueCutPrintChars(line, ranges, rangeCount);
+            } else {
+                smallclueCutPrintFields(line, delimiter, ranges, rangeCount, suppressNoDelim);
             }
-            fclose(fp);
         }
+        if (fp != stdin) fclose(fp);
     }
     free(line);
     return status;
