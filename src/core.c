@@ -2450,8 +2450,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
 #if SMALLCLUE_HAS_IFADDRS
     {"ipaddr", "ipaddr [-4|-6] [-a]\n"
                "  Show interface IP addresses\n"
-               "  ipaddr add|del ADDR/PREFIXLEN dev IFACE (Linux only,\n"
-               "  needs CAP_NET_ADMIN; IPv4 only)"},
+               "  ipaddr add|del ADDR/PREFIXLEN dev IFACE\n"
+               "  ipaddr link set IFACE up|down\n"
+               "  ipaddr route add|del DEST/PREFIXLEN|default [via GW] [dev IFACE]\n"
+               "  (Linux only, needs CAP_NET_ADMIN; IPv4 only)"},
 #endif
     {"kill", "kill [-SIGNAL] PID...\n"
              "  Signals: HUP INT TERM KILL etc."},
@@ -13535,7 +13537,10 @@ static int smallclueAddTabCommand(int argc, char **argv) {
 #if SMALLCLUE_HAS_IFADDRS
 static void smallclueIpAddrUsage(void) {
     fputs("usage: ipaddr [-4|-6] [-a]\n"
-          "       ipaddr add|del ADDR/PREFIXLEN dev IFACE\n", stderr);
+          "       ipaddr add|del ADDR/PREFIXLEN dev IFACE\n"
+          "       ipaddr link set IFACE up|down\n"
+          "       ipaddr route add|del DEST/PREFIXLEN|default [via GATEWAY] [dev IFACE]\n",
+          stderr);
 }
 
 #if defined(__linux__) || defined(linux) || defined(__linux)
@@ -13642,6 +13647,203 @@ static int smallclueIpAddrModify(const char *ifaceName, const char *addrSpec, bo
     fprintf(stderr, "ipaddr: no netlink ACK received\n");
     return 1;
 }
+
+/* Reads one netlink ACK/error reply and reports it; shared by the link
+ * and route senders below (smallclueIpAddrModify above has its own
+ * inline copy, predating this helper). */
+static int smallclueNlReadAck(int sock, const char *context) {
+    char replyBuf[4096];
+    ssize_t n = recv(sock, replyBuf, sizeof(replyBuf), 0);
+    if (n < 0) {
+        fprintf(stderr, "ipaddr: netlink recv: %s\n", strerror(errno));
+        return 1;
+    }
+    for (struct nlmsghdr *nh = (struct nlmsghdr *)replyBuf; NLMSG_OK(nh, (size_t)n); nh = NLMSG_NEXT(nh, n)) {
+        if (nh->nlmsg_type == NLMSG_ERROR) {
+            const struct nlmsgerr *err = (const struct nlmsgerr *)NLMSG_DATA(nh);
+            if (err->error != 0) {
+                fprintf(stderr, "ipaddr: %s: %s\n", context, strerror(-err->error));
+                return 1;
+            }
+            return 0;
+        }
+    }
+    fprintf(stderr, "ipaddr: no netlink ACK received\n");
+    return 1;
+}
+
+struct smallclueNlLinkReq {
+    struct nlmsghdr nh;
+    struct ifinfomsg ifi;
+};
+
+static int smallclueIpLinkSetUpDown(const char *ifaceName, bool up) {
+    unsigned int ifindex = if_nametoindex(ifaceName);
+    if (ifindex == 0) {
+        fprintf(stderr, "ipaddr: %s: %s\n", ifaceName, strerror(errno));
+        return 1;
+    }
+    int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (sock < 0) {
+        fprintf(stderr, "ipaddr: netlink socket: %s\n", strerror(errno));
+        return 1;
+    }
+    struct smallclueNlLinkReq req;
+    memset(&req, 0, sizeof(req));
+    req.nh.nlmsg_len = sizeof(req);
+    req.nh.nlmsg_type = RTM_NEWLINK;
+    req.nh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    req.nh.nlmsg_seq = 1;
+    req.ifi.ifi_family = AF_UNSPEC;
+    req.ifi.ifi_index = (int)ifindex;
+    req.ifi.ifi_flags = up ? IFF_UP : 0;
+    req.ifi.ifi_change = IFF_UP; /* only the UP bit is being changed */
+
+    struct sockaddr_nl dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.nl_family = AF_NETLINK;
+    if (sendto(sock, &req, req.nh.nlmsg_len, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+        fprintf(stderr, "ipaddr: netlink send: %s\n", strerror(errno));
+        close(sock);
+        return 1;
+    }
+    char ctx[256];
+    snprintf(ctx, sizeof(ctx), "link set %s %s", ifaceName, up ? "up" : "down");
+    int rc = smallclueNlReadAck(sock, ctx);
+    close(sock);
+    return rc;
+}
+
+/* IPv4-only netlink RTM_NEWROUTE/RTM_DELROUTE sender for `ipaddr route
+ * add/del`. Supports the common forms: a plain destination network
+ * (DEST/PREFIXLEN or the "default" shorthand for 0.0.0.0/0), an
+ * optional gateway (`via ADDR`), and/or an optional outgoing interface
+ * (`dev IFACE`) -- at least one of the two must be given, matching real
+ * `ip route`. */
+struct smallclueNlRouteReq {
+    struct nlmsghdr nh;
+    struct rtmsg rt;
+    struct rtattr rta_dst;
+    uint32_t addr_dst;
+    /* RTA_GATEWAY and RTA_OIF appended dynamically after this fixed part,
+     * sized generously in the buffer below. */
+};
+
+static int smallclueIpRouteModify(const char *destSpec, const char *gateway, const char *iface, bool isAdd) {
+    struct in_addr dstAddr;
+    int prefixLen;
+    if (strcmp(destSpec, "default") == 0) {
+        dstAddr.s_addr = 0;
+        prefixLen = 0;
+    } else {
+        char addrPart[64];
+        const char *slash = strchr(destSpec, '/');
+        if (!slash) {
+            fprintf(stderr, "ipaddr: %s: expected DEST/PREFIXLEN or 'default'\n", destSpec);
+            return 1;
+        }
+        size_t addrLen = (size_t)(slash - destSpec);
+        if (addrLen == 0 || addrLen >= sizeof(addrPart)) {
+            fprintf(stderr, "ipaddr: %s: invalid destination\n", destSpec);
+            return 1;
+        }
+        memcpy(addrPart, destSpec, addrLen);
+        addrPart[addrLen] = '\0';
+        prefixLen = atoi(slash + 1);
+        if (prefixLen < 0 || prefixLen > 32) {
+            fprintf(stderr, "ipaddr: %s: invalid prefix length\n", destSpec);
+            return 1;
+        }
+        if (inet_pton(AF_INET, addrPart, &dstAddr) != 1) {
+            fprintf(stderr, "ipaddr: %s: not a valid IPv4 address\n", addrPart);
+            return 1;
+        }
+    }
+    struct in_addr gwAddr;
+    bool haveGw = false;
+    if (gateway) {
+        if (inet_pton(AF_INET, gateway, &gwAddr) != 1) {
+            fprintf(stderr, "ipaddr: %s: not a valid IPv4 gateway address\n", gateway);
+            return 1;
+        }
+        haveGw = true;
+    }
+    unsigned int ifindex = 0;
+    if (iface) {
+        ifindex = if_nametoindex(iface);
+        if (ifindex == 0) {
+            fprintf(stderr, "ipaddr: %s: %s\n", iface, strerror(errno));
+            return 1;
+        }
+    }
+    if (!haveGw && ifindex == 0) {
+        fprintf(stderr, "ipaddr: route needs at least 'via GATEWAY' or 'dev IFACE'\n");
+        return 1;
+    }
+
+    int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (sock < 0) {
+        fprintf(stderr, "ipaddr: netlink socket: %s\n", strerror(errno));
+        return 1;
+    }
+
+    unsigned char buf[512];
+    memset(buf, 0, sizeof(buf));
+    struct nlmsghdr *nh = (struct nlmsghdr *)buf;
+    struct rtmsg *rt = (struct rtmsg *)NLMSG_DATA(nh);
+    nh->nlmsg_type = isAdd ? RTM_NEWROUTE : RTM_DELROUTE;
+    nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    if (isAdd) nh->nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
+    nh->nlmsg_seq = 1;
+    nh->nlmsg_len = NLMSG_LENGTH(sizeof(*rt));
+
+    rt->rtm_family = AF_INET;
+    rt->rtm_dst_len = (unsigned char)prefixLen;
+    rt->rtm_src_len = 0;
+    rt->rtm_tos = 0;
+    rt->rtm_table = RT_TABLE_MAIN;
+    rt->rtm_protocol = RTPROT_STATIC;
+    rt->rtm_scope = haveGw ? RT_SCOPE_UNIVERSE : RT_SCOPE_LINK;
+    rt->rtm_type = RTN_UNICAST;
+    rt->rtm_flags = 0;
+
+    if (prefixLen > 0 || strcmp(destSpec, "default") != 0) {
+        struct rtattr *rta = (struct rtattr *)((char *)nh + NLMSG_ALIGN(nh->nlmsg_len));
+        rta->rta_type = RTA_DST;
+        rta->rta_len = RTA_LENGTH(sizeof(uint32_t));
+        memcpy(RTA_DATA(rta), &dstAddr.s_addr, sizeof(uint32_t));
+        nh->nlmsg_len = NLMSG_ALIGN(nh->nlmsg_len) + RTA_LENGTH(sizeof(uint32_t));
+    }
+    if (haveGw) {
+        struct rtattr *rta = (struct rtattr *)((char *)nh + NLMSG_ALIGN(nh->nlmsg_len));
+        rta->rta_type = RTA_GATEWAY;
+        rta->rta_len = RTA_LENGTH(sizeof(uint32_t));
+        memcpy(RTA_DATA(rta), &gwAddr.s_addr, sizeof(uint32_t));
+        nh->nlmsg_len = NLMSG_ALIGN(nh->nlmsg_len) + RTA_LENGTH(sizeof(uint32_t));
+    }
+    if (ifindex != 0) {
+        struct rtattr *rta = (struct rtattr *)((char *)nh + NLMSG_ALIGN(nh->nlmsg_len));
+        rta->rta_type = RTA_OIF;
+        uint32_t idx = ifindex;
+        rta->rta_len = RTA_LENGTH(sizeof(uint32_t));
+        memcpy(RTA_DATA(rta), &idx, sizeof(uint32_t));
+        nh->nlmsg_len = NLMSG_ALIGN(nh->nlmsg_len) + RTA_LENGTH(sizeof(uint32_t));
+    }
+
+    struct sockaddr_nl dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.nl_family = AF_NETLINK;
+    if (sendto(sock, buf, nh->nlmsg_len, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+        fprintf(stderr, "ipaddr: netlink send: %s\n", strerror(errno));
+        close(sock);
+        return 1;
+    }
+    char ctx[256];
+    snprintf(ctx, sizeof(ctx), "route %s %s", isAdd ? "add" : "del", destSpec);
+    int rc = smallclueNlReadAck(sock, ctx);
+    close(sock);
+    return rc;
+}
 #endif
 
 static bool smallclueShouldSkipInterface(const struct ifaddrs *ifa, int family, bool show_all) {
@@ -13674,6 +13876,50 @@ static int smallclueIpAddrCommand(int argc, char **argv) {
         return smallclueIpAddrModify(argv[4], argv[2], isAdd);
 #else
         fprintf(stderr, "ipaddr: add/del is only supported on Linux (needs netlink)\n");
+        return 1;
+#endif
+    }
+    if (argc >= 2 && strcmp(argv[1], "link") == 0) {
+#if defined(__linux__) || defined(linux) || defined(__linux)
+        /* link set IFACE up|down */
+        if (argc != 5 || strcmp(argv[2], "set") != 0 ||
+            (strcmp(argv[4], "up") != 0 && strcmp(argv[4], "down") != 0)) {
+            smallclueIpAddrUsage();
+            return 1;
+        }
+        return smallclueIpLinkSetUpDown(argv[3], strcmp(argv[4], "up") == 0);
+#else
+        fprintf(stderr, "ipaddr: link set is only supported on Linux (needs netlink)\n");
+        return 1;
+#endif
+    }
+    if (argc >= 2 && strcmp(argv[1], "route") == 0) {
+#if defined(__linux__) || defined(linux) || defined(__linux)
+        /* route add|del DEST[/PREFIXLEN]|default [via GATEWAY] [dev IFACE] */
+        if (argc < 4 || (strcmp(argv[2], "add") != 0 && strcmp(argv[2], "del") != 0)) {
+            smallclueIpAddrUsage();
+            return 1;
+        }
+        bool isAdd = strcmp(argv[2], "add") == 0;
+        const char *dest = argv[3];
+        const char *gateway = NULL;
+        const char *iface = NULL;
+        int i = 4;
+        while (i < argc) {
+            if (strcmp(argv[i], "via") == 0 && i + 1 < argc) {
+                gateway = argv[i + 1];
+                i += 2;
+            } else if (strcmp(argv[i], "dev") == 0 && i + 1 < argc) {
+                iface = argv[i + 1];
+                i += 2;
+            } else {
+                smallclueIpAddrUsage();
+                return 1;
+            }
+        }
+        return smallclueIpRouteModify(dest, gateway, iface, isAdd);
+#else
+        fprintf(stderr, "ipaddr: route add/del is only supported on Linux (needs netlink)\n");
         return 1;
 #endif
     }
