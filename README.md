@@ -90,7 +90,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **telnet**: Telnet client with real IAC option negotiation (declines every DO/WILL request, handles subnegotiation blocks and escaped IAC bytes) -- no actual options are supported, but it interoperates cleanly with real telnetd servers instead of showing negotiation bytes as garbage.
 * **nslookup** / **host**: DNS lookup utilities; IP-shaped queries auto-detect as PTR/reverse lookups. An optional trailing `server` argument queries that DNS server directly over UDP/53 (falling back to TCP for truncated replies, per RFC 1035) via a from-scratch DNS client (raw wire-format encode/decode, name compression, A/AAAA/PTR/CNAME/NS/MX/TXT/SRV), instead of going through the system resolver. `host -t TYPE` and `nslookup -type=TYPE`/`-q=TYPE` select NS/MX/TXT/SRV lookups (in addition to A/AAAA); since `getaddrinfo()` has no equivalent for these, they always use the raw client, defaulting to `/etc/resolv.conf`'s nameserver when no explicit server is given.
 * **traceroute**: Trace the route packets take to a network host.
-* **ipaddr**: Display network interface addresses; on Linux (real netlink, IPv4 only, needs `CAP_NET_ADMIN`): `ipaddr add|del ADDR/PREFIXLEN dev IFACE`, `ipaddr link set IFACE up|down`, `ipaddr route add|del DEST/PREFIXLEN|default [via GW] [dev IFACE]`.
+* **ipaddr**: Display network interface addresses; on Linux (real netlink, IPv4 only, needs `CAP_NET_ADMIN`): `ipaddr add|del ADDR/PREFIXLEN dev IFACE`, `ipaddr flush dev IFACE`, `ipaddr link set IFACE up|down`, `ipaddr route add|del DEST/PREFIXLEN|default [via GW] [dev IFACE]`.
 
 ### Shell & System
 * **sh**: Launches the PSCAL shell frontend (`exsh`).
