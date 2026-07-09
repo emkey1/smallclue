@@ -243,10 +243,9 @@ of the metadata this applet already collects.
 
 ### Honorable mentions (just outside the top 10)
 
-**Status update: all items below are now closed too**, with the exception of
-`mv`'s cross-filesystem directory fallback, which is a genuine remaining gap
-(see the `mv` bullet in section 3 — `cp`'s recursive-copy upgrade was never
-plumbed into `mv`'s `EXDEV` fallback path).
+**Status update: all items below are now closed**, including `mv`'s
+cross-filesystem directory fallback (see the `mv` bullet in section 3 —
+now repointed at `cp`'s recursive-copy path).
 
 - **`xargs`: allow invoking arbitrary external binaries**, not just built-in
   applets — currently `find . | xargs anything-not-a-smallclue-applet` fails
