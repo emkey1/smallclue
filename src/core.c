@@ -23368,11 +23368,18 @@ static int smallclueMvCommand(int argc, char **argv) {
             continue;
         }
         if (errno == EXDEV) {
-            if (smallclueCopyFile("mv", src, target) != 0) {
+            struct stat src_stat;
+            bool src_is_dir = (lstat(src, &src_stat) == 0) && S_ISDIR(src_stat.st_mode);
+            if (src_is_dir) {
+                if (smallclueCopyRecursive("mv", src, target, true) != 0) {
+                    status = 1;
+                    continue;
+                }
+            } else if (smallclueCopyFile("mv", src, target) != 0) {
                 status = 1;
                 continue;
             }
-            if (smallclueRemovePathWithLabel("mv", src, false, true, false) != 0) {
+            if (smallclueRemovePathWithLabel("mv", src, src_is_dir, true, false) != 0) {
                 fprintf(stderr, "mv: %s: unable to remove after copy\n", src);
                 status = 1;
             }
