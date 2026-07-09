@@ -90,7 +90,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **telnet**: Telnet client with real IAC option negotiation (declines every DO/WILL request, handles subnegotiation blocks and escaped IAC bytes) -- no actual options are supported, but it interoperates cleanly with real telnetd servers instead of showing negotiation bytes as garbage.
 * **nslookup** / **host**: DNS lookup utilities; IP-shaped queries auto-detect as PTR/reverse lookups (no custom DNS server override).
 * **traceroute**: Trace the route packets take to a network host.
-* **ipaddr**: Display network interface addresses; `ipaddr add|del ADDR/PREFIXLEN dev IFACE` on Linux (real netlink, IPv4 only, needs `CAP_NET_ADMIN`).
+* **ipaddr**: Display network interface addresses; on Linux (real netlink, IPv4 only, needs `CAP_NET_ADMIN`): `ipaddr add|del ADDR/PREFIXLEN dev IFACE`, `ipaddr link set IFACE up|down`, `ipaddr route add|del DEST/PREFIXLEN|default [via GW] [dev IFACE]`.
 
 ### Shell & System
 * **sh**: Launches the PSCAL shell frontend (`exsh`).
