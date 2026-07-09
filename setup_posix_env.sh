@@ -661,6 +661,22 @@ for applet in $APPLETS; do
     ln -sf smallclue "$ROOTFS/bin/$applet"
 done
 
+# Sanity check: if smallclue advertises an "rsync" applet, the symlink it
+# depends on for local-to-local transfers (openrsync's execvp("rsync", ...)
+# re-exec) must actually be there and resolve back to smallclue. A silent
+# miss here means every "rsync -a src/ dst/" invocation fails with ENOENT
+# inside the rootfs, with no other build-time signal.
+if echo "$APPLETS" | grep -qx "rsync"; then
+    RSYNC_LINK_TARGET=$(readlink "$ROOTFS/bin/rsync" 2>/dev/null || true)
+    if [ "$RSYNC_LINK_TARGET" != "smallclue" ]; then
+        echo "ERROR: 'rsync' applet is advertised by smallclue but $ROOTFS/bin/rsync" >&2
+        echo "       is not a 'smallclue' symlink (got: '${RSYNC_LINK_TARGET:-<missing>}')." >&2
+        echo "       openrsync's local-to-local transfer path execvp()s literal 'rsync'" >&2
+        echo "       and will fail with ENOENT without this symlink." >&2
+        exit 1
+    fi
+fi
+
 # Init symlink
 ln -sf /bin/smallclue "$ROOTFS/sbin/init"
 
