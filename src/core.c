@@ -34,6 +34,7 @@
 #include "split_app.h"
 #include "fmt_app.h"
 #include "comm_app.h"
+#include "awk_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
@@ -2181,6 +2182,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"split", smallclueSplitCommand, "Split a file into pieces"},
     {"fmt", smallclueFmtCommand, "Reflow text into filled paragraphs"},
     {"comm", smallclueCommCommand, "Compare two sorted files line by line"},
+    {"awk", smallclueAwkCommand, "Pattern scanning and processing language"},
     {"nslookup", smallclueNslookupCommand, "DNS lookup utility"},
     {"no", smallclueNoCommand, "Repeatedly print strings (exit 1)"},
     {"nohup", smallclueNohupCommand, "Run a command immune to hangups"},
@@ -2555,6 +2557,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"comm", "comm [-1] [-2] [-3] FILE1 FILE2\n"
              "  Compare two SORTED files; 3 columns by default (unique to\n"
              "  FILE1, unique to FILE2, common); -N suppresses column N"},
+    {"awk", "awk [-F sep] [-v var=val] [-f progfile | -e prog | 'prog'] [file ...]\n"
+            "  Pattern scanning/processing: BEGIN/END, patterns+actions,\n"
+            "  fields/arrays/functions/getline/printf (BusyBox awk feature set)"},
     {"nextvi", "nextvi [FILE]\n"
                "  Full-screen text editor"},
     {"passwd", "passwd [username]\n"

@@ -68,6 +68,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **paste**: Merge corresponding lines of files side by side (`-d`, `-s`).
 * **split**: Split a file into pieces by line count or byte count (`-l`, `-b`).
 * **fmt**: Reflow text into filled paragraphs (`-w` width, default 75).
+* **awk**: Pattern scanning and processing language targeting the BusyBox awk feature set -- patterns/actions, `BEGIN`/`END`, range patterns, user-defined functions (arrays passed by reference, scalars by value), associative arrays (`for...in`, `delete`, multi-dimensional via `SUBSEP`), full expression grammar, `getline` (plain/`var`/`< file`/`cmd |`), `print`/`printf` with `>`/`>>`/`|` redirection, string functions (`length`, `substr`, `index`, `split`, `sub`, `gsub`, `match`, `sprintf`, `tolower`/`toupper`), math functions, `-F`/`-v`/`-f`/`-e` CLI options. Not implemented: gawk extensions (`asort`, `gensub`, `strftime`, bitwise functions, `switch`, coprocesses).
 * **comm**: Compare two sorted files line by line (`-1`/`-2`/`-3` to suppress columns).
 * **md5sum** / **sha1sum** / **sha256sum**: Compute or check cryptographic digests (`-c`).
 * **base64**: Base64 encode or decode (`-d`, `-i`, `-w`).

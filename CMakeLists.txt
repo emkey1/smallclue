@@ -196,6 +196,11 @@ set(SOURCES
     src/split_app.c
     src/fmt_app.c
     src/comm_app.c
+    src/awk_lexer.c
+    src/awk_parser.c
+    src/awk_value.c
+    src/awk_interp.c
+    src/awk_app.c
     ${NEXTVI_SOURCES}
     ${OPENSSH_SOURCES}
     ${OPENRSYNC_ROOT}/blocks.c
