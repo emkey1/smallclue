@@ -1501,9 +1501,13 @@ static bool smallclueTryReverseDnsLookup(const char *label, const char *host, bo
  * needing a second round-trip). */
 
 #define SMALLCLUE_DNS_TYPE_A 1
-#define SMALLCLUE_DNS_TYPE_PTR 12
-#define SMALLCLUE_DNS_TYPE_AAAA 28
+#define SMALLCLUE_DNS_TYPE_NS 2
 #define SMALLCLUE_DNS_TYPE_CNAME 5
+#define SMALLCLUE_DNS_TYPE_PTR 12
+#define SMALLCLUE_DNS_TYPE_MX 15
+#define SMALLCLUE_DNS_TYPE_TXT 16
+#define SMALLCLUE_DNS_TYPE_AAAA 28
+#define SMALLCLUE_DNS_TYPE_SRV 33
 
 static size_t smallclueDnsEncodeName(const char *name, unsigned char *buf, size_t bufSize) {
     size_t pos = 0;
@@ -1581,6 +1585,35 @@ static const char *smallclueDnsRcodeName(int rcode) {
     return (rcode >= 0 && rcode < 6) ? rcodeNames[rcode] : "unknown error";
 }
 
+/* send()/recv() aren't guaranteed to move the whole buffer in one
+ * call, which matters for the DNS-over-TCP fallback below (length-
+ * prefixed messages need every byte accounted for). Returns 0 on
+ * success, -1 on error. */
+static int smallclueSendAll(int fd, const void *buf, size_t len) {
+    const unsigned char *p = (const unsigned char *)buf;
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t w = send(fd, p + sent, len - sent, 0);
+        if (w <= 0) return -1;
+        sent += (size_t)w;
+    }
+    return 0;
+}
+
+/* Returns the number of bytes read (== len on success), 0 on a clean
+ * EOF before len bytes arrived, or -1 on error. */
+static ssize_t smallclueRecvAll(int fd, void *buf, size_t len) {
+    unsigned char *p = (unsigned char *)buf;
+    size_t got = 0;
+    while (got < len) {
+        ssize_t r = recv(fd, p + got, len - got, 0);
+        if (r < 0) return -1;
+        if (r == 0) return (ssize_t)got > 0 ? -1 : 0;
+        got += (size_t)r;
+    }
+    return (ssize_t)got;
+}
+
 static int smallclueDnsQueryServer(const char *server, const char *qname, int qtype,
                                     char ***outAnswers, int *outCount, int *outRcode) {
     struct addrinfo hints;
@@ -1629,18 +1662,78 @@ static int smallclueDnsQueryServer(const char *server, const char *qname, int qt
     }
     freeaddrinfo(res);
 
-    unsigned char reply[2048];
-    ssize_t n = recv(sock, reply, sizeof(reply), 0);
+    unsigned char replyBuf[2048];
+    unsigned char *reply = replyBuf;
+    unsigned char *tcpReply = NULL;
+    ssize_t n = recv(sock, replyBuf, sizeof(replyBuf), 0);
     close(sock);
     if (n < 12) {
         fprintf(stderr, "dns: %s: no reply (timed out or unreachable)\n", server);
         return -1;
     }
-    uint16_t rid = (uint16_t)((reply[0] << 8) | reply[1]);
+    uint16_t rid = (uint16_t)((replyBuf[0] << 8) | replyBuf[1]);
     if (rid != qid) {
         fprintf(stderr, "dns: %s: reply ID mismatch\n", server);
         return -1;
     }
+
+    /* TC (truncated) bit: the UDP reply didn't fit (common for TXT
+     * records on well-populated domains, since we don't advertise an
+     * EDNS0 buffer size, so servers default to the original 512-byte
+     * UDP limit). Per RFC 1035 4.2.1, retry the identical query over
+     * TCP to get the untruncated answer. */
+    if (replyBuf[2] & 0x02) {
+        if (getaddrinfo(server, "53", &hints, &res) != 0 || !res) {
+            fprintf(stderr, "dns: %s: server address not found\n", server);
+            return -1;
+        }
+        hints.ai_socktype = SOCK_STREAM;
+        int tsock = socket(res->ai_family, SOCK_STREAM, 0);
+        if (tsock < 0) {
+            freeaddrinfo(res);
+            fprintf(stderr, "dns: %s: %s\n", server, strerror(errno));
+            return -1;
+        }
+        setsockopt(tsock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(tsock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        if (connect(tsock, res->ai_addr, res->ai_addrlen) < 0) {
+            fprintf(stderr, "dns: %s: %s\n", server, strerror(errno));
+            close(tsock);
+            freeaddrinfo(res);
+            return -1;
+        }
+        freeaddrinfo(res);
+
+        unsigned char lenPrefix[2] = { (unsigned char)(qlen >> 8), (unsigned char)(qlen & 0xff) };
+        if (smallclueSendAll(tsock, lenPrefix, sizeof(lenPrefix)) < 0 ||
+            smallclueSendAll(tsock, query, qlen) < 0) {
+            fprintf(stderr, "dns: %s: %s\n", server, strerror(errno));
+            close(tsock);
+            return -1;
+        }
+        unsigned char respLenBuf[2];
+        if (smallclueRecvAll(tsock, respLenBuf, sizeof(respLenBuf)) <= 0) {
+            fprintf(stderr, "dns: %s: no TCP reply (timed out)\n", server);
+            close(tsock);
+            return -1;
+        }
+        size_t tcpLen = (size_t)((respLenBuf[0] << 8) | respLenBuf[1]);
+        tcpReply = (unsigned char *)malloc(tcpLen);
+        if (!tcpReply) {
+            close(tsock);
+            return -1;
+        }
+        ssize_t got = smallclueRecvAll(tsock, tcpReply, tcpLen);
+        close(tsock);
+        if (got <= 0 || (size_t)got != tcpLen) {
+            fprintf(stderr, "dns: %s: incomplete TCP reply\n", server);
+            free(tcpReply);
+            return -1;
+        }
+        reply = tcpReply;
+        n = (ssize_t)tcpLen;
+    }
+
     int rcode = reply[3] & 0x0F;
     uint16_t qdcount = (uint16_t)((reply[4] << 8) | reply[5]);
     uint16_t ancount = (uint16_t)((reply[6] << 8) | reply[7]);
@@ -1650,6 +1743,7 @@ static int smallclueDnsQueryServer(const char *server, const char *qname, int qt
          * queried) -- querying A then AAAA separately would otherwise
          * print the same NXDOMAIN/SERVFAIL/etc. twice. */
         *outCount = 0;
+        free(tcpReply);
         return 0;
     }
 
@@ -1658,6 +1752,7 @@ static int smallclueDnsQueryServer(const char *server, const char *qname, int qt
         size_t after;
         if (!smallclueDnsDecodeName(reply, (size_t)n, pos, NULL, 0, &after)) {
             fprintf(stderr, "dns: %s: malformed reply\n", server);
+            free(tcpReply);
             return -1;
         }
         pos = after + 4; /* QTYPE + QCLASS */
@@ -1693,6 +1788,52 @@ static int smallclueDnsQueryServer(const char *server, const char *qname, int qt
                 answers = (char **)realloc(answers, sizeof(char *) * (size_t)(count + 1));
                 answers[count++] = strdup(ptrName);
             }
+        } else if (rtype == qtype && qtype == SMALLCLUE_DNS_TYPE_NS) {
+            char nsName[256];
+            size_t nsAfter;
+            if (smallclueDnsDecodeName(reply, (size_t)n, rdataPos, nsName, sizeof(nsName), &nsAfter)) {
+                answers = (char **)realloc(answers, sizeof(char *) * (size_t)(count + 1));
+                answers[count++] = strdup(nsName);
+            }
+        } else if (rtype == qtype && qtype == SMALLCLUE_DNS_TYPE_MX && rdlength >= 2) {
+            unsigned preference = (unsigned)((reply[rdataPos] << 8) | reply[rdataPos + 1]);
+            char mxName[256];
+            size_t mxAfter;
+            if (smallclueDnsDecodeName(reply, (size_t)n, rdataPos + 2, mxName, sizeof(mxName), &mxAfter)) {
+                char formatted[300];
+                snprintf(formatted, sizeof(formatted), "%u %s", preference, mxName);
+                answers = (char **)realloc(answers, sizeof(char *) * (size_t)(count + 1));
+                answers[count++] = strdup(formatted);
+            }
+        } else if (rtype == qtype && qtype == SMALLCLUE_DNS_TYPE_TXT && rdlength > 0) {
+            char text[512];
+            size_t textLen = 0;
+            size_t txtPos = rdataPos;
+            size_t txtEnd = rdataPos + rdlength;
+            while (txtPos < txtEnd) {
+                unsigned char segLen = reply[txtPos++];
+                if (txtPos + segLen > txtEnd) break;
+                for (unsigned char i = 0; i < segLen && textLen + 1 < sizeof(text); ++i)
+                    text[textLen++] = (char)reply[txtPos + i];
+                txtPos += segLen;
+            }
+            text[textLen] = '\0';
+            char formatted[520];
+            snprintf(formatted, sizeof(formatted), "\"%s\"", text);
+            answers = (char **)realloc(answers, sizeof(char *) * (size_t)(count + 1));
+            answers[count++] = strdup(formatted);
+        } else if (rtype == qtype && qtype == SMALLCLUE_DNS_TYPE_SRV && rdlength >= 6) {
+            unsigned priority = (unsigned)((reply[rdataPos] << 8) | reply[rdataPos + 1]);
+            unsigned weight = (unsigned)((reply[rdataPos + 2] << 8) | reply[rdataPos + 3]);
+            unsigned port = (unsigned)((reply[rdataPos + 4] << 8) | reply[rdataPos + 5]);
+            char srvName[256];
+            size_t srvAfter;
+            if (smallclueDnsDecodeName(reply, (size_t)n, rdataPos + 6, srvName, sizeof(srvName), &srvAfter)) {
+                char formatted[300];
+                snprintf(formatted, sizeof(formatted), "%u %u %u %s", priority, weight, port, srvName);
+                answers = (char **)realloc(answers, sizeof(char *) * (size_t)(count + 1));
+                answers[count++] = strdup(formatted);
+            }
         }
         /* CNAME and any other record type in the answer section is
          * skipped -- rdlength already lets us jump past it uniformly. */
@@ -1700,12 +1841,102 @@ static int smallclueDnsQueryServer(const char *server, const char *qname, int qt
     }
     *outAnswers = answers;
     *outCount = count;
+    free(tcpReply);
     return 0;
 }
 
 static void smallclueDnsFreeAnswers(char **answers, int count) {
     for (int i = 0; i < count; ++i) free(answers[i]);
     free(answers);
+}
+
+/* Reads the first "nameserver X" line from /etc/resolv.conf, for
+ * MX/NS/TXT/SRV lookups with no explicit server argument (getaddrinfo
+ * has no notion of these record types, so there's no system-resolver
+ * fallback path the way there is for plain A/AAAA lookups -- a raw
+ * query needs an actual server address to send it to). */
+/* Maps a -t/-type= record-type name to its wire-format type value, for
+ * the types getaddrinfo can't do (MX/NS/TXT/SRV). Returns 0 for A/AAAA
+ * or anything unrecognized, since those go through the existing
+ * address-family path instead. */
+static int smallclueDnsTypeFromName(const char *name) {
+    if (strcasecmp(name, "MX") == 0) return SMALLCLUE_DNS_TYPE_MX;
+    if (strcasecmp(name, "TXT") == 0) return SMALLCLUE_DNS_TYPE_TXT;
+    if (strcasecmp(name, "NS") == 0) return SMALLCLUE_DNS_TYPE_NS;
+    if (strcasecmp(name, "SRV") == 0) return SMALLCLUE_DNS_TYPE_SRV;
+    return 0;
+}
+
+static bool smallclueDnsDefaultServer(char *buf, size_t bufSize) {
+    FILE *fp = fopen("/etc/resolv.conf", "r");
+    if (!fp) return false;
+    char line[256];
+    bool found = false;
+    while (fgets(line, sizeof(line), fp)) {
+        char ip[128];
+        if (sscanf(line, " nameserver %127s", ip) == 1) {
+            snprintf(buf, bufSize, "%s", ip);
+            found = true;
+            break;
+        }
+    }
+    fclose(fp);
+    return found;
+}
+
+/* Handles nslookup/host's -t/-type= record-type selector for the
+ * types getaddrinfo has no concept of: MX/NS/TXT/SRV. Always issues a
+ * single raw query of exactly that type (no A/AAAA dual-query dance,
+ * no reverse-lookup auto-detection -- those only make sense for
+ * address types). Uses SERVER if given, else the first nameserver in
+ * /etc/resolv.conf. Returns true if it handled the whole command
+ * (this type was requested), setting *exitStatus. */
+static bool smallclueTryTypedDnsLookup(const char *label, const char *hostArg,
+                                        const char *server, int qtype,
+                                        bool nslookupStyle, int *exitStatus) {
+    char resolvBuf[128];
+    const char *useServer = server;
+    if (!useServer) {
+        if (!smallclueDnsDefaultServer(resolvBuf, sizeof(resolvBuf))) {
+            fprintf(stderr, "%s: no DNS server available (checked /etc/resolv.conf)\n", label);
+            *exitStatus = 1;
+            return true;
+        }
+        useServer = resolvBuf;
+    }
+
+    if (nslookupStyle) {
+        printf("Server:\t\t%s\n", useServer);
+        printf("Address:\t%s#53\n\n", useServer);
+    }
+
+    char **answers = NULL;
+    int count = 0;
+    int rcode = 0;
+    if (smallclueDnsQueryServer(useServer, hostArg, qtype, &answers, &count, &rcode) != 0) {
+        *exitStatus = 1;
+        return true;
+    }
+    if (count == 0) {
+        if (rcode != 0) {
+            fprintf(stderr, "%s: %s: %s\n", label, hostArg, smallclueDnsRcodeName(rcode));
+        } else {
+            fprintf(stderr, "%s: %s: no records found via %s\n", label, hostArg, useServer);
+        }
+        *exitStatus = 1;
+        smallclueDnsFreeAnswers(answers, count);
+        return true;
+    }
+    for (int i = 0; i < count; ++i) {
+        if (nslookupStyle) {
+            printf("%s\t%s\n", hostArg, answers[i]);
+        } else {
+            printf("%s %s\n", hostArg, answers[i]);
+        }
+    }
+    smallclueDnsFreeAnswers(answers, count);
+    *exitStatus = 0;
+    return true;
 }
 
 /* Handles nslookup/host's optional trailing SERVER argument by actually
@@ -1811,8 +2042,30 @@ static bool smallclueTryServerDnsLookup(const char *label, const char *host, con
 }
 
 static int smallclueNslookupCommand(int argc, char **argv) {
-    const char *usage = "usage: nslookup [-v] host [server]\n";
+    const char *usage = "usage: nslookup [-v] [-type=TYPE] host [server]\n";
     bool verbose = false;
+    int typedQtype = 0;
+
+    /* nslookup's -type=/-q=/-query=TYPE options use BIND-style "=value"
+     * single-token syntax rather than a getopt-friendly separate
+     * argument, so pull them out of argv (compacting in place) before
+     * the normal getopt loop ever sees them. */
+    int writeIdx = 1;
+    for (int readIdx = 1; readIdx < argc; ++readIdx) {
+        const char *arg = argv[readIdx];
+        const char *val = NULL;
+        if (strncmp(arg, "-type=", 6) == 0) val = arg + 6;
+        else if (strncmp(arg, "-query=", 7) == 0) val = arg + 7;
+        else if (strncmp(arg, "-q=", 3) == 0) val = arg + 3;
+        if (val) {
+            int qt = smallclueDnsTypeFromName(val);
+            if (qt != 0) typedQtype = qt;
+            continue;
+        }
+        argv[writeIdx++] = argv[readIdx];
+    }
+    argc = writeIdx;
+
     smallclueResetGetopt();
     int opt;
     while ((opt = getopt(argc, argv, "v")) != -1) {
@@ -1836,6 +2089,12 @@ static int smallclueNslookupCommand(int argc, char **argv) {
     }
     const char *host = argv[optind];
     const char *server = (optind + 1 < argc) ? argv[optind + 1] : NULL;
+
+    if (typedQtype != 0) {
+        int typedStatus = 0;
+        smallclueTryTypedDnsLookup("nslookup", host, server, typedQtype, true, &typedStatus);
+        return typedStatus;
+    }
 
     int serverStatus = 0;
     if (smallclueTryServerDnsLookup("nslookup", host, server, AF_UNSPEC, true, &serverStatus)) {
@@ -1879,6 +2138,7 @@ static int smallclueNslookupCommand(int argc, char **argv) {
 static int smallclueHostCommand(int argc, char **argv) {
     const char *usage = "usage: host [-4|-6] [-v] [-t TYPE] host [server]\n";
     int family = AF_UNSPEC;
+    int typedQtype = 0;
     bool verbose = false;
     smallclueResetGetopt();
     int opt;
@@ -1890,6 +2150,7 @@ static int smallclueHostCommand(int argc, char **argv) {
             case 't':
                 if (strcasecmp(optarg, "A") == 0) family = AF_INET;
                 else if (strcasecmp(optarg, "AAAA") == 0) family = AF_INET6;
+                else typedQtype = smallclueDnsTypeFromName(optarg);
                 break;
             default:
                 fputs(usage, stderr);
@@ -1907,6 +2168,12 @@ static int smallclueHostCommand(int argc, char **argv) {
     }
     const char *host = argv[optind];
     const char *server = (optind + 1 < argc) ? argv[optind + 1] : NULL;
+
+    if (typedQtype != 0) {
+        int typedStatus = 0;
+        smallclueTryTypedDnsLookup("host", host, server, typedQtype, false, &typedStatus);
+        return typedStatus;
+    }
 
     int serverStatus = 0;
     if (smallclueTryServerDnsLookup("host", host, server, family, false, &serverStatus)) {
