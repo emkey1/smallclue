@@ -399,16 +399,21 @@ $OPENSSH_DIR/ssh-keygen.o $OPENSSH_DIR/sshsig.o $OPENSSH_DIR/ssh-pkcs11.o"
     OPENSSH_SHIM=""
 fi
 
-# Build dash if present
+# Build dash if present. Non-fatal: smallclue ships its own sh applet, so a
+# missing autotools chain (aclocal etc.) just means /bin/sh falls back to it.
 DASH_DIR="third-party/dash"
 if [ -d "$DASH_DIR" ] && [ ! -f "$DASH_DIR/src/dash" ]; then
     echo "Building dash..."
-    # Git checkout needs autogen
-    if [ ! -f "$DASH_DIR/configure" ]; then
-        echo "Generating dash configure script..."
-        (cd "$DASH_DIR" && ./autogen.sh)
-    fi
-    (cd "$DASH_DIR" && ./configure --enable-static && make -j4)
+    (
+        set -e
+        cd "$DASH_DIR"
+        # Git checkout needs autogen
+        if [ ! -f configure ]; then
+            echo "Generating dash configure script..."
+            ./autogen.sh
+        fi
+        ./configure --enable-static && make -j4
+    ) || echo "Warning: dash build failed; /bin/sh will use smallclue's built-in shell."
 fi
 
 if [ "$SMALLCLUE_WITH_DVTM" = "1" ]; then
@@ -507,7 +512,7 @@ if [ "$SMALLCLUE_WITH_LIBGIT2" = "1" ]; then
     LIBGIT2_LIBS="$LIBGIT2_ARCHIVE"
 fi
 
-gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${EXTRA_C_DEFS} ${DVTM_EXTRA_DEFS} ${LIBGIT2_EXTRA_DEFS} \
+gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -DSMALLCLUE_WITH_SH ${EXTRA_C_DEFS} ${DVTM_EXTRA_DEFS} ${LIBGIT2_EXTRA_DEFS} \
     ${LIBGIT2_EXTRA_CFLAGS} \
     -I. -Isrc ${EXTRA_LD_FLAGS} -lpthread \
     src/main.c \
@@ -522,6 +527,18 @@ gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${EXTRA
     ${DVTM_OBJS} \
     src/openssh_app.c \
     src/vproc_test_app.c \
+    src/shell/lexer.c \
+    src/shell/parser.c \
+    src/shell/ast.c \
+    src/shell/sh_utils.c \
+    src/shell/sh_var.c \
+    src/shell/sh_astcopy.c \
+    src/shell/sh_expand.c \
+    src/shell/sh_arith.c \
+    src/shell/sh_exec.c \
+    src/shell/sh_builtins.c \
+    src/shell/sh_lineedit.c \
+    src/shell/sh_main.c \
     src/micro_app.c \
     ${OPENSSH_SHIM} \
     src/runtime_stubs_extra.c \

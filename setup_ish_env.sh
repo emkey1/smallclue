@@ -816,7 +816,7 @@ if [ "$NEXTVI_DIRECT_MODE" = "1" ]; then
 fi
 
 echo "Compiling smallclue (iSH/32-bit static)..."
-"${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" "${TARGET_LDFLAGS[@]}" -static -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${NEXTVI_DEFS} ${DVTM_DEFS} ${LIBGIT2_DEFS} \
+"${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" "${TARGET_LDFLAGS[@]}" -static -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -DSMALLCLUE_WITH_SH ${NEXTVI_DEFS} ${DVTM_DEFS} ${LIBGIT2_DEFS} \
     ${LIBGIT2_INCLUDES} \
     -I. -Isrc ${OPENSSH_LDFLAGS} -lpthread \
     src/main.c \
@@ -830,6 +830,18 @@ echo "Compiling smallclue (iSH/32-bit static)..."
     ${DVTM_OBJS} \
     src/openssh_app.c \
     src/vproc_test_app.c \
+    src/shell/lexer.c \
+    src/shell/parser.c \
+    src/shell/ast.c \
+    src/shell/sh_utils.c \
+    src/shell/sh_var.c \
+    src/shell/sh_astcopy.c \
+    src/shell/sh_expand.c \
+    src/shell/sh_arith.c \
+    src/shell/sh_exec.c \
+    src/shell/sh_builtins.c \
+    src/shell/sh_lineedit.c \
+    src/shell/sh_main.c \
     ${OPENSSH_SHIM} \
     src/runtime_stubs_extra.c \
     ${OPENSSH_LIBS} \

@@ -57,7 +57,14 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/third-party/openssh/openbsd-compat
 )
 
+# openrsync lives in PSCAL's third-party tree when smallclue is the
+# src/smallclue submodule; standalone checkouts can put it in their own
+# third-party/ instead.
 set(OPENRSYNC_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../third-party/openrsync)
+if(NOT EXISTS ${OPENRSYNC_ROOT}/config_pscal.h AND
+   EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third-party/openrsync/config_pscal.h)
+    set(OPENRSYNC_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third-party/openrsync)
+endif()
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated/openrsync)
 configure_file(${OPENRSYNC_ROOT}/config_pscal.h
     ${CMAKE_CURRENT_BINARY_DIR}/generated/openrsync/config.h COPYONLY)
@@ -295,6 +302,25 @@ if(WITH_EXSH)
     list(APPEND SOURCES src/integration.c)
     # You might need to add include paths for vm/ and backend_ast/ here
     # include_directories(${CMAKE_CURRENT_SOURCE_DIR}/vm)
+else()
+    # Standalone builds ship smallclue's own POSIX shell (BusyBox-ash-class):
+    # the exsh lexer/parser vendored in src/shell/ plus a native AST-walking
+    # interpreter with no PSCAL VM dependency.
+    add_definitions(-DSMALLCLUE_WITH_SH)
+    list(APPEND SOURCES
+        src/shell/lexer.c
+        src/shell/parser.c
+        src/shell/ast.c
+        src/shell/sh_utils.c
+        src/shell/sh_var.c
+        src/shell/sh_astcopy.c
+        src/shell/sh_expand.c
+        src/shell/sh_arith.c
+        src/shell/sh_exec.c
+        src/shell/sh_builtins.c
+        src/shell/sh_lineedit.c
+        src/shell/sh_main.c
+    )
 endif()
 
 # The built-in `git` applet (src/git_app.c) is libgit2-backed. This mirrors

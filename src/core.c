@@ -518,6 +518,9 @@ static const char *smallclueResolveShebangToolName(const char *interpreter) {
 #if defined(SMALLCLUE_WITH_EXSH)
     if (strcasecmp(base, "sh") == 0) return "exsh";
     if (strcasecmp(base, "exsh") == 0) return "exsh";
+#elif defined(SMALLCLUE_WITH_SH)
+    if (strcasecmp(base, "sh") == 0) return "sh";
+    if (strcasecmp(base, "ash") == 0) return "sh";
 #endif
     return NULL;
 }
@@ -1382,6 +1385,8 @@ static int smallclueHaltCommand(int argc, char **argv);
 #if defined(SMALLCLUE_WITH_EXSH)
 extern int exsh_main(int argc, char **argv);
 static int smallclueShCommand(int argc, char **argv);
+#elif defined(SMALLCLUE_WITH_SH)
+static int smallclueNativeShCommand(int argc, char **argv);
 #endif
 static int smallclueUptimeCommand(int argc, char **argv);
 static int smallclueUnameCommand(int argc, char **argv);
@@ -2805,6 +2810,9 @@ static const SmallclueApplet kSmallclueApplets[] = {
 #if defined(SMALLCLUE_WITH_EXSH)
     {"exsh", smallclueShCommand, "Run the PSCAL shell front end"},
     {"sh", smallclueShCommand, "Run the PSCAL shell front end"},
+#elif defined(SMALLCLUE_WITH_SH)
+    {"ash", smallclueNativeShCommand, "POSIX shell (BusyBox-ash compatible)"},
+    {"sh", smallclueNativeShCommand, "POSIX shell (BusyBox-ash compatible)"},
 #endif
     {"scp", smallclueScpCommand, "Securely copy files over SSH"},
     {"sftp", smallclueSftpCommand, "Interactive SFTP client"},
@@ -3262,6 +3270,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Launch PSCAL shell front end"},
     {"sh", "sh\n"
            "  Launch PSCAL shell front end"},
+#elif defined(SMALLCLUE_WITH_SH)
+    {"sh", "sh [-eiuxvnfCam] [-c command | script | -s] [args]\n"
+           "  POSIX shell (BusyBox-ash compatible): pipelines, functions,\n"
+           "  expansions, job control, interactive line editing"},
+    {"ash", "ash [-eiuxvnfCam] [-c command | script | -s] [args]\n"
+            "  Alias for sh"},
 #endif
     {"scp", "scp [-P PORT] SRC... DEST\n"
             "  Uses OpenSSH scp"},
@@ -13135,6 +13149,12 @@ static int smallclueHelpCommand(int argc, char **argv) {
 #if defined(SMALLCLUE_WITH_EXSH)
 static int smallclueShCommand(int argc, char **argv) {
     return exsh_main(argc, argv);
+}
+#elif defined(SMALLCLUE_WITH_SH)
+/* smallclue's native POSIX shell (src/shell/). */
+extern int shMain(int argc, char **argv);
+static int smallclueNativeShCommand(int argc, char **argv) {
+    return shMain(argc, argv);
 }
 #endif
 
