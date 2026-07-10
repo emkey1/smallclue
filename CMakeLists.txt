@@ -90,6 +90,13 @@ list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/session\\.c$")
 list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/sandbox-.*\\.c$")
 list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/ssh-keysign\\.c$")
 list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "/ssh-pkcs11-helper\\.c$")
+# openbsd-compat/getopt_long.c defines its own `struct option` unconditionally
+# (not gated on configure's HAVE_GETOPT_LONG), which collides with glibc's own
+# <getopt.h> declaration wherever both end up visible in the same translation
+# unit -- a real, reproducible clash on Debian/glibc, not a config quirk. Every
+# libc smallclue targets already provides getopt_long, so just don't build
+# OpenSSH's compat copy.
+list(FILTER OPENSSH_SOURCES EXCLUDE REGEX "openbsd-compat/getopt_long\\.c$")
 # ssh-pkcs11.c is the direct (dlopen-based) PKCS11 provider implementation,
 # meant to be compiled only inside the ssh-pkcs11-helper subprocess (just
 # excluded above). The actual client-side entry point sshconnect2.c/
