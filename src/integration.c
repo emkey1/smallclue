@@ -68,15 +68,15 @@ static char *smallclueDuplicateArg(const Value *value) {
     if (!value) {
         return strdup("");
     }
-    if (value->type == TYPE_STRING && value->s_val) {
-        return strdup(value->s_val);
+    if (VALUE_TYPE(*value) == TYPE_STRING && AS_STRING(*value)) {
+        return strdup(AS_STRING(*value));
     }
     if (IS_INTLIKE(*value)) {
         char buf[32];
         snprintf(buf, sizeof(buf), "%lld", (long long)AS_INTEGER(*value));
         return strdup(buf);
     }
-    if (isRealType(value->type)) {
+    if (isRealType(VALUE_TYPE(*value))) {
         char buf[64];
         long double real = AS_REAL(*value);
         snprintf(buf, sizeof(buf), "%.17Lg", real);
@@ -119,8 +119,8 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
     }
 
     int arg_start = 0;
-    if (arg_count > 0 && args[0].type == TYPE_STRING && args[0].s_val) {
-        if (strcasecmp(args[0].s_val, applet->name) == 0) {
+    if (arg_count > 0 && VALUE_TYPE(args[0]) == TYPE_STRING && AS_STRING(args[0])) {
+        if (strcasecmp(AS_STRING(args[0]), applet->name) == 0) {
             arg_start = 1;
         }
     }
@@ -314,6 +314,7 @@ DEFINE_SMALLCLUE_WRAPPER("uniq", uniq)
 DEFINE_SMALLCLUE_WRAPPER("sed", sed)
 DEFINE_SMALLCLUE_WRAPPER("cut", cut)
 DEFINE_SMALLCLUE_WRAPPER("curl", curl)
+DEFINE_SMALLCLUE_WRAPPER("git", git)
 DEFINE_SMALLCLUE_WRAPPER("tr", tr)
 DEFINE_SMALLCLUE_WRAPPER("id", id)
 DEFINE_SMALLCLUE_WRAPPER("pbcopy", pbcopy)
@@ -323,6 +324,8 @@ DEFINE_SMALLCLUE_WRAPPER("init", init)
 DEFINE_SMALLCLUE_WRAPPER("runit", runit)
 DEFINE_SMALLCLUE_WRAPPER("mdev", mdev)
 DEFINE_SMALLCLUE_WRAPPER("mknod", mknod)
+DEFINE_SMALLCLUE_WRAPPER("mount", mount)
+DEFINE_SMALLCLUE_WRAPPER("umount", umount)
 DEFINE_SMALLCLUE_WRAPPER("halt", halt)
 
 #if SMALLCLUE_HAS_IFADDRS
@@ -359,6 +362,7 @@ DEFINE_SMALLCLUE_WRAPPER("su", su)
 DEFINE_SMALLCLUE_WRAPPER("sudo", sudo)
 DEFINE_SMALLCLUE_WRAPPER("scp", scp)
 DEFINE_SMALLCLUE_WRAPPER("sftp", sftp)
+DEFINE_SMALLCLUE_WRAPPER("rsync", rsync)
 DEFINE_SMALLCLUE_WRAPPER("script", script)
 DEFINE_SMALLCLUE_WRAPPER("ssh", ssh)
 DEFINE_SMALLCLUE_WRAPPER("ssh-keygen", sshkeygen)
@@ -435,7 +439,12 @@ static void registerSmallclueBuiltin(const char *name,
         /* Preserve any existing handler (e.g., shell builtins); only register when missing. */
         return;
     }
-    registerVmBuiltin(name, handler, BUILTIN_TYPE_PROCEDURE, display_name);
+    /* Busybox-style CLI tools (cat/ls/wget/watch/...): filesystem, process,
+     * and (wget) network side effects. Blanket-classify conservatively rather
+     * than auditing each of the ~30 wrapped tools (Docs/pscal_vm2_plan.md
+     * §6.3's default for ext_builtins categories). */
+    registerVmBuiltin(name, handler, BUILTIN_TYPE_PROCEDURE, display_name,
+                      FX_PROC | FX_IO | FX_NET);
     smallclueRecordRegisteredName(name);
 }
 
@@ -468,6 +477,7 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("sed", vmBuiltinSmallclue_sed, "sed");
     registerSmallclueBuiltin("cut", vmBuiltinSmallclue_cut, "cut");
     registerSmallclueBuiltin("curl", vmBuiltinSmallclue_curl, "curl");
+    registerSmallclueBuiltin("git", vmBuiltinSmallclue_git, "git");
     registerSmallclueBuiltin("tr", vmBuiltinSmallclue_tr, "tr");
     registerSmallclueBuiltin("id", vmBuiltinSmallclue_id, "id");
     registerSmallclueBuiltin("pbcopy", vmBuiltinSmallclue_pbcopy, "pbcopy");
@@ -477,6 +487,8 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("runit", vmBuiltinSmallclue_runit, "runit");
     registerSmallclueBuiltin("mdev", vmBuiltinSmallclue_mdev, "mdev");
     registerSmallclueBuiltin("mknod", vmBuiltinSmallclue_mknod, "mknod");
+    registerSmallclueBuiltin("mount", vmBuiltinSmallclue_mount, "mount");
+    registerSmallclueBuiltin("umount", vmBuiltinSmallclue_umount, "umount");
     registerSmallclueBuiltin("halt", vmBuiltinSmallclue_halt, "halt");
     registerSmallclueBuiltin("poweroff", vmBuiltinSmallclue_halt, "poweroff");
     registerSmallclueBuiltin("reboot", vmBuiltinSmallclue_halt, "reboot");
@@ -510,6 +522,7 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("type", vmBuiltinSmallclue_type, "type");
     registerSmallclueBuiltin("scp", vmBuiltinSmallclue_scp, "scp");
     registerSmallclueBuiltin("sftp", vmBuiltinSmallclue_sftp, "sftp");
+    registerSmallclueBuiltin("rsync", vmBuiltinSmallclue_rsync, "rsync");
     registerSmallclueBuiltin("su", vmBuiltinSmallclue_su, "su");
     registerSmallclueBuiltin("sudo", vmBuiltinSmallclue_sudo, "sudo");
     registerSmallclueBuiltin("ssh", vmBuiltinSmallclue_ssh, "ssh");

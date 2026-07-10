@@ -1,0 +1,45 @@
+--- src/core.c
++++ src/core.c
+@@ -7413,10 +7413,19 @@
+
+         smallclueMenuStartFrame(&first_frame);
++        char header[256];
+         if (source_label && *source_label) {
+-            printf("Links in %s (%zu/%zu)  [Arrows=move Enter=open q=cancel]\n",
++            snprintf(header, sizeof(header), "Links in %s (%zu/%zu)  [Arrows=move Enter=open q=cancel]",
+                    source_label, cursor + 1, links->count);
+         } else {
+-            printf("Links (%zu/%zu)  [Arrows=move Enter=open q=cancel]\n",
++            snprintf(header, sizeof(header), "Links (%zu/%zu)  [Arrows=move Enter=open q=cancel]",
+                    cursor + 1, links->count);
+         }
++        printf("\x1b[7m");
++        if (cols > 0 && (int)strlen(header) > cols) {
++            if (cols <= 3) { fwrite(header, 1, (size_t)cols, stdout); }
++            else { fwrite(header, 1, (size_t)(cols - 3), stdout); fputs("...", stdout); }
++        } else {
++            printf("%s", header);
++        }
++        printf("\x1b[0m\n");
+
+         size_t end = top + window;
+@@ -7766,12 +7775,13 @@
+     snprintf(header, sizeof(header),
+              "Markdown docs (Arrows=move, Enter=open, q=quit) [%zu/%zu]",
+              cursor + 1, count);
++    printf("\x1b[7m");
+     if (term_cols > 0 && (int)strlen(header) > term_cols) {
+         if (term_cols <= 3) {
+             fwrite(header, 1, (size_t)term_cols, stdout);
+         } else {
+             fwrite(header, 1, (size_t)(term_cols - 3), stdout);
+             fputs("...", stdout);
+         }
+-        fputc('\n', stdout);
+     } else {
+-        printf("%s\n", header);
++        printf("%s", header);
+     }
++    printf("\x1b[0m\n");
+
+     size_t end = top + window;

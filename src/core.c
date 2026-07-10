@@ -10,9 +10,37 @@
 #include "micro_app.h"
 #include "nextvi_app.h"
 #include "openssh_app.h"
+#include "openrsync_app.h"
+#include "tar_app.h"
+#include "gzip_app.h"
+#include "readlink_app.h"
+#include "checksum_app.h"
+#include "diff_app.h"
+#include "patch_app.h"
+#include "printf_app.h"
+#include "expr_app.h"
+#include "chown_app.h"
+#include "base64_app.h"
+#include "nohup_app.h"
+#include "cmp_app.h"
+#include "dd_app.h"
+#include "od_app.h"
+#include "seq_app.h"
+#include "nl_app.h"
+#include "tac_app.h"
+#include "rev_app.h"
+#include "fold_app.h"
+#include "paste_app.h"
+#include "split_app.h"
+#include "fmt_app.h"
+#include "comm_app.h"
+#include "awk_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
+#endif
+#if defined(PSCAL_HAS_LIBGIT2)
+#include <git2.h>
 #endif
 #if defined(PSCAL_TARGET_IOS)
 #include "common/path_virtualization.h"
@@ -35,14 +63,19 @@
 #include <dlfcn.h>
 #include <poll.h>
 #include <fnmatch.h>
+#include <regex.h>
 #include <grp.h>
 #include <limits.h>
 #include <libgen.h>
+#include <locale.h>
+#include <wchar.h>
 #include <pwd.h>
 #if defined(__linux__) || defined(linux) || defined(__linux)
 #include <shadow.h>
 #include <crypt.h>
 #include <sys/klog.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #endif
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -59,6 +92,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/ip_icmp.h>
+#include <netinet/icmp6.h>
 #include <arpa/inet.h>
 #include <inttypes.h>
 #include <sys/ioctl.h>
@@ -69,6 +103,7 @@
 #include <stdatomic.h>
 #include <sys/select.h>
 #include <glob.h>
+#include <pthread.h>
 #include "common/pscal_hosts.h"
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -89,12 +124,28 @@ void PSCALRuntimeEndScriptCapture(void) __attribute__((weak));
 int PSCALRuntimeScriptCaptureActive(void) __attribute__((weak));
 int pscalRuntimeOpenShellTab(void) __attribute__((weak));
 char *pscalRuntimePickMountSourceDirectory(void) __attribute__((weak));
+extern int PSCALRuntimePingHost(const char *host,
+    int count,
+    int timeout_ms,
+    char **out_output) __attribute__((weak_import));
+extern void *PSCALRuntimeGetCurrentRuntimeContext(void) __attribute__((weak_import));
+extern void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) __attribute__((weak_import));
+#if !defined(__APPLE__)
+extern int PSCALRuntimePingHost(const char *host,
+    int count,
+    int timeout_ms,
+    char **out_output) __attribute__((weak));
+extern void *PSCALRuntimeGetCurrentRuntimeContext(void) __attribute__((weak));
+extern void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) __attribute__((weak));
+#endif
 #ifndef PSCAL_RUNTIME_CAPTURE_IMPL
 __attribute__((weak)) void PSCALRuntimeBeginScriptCapture(const char *path, int append) { (void)path; (void)append; }
 __attribute__((weak)) void PSCALRuntimeEndScriptCapture(void) {}
 __attribute__((weak)) int PSCALRuntimeScriptCaptureActive(void) { return 0; }
 __attribute__((weak)) int pscalRuntimeOpenShellTab(void) { errno = ENOSYS; return -1; }
 __attribute__((weak)) char *pscalRuntimePickMountSourceDirectory(void) { errno = ENOSYS; return NULL; }
+__attribute__((weak)) void *PSCALRuntimeGetCurrentRuntimeContext(void) { return NULL; }
+__attribute__((weak)) void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) { (void)ctx; }
 #endif
 __attribute__((weak)) char *pscalRuntimeCopyMarketingVersion(void) { return NULL; }
 #endif
@@ -126,6 +177,7 @@ int PSCALRuntimeScriptCaptureActive(void) { return 0; }
 #endif
 
 int smallclueVprocTestCommand(int argc, char **argv);
+int smallclueGitCommand(int argc, char **argv);
 
 static ssize_t smallclueGetlineStream(char **line, size_t *cap, FILE *stream, int *out_errno);
 static uint64_t gSmallclueProcessStartMonoNs = 0;
@@ -362,9 +414,6 @@ static const char *smallclueDisplayPath(const char *path, char *buffer, size_t b
     return path;
 }
 
-static bool smallclueResolveCommandPathForExec(const char *name, char *resolved, size_t resolved_size);
-
-#if defined(PSCAL_TARGET_IOS)
 static bool smallcluePathHasShebang(const char *path) {
     if (!path || !*path) {
         return false;
@@ -379,6 +428,9 @@ static bool smallcluePathHasShebang(const char *path) {
     return n == 2 && header[0] == '#' && header[1] == '!';
 }
 
+static bool smallclueResolveCommandPathForExec(const char *name, char *resolved, size_t resolved_size);
+
+#if defined(PSCAL_TARGET_IOS)
 static bool smallclueReadShebangInterpreter(const char *path,
                                             char *interpreter,
                                             size_t interpreter_size,
@@ -434,6 +486,301 @@ static bool smallclueReadShebangInterpreter(const char *path,
         }
     }
     return true;
+}
+
+typedef int (*SmallclueToolEntryFn)(int argc, char **argv);
+
+static SmallclueToolEntryFn smallclueLookupToolEntrySymbol(const char *symbol_name) {
+    if (!symbol_name || !*symbol_name) {
+        return NULL;
+    }
+    return (SmallclueToolEntryFn)dlsym(RTLD_DEFAULT, symbol_name);
+}
+
+static const char *smallclueResolveShebangToolName(const char *interpreter) {
+    if (!interpreter || !*interpreter) {
+        return NULL;
+    }
+    const char *base = strrchr(interpreter, '/');
+    base = base ? (base + 1) : interpreter;
+    if (strcasecmp(base, "pascal") == 0) return "pascal";
+    if (strcasecmp(base, "clike") == 0) return "clike";
+    if (strcasecmp(base, "rea") == 0) return "rea";
+    if (strcasecmp(base, "pscalvm") == 0) return "pscalvm";
+    if (strcasecmp(base, "pscaljson2bc") == 0) return "pscaljson2bc";
+#ifdef BUILD_DASCAL
+    if (strcasecmp(base, "dascal") == 0) return "dascal";
+#endif
+#ifdef BUILD_PSCALD
+    if (strcasecmp(base, "pscald") == 0) return "pscald";
+    if (strcasecmp(base, "pscalasm") == 0) return "pscalasm";
+#endif
+#if defined(SMALLCLUE_WITH_EXSH)
+    if (strcasecmp(base, "sh") == 0) return "exsh";
+    if (strcasecmp(base, "exsh") == 0) return "exsh";
+#endif
+    return NULL;
+}
+
+static SmallclueToolEntryFn smallclueResolveShebangToolEntry(const char *tool_name) {
+    if (!tool_name || !*tool_name) {
+        return NULL;
+    }
+    if (strcmp(tool_name, "pascal") == 0) return smallclueLookupToolEntrySymbol("pascal_main");
+    if (strcmp(tool_name, "clike") == 0) return smallclueLookupToolEntrySymbol("clike_main");
+    if (strcmp(tool_name, "rea") == 0) return smallclueLookupToolEntrySymbol("rea_main");
+    if (strcmp(tool_name, "pscalvm") == 0) return smallclueLookupToolEntrySymbol("pscalvm_main");
+    if (strcmp(tool_name, "pscaljson2bc") == 0) return smallclueLookupToolEntrySymbol("pscaljson2bc_main");
+#ifdef BUILD_DASCAL
+    if (strcmp(tool_name, "dascal") == 0) return smallclueLookupToolEntrySymbol("dascal_main");
+#endif
+#ifdef BUILD_PSCALD
+    if (strcmp(tool_name, "pscald") == 0) return smallclueLookupToolEntrySymbol("pscald_main");
+    if (strcmp(tool_name, "pscalasm") == 0) return smallclueLookupToolEntrySymbol("pscalasm_main");
+#endif
+#if defined(SMALLCLUE_WITH_EXSH)
+    if (strcmp(tool_name, "exsh") == 0) return smallclueLookupToolEntrySymbol("exsh_main");
+#endif
+    return NULL;
+}
+
+#if defined(PSCAL_TARGET_IOS)
+#ifndef SMALLCLUE_TOOL_THREAD_STACK_SZ
+#define SMALLCLUE_TOOL_THREAD_STACK_SZ (8 * 1024 * 1024)
+#endif
+
+typedef struct SmallclueToolThreadContext {
+    SmallclueToolEntryFn entry;
+    int argc;
+    char **argv;
+    VProcSessionStdio *session_stdio;
+    VProc *session_vproc;
+    void *runtime_ctx;
+    int status;
+} SmallclueToolThreadContext;
+
+static bool smallclueShebangToolNeedsWorkerThread(const char *tool_name) {
+    if (!tool_name || !*tool_name) {
+        return false;
+    }
+    if (strcmp(tool_name, "exsh") == 0) {
+        return false;
+    }
+    return true;
+}
+
+static void *smallclueToolThreadMain(void *opaque) {
+    SmallclueToolThreadContext *ctx = (SmallclueToolThreadContext *)opaque;
+    if (!ctx || !ctx->entry) {
+        if (ctx) {
+            ctx->status = 127;
+        }
+        return NULL;
+    }
+
+    void *prev_runtime_ctx = NULL;
+    VProcSessionStdio *prev_stdio = vprocSessionStdioCurrent();
+    bool runtime_ctx_swapped = false;
+    bool vproc_active = false;
+    if (PSCALRuntimeGetCurrentRuntimeContext) {
+        prev_runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext();
+    }
+    if (PSCALRuntimeSetCurrentRuntimeContext && ctx->runtime_ctx) {
+        PSCALRuntimeSetCurrentRuntimeContext(ctx->runtime_ctx);
+        runtime_ctx_swapped = true;
+    }
+    if (ctx->session_stdio) {
+        vprocSessionStdioActivate(ctx->session_stdio);
+    }
+    if (ctx->session_vproc) {
+        vprocRegisterThread(ctx->session_vproc, pthread_self());
+        vprocActivate(ctx->session_vproc);
+        vproc_active = true;
+        int worker_pid = vprocPid(ctx->session_vproc);
+        if (worker_pid > 0) {
+            vprocSetStopUnsupported(worker_pid, false);
+            vprocSetCooperativeStopWait(worker_pid, false);
+        }
+    }
+
+    sigset_t unblock_mask;
+    sigemptyset(&unblock_mask);
+    sigaddset(&unblock_mask, SIGINT);
+    sigaddset(&unblock_mask, SIGTSTP);
+    (void)pthread_sigmask(SIG_UNBLOCK, &unblock_mask, NULL);
+
+    ctx->status = ctx->entry(ctx->argc, ctx->argv);
+
+    if (ctx->session_stdio) {
+        vprocSessionStdioActivate(prev_stdio);
+    }
+    if (vproc_active) {
+        vprocDeactivate();
+    }
+    if (runtime_ctx_swapped && PSCALRuntimeSetCurrentRuntimeContext) {
+        PSCALRuntimeSetCurrentRuntimeContext(prev_runtime_ctx);
+    }
+    return NULL;
+}
+
+static int smallclueRunToolEntryInWorkerThread(SmallclueToolEntryFn entry, int argc, char **argv) {
+    if (!entry) {
+        return 127;
+    }
+
+    SmallclueToolThreadContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.entry = entry;
+    ctx.argc = argc;
+    ctx.argv = argv;
+    ctx.status = 127;
+    ctx.session_stdio = vprocSessionStdioCurrent();
+    ctx.session_vproc = vprocCurrent();
+    ctx.runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext
+        ? PSCALRuntimeGetCurrentRuntimeContext()
+        : NULL;
+
+    struct termios stdin_termios;
+    bool stdin_termios_valid = (tcgetattr(STDIN_FILENO, &stdin_termios) == 0);
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    (void)pthread_attr_setstacksize(&attr, SMALLCLUE_TOOL_THREAD_STACK_SZ);
+    pthread_t worker_thread;
+    int create_rc = pthread_create(&worker_thread, &attr, smallclueToolThreadMain, &ctx);
+    pthread_attr_destroy(&attr);
+    if (create_rc != 0) {
+        return entry(argc, argv);
+    }
+
+    pthread_join(worker_thread, NULL);
+    if (stdin_termios_valid) {
+        (void)tcsetattr(STDIN_FILENO, TCSAFLUSH, &stdin_termios);
+    }
+    return ctx.status;
+}
+#endif
+
+static int smallclueRunShebangTool(const char *path, char *const *argv) {
+    if (!path || !*path) {
+        return -1;
+    }
+
+    char interpreter[PATH_MAX];
+    char interpreter_arg[PATH_MAX];
+    if (!smallclueReadShebangInterpreter(path,
+                                         interpreter,
+                                         sizeof(interpreter),
+                                         interpreter_arg,
+                                         sizeof(interpreter_arg))) {
+        return -1;
+    }
+
+    char arg_words[PATH_MAX];
+    arg_words[0] = '\0';
+    if (interpreter_arg[0]) {
+        snprintf(arg_words, sizeof(arg_words), "%s", interpreter_arg);
+    }
+    char *words[16];
+    size_t word_count = 0;
+    char *cursor = arg_words;
+    while (*cursor && word_count < (sizeof(words) / sizeof(words[0]))) {
+        while (*cursor && isspace((unsigned char)*cursor)) {
+            cursor++;
+        }
+        if (!*cursor) {
+            break;
+        }
+        words[word_count++] = cursor;
+        while (*cursor && !isspace((unsigned char)*cursor)) {
+            cursor++;
+        }
+        if (*cursor) {
+            *cursor++ = '\0';
+        }
+    }
+    const char *tool_name = NULL;
+    size_t shebang_arg_start = 0;
+    const char *base = strrchr(interpreter, '/');
+    base = base ? (base + 1) : interpreter;
+    if (strcmp(base, "env") == 0) {
+        if (word_count == 0) {
+            return -1;
+        }
+        tool_name = smallclueResolveShebangToolName(words[0]);
+        shebang_arg_start = 1;
+    } else {
+        tool_name = smallclueResolveShebangToolName(interpreter);
+        shebang_arg_start = 0;
+    }
+    SmallclueToolEntryFn entry = smallclueResolveShebangToolEntry(tool_name);
+    if (!tool_name || !entry) {
+        return -1;
+    }
+
+    size_t shebang_argc = (word_count > shebang_arg_start)
+                              ? (word_count - shebang_arg_start)
+                              : 0;
+    size_t script_argc = 0;
+    if (argv) {
+        while (argv[1 + script_argc]) {
+            script_argc++;
+        }
+    }
+
+    size_t total_args = 1 + shebang_argc + 1 + script_argc;
+    char **tool_argv = (char **)calloc(total_args + 1, sizeof(char *));
+    if (!tool_argv) {
+        return EXIT_FAILURE;
+    }
+
+    bool ok = true;
+    size_t idx = 0;
+    tool_argv[idx++] = strdup(tool_name);
+    if (!tool_argv[idx - 1]) {
+        ok = false;
+    }
+    for (size_t i = 0; ok && i < shebang_argc; ++i) {
+        tool_argv[idx++] = strdup(words[shebang_arg_start + i]);
+        if (!tool_argv[idx - 1]) {
+            ok = false;
+        }
+    }
+    if (ok) {
+        tool_argv[idx++] = strdup(path);
+        if (!tool_argv[idx - 1]) {
+            ok = false;
+        }
+    }
+    for (size_t i = 0; ok && i < script_argc; ++i) {
+        const char *arg = argv[1 + i];
+        tool_argv[idx++] = strdup(arg ? arg : "");
+        if (!tool_argv[idx - 1]) {
+            ok = false;
+        }
+    }
+    tool_argv[idx] = NULL;
+
+    int status = EXIT_FAILURE;
+    if (ok) {
+ #if defined(PSCAL_TARGET_IOS)
+        if (smallclueShebangToolNeedsWorkerThread(tool_name)) {
+            status = smallclueRunToolEntryInWorkerThread(entry, (int)total_args, tool_argv);
+        } else {
+            status = entry((int)total_args, tool_argv);
+        }
+ #else
+        status = entry((int)total_args, tool_argv);
+ #endif
+    } else {
+        fprintf(stderr, "%s: out of memory launching tool runner\n", tool_name);
+    }
+
+    for (size_t i = 0; i < idx; ++i) {
+        free(tool_argv[i]);
+    }
+    free(tool_argv);
+    return status;
 }
 
 static bool smallclueWatchExecViaShebang(const char *script_path, int argc, char **argv) {
@@ -809,12 +1156,6 @@ static bool smallclueShouldAbort(int *out_status) {
             sigaddset(&watchset, SIGTSTP);
             int signo = 0;
             if (vprocSigwait(cur_pid, &watchset, &signo) == 0) {
-                if (signo == SIGTSTP && !allow_cooperative_sigtstp) {
-                    if (dbg && *dbg) {
-                        fprintf(stderr, "[smallclue] ignore vproc SIGTSTP for non-coop stop\n");
-                    }
-                    return false;
-                }
                 if (out_status) {
                     *out_status = 128 + signo;
                 }
@@ -850,13 +1191,6 @@ static bool smallclueShouldAbort(int *out_status) {
             (sigismember(&pending, SIGINT) || sigismember(&pending, SIGTSTP))) {
             int signo = 0;
             if (sigwait(&watchset, &signo) == 0) {
-                if (signo == SIGTSTP && !allow_cooperative_sigtstp) {
-                    sigprocmask(SIG_SETMASK, &oldset, NULL);
-                    if (dbg && *dbg) {
-                        fprintf(stderr, "[smallclue] ignore host SIGTSTP for non-coop stop\n");
-                    }
-                    return false;
-                }
                 if (out_status) {
                     *out_status = 128 + signo;
                 }
@@ -961,6 +1295,8 @@ static int smallclueClearCommand(int argc, char **argv);
 static int smallclueRmCommand(int argc, char **argv);
 static int smallclueCpCommand(int argc, char **argv);
 static int smallclueMvCommand(int argc, char **argv);
+static int smallclueInstallCommand(int argc, char **argv);
+static int smallclueRsyncCommand(int argc, char **argv);
 static int smallcluePwdCommand(int argc, char **argv);
 static int smallclueEnvCommand(int argc, char **argv);
 static int smallclueChmodCommand(int argc, char **argv);
@@ -1003,9 +1339,11 @@ static int smallclueBracketCommand(int argc, char **argv);
 static int smallclueXargsCommand(int argc, char **argv);
 static int smallcluePsCommand(int argc, char **argv);
 static int smallclueKillCommand(int argc, char **argv);
+static int smallclueTimeoutCommand(int argc, char **argv);
 static int smallclueMkdirCommand(int argc, char **argv);
 static int smallclueMknodCommand(int argc, char **argv);
 static int smallclueMountCommand(int argc, char **argv);
+static int smallclueUmountCommand(int argc, char **argv);
 static int smallclueWhoamiCommand(int argc, char **argv);
 static void smallclueEmitTerminalSane(void);
 #if defined(PSCAL_TARGET_IOS)
@@ -1052,8 +1390,19 @@ static int smallclueMarkdownCommand(int argc, char **argv);
 static int smallclueCurlCommand(int argc, char **argv);
 static int smallclueWgetCommand(int argc, char **argv);
 static int smallclueWhichCommand(int argc, char **argv);
-static int smallclueHttpFetch(const char *cmd_name, const char *url, const char *destinationPath);
-static int smallclueHttpFetchToMemory(const char *cmd_name, const char *url, char **data_out, size_t *len_out);
+typedef struct {
+    const char *method;   /* NULL = default (GET, or POST if postData is set) */
+    char **headers;       /* array of "Key: Value" strings */
+    int headerCount;
+    const char *postData; /* NULL = no request body */
+    const char *userpwd;  /* NULL = no auth; else "user:password" */
+    bool insecureTls;     /* true = skip TLS certificate/host verification */
+} SmallclueHttpRequestOptions;
+
+static int smallclueHttpFetch(const char *cmd_name, const char *url, const char *destinationPath,
+                              const SmallclueHttpRequestOptions *reqOpts);
+static int smallclueHttpFetchToMemory(const char *cmd_name, const char *url, char **data_out, size_t *len_out,
+                                      const SmallclueHttpRequestOptions *reqOpts);
 static int smallclueTelnetCommand(int argc, char **argv);
 static int smallclueTracerouteCommand(int argc, char **argv);
 static int smallclueNslookupCommand(int argc, char **argv);
@@ -1063,17 +1412,660 @@ static int smallclueHostnameCommand(int argc, char **argv);
 static int smallclueIpAddrCommand(int argc, char **argv);
 #endif
 static int smallclueDfCommand(int argc, char **argv);
-#if defined(PSCAL_TARGET_IOS)
 static int smallclueTopCommand(int argc, char **argv);
+#if defined(PSCAL_TARGET_IOS)
 static int smallclueHelpCommand(int argc, char **argv);
 static int smallclueAddTabCommand(int argc, char **argv);
 #endif
 static int smallclueDmesgCommand(int argc, char **argv);
 
 
+/* Builds the reverse-DNS query name real nslookup/host display for a PTR
+ * lookup (e.g. "8.8.8.8" -> "8.8.8.8.in-addr.arpa", "::1" ->
+ * "1.0.0...0.ip6.arpa") -- purely for display, matching what those tools
+ * print; the actual lookup itself goes through getnameinfo(), which
+ * doesn't need this string. IPv6 uses nibble-reversed hex per RFC 3596,
+ * verified against real host/nslookup in Docker. */
+static void smallclueBuildReverseDnsName(int family, const void *addr, char *out, size_t outSize) {
+    if (family == AF_INET) {
+        const unsigned char *b = (const unsigned char *)addr;
+        snprintf(out, outSize, "%u.%u.%u.%u.in-addr.arpa", b[3], b[2], b[1], b[0]);
+    } else {
+        const unsigned char *b = (const unsigned char *)addr;
+        size_t pos = 0;
+        for (int i = 15; i >= 0 && pos + 4 < outSize; --i) {
+            pos += (size_t)snprintf(out + pos, outSize - pos, "%x.%x.", b[i] & 0xF, (b[i] >> 4) & 0xF);
+        }
+        snprintf(out + pos, outSize - pos, "ip6.arpa");
+    }
+}
+
+/* Detects an IP-address-shaped query and performs a PTR (reverse) lookup
+ * instead of the usual forward A/AAAA lookup, matching real
+ * nslookup/host's auto-detection. Returns true if `host` was IP-shaped
+ * (whether or not the lookup itself succeeded, in which case an error
+ * was already printed and *exitStatus set). */
+static bool smallclueTryReverseDnsLookup(const char *label, const char *host, bool nslookupStyle, int *exitStatus) {
+    struct in_addr addr4;
+    struct in6_addr addr6;
+    int family;
+    const void *addrBytes;
+    struct sockaddr_storage sa;
+    socklen_t saLen;
+    memset(&sa, 0, sizeof(sa));
+    if (inet_pton(AF_INET, host, &addr4) == 1) {
+        family = AF_INET;
+        addrBytes = &addr4;
+        struct sockaddr_in *sin = (struct sockaddr_in *)&sa;
+        sin->sin_family = AF_INET;
+        sin->sin_addr = addr4;
+        saLen = sizeof(*sin);
+    } else if (inet_pton(AF_INET6, host, &addr6) == 1) {
+        family = AF_INET6;
+        addrBytes = &addr6;
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&sa;
+        sin6->sin6_family = AF_INET6;
+        sin6->sin6_addr = addr6;
+        saLen = sizeof(*sin6);
+    } else {
+        return false;
+    }
+
+    char revname[256];
+    smallclueBuildReverseDnsName(family, addrBytes, revname, sizeof(revname));
+
+    char hostbuf[NI_MAXHOST];
+    int rc = getnameinfo((struct sockaddr *)&sa, saLen, hostbuf, sizeof(hostbuf), NULL, 0, NI_NAMEREQD);
+    if (rc != 0) {
+        fprintf(stderr, "%s: %s: %s\n", label, revname, gai_strerror(rc));
+        *exitStatus = 1;
+        return true;
+    }
+    if (nslookupStyle) {
+        printf("%s\tname = %s.\n", revname, hostbuf);
+    } else {
+        printf("%s domain name pointer %s.\n", revname, hostbuf);
+    }
+    *exitStatus = 0;
+    return true;
+}
+
+/* ---- Minimal raw DNS client, for querying an explicit server (nslookup/
+ * host's optional trailing SERVER argument) -- getaddrinfo/getnameinfo
+ * have no per-call server override, so a custom-server query needs a
+ * real (if minimal) DNS message encoder/decoder over UDP. Supports A
+ * (1), AAAA (28), and PTR (12) queries against a recursive resolver;
+ * CNAME records in the answer section are skipped rather than followed
+ * (a normal recursive resolver returns the final A/AAAA alongside any
+ * CNAME in the same response, so this covers the common case without
+ * needing a second round-trip). */
+
+#define SMALLCLUE_DNS_TYPE_A 1
+#define SMALLCLUE_DNS_TYPE_NS 2
+#define SMALLCLUE_DNS_TYPE_CNAME 5
+#define SMALLCLUE_DNS_TYPE_PTR 12
+#define SMALLCLUE_DNS_TYPE_MX 15
+#define SMALLCLUE_DNS_TYPE_TXT 16
+#define SMALLCLUE_DNS_TYPE_AAAA 28
+#define SMALLCLUE_DNS_TYPE_SRV 33
+
+static size_t smallclueDnsEncodeName(const char *name, unsigned char *buf, size_t bufSize) {
+    size_t pos = 0;
+    const char *p = name;
+    while (*p) {
+        const char *dot = strchr(p, '.');
+        size_t labelLen = dot ? (size_t)(dot - p) : strlen(p);
+        if (labelLen == 0 || labelLen > 63 || pos + labelLen + 1 >= bufSize) return 0;
+        buf[pos++] = (unsigned char)labelLen;
+        memcpy(buf + pos, p, labelLen);
+        pos += labelLen;
+        p += labelLen;
+        if (*p == '.') p++;
+    }
+    if (pos + 1 >= bufSize) return 0;
+    buf[pos++] = 0;
+    return pos;
+}
+
+/* Decodes a (possibly compressed) name starting at `pos` into `out`,
+ * and advances `*afterPos` past the name AS IT APPEARS AT `pos` (i.e.
+ * past the pointer itself if compressed, not into the target it points
+ * to) -- the correct semantics for skipping past a name inline in the
+ * message. Returns false on a malformed/truncated name. */
+static bool smallclueDnsDecodeName(const unsigned char *msg, size_t msgLen, size_t pos,
+                                    char *out, size_t outSize, size_t *afterPos) {
+    size_t outLen = 0;
+    if (out && outSize > 0) out[0] = '\0';
+    bool first = true;
+    bool jumped = false;
+    size_t cur = pos;
+    size_t guard = 0;
+    for (;;) {
+        if (guard++ > 128 || cur >= msgLen) return false;
+        unsigned char lenByte = msg[cur];
+        if (lenByte == 0) {
+            cur++;
+            if (!jumped) *afterPos = cur;
+            break;
+        }
+        if ((lenByte & 0xC0) == 0xC0) {
+            if (cur + 1 >= msgLen) return false;
+            size_t offset = (size_t)((lenByte & 0x3F) << 8) | msg[cur + 1];
+            if (!jumped) *afterPos = cur + 2;
+            jumped = true;
+            cur = offset;
+            continue;
+        }
+        if ((lenByte & 0xC0) != 0) return false; /* reserved bits set */
+        size_t labelLen = lenByte;
+        cur++;
+        if (cur + labelLen > msgLen) return false;
+        if (out) {
+            if (!first && outLen + 1 < outSize) out[outLen++] = '.';
+            for (size_t i = 0; i < labelLen && outLen + 1 < outSize; ++i) out[outLen++] = (char)msg[cur + i];
+            out[outLen] = '\0';
+        }
+        first = false;
+        cur += labelLen;
+    }
+    return true;
+}
+
+/* Sends one query to `server` (IPv4/IPv6 literal or hostname) for
+ * `qname`/`qtype`, and appends every matching answer record's value
+ * (an IP address string for A/AAAA, or a hostname for PTR) to
+ * `*outAnswers`. Returns 0 on success (even with zero answers -- caller
+ * checks *outCount), or a negative value on a real query failure
+ * (unreachable server, timeout, malformed response). */
+static const char *smallclueDnsRcodeName(int rcode) {
+    static const char *rcodeNames[] = {
+        "no error", "format error", "server failure", "name error (NXDOMAIN)",
+        "not implemented", "refused"
+    };
+    return (rcode >= 0 && rcode < 6) ? rcodeNames[rcode] : "unknown error";
+}
+
+/* send()/recv() aren't guaranteed to move the whole buffer in one
+ * call, which matters for the DNS-over-TCP fallback below (length-
+ * prefixed messages need every byte accounted for). Returns 0 on
+ * success, -1 on error. */
+static int smallclueSendAll(int fd, const void *buf, size_t len) {
+    const unsigned char *p = (const unsigned char *)buf;
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t w = send(fd, p + sent, len - sent, 0);
+        if (w <= 0) return -1;
+        sent += (size_t)w;
+    }
+    return 0;
+}
+
+/* Returns the number of bytes read (== len on success), 0 on a clean
+ * EOF before len bytes arrived, or -1 on error. */
+static ssize_t smallclueRecvAll(int fd, void *buf, size_t len) {
+    unsigned char *p = (unsigned char *)buf;
+    size_t got = 0;
+    while (got < len) {
+        ssize_t r = recv(fd, p + got, len - got, 0);
+        if (r < 0) return -1;
+        if (r == 0) return (ssize_t)got > 0 ? -1 : 0;
+        got += (size_t)r;
+    }
+    return (ssize_t)got;
+}
+
+static int smallclueDnsQueryServer(const char *server, const char *qname, int qtype,
+                                    char ***outAnswers, int *outCount, int *outRcode) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(server, "53", &hints, &res) != 0 || !res) {
+        fprintf(stderr, "dns: %s: server address not found\n", server);
+        return -1;
+    }
+
+    int sock = socket(res->ai_family, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        freeaddrinfo(res);
+        return -1;
+    }
+    struct timeval tv = { 5, 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    unsigned char query[512];
+    memset(query, 0, sizeof(query));
+    uint16_t qid = (uint16_t)(getpid() & 0xffff);
+    query[0] = (unsigned char)(qid >> 8);
+    query[1] = (unsigned char)(qid & 0xff);
+    query[2] = 0x01; /* RD=1 */
+    query[3] = 0x00;
+    query[4] = 0x00; query[5] = 0x01; /* QDCOUNT=1 */
+    /* ANCOUNT/NSCOUNT/ARCOUNT already zero */
+    size_t nameLen = smallclueDnsEncodeName(qname, query + 12, sizeof(query) - 12);
+    if (nameLen == 0) {
+        fprintf(stderr, "dns: %s: name too long\n", qname);
+        close(sock);
+        freeaddrinfo(res);
+        return -1;
+    }
+    size_t qlen = 12 + nameLen;
+    query[qlen++] = 0; query[qlen++] = (unsigned char)qtype;
+    query[qlen++] = 0; query[qlen++] = 1; /* QCLASS=IN */
+
+    if (sendto(sock, query, qlen, 0, res->ai_addr, res->ai_addrlen) < 0) {
+        fprintf(stderr, "dns: %s: %s\n", server, strerror(errno));
+        close(sock);
+        freeaddrinfo(res);
+        return -1;
+    }
+    freeaddrinfo(res);
+
+    unsigned char replyBuf[2048];
+    unsigned char *reply = replyBuf;
+    unsigned char *tcpReply = NULL;
+    ssize_t n = recv(sock, replyBuf, sizeof(replyBuf), 0);
+    close(sock);
+    if (n < 12) {
+        fprintf(stderr, "dns: %s: no reply (timed out or unreachable)\n", server);
+        return -1;
+    }
+    uint16_t rid = (uint16_t)((replyBuf[0] << 8) | replyBuf[1]);
+    if (rid != qid) {
+        fprintf(stderr, "dns: %s: reply ID mismatch\n", server);
+        return -1;
+    }
+
+    /* TC (truncated) bit: the UDP reply didn't fit (common for TXT
+     * records on well-populated domains, since we don't advertise an
+     * EDNS0 buffer size, so servers default to the original 512-byte
+     * UDP limit). Per RFC 1035 4.2.1, retry the identical query over
+     * TCP to get the untruncated answer. */
+    if (replyBuf[2] & 0x02) {
+        if (getaddrinfo(server, "53", &hints, &res) != 0 || !res) {
+            fprintf(stderr, "dns: %s: server address not found\n", server);
+            return -1;
+        }
+        hints.ai_socktype = SOCK_STREAM;
+        int tsock = socket(res->ai_family, SOCK_STREAM, 0);
+        if (tsock < 0) {
+            freeaddrinfo(res);
+            fprintf(stderr, "dns: %s: %s\n", server, strerror(errno));
+            return -1;
+        }
+        setsockopt(tsock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(tsock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        if (connect(tsock, res->ai_addr, res->ai_addrlen) < 0) {
+            fprintf(stderr, "dns: %s: %s\n", server, strerror(errno));
+            close(tsock);
+            freeaddrinfo(res);
+            return -1;
+        }
+        freeaddrinfo(res);
+
+        unsigned char lenPrefix[2] = { (unsigned char)(qlen >> 8), (unsigned char)(qlen & 0xff) };
+        if (smallclueSendAll(tsock, lenPrefix, sizeof(lenPrefix)) < 0 ||
+            smallclueSendAll(tsock, query, qlen) < 0) {
+            fprintf(stderr, "dns: %s: %s\n", server, strerror(errno));
+            close(tsock);
+            return -1;
+        }
+        unsigned char respLenBuf[2];
+        if (smallclueRecvAll(tsock, respLenBuf, sizeof(respLenBuf)) <= 0) {
+            fprintf(stderr, "dns: %s: no TCP reply (timed out)\n", server);
+            close(tsock);
+            return -1;
+        }
+        size_t tcpLen = (size_t)((respLenBuf[0] << 8) | respLenBuf[1]);
+        tcpReply = (unsigned char *)malloc(tcpLen);
+        if (!tcpReply) {
+            close(tsock);
+            return -1;
+        }
+        ssize_t got = smallclueRecvAll(tsock, tcpReply, tcpLen);
+        close(tsock);
+        if (got <= 0 || (size_t)got != tcpLen) {
+            fprintf(stderr, "dns: %s: incomplete TCP reply\n", server);
+            free(tcpReply);
+            return -1;
+        }
+        reply = tcpReply;
+        n = (ssize_t)tcpLen;
+    }
+
+    int rcode = reply[3] & 0x0F;
+    uint16_t qdcount = (uint16_t)((reply[4] << 8) | reply[5]);
+    uint16_t ancount = (uint16_t)((reply[6] << 8) | reply[7]);
+    if (outRcode) *outRcode = rcode;
+    if (rcode != 0) {
+        /* Left to the caller to report (once, not once per record type
+         * queried) -- querying A then AAAA separately would otherwise
+         * print the same NXDOMAIN/SERVFAIL/etc. twice. */
+        *outCount = 0;
+        free(tcpReply);
+        return 0;
+    }
+
+    size_t pos = 12;
+    for (int i = 0; i < qdcount; ++i) {
+        size_t after;
+        if (!smallclueDnsDecodeName(reply, (size_t)n, pos, NULL, 0, &after)) {
+            fprintf(stderr, "dns: %s: malformed reply\n", server);
+            free(tcpReply);
+            return -1;
+        }
+        pos = after + 4; /* QTYPE + QCLASS */
+    }
+
+    char **answers = NULL;
+    int count = 0;
+    for (int i = 0; i < ancount; ++i) {
+        char nameBuf[256];
+        size_t after;
+        if (!smallclueDnsDecodeName(reply, (size_t)n, pos, nameBuf, sizeof(nameBuf), &after)) break;
+        pos = after;
+        if (pos + 10 > (size_t)n) break;
+        int rtype = (reply[pos] << 8) | reply[pos + 1];
+        uint16_t rdlength = (uint16_t)((reply[pos + 8] << 8) | reply[pos + 9]);
+        size_t rdataPos = pos + 10;
+        if (rdataPos + rdlength > (size_t)n) break;
+
+        if (rtype == qtype && qtype == SMALLCLUE_DNS_TYPE_A && rdlength == 4) {
+            char addrStr[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, reply + rdataPos, addrStr, sizeof(addrStr));
+            answers = (char **)realloc(answers, sizeof(char *) * (size_t)(count + 1));
+            answers[count++] = strdup(addrStr);
+        } else if (rtype == qtype && qtype == SMALLCLUE_DNS_TYPE_AAAA && rdlength == 16) {
+            char addrStr[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, reply + rdataPos, addrStr, sizeof(addrStr));
+            answers = (char **)realloc(answers, sizeof(char *) * (size_t)(count + 1));
+            answers[count++] = strdup(addrStr);
+        } else if (rtype == qtype && qtype == SMALLCLUE_DNS_TYPE_PTR) {
+            char ptrName[256];
+            size_t ptrAfter;
+            if (smallclueDnsDecodeName(reply, (size_t)n, rdataPos, ptrName, sizeof(ptrName), &ptrAfter)) {
+                answers = (char **)realloc(answers, sizeof(char *) * (size_t)(count + 1));
+                answers[count++] = strdup(ptrName);
+            }
+        } else if (rtype == qtype && qtype == SMALLCLUE_DNS_TYPE_NS) {
+            char nsName[256];
+            size_t nsAfter;
+            if (smallclueDnsDecodeName(reply, (size_t)n, rdataPos, nsName, sizeof(nsName), &nsAfter)) {
+                answers = (char **)realloc(answers, sizeof(char *) * (size_t)(count + 1));
+                answers[count++] = strdup(nsName);
+            }
+        } else if (rtype == qtype && qtype == SMALLCLUE_DNS_TYPE_MX && rdlength >= 2) {
+            unsigned preference = (unsigned)((reply[rdataPos] << 8) | reply[rdataPos + 1]);
+            char mxName[256];
+            size_t mxAfter;
+            if (smallclueDnsDecodeName(reply, (size_t)n, rdataPos + 2, mxName, sizeof(mxName), &mxAfter)) {
+                char formatted[300];
+                snprintf(formatted, sizeof(formatted), "%u %s", preference, mxName);
+                answers = (char **)realloc(answers, sizeof(char *) * (size_t)(count + 1));
+                answers[count++] = strdup(formatted);
+            }
+        } else if (rtype == qtype && qtype == SMALLCLUE_DNS_TYPE_TXT && rdlength > 0) {
+            char text[512];
+            size_t textLen = 0;
+            size_t txtPos = rdataPos;
+            size_t txtEnd = rdataPos + rdlength;
+            while (txtPos < txtEnd) {
+                unsigned char segLen = reply[txtPos++];
+                if (txtPos + segLen > txtEnd) break;
+                for (unsigned char i = 0; i < segLen && textLen + 1 < sizeof(text); ++i)
+                    text[textLen++] = (char)reply[txtPos + i];
+                txtPos += segLen;
+            }
+            text[textLen] = '\0';
+            char formatted[520];
+            snprintf(formatted, sizeof(formatted), "\"%s\"", text);
+            answers = (char **)realloc(answers, sizeof(char *) * (size_t)(count + 1));
+            answers[count++] = strdup(formatted);
+        } else if (rtype == qtype && qtype == SMALLCLUE_DNS_TYPE_SRV && rdlength >= 6) {
+            unsigned priority = (unsigned)((reply[rdataPos] << 8) | reply[rdataPos + 1]);
+            unsigned weight = (unsigned)((reply[rdataPos + 2] << 8) | reply[rdataPos + 3]);
+            unsigned port = (unsigned)((reply[rdataPos + 4] << 8) | reply[rdataPos + 5]);
+            char srvName[256];
+            size_t srvAfter;
+            if (smallclueDnsDecodeName(reply, (size_t)n, rdataPos + 6, srvName, sizeof(srvName), &srvAfter)) {
+                char formatted[300];
+                snprintf(formatted, sizeof(formatted), "%u %u %u %s", priority, weight, port, srvName);
+                answers = (char **)realloc(answers, sizeof(char *) * (size_t)(count + 1));
+                answers[count++] = strdup(formatted);
+            }
+        }
+        /* CNAME and any other record type in the answer section is
+         * skipped -- rdlength already lets us jump past it uniformly. */
+        pos = rdataPos + rdlength;
+    }
+    *outAnswers = answers;
+    *outCount = count;
+    free(tcpReply);
+    return 0;
+}
+
+static void smallclueDnsFreeAnswers(char **answers, int count) {
+    for (int i = 0; i < count; ++i) free(answers[i]);
+    free(answers);
+}
+
+/* Reads the first "nameserver X" line from /etc/resolv.conf, for
+ * MX/NS/TXT/SRV lookups with no explicit server argument (getaddrinfo
+ * has no notion of these record types, so there's no system-resolver
+ * fallback path the way there is for plain A/AAAA lookups -- a raw
+ * query needs an actual server address to send it to). */
+/* Maps a -t/-type= record-type name to its wire-format type value, for
+ * the types getaddrinfo can't do (MX/NS/TXT/SRV). Returns 0 for A/AAAA
+ * or anything unrecognized, since those go through the existing
+ * address-family path instead. */
+static int smallclueDnsTypeFromName(const char *name) {
+    if (strcasecmp(name, "MX") == 0) return SMALLCLUE_DNS_TYPE_MX;
+    if (strcasecmp(name, "TXT") == 0) return SMALLCLUE_DNS_TYPE_TXT;
+    if (strcasecmp(name, "NS") == 0) return SMALLCLUE_DNS_TYPE_NS;
+    if (strcasecmp(name, "SRV") == 0) return SMALLCLUE_DNS_TYPE_SRV;
+    return 0;
+}
+
+static bool smallclueDnsDefaultServer(char *buf, size_t bufSize) {
+    FILE *fp = fopen("/etc/resolv.conf", "r");
+    if (!fp) return false;
+    char line[256];
+    bool found = false;
+    while (fgets(line, sizeof(line), fp)) {
+        char ip[128];
+        if (sscanf(line, " nameserver %127s", ip) == 1) {
+            snprintf(buf, bufSize, "%s", ip);
+            found = true;
+            break;
+        }
+    }
+    fclose(fp);
+    return found;
+}
+
+/* Handles nslookup/host's -t/-type= record-type selector for the
+ * types getaddrinfo has no concept of: MX/NS/TXT/SRV. Always issues a
+ * single raw query of exactly that type (no A/AAAA dual-query dance,
+ * no reverse-lookup auto-detection -- those only make sense for
+ * address types). Uses SERVER if given, else the first nameserver in
+ * /etc/resolv.conf. Returns true if it handled the whole command
+ * (this type was requested), setting *exitStatus. */
+static bool smallclueTryTypedDnsLookup(const char *label, const char *hostArg,
+                                        const char *server, int qtype,
+                                        bool nslookupStyle, int *exitStatus) {
+    char resolvBuf[128];
+    const char *useServer = server;
+    if (!useServer) {
+        if (!smallclueDnsDefaultServer(resolvBuf, sizeof(resolvBuf))) {
+            fprintf(stderr, "%s: no DNS server available (checked /etc/resolv.conf)\n", label);
+            *exitStatus = 1;
+            return true;
+        }
+        useServer = resolvBuf;
+    }
+
+    if (nslookupStyle) {
+        printf("Server:\t\t%s\n", useServer);
+        printf("Address:\t%s#53\n\n", useServer);
+    }
+
+    char **answers = NULL;
+    int count = 0;
+    int rcode = 0;
+    if (smallclueDnsQueryServer(useServer, hostArg, qtype, &answers, &count, &rcode) != 0) {
+        *exitStatus = 1;
+        return true;
+    }
+    if (count == 0) {
+        if (rcode != 0) {
+            fprintf(stderr, "%s: %s: %s\n", label, hostArg, smallclueDnsRcodeName(rcode));
+        } else {
+            fprintf(stderr, "%s: %s: no records found via %s\n", label, hostArg, useServer);
+        }
+        *exitStatus = 1;
+        smallclueDnsFreeAnswers(answers, count);
+        return true;
+    }
+    for (int i = 0; i < count; ++i) {
+        if (nslookupStyle) {
+            printf("%s\t%s\n", hostArg, answers[i]);
+        } else {
+            printf("%s %s\n", hostArg, answers[i]);
+        }
+    }
+    smallclueDnsFreeAnswers(answers, count);
+    *exitStatus = 0;
+    return true;
+}
+
+/* Handles nslookup/host's optional trailing SERVER argument by actually
+ * querying that server (A, then AAAA, unless -4/-6 restricts it) rather
+ * than rejecting/ignoring it. Returns true if it handled the whole
+ * command (a server was given), setting *exitStatus; false if no server
+ * was given and the caller should fall through to the normal
+ * getaddrinfo-based path. */
+static bool smallclueTryServerDnsLookup(const char *label, const char *host, const char *server,
+                                        int forcedFamily, bool nslookupStyle, int *exitStatus) {
+    if (!server) return false;
+
+    struct in_addr addr4;
+    struct in6_addr addr6;
+    bool isReverse = inet_pton(AF_INET, host, &addr4) == 1 || inet_pton(AF_INET6, host, &addr6) == 1;
+
+    if (nslookupStyle) {
+        printf("Server:\t\t%s\n", server);
+        printf("Address:\t%s#53\n\n", server);
+    }
+
+    if (isReverse) {
+        int family = inet_pton(AF_INET, host, &addr4) == 1 ? AF_INET : AF_INET6;
+        const void *addrBytes = (family == AF_INET) ? (void *)&addr4 : (void *)&addr6;
+        char revname[256];
+        smallclueBuildReverseDnsName(family, addrBytes, revname, sizeof(revname));
+        char **answers = NULL;
+        int count = 0;
+        int rcode = 0;
+        if (smallclueDnsQueryServer(server, revname, SMALLCLUE_DNS_TYPE_PTR, &answers, &count, &rcode) != 0) {
+            *exitStatus = 1;
+            return true;
+        }
+        if (count == 0) {
+            if (rcode != 0) {
+                fprintf(stderr, "%s: %s: %s\n", label, host, smallclueDnsRcodeName(rcode));
+            } else {
+                fprintf(stderr, "%s: %s: no PTR record found via %s\n", label, host, server);
+            }
+            *exitStatus = 1;
+            smallclueDnsFreeAnswers(answers, count);
+            return true;
+        }
+        for (int i = 0; i < count; ++i) {
+            if (nslookupStyle) printf("%s\tname = %s.\n", revname, answers[i]);
+            else printf("%s domain name pointer %s.\n", revname, answers[i]);
+        }
+        smallclueDnsFreeAnswers(answers, count);
+        *exitStatus = 0;
+        return true;
+    }
+
+    bool printed = false;
+    int status = 0;
+    int lastRcode = 0;
+    bool haveRcode = false;
+    if (forcedFamily != AF_INET6) {
+        char **answers = NULL; int count = 0; int rcode = 0;
+        if (smallclueDnsQueryServer(server, host, SMALLCLUE_DNS_TYPE_A, &answers, &count, &rcode) == 0) {
+            for (int i = 0; i < count; ++i) {
+                if (nslookupStyle) {
+                    if (!printed) printf("Non-authoritative answer:\n");
+                    printf("Name:\t%s\nAddress: %s\n", host, answers[i]);
+                } else {
+                    printf("%s has address %s\n", host, answers[i]);
+                }
+                printed = true;
+            }
+            if (count == 0 && rcode != 0) { lastRcode = rcode; haveRcode = true; }
+        } else {
+            status = 1;
+        }
+        smallclueDnsFreeAnswers(answers, count);
+    }
+    if (forcedFamily != AF_INET) {
+        char **answers = NULL; int count = 0; int rcode = 0;
+        if (smallclueDnsQueryServer(server, host, SMALLCLUE_DNS_TYPE_AAAA, &answers, &count, &rcode) == 0) {
+            for (int i = 0; i < count; ++i) {
+                if (nslookupStyle) {
+                    if (!printed) printf("Non-authoritative answer:\n");
+                    printf("Name:\t%s\nAddress: %s\n", host, answers[i]);
+                } else {
+                    printf("%s has IPv6 address %s\n", host, answers[i]);
+                }
+                printed = true;
+            }
+            if (count == 0 && rcode != 0) { lastRcode = rcode; haveRcode = true; }
+        } else {
+            status = 1;
+        }
+        smallclueDnsFreeAnswers(answers, count);
+    }
+    if (!printed && status == 0) {
+        if (haveRcode) {
+            fprintf(stderr, "%s: %s: %s\n", label, host, smallclueDnsRcodeName(lastRcode));
+        } else {
+            fprintf(stderr, "%s: %s: no records found via %s\n", label, host, server);
+        }
+        status = 1;
+    }
+    *exitStatus = status;
+    return true;
+}
+
 static int smallclueNslookupCommand(int argc, char **argv) {
-    const char *usage = "usage: nslookup [-v] host [port]\n";
+    const char *usage = "usage: nslookup [-v] [-type=TYPE] host [server]\n";
     bool verbose = false;
+    int typedQtype = 0;
+
+    /* nslookup's -type=/-q=/-query=TYPE options use BIND-style "=value"
+     * single-token syntax rather than a getopt-friendly separate
+     * argument, so pull them out of argv (compacting in place) before
+     * the normal getopt loop ever sees them. */
+    int writeIdx = 1;
+    for (int readIdx = 1; readIdx < argc; ++readIdx) {
+        const char *arg = argv[readIdx];
+        const char *val = NULL;
+        if (strncmp(arg, "-type=", 6) == 0) val = arg + 6;
+        else if (strncmp(arg, "-query=", 7) == 0) val = arg + 7;
+        else if (strncmp(arg, "-q=", 3) == 0) val = arg + 3;
+        if (val) {
+            int qt = smallclueDnsTypeFromName(val);
+            if (qt != 0) typedQtype = qt;
+            continue;
+        }
+        argv[writeIdx++] = argv[readIdx];
+    }
+    argc = writeIdx;
+
     smallclueResetGetopt();
     int opt;
     while ((opt = getopt(argc, argv, "v")) != -1) {
@@ -1096,14 +2088,30 @@ static int smallclueNslookupCommand(int argc, char **argv) {
         return 1;
     }
     const char *host = argv[optind];
-    const char *service = (optind + 1 < argc) ? argv[optind + 1] : "53";
+    const char *server = (optind + 1 < argc) ? argv[optind + 1] : NULL;
+
+    if (typedQtype != 0) {
+        int typedStatus = 0;
+        smallclueTryTypedDnsLookup("nslookup", host, server, typedQtype, true, &typedStatus);
+        return typedStatus;
+    }
+
+    int serverStatus = 0;
+    if (smallclueTryServerDnsLookup("nslookup", host, server, AF_UNSPEC, true, &serverStatus)) {
+        return serverStatus;
+    }
+
+    int reverseStatus = 0;
+    if (smallclueTryReverseDnsLookup("nslookup", host, true, &reverseStatus)) {
+        return reverseStatus;
+    }
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_family = AF_UNSPEC;
     struct addrinfo *res = NULL;
-    int gai = pscalHostsGetAddrInfo(host, service, &hints, &res);
+    int gai = pscalHostsGetAddrInfo(host, "53", &hints, &res);
     if (gai != 0 || !res) {
 #if defined(PSCAL_TARGET_IOS)
         fprintf(stderr, "nslookup: hosts lookup paths: %s first, then /etc/hosts\n",
@@ -1130,6 +2138,7 @@ static int smallclueNslookupCommand(int argc, char **argv) {
 static int smallclueHostCommand(int argc, char **argv) {
     const char *usage = "usage: host [-4|-6] [-v] [-t TYPE] host [server]\n";
     int family = AF_UNSPEC;
+    int typedQtype = 0;
     bool verbose = false;
     smallclueResetGetopt();
     int opt;
@@ -1141,6 +2150,7 @@ static int smallclueHostCommand(int argc, char **argv) {
             case 't':
                 if (strcasecmp(optarg, "A") == 0) family = AF_INET;
                 else if (strcasecmp(optarg, "AAAA") == 0) family = AF_INET6;
+                else typedQtype = smallclueDnsTypeFromName(optarg);
                 break;
             default:
                 fputs(usage, stderr);
@@ -1157,8 +2167,22 @@ static int smallclueHostCommand(int argc, char **argv) {
         return 1;
     }
     const char *host = argv[optind];
-    if (optind + 1 < argc) {
-        fprintf(stderr, "host: server override not supported; ignoring '%s'\n", argv[optind + 1]);
+    const char *server = (optind + 1 < argc) ? argv[optind + 1] : NULL;
+
+    if (typedQtype != 0) {
+        int typedStatus = 0;
+        smallclueTryTypedDnsLookup("host", host, server, typedQtype, false, &typedStatus);
+        return typedStatus;
+    }
+
+    int serverStatus = 0;
+    if (smallclueTryServerDnsLookup("host", host, server, family, false, &serverStatus)) {
+        return serverStatus;
+    }
+
+    int reverseStatus = 0;
+    if (smallclueTryReverseDnsLookup("host", host, false, &reverseStatus)) {
+        return reverseStatus;
     }
 
     struct addrinfo hints;
@@ -1234,6 +2258,13 @@ static int smallclueSuCommand(int argc, char **argv) {
     const char *user = "root";
     const char *command = NULL;
     bool login = false;
+
+    /* Sentinel: Sanitize environment to prevent privilege escalation via LD_PRELOAD/PATH injection */
+    unsetenv("LD_PRELOAD");
+    unsetenv("LD_LIBRARY_PATH");
+    unsetenv("LD_DEBUG");
+    unsetenv("IFS");
+    setenv("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", 1);
 
     int arg_idx = 1;
     if (arg_idx < argc && strcmp(argv[arg_idx], "-") == 0) {
@@ -1364,6 +2395,7 @@ static int smallclueSudoCommand(int argc, char **argv) {
             if (!pass) return 1;
             char *encrypted = crypt(pass, sp->sp_pwdp);
             smallclueSecureMemzero(pass, strlen(pass));
+            free(pass);
             if (!encrypted || strcmp(encrypted, sp->sp_pwdp) != 0) {
                 fprintf(stderr, "sudo: authentication failure\n");
                 return 1;
@@ -1420,8 +2452,18 @@ static char *smallclueGetPass(const char *prompt) {
     size_t len = strlen(buf);
     if (len > 0 && buf[len - 1] == '\n') {
         buf[len - 1] = '\0';
+    } else if (len == sizeof(buf) - 1) {
+        /* Sentinel: If the password exceeded the buffer size, flush the remaining
+         * input up to the newline to prevent residual password fragments from
+         * leaking into subsequent stdin reads. */
+        int c;
+        while ((c = fgetc(stdin)) != '\n' && c != EOF) {
+            /* discard */
+        }
     }
-    return buf;
+    char *result = strdup(buf);
+    smallclueSecureMemzero(buf, sizeof(buf));
+    return result;
 }
 #endif
 
@@ -1473,6 +2515,7 @@ static int smallcluePasswdCommand(int argc, char **argv) {
         }
         char *encrypted = crypt(pass, sp->sp_pwdp);
         smallclueSecureMemzero(pass, strlen(pass));
+        free(pass);
         if (!encrypted || strcmp(encrypted, sp->sp_pwdp) != 0) {
             fprintf(stderr, "passwd: authentication failure\n");
             ulckpwdf();
@@ -1482,12 +2525,14 @@ static int smallcluePasswdCommand(int argc, char **argv) {
 
     char *new_pass = smallclueGetPass("New password: ");
     if (!new_pass || !*new_pass) {
+        if (new_pass) free(new_pass);
         fprintf(stderr, "passwd: password unchanged\n");
         ulckpwdf();
         return 1;
     }
     char *new_pass_copy = strdup(new_pass);
-    smallclueSecureMemzero(new_pass, strlen(new_pass)); // Clear static buffer immediately
+    smallclueSecureMemzero(new_pass, strlen(new_pass));
+    free(new_pass);
     if (!new_pass_copy) {
         fprintf(stderr, "passwd: out of memory\n");
         ulckpwdf();
@@ -1497,13 +2542,19 @@ static int smallcluePasswdCommand(int argc, char **argv) {
     char *confirm_pass = smallclueGetPass("Retype new password: ");
     if (!confirm_pass || strcmp(new_pass_copy, confirm_pass) != 0) {
         fprintf(stderr, "passwd: passwords do not match\n");
-        if (confirm_pass) smallclueSecureMemzero(confirm_pass, strlen(confirm_pass));
+        if (confirm_pass) {
+            smallclueSecureMemzero(confirm_pass, strlen(confirm_pass));
+            free(confirm_pass);
+        }
         smallclueSecureMemzero(new_pass_copy, strlen(new_pass_copy));
         free(new_pass_copy);
         ulckpwdf();
         return 1;
     }
-    if (confirm_pass) smallclueSecureMemzero(confirm_pass, strlen(confirm_pass));
+    if (confirm_pass) {
+        smallclueSecureMemzero(confirm_pass, strlen(confirm_pass));
+        free(confirm_pass);
+    }
 
     // Generate salt
     char salt[64];
@@ -1659,12 +2710,18 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"cal", smallclueCalCommand, "Show a simple calendar"},
     {"cat", smallclueCatCommand, "Concatenate files"},
     {"chmod", smallclueChmodCommand, "Change file permissions"},
+    {"chown", smallclueChownCommand, "Change file owner and group"},
+    {"chgrp", smallclueChgrpCommand, "Change file group ownership"},
     {"clear", smallclueClearCommand, "Clear the terminal"},
     {"cls", smallclueClearCommand, "Clear the terminal"},
-    {"cp", smallclueCpCommand, "Copy files"},
+    {"cp", smallclueCpCommand, "Copy files and directories"},
+    {"rsync", smallclueRsyncCommand, "Synchronize files and directories"},
     {"curl", smallclueCurlCommand, "Transfer data from URLs"},
     {"cut", smallclueCutCommand, "Extract fields from lines"},
     {"date", smallclueDateCommand, "Display current date/time"},
+    {"dd", smallclueDdCommand, "Convert and copy a file block by block"},
+    {"diff", smallclueDiffCommand, "Compare files line by line"},
+    {"cmp", smallclueCmpCommand, "Compare two files byte by byte"},
     {"dirname", smallclueDirnameCommand, "Strip last path component"},
     {"du", smallclueDuCommand, "Summarize disk usage"},
 #if defined(SMALLCLUE_WITH_DVTM)
@@ -1674,10 +2731,15 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"micro", smallclueMicroCommand, "Micro text editor"},
     {"nextvi", smallclueEditorCommand, "Nextvi text editor"},
     {"env", smallclueEnvCommand, "Display or update environment"},
+    {"expr", smallclueExprCommand, "Evaluate expressions"},
     {"false", smallclueFalseCommand, "Do nothing, unsuccessfully"},
     {"file", smallclueFileCommand, "Identify file types"},
     {"find", smallclueFindCommand, "Search for files"},
     {"grep", smallclueGrepCommand, "Search for patterns"},
+    {"git", smallclueGitCommand, "Git plumbing and porcelain"},
+    {"gzip", smallclueGzipCommand, "Compress files"},
+    {"gunzip", smallclueGunzipCommand, "Decompress files"},
+    {"zcat", smallclueZcatCommand, "Decompress files to standard output"},
     {"head", smallclueHeadCommand, "Print the first lines of files"},
     {"history", smallclueHistoryCommand, "Show command history"},
     {"id", smallclueIdCommand, "Print user identity information"},
@@ -1697,19 +2759,41 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"mkdir", smallclueMkdirCommand, "Create directories"},
     {"mknod", smallclueMknodCommand, "Create special files"},
     {"mount", smallclueMountCommand, "Mount filesystems"},
+    {"umount", smallclueUmountCommand, "Unmount filesystems"},
     {"more", smallcluePagerCommand, "Paginate file contents"},
     {"mv", smallclueMvCommand, "Move or rename files"},
+    {"install", smallclueInstallCommand, "Copy files and set attributes (or create directories)"},
+    {"base64", smallclueBase64Command, "Base64 encode or decode"},
+    {"md5sum", smallclueMd5sumCommand, "Compute or check MD5 digests"},
+    {"sha1sum", smallclueSha1sumCommand, "Compute or check SHA-1 digests"},
+    {"sha256sum", smallclueSha256sumCommand, "Compute or check SHA-256 digests"},
+    {"od", smallclueOdCommand, "Dump files in octal/hex/decimal/character format"},
+    {"seq", smallclueSeqCommand, "Print a sequence of numbers"},
+    {"nl", smallclueNlCommand, "Number lines of files"},
+    {"tac", smallclueTacCommand, "Concatenate and print files in reverse"},
+    {"rev", smallclueRevCommand, "Reverse the characters of each line"},
+    {"fold", smallclueFoldCommand, "Wrap each line to a given width"},
+    {"paste", smallcluePasteCommand, "Merge lines of files"},
+    {"split", smallclueSplitCommand, "Split a file into pieces"},
+    {"fmt", smallclueFmtCommand, "Reflow text into filled paragraphs"},
+    {"comm", smallclueCommCommand, "Compare two sorted files line by line"},
+    {"awk", smallclueAwkCommand, "Pattern scanning and processing language"},
     {"nslookup", smallclueNslookupCommand, "DNS lookup utility"},
     {"no", smallclueNoCommand, "Repeatedly print strings (exit 1)"},
+    {"nohup", smallclueNohupCommand, "Run a command immune to hangups"},
     {"passwd", smallcluePasswdCommand, "Change user password"},
+    {"patch", smallcluePatchCommand, "Apply a unified diff to files"},
+    {"printf", smallcluePrintfCommand, "Format and print data"},
     {"pbcopy", smallcluePbcopyCommand, "Copy stdin to the system clipboard"},
     {"pbpaste", smallcluePbpasteCommand, "Paste the system clipboard to stdout"},
-    {"ping", smallcluePingCommand, "TCP ping utility"},
+    {"ping", smallcluePingCommand, "ICMP echo utility"},
     {"poweroff", smallclueHaltCommand, "Power off the system"},
     {"ps", smallcluePsCommand, "Show simple process information"},
     {"pwd", smallcluePwdCommand, "Print working directory"},
     {"reboot", smallclueHaltCommand, "Reboot the system"},
     {"resize", smallclueResizeCommand, "Synchronize terminal rows/columns"},
+    {"readlink", smallclueReadlinkCommand, "Print resolved symbolic links or canonical paths"},
+    {"realpath", smallclueRealpathCommand, "Print the canonicalized absolute path"},
     {"rm", smallclueRmCommand, "Remove files"},
     {"rmdir", smallclueRmdirCommand, "Remove empty directories"},
     {"runit", smallclueRunitCommand, "System service supervisor"},
@@ -1731,12 +2815,14 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"su", smallclueSuCommand, "Change user ID or become superuser"},
     {"sudo", smallclueSudoCommand, "Execute a command as another user"},
     {"tail", smallclueTailCommand, "Print the last lines of files"},
+    {"tar", smallclueTarCommand, "Create, extract, or list tar archives"},
     {"tee", smallclueTeeCommand, "Copy stdin to files and stdout"},
     {"telnet", smallclueTelnetCommand, "Simple TCP telnet client"},
     {"test", smallclueTestCommand, "Evaluate expressions"},
     {"time", smallclueTimeCommand, "Measure command runtime"},
     {"tset", smallclueTsetCommand, "Initialize terminal settings"},
     {"touch", smallclueTouchCommand, "Update file timestamps"},
+    {"timeout", smallclueTimeoutCommand, "Run a command with a time limit"},
     {"tty", smallclueTtyCommand, "Print terminal name"},
     {"traceroute", smallclueTracerouteCommand, "Trace network path to a host"},
     {"tr", smallclueTrCommand, "Translate or delete characters"},
@@ -1766,63 +2852,189 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"smallclue-help", smallclueHelpCommand, "List available smallclue applets"},
     {"licenses", smallclueLicensesCommand, "View third-party licenses"},
     {"top", smallclueTopCommand, "Show PSCAL virtual processes"},
+#else
+    {"top", smallclueTopCommand, "Show running processes (sorted by %CPU)"},
 #endif
 };
 
 static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"[", "[ expression ]\n"
           "  Alias for test; see 'test' for operators"},
-    {"basename", "basename PATH [SUFFIX]\n"
-                 "  Strip directory prefix and optional suffix"},
+    {"basename", "basename PATH [SUFFIX] | basename -a|-s SUFFIX PATH...\n"
+                 "  Strip directory prefix and optional suffix\n"
+                 "  -a/--multiple: treat every operand as a PATH (no positional SUFFIX)\n"
+                 "  -s/--suffix=SUFFIX: strip SUFFIX from every PATH (implies -a)\n"
+                 "  -z/--zero: NUL-terminate output instead of newline"},
     {"cal", "cal [month] [year]\n"
             "  Show a simple calendar"},
-    {"cat", "cat [FILE ...]\n"
-            "  Concatenate files to stdout"},
-    {"chmod", "chmod MODE FILE ...\n"
-              "  MODE forms: u+rwx,g-w,o=r, a-wx, 755, 0644"},
+    {"cat", "cat [-n|-b] [-E] [-T] [-A] [-s] [FILE ...]\n"
+            "  Concatenate files to stdout\n"
+            "  -n number all lines  -b number non-blank lines only\n"
+            "  -E show $ at line end  -T show tabs as ^I  -A = -E -T\n"
+            "  -s squeeze runs of blank lines to one\n"
+            "  (previously any flag was silently treated as a filename)"},
+    {"chmod", "chmod [-R] MODE FILE ...\n"
+              "  MODE forms: u+rwx,g-w,o=r, a-wx, 755, 0644\n"
+              "  -R recursive"},
+    {"chown", "chown [-R] [-h] OWNER[:[GROUP]] FILE ...\n"
+              "  Change owner (and optionally group) of each FILE\n"
+              "  OWNER[:GROUP]: both numeric IDs and names accepted\n"
+              "  \"user:\" changes owner only; \":group\" changes group only\n"
+              "  -R recursive  -h affect symlinks themselves, not their targets"},
+    {"chgrp", "chgrp [-R] [-h] GROUP FILE ...\n"
+              "  Change group ownership of each FILE (numeric ID or name)\n"
+              "  -R recursive  -h affect symlinks themselves, not their targets"},
     {"clear", "clear\n"
               "  Clear the terminal"},
     {"cls", "cls\n"
             "  Clear the terminal (alias)"},
-    {"cp", "cp [-r] SRC... DEST\n"
-           "  -r  recursive copy"},
+    {"cp", "cp [-r|-R] [-a] [-p] SRC... DEST\n"
+           "  -r/-R  recursive copy (directories)\n"
+           "  -a     archive: recursive + preserve timestamps\n"
+           "  -p     preserve timestamps"},
     {"curl", "curl [options] URL...\n"
              "  Common: -o FILE,\n"
              "  -O (remote name)\n"
              "  -L (follow)\n"
-             "  -d DATA\n"
-             "  -H HEADER"},
-    {"cut", "cut -d DELIM -f LIST [FILE...]\n"
+             "  -X METHOD\n"
+             "  -d DATA (repeatable, joined with '&')\n"
+             "  -H HEADER (repeatable)\n"
+             "  -u USER:PASS (basic auth)\n"
+             "  -k (skip TLS verification)"},
+    {"cut", "cut -f LIST [-d DELIM] [-s] [FILE...]\n"
+            "       cut -c LIST [FILE...]\n"
+            "  -f fields, -c characters/bytes: LIST is N, N-M, N-, or -M,\n"
+            "     comma-separated (e.g. 1,3-5)\n"
             "  -d delimiter (default tab)\n"
-            "  -f fields (e.g. 1,3-5)"},
-    {"date", "date [+FORMAT]\n"
-             "  Show date/time"},
-    {"dirname", "dirname PATH\n"
-                "  Strip last path component"},
-    {"du", "du [-h] [PATH...]\n"
-           "  -h human-readable sizes"},
+            "  -s suppress lines with no delimiter (default: print unchanged)"},
+    {"date", "date [-u] [-d STRING] [-s STRING] [+FORMAT]\n"
+             "  Show (or set) date/time\n"
+             "  -u: use UTC instead of local time\n"
+             "  -d/--date=STRING: display STRING's time instead of now\n"
+             "  -s/--set=STRING: set the system clock to STRING, then display it\n"
+             "  STRING accepts \"YYYY-MM-DD[ HH:MM[:SS]]\" (also T-separated\n"
+             "  and '/'-separated) -- not full natural-language date parsing"},
+    {"dd", "dd [if=FILE] [of=FILE] [bs=N] [count=N] [skip=N] [seek=N] [conv=notrunc]\n"
+           "  Block-copy if= to of= (default stdin to stdout, bs=512)\n"
+           "  N accepts k/M/G/b/w size suffixes\n"
+           "  skip=N/seek=N: skip N input/output blocks before copying\n"
+           "  conv=notrunc: don't truncate an existing output file first\n"
+           "  Prints a records-in/records-out/bytes summary to stderr"},
+    {"diff", "diff [-u] [-q] FILE1 FILE2\n"
+             "  Unified diff (only mode implemented); -q brief \"differ\" message\n"
+             "  Exit status: 0 same, 1 differ, 2 error. No directory comparison."},
+    {"cmp", "cmp [-s] [-l] FILE1 FILE2\n"
+            "  Byte-for-byte comparison; default prints the first differing\n"
+            "  byte/line offset (or an EOF message if one file is a prefix\n"
+            "  of the other). FILE may be '-' for stdin (only one side).\n"
+            "  -s: silent, exit status only\n"
+            "  -l: list every differing byte offset with both octal values\n"
+            "  Exit status: 0 same, 1 differ, 2 error"},
+    {"dirname", "dirname PATH...\n"
+                "  Strip last path component from each PATH, one per line\n"
+                "  -z/--zero: NUL-terminate output instead of newline"},
+    {"du", "du [-s] [-h] [-k] [-c] [-x] [-d N|--max-depth=N] [PATH...]\n"
+           "  Default: print a subtotal for every directory (not files)\n"
+           "  -s: only the grand total per PATH argument\n"
+           "  -h: human-readable sizes  -k: force 1K-block units\n"
+           "  -c: print a grand total after all arguments\n"
+           "  -x: don't cross onto a different filesystem\n"
+           "  -d N/--max-depth=N: only print subtotals down to depth N"},
 #if defined(SMALLCLUE_WITH_DVTM)
     {"dvtm", "dvtm\n"
              "  Launch dvtm terminal multiplexer"},
 #endif
-    {"echo", "echo [args...]\n"
-             "  Print arguments"},
+    {"echo", "echo [-neE] [args...]\n"
+             "  Print arguments\n"
+             "  -n: suppress the trailing newline\n"
+             "  -e: interpret backslash escapes (\\n \\t \\\\ \\0NNN \\xHH etc; \\c\n"
+             "      stops all further output immediately)\n"
+             "  -E: don't interpret backslash escapes (the default)"},
     {"env", "env [-i] [NAME=VALUE ...] [command]\n"
             "  -i start with empty environment"},
+    {"expr", "expr EXPRESSION\n"
+             "  Evaluate an expression: arithmetic (+ - * / %), string\n"
+             "  comparison (= != < <= > >=), logical (& |), and string\n"
+             "  operators (STR : REGEXP, match, substr, index, length)\n"
+             "  Exit status: 0 if result is non-empty and non-zero, 1\n"
+             "  if null/zero, 2 on error"},
     {"false", "false\n"
               "  Exit with status 1"},
     {"file", "file FILE...\n"
              "  Identify file types"},
-    {"find", "find PATH... [expression]\n"
-             "  Common: -name PATTERN -type f|d"},
-    {"grep", "grep [-i] [-n] [-v] PATTERN [FILE...]\n"
+    {"find", "find PATH [expression]\n"
+             "  Common: -name PATTERN -type f|d|l\n"
+             "  -mtime [+-]N: modified N days ago (+older, -newer)\n"
+             "  -newer FILE: modified more recently than FILE\n"
+             "  -size [+-]N[c|k|M|G|w]: size comparison (default unit: 512B blocks)\n"
+             "  -print0: NUL-separated output (pairs with xargs -0)\n"
+             "  -maxdepth/-mindepth N (global traversal options)\n"
+             "  Boolean logic: -a/-and (implicit between adjacent terms),\n"
+             "  -o/-or, !/-not, and \\( \\) grouping"},
+    {"gzip", "gzip [-c] [-k] [-f] [-d] FILE...\n"
+             "  -c stdout  -k keep original  -f force overwrite  -d decompress"},
+    {"gunzip", "gunzip [-c] [-k] [-f] FILE...\n"
+               "  -c stdout  -k keep original  -f force overwrite"},
+    {"zcat", "zcat FILE...\n"
+             "  Decompress to standard output"},
+    {"grep", "grep [-i] [-n] [-v] [-r|-R] [-E] [-c] [-o] [-w] [-x] PATTERN [FILE...]\n"
              "  -i ignore case\n"
              "  -n line numbers\n"
-             "  -v invert match"},
+             "  -v invert match\n"
+             "  -r/-R recursive directory search\n"
+             "  -E extended regex (default: POSIX basic regex)\n"
+             "  -c print only a count of matching lines per file\n"
+             "  -o print only the matched portion, one match per line\n"
+             "  -w match whole words only\n"
+             "  -x match whole lines only"},
+    {"git", "git [-C PATH] [--no-pager] [-c key=value] <subcommand> [args]\n"
+            "  Supported in this build:\n"
+            "  init,\n"
+            "  clone (supports --depth N for a shallow clone),\n"
+            "  submodule (status, update/init [--recursive] [path...]),\n"
+            "  remote,\n"
+            "  ls-remote,\n"
+            "  fetch,\n"
+            "  pull,\n"
+            "  merge,\n"
+            "  cherry,\n"
+            "  cherry-pick,\n"
+            "  revert,\n"
+            "  rebase,\n"
+            "  push,\n"
+            "  add,\n"
+            "  rm,\n"
+            "  mv,\n"
+            "  clean,\n"
+            "  stash,\n"
+            "  commit,\n"
+            "  reset,\n"
+            "  restore,\n"
+            "  checkout,\n"
+            "  switch,\n"
+            "  config --get,\n"
+            "  symbolic-ref,\n"
+            "  rev-list,\n"
+            "  merge-base,\n"
+            "  show-ref,\n"
+            "  ls-files,\n"
+            "  ls-tree,\n"
+            "  cat-file,\n"
+            "  rev-parse,\n"
+            "  status,\n"
+            "  branch,\n"
+            "  tag,\n"
+            "  diff,\n"
+            "  log,\n"
+            "  show,\n"
+            "  reflog,\n"
+            "  blame,\n"
+            "  describe"},
     {"halt", "halt [-f]\n"
              "  Halt the system"},
-    {"head", "head [-n N] [FILE...]\n"
-             "  Default N=10"},
+    {"head", "head [-n N|-n -N] [FILE...]\n"
+             "  Default N=10\n"
+             "  -n -N: print all but the last N lines instead of the first N"},
     {"history", "history\n"
                 "  Show command history"},
     {"id", "id\n"
@@ -1831,25 +3043,37 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  System initialization (PID 1 by default)\n"
              "  --service-mode allows compatibility startup when PID != 1"},
 #if SMALLCLUE_HAS_IFADDRS
-    {"ipaddr", "ipaddr\n"
-               "  Show interface IP addresses"},
+    {"ipaddr", "ipaddr [-4|-6] [-a]\n"
+               "  Show interface IP addresses\n"
+               "  ipaddr add|del ADDR/PREFIXLEN dev IFACE\n"
+               "  ipaddr flush dev IFACE\n"
+               "  ipaddr link set IFACE up|down\n"
+               "  ipaddr route add|del DEST/PREFIXLEN|default [via GW] [dev IFACE]\n"
+               "  (Linux only, needs CAP_NET_ADMIN; IPv4 only)"},
 #endif
     {"kill", "kill [-SIGNAL] PID...\n"
              "  Signals: HUP INT TERM KILL etc."},
     {"less", "less [FILE...]\n"
              "  Pager; navigation: j/k, /, n, g/G, q"},
-    {"ln", "ln [-s] TARGET LINK\n"
-           "  -s symbolic link"},
-    {"ls", "ls [-a] [-A] [-l] [-n] [-1] [-C] [-t] [-h] [-d] [--color[=auto|always|never]] [path ...]\n"
+    {"ln", "ln [-s] [-f] TARGET LINK\n"
+           "       ln [-s] [-f] TARGET... DIRECTORY\n"
+           "  -s symbolic link  -f force overwrite\n"
+           "  When the last operand is a directory, each target's basename\n"
+           "  is created inside it"},
+    {"ls", "ls [-a] [-A] [-l] [-n] [-1] [-C] [-t] [-S] [-X] [-v] [-r] [-R] [-h] [-d] [-i]\n"
+           "     [--color[=auto|always|never]] [path ...]\n"
            "  -a show entries starting with '.' (including . and ..)\n"
            "  -A show entries starting with '.' (excluding . and ..)\n"
            "  -l long format with permissions, ownership, size, time\n"
            "  -n numeric uid/gid (implies -l)\n"
            "  -1 list one file per line\n"
            "  -C list entries by columns\n"
-           "  -t sort by modification time\n"
+           "  -t sort by modification time  -S sort by size  -X sort by extension\n"
+           "  -v natural/version sort (e.g. file2 before file10)\n"
+           "  -r reverse sort order  -R recurse into subdirectories\n"
            "  -h human-readable sizes (with -l)\n"
-           "  -d list directories themselves, not their contents"},
+           "  -d list directories themselves, not their contents\n"
+           "  -i show each entry's inode number as a leading column"},
     {"md", "md [-i] [-c] [FILE|URL]\n"
            "  View Markdown/HTML document; press 'o' to open links in-page\n"
            "  -i interactive mode.  Makes ~/Docs browsable\n"
@@ -1861,26 +3085,100 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  -v verbose"},
     {"mknod", "mknod [-m mode] NAME TYPE [MAJOR MINOR]\n"
               "  Create special files (b=block, c/u=char, p=fifo)"},
-    {"mount", "mount [-t type] [-o options] [source] dir\n"
-              "  Mount filesystems (iOS: omit source to open folder picker)"},
+    {"mount", "mount [-p] [-t type] [-o options] [source] dir\n"
+              "  Mount filesystems (iOS: omit source to open folder picker; -p persists to /etc/fstab)"},
+    {"umount", "umount [-p] [-l] [-f] dir\n"
+               "  Unmount filesystems (iOS: -p also removes matching /etc/fstab entry)\n"
+               "  Linux: -l lazy unmount (MNT_DETACH), -f force (MNT_FORCE)"},
     {"micro", "micro [FILE]\n"
               "  Micro editor"},
     {"more", "more [FILE...]\n"
              "  Pager (alias of less)"},
     {"mv", "mv SRC... DEST\n"
            "  Move or rename files"},
-    {"nslookup", "nslookup [-v] host [port]\n"
-                 "  DNS lookup utility (UDP port defaults to 53).\n"
+    {"install", "install [-m MODE] [-D] SRC... DEST\n"
+                "       install -d [-m MODE] DIRECTORY...\n"
+                "  Copy SRC to DEST (or each SRC into DEST/ if it's a\n"
+                "  directory) and chmod to MODE (default 0755)\n"
+                "  -D create DEST's parent directories first\n"
+                "  -d create directories instead of copying files\n"
+                "  -v verbose"},
+    {"base64", "base64 [-d] [-i] [-w COLS] [FILE]\n"
+               "  Encode FILE/stdin to base64 (default), or decode with -d\n"
+               "  -i/--ignore-garbage: skip invalid characters when decoding\n"
+               "  -w COLS: wrap encoded output at COLS columns (default 76, 0 disables)"},
+    {"md5sum", "md5sum [-c] [FILE...]\n"
+               "  -c verify against a checksums file (\"HEXDIGEST  path\" per line)"},
+    {"sha1sum", "sha1sum [-c] [FILE...]\n"
+                "  -c verify against a checksums file"},
+    {"sha256sum", "sha256sum [-c] [FILE...]\n"
+                  "  -c verify against a checksums file"},
+    {"nohup", "nohup COMMAND [ARG...]\n"
+              "  Run COMMAND immune to SIGHUP, so it survives the controlling\n"
+              "  terminal hanging up. If stdout is a terminal, output is appended\n"
+              "  to nohup.out (or $HOME/nohup.out); if stderr is also a terminal,\n"
+              "  it goes to the same place."},
+    {"nslookup", "nslookup [-v] host [server]\n"
+                 "  DNS lookup utility; queries SERVER directly (port 53) if\n"
+                 "  given, else uses the system resolver. IP-shaped queries\n"
+                 "  auto-detect as PTR/reverse lookups.\n"
                  "  -v prints hosts lookup debugging."},
+    {"od", "od [-A d|o|x|n] [-t TYPE] [-c] [-v] [FILE]\n"
+           "  Dump FILE/stdin in the given format (default: 2-byte octal words)\n"
+           "  -A: address radix (d/o/x) or n for no address column\n"
+           "  -t TYPE: x1/x2/x4 (hex), o1/o2/o4 (octal), d1/d2/d4 (signed decimal),\n"
+           "           u1/u2/u4 (unsigned decimal), c (character)\n"
+           "  -c: shorthand for -t c\n"
+           "  -v: accepted for compatibility (repeated lines are never collapsed)"},
+    {"seq", "seq [-w] [-s SEP] [FIRST [INCREMENT]] LAST\n"
+            "  Print a sequence of numbers; -w zero-pads to equal width,\n"
+            "  -s SEP sets the separator (default newline)"},
+    {"nl", "nl [-b a|t] [-w WIDTH] [-s SEP] [FILE]\n"
+           "  Number lines of FILE/stdin; -b t (default) numbers non-blank\n"
+           "  lines only, -b a numbers every line"},
+    {"tac", "tac [FILE...]\n"
+            "  Concatenate and print FILE/stdin with lines in reverse order"},
+    {"rev", "rev [FILE...]\n"
+            "  Reverse the characters of each line of FILE/stdin"},
+    {"fold", "fold [-w WIDTH] [-s] [FILE...]\n"
+             "  Wrap each line to WIDTH characters (default 80);\n"
+             "  -s breaks at the last whitespace before the width"},
+    {"paste", "paste [-d LIST] [-s] [FILE...]\n"
+              "  Merge corresponding lines of FILE/stdin side by side\n"
+              "  (default delimiter: tab, cycles through -d LIST's chars);\n"
+              "  -s: join each file's own lines serially instead"},
+    {"split", "split [-l LINES | -b BYTES] [FILE [PREFIX]]\n"
+              "  Split FILE/stdin into PREFIXaa, PREFIXab, ... (default\n"
+              "  PREFIX: x); -l 1000 lines/chunk by default, or -b BYTES"},
+    {"fmt", "fmt [-w WIDTH] [FILE...]\n"
+            "  Reflow text into filled paragraphs (default width 75);\n"
+            "  blank lines are paragraph breaks"},
+    {"comm", "comm [-1] [-2] [-3] FILE1 FILE2\n"
+             "  Compare two SORTED files; 3 columns by default (unique to\n"
+             "  FILE1, unique to FILE2, common); -N suppresses column N"},
+    {"awk", "awk [-F sep] [-v var=val] [-f progfile | -e prog | 'prog'] [file ...]\n"
+            "  Pattern scanning/processing: BEGIN/END, patterns+actions,\n"
+            "  fields/arrays/functions/getline/printf (BusyBox awk feature set)"},
     {"nextvi", "nextvi [FILE]\n"
                "  Full-screen text editor"},
     {"passwd", "passwd [username]\n"
                "  Change user password"},
+    {"patch", "patch [-p N] [-i PATCHFILE] [FILE]\n"
+              "  Apply a unified diff (from stdin, or -i PATCHFILE)\n"
+              "  -p N strip N leading path components (default 1)\n"
+              "  FILE overrides the target path for a single-file patch\n"
+              "  Context-diff/plain-diff formats are not supported, only unified"},
+    {"printf", "printf FORMAT [ARGUMENT...]\n"
+               "  Format and print ARGUMENTs per FORMAT (like the shell builtin)\n"
+               "  Conversions: %d %i %o %u %x %X %e %f %g %c %s %b %%\n"
+               "  FORMAT escapes: \\n \\t \\r \\a \\b \\f \\v \\\\\n"
+               "  If more ARGUMENTs remain than FORMAT consumes, FORMAT is reused"},
     {"host", "host [-4|-6] [-v] [-t TYPE] host [server]\n"
              "  -4 IPv4 only\n"
              "  -6 IPv6 only\n"
              "  -t A|AAAA select record type\n"
              "  -v verbose (hosts debug)\n"
+             "  IP-shaped queries auto-detect as PTR/reverse lookups\n"
              "Server override is ignored."},
     {"hostname", "hostname\n"
                  "  Show system hostname"},
@@ -1888,40 +3186,80 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                "  Copy stdin to system clipboard"},
     {"pbpaste", "pbpaste\n"
                 "  Paste system clipboard to stdout"},
-    {"ping", "ping HOST [PORT]\n"
-             "  TCP ping (default port 80)"},
+    {"ping", "ping [-4|-6] [-c count] [-t timeout_ms] HOST\n"
+             "  ICMP echo ping (IPv4 and IPv6)"},
     {"poweroff", "poweroff [-f]\n"
              "  Power off the system"},
-    {"ps", "ps\n"
-           "  Show simple process list"},
+    {"ps", "ps [-e|-A|-a] [-f] [-p PID[,PID...]] [-u USER[,USER...]]\n"
+           "  Show process list (all processes are always shown; -e/-A/-a\n"
+           "  are accepted for compatibility). Also accepts bundled BSD-style\n"
+           "  flags without a leading dash, e.g. `ps aux`, `ps ef`.\n"
+           "  -f: full format, adds a STAT (state) column\n"
+           "  -p PID[,PID...]: only show the given PID(s)\n"
+           "  -u USER[,USER...]: only show processes owned by the given user(s)"},
     {"pwd", "pwd\n"
             "  Print working directory"},
     {"reboot", "reboot [-f]\n"
              "  Reboot the system"},
     {"resize", "resize [COLUMNS ROWS]\n"
                "  Report or set terminal size"},
-    {"rm", "rm [-r] [-f] [-i] FILE...\n"
-           "  -r recursive\n"
+    {"readlink", "readlink [-f|-e|-m] [-n] PATH...\n"
+                 "  No flag: print the immediate symlink target\n"
+                 "  -f canonicalize (resolve all symlinks + ./..); -e requires\n"
+                 "  every component to exist; -m allows a missing final component\n"
+                 "  -n suppress trailing newline"},
+    {"realpath", "realpath [-e|-m] PATH...\n"
+                 "  Print the canonicalized absolute path\n"
+                 "  -e require full existence  -m allow a missing final component (default)"},
+    {"rm", "rm [-r|-R] [-f] [-i] [--no-preserve-root] FILE...\n"
+           "  -r/-R recursive\n"
            "  -f force\n"
-           "  -i interactive"},
+           "  -i interactive\n"
+           "  --preserve-root (default): refuse recursive removal of '/'\n"
+           "  --no-preserve-root: disable that failsafe"},
     {"rmdir", "rmdir [-p] [-v] DIR...\n"
               "  Remove empty directories\n"
               "  -p remove parents\n"
               "  -v verbose"},
+    {"rsync", "rsync [options] <source>... <destination>\n"
+              "  Synchronize files and directories (OpenRsync-compatible applet)\n"
+              "  Common: -a -v -z -r --delete --exclude PATTERN --include PATTERN\n"
+              "  Remote paths use host:path syntax over SSH"},
     {"runit", "runit\n"
              "  Service supervisor"},
-    {"sed", "sed 's/old/new/g' [FILE...]\n"
-            "  Simple substitution support"},
+    {"sed", "sed [-n] [-E|-r] [-i[SUFFIX]] [-e SCRIPT]... [-f SCRIPTFILE]... [SCRIPT] [FILE...]\n"
+            "  Commands: s/PAT/REP/[gi], y/SET1/SET2/, d, p\n"
+            "  Address prefixes (any command): N, $, /regex/, N,M, N,$,\n"
+            "  /regex1/,/regex2/, /regex1/,N -- restrict the command to matching lines\n"
+            "  -n: suppress automatic printing (use with p)\n"
+            "  Multiple -e/-f accumulate; commands within one script are\n"
+            "  ';'-or-newline-separated. -E/-r: extended regex (default: basic)\n"
+            "  -i[SUFFIX]: edit files in place, optionally backing up to FILE+SUFFIX"},
     {"sleep", "sleep SECONDS\n"
               "  Pause execution"},
-    {"sort", "sort [-r] [-n]\n"
+    {"sort", "sort [-r] [-n] [-u] [-k N] [-t SEP] [-c|-C] [-m] [FILE...]\n"
              "  -r reverse\n"
-             "  -n numeric"},
-    {"stat", "stat [-L] FILE...\n"
-             "  -L follow symlinks"},
+             "  -n numeric\n"
+             "  -u unique (after sorting)\n"
+             "  -k N sort by field N through end of line (1-based)\n"
+             "  -t SEP field separator for -k (default: runs of whitespace)\n"
+             "  -c/--check: verify input is already sorted; no output, exits 1\n"
+             "     and reports the first out-of-order line if not\n"
+             "  -C/--check=quiet: like -c but no diagnostic message\n"
+             "  -m/--merge: accepted for compatibility (sorts fully rather\n"
+             "     than doing a true presorted-runs merge; same output)\n"
+             "  Stable: equal-key lines keep their original relative order"},
+    {"stat", "stat [-L] [-c FORMAT|--format=FORMAT] FILE...\n"
+             "  -L follow symlinks\n"
+             "  -c/--format FORMAT: %n name %s size %F type %a/%A perms\n"
+             "    %u/%g uid/gid %U/%G user/group %i inode %h links\n"
+             "    %d device %b blocks %B block-size %f raw mode(hex)\n"
+             "    %X/%Y/%Z atime/mtime/ctime (epoch seconds), %% literal %"},
     {"stty", "stty [reset] [sane]\n"
              "  Report terminal settings; apply reset/sane"},
 #if defined(SMALLCLUE_WITH_EXSH)
+    {"exsh", "exsh\n"
+             "  Launch PSCAL shell front end"},
     {"sh", "sh\n"
            "  Launch PSCAL shell front end"},
 #endif
@@ -1943,16 +3281,29 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  Change user ID or become superuser"},
     {"sudo", "sudo command [args...]\n"
              "  Execute a command as another user"},
-    {"tail", "tail [-n N] [FILE...]\n"
-             "  Default N=10"},
+    {"tail", "tail [-n N|-n +N] [-f] [FILE...]\n"
+             "  Default N=10\n"
+             "  -n +N: start output at line N (relative to the start) instead\n"
+             "  of printing the last N lines. Not combinable with -f."},
+    {"tar", "tar -c|-x|-t -f archive [-v] [-z] [-C dir] [file...]\n"
+            "  -c create  -x extract  -t list\n"
+            "  -f archive path (or - for stdin/stdout)\n"
+            "  -v verbose  -z gzip (also auto-detected on read)\n"
+            "  -C dir  chdir before create, or extract-destination dir\n"
+            "  Bundled form also accepted: tar xzf archive.tar.gz"},
     {"tee", "tee [-a] FILE...\n"
             "  -a append"},
     {"telnet", "telnet [-p PORT] HOST\n"
-               "  Connect to HOST over TCP (default port 23) and relay stdin/stdout"},
+               "  Connect to HOST over TCP (default port 23) and relay stdin/stdout;\n"
+               "  handles IAC option negotiation (declines every DO/WILL request)\n"
+               "  and subnegotiation blocks -- no actual options are supported"},
     {"traceroute", "traceroute HOST [PORT]\n"
                    "  Trace network path using the system traceroute command"},
     {"test", "test EXPRESSION\n"
-             "  File: -f -d -e; String: = != -z; Int: -eq -ne -lt -le -gt -ge"},
+             "  File: -f -d -e -r -w -x -s -L/-h\n"
+             "  File compare: -nt -ot -ef\n"
+             "  String: = != -z -n; Int: -eq -ne -lt -le -gt -ge\n"
+             "  Combine: ! (not), -a (and), -o (or) -- -a binds tighter than -o"},
     {"time", "time command [args...]\n"
              "  Run a smallclue applet and print real/user/sys timing"},
     {"tset", "tset [-IQqs] [-e CH] [-i CH] [-k CH] [-r] [TERM]\n"
@@ -1961,8 +3312,20 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -r report terminal type\n"
              "  -Q quiet, -I skip init\n"
              "  -e/-i/-k set erase/intr/kill chars"},
-    {"touch", "touch FILE...\n"
-              "  Update timestamps or create empty file"},
+    {"touch", "touch [-c] [-a] [-m] [-r REFFILE|-t STAMP|-d STRING] FILE...\n"
+              "  Update timestamps or create empty file\n"
+              "  -c no-create  -a access-time-only  -m mtime-only\n"
+              "  -r REFFILE: copy REFFILE's timestamps\n"
+              "  -t [[CC]YY]MMDDhhmm[.ss]\n"
+              "  -d STRING: ISO-ish date (\"YYYY-MM-DD[ HH:MM[:SS]]\")"},
+    {"timeout", "timeout [-s SIGNAL] [-k DURATION] [--preserve-status] DURATION COMMAND [ARG...]\n"
+                "  Run COMMAND, terminating it if it's still running after DURATION\n"
+                "  DURATION accepts an optional s/m/h/d suffix (default seconds)\n"
+                "  -s SIGNAL: signal to send on timeout (default TERM)\n"
+                "  -k DURATION: send KILL after this additional time if still alive\n"
+                "  --preserve-status: exit with COMMAND's own status instead of 124\n"
+                "  Exit 124 on timeout (unless --preserve-status), 125 on usage/setup\n"
+                "  error, 126/127 if COMMAND can't be invoked, else COMMAND's status"},
     {"sum", "sum [-r|-s] [FILE...]\n"
             "  BSD (-r, default): rotate-right checksum, 1K blocks.\n"
             "  SysV (-s, --sysv): simple sum, 512-byte blocks.\n"
@@ -1970,8 +3333,13 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  Prints: <checksum> <blocks> [filename]\n"},
     {"tty", "tty [-s]\n"
             "  Print terminal name"},
-    {"tr", "tr SET1 SET2\n"
-           "  Translate/delete characters"},
+    {"tr", "tr [-d] [-s] [-c] SET1 [SET2]\n"
+           "  -d delete characters in SET1\n"
+           "  -s squeeze repeats (of SET2 chars in translate mode,\n"
+           "     SET1 chars if used alone or with -d)\n"
+           "  -c/-C complement SET1\n"
+           "  Sets support a-z ranges, [:alpha:]-style POSIX classes,\n"
+           "  [c*n]/[c*] repeats, and \\n/\\t/\\\\ escapes"},
     {"true", "true\n"
              "  Exit status 0"},
     {"type", "type NAME...\n"
@@ -1984,10 +3352,14 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  -v version\n"
               "  -m machine\n"
               "  -p processor"},
-    {"uniq", "uniq [-c] [-d] [-u] [FILE]\n"
+    {"uniq", "uniq [-c] [-d] [-u] [-i] [-f N] [-s N] [-w N] [FILE]\n"
              "  -c count\n"
              "  -d duplicates only\n"
-             "  -u unique only"},
+             "  -u unique only\n"
+             "  -i ignore case when comparing\n"
+             "  -f N: skip the first N whitespace-separated fields\n"
+             "  -s N: additionally skip the first N characters\n"
+             "  -w N: compare at most N characters (default: rest of line)"},
     {"uptime", "uptime [-s]\n"
                "  Show app uptime since launch\n"
                "  -s show system uptime"},
@@ -2003,12 +3375,16 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  Alias for nextvi"},
     {"watch", "watch [-n SECONDS] [-c COUNT|--count COUNT] command...\n"
               "  Periodically run a command"},
-    {"wc", "wc [-l] [-w] [-c] [FILE...]\n"
-           "  Count lines/words/bytes"},
+    {"wc", "wc [-l] [-w] [-c] [-m] [-L] [FILE...]\n"
+           "  Count lines/words/bytes; -m chars (locale-aware),\n"
+           "  -L max line length (tabs expand to 8-col stops)"},
     {"wget", "wget [options] URL...\n"
              "  Common: -O FILE\n"
-             "  --header\n"
-             "  --post-data\n"
+             "  --method=METHOD\n"
+             "  --header=HEADER (repeatable)\n"
+             "  --post-data=DATA\n"
+             "  --user=USER --password=PASS\n"
+             "  --no-check-certificate\n"
              "  -q\n"
              "  -nv"},
     {"which", "which [-a] program ...\n"
@@ -2019,18 +3395,33 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  Repeatedly print STRING (default: y)"},
     {"no", "no [STRING...]\n"
            "  Repeatedly print STRING (default: n) and exit 1 on stop"},
-    {"xargs", "xargs [-n N] [-0]\n"
-              "  Build command lines from stdin"},
-    {"df", "df [-h]\n"
+    {"xargs", "xargs [-n N] [-0] [-I REPLACE] [-t] COMMAND [initial-args]\n"
+              "  Build and run command lines from stdin (builtin applets\n"
+              "  or arbitrary external binaries via execvp)\n"
+              "  -n N max args per invocation (default: one invocation, all args)\n"
+              "  -0 NUL-delimited input (pairs with find -print0)\n"
+              "  -I REPLACE: one invocation per input line, substituting\n"
+              "    REPLACE wherever it appears in COMMAND's arguments\n"
+              "  -t print each command line before running it\n"
+              "  Without -0: single/double quotes group whitespace into one\n"
+              "    token (quotes stripped); backslash escapes the next char"},
+    {"df", "df [-h] [path ...]\n"
+           "  With no path, lists every mounted filesystem (like real df)\n"
            "  -h human-readable sizes"},
     {"dmesg", "dmesg [-T]\n"
               "  Print or control the kernel ring buffer\n"
               "  -T  show human-readable timestamps (iOS only)"},
-    {"nslookup", "nslookup [-v] host [port]\n"
-                 "  DNS lookup utility (UDP port defaults to 53). -v prints hosts lookup debugging."},
+    {"nslookup", "nslookup [-v] host [server]\n"
+                 "  DNS lookup utility; queries SERVER directly (port 53) if given,\n"
+                 "  else uses the system resolver. IP-shaped queries auto-detect as\n"
+                 "  PTR/reverse lookups. -v prints hosts lookup debugging."},
 #if defined(PSCAL_TARGET_IOS)
     {"addt", "addt\n"
              "  Open an additional shell tab"},
+    {"tabadd", "tabadd\n"
+               "  Alias for addt"},
+    {"tadd", "tadd\n"
+             "  Alias for addt"},
     {"smallclue-help", "smallclue-help [command]\n"
                        "  Without arguments: list all applets\n"
                        "  With a command: show usage if available"},
@@ -2038,13 +3429,22 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                  "  Browse PSCAL and third-party licenses; use arrows/enter to view"},
     {"top", "top\n"
             "  Show PSCAL virtual processes and CPU ticks"},
+#else
+    {"top", "top [-d SECONDS] [-n COUNT] [-b]\n"
+            "  Show real system processes from /proc, sorted by %CPU\n"
+            "  -d SECONDS refresh delay (default 3)\n"
+            "  -n COUNT   exit after COUNT frames (default: run until interrupted)\n"
+            "  -b         batch mode: never clear the screen, print every frame"},
 #endif
     {NULL, NULL}
 };
 
 static size_t kSmallclueAppletCount = sizeof(kSmallclueApplets) / sizeof(kSmallclueApplets[0]);
 
-static const char * __attribute__((unused)) smallclueLookupHelp(const char *name) {
+const char *smallclueLookupAppletUsage(const char *name) {
+    if (!name) {
+        return NULL;
+    }
     for (const SmallclueAppletHelp *h = kSmallclueAppletHelp; h && h->name; ++h) {
         if (strcmp(h->name, name) == 0) {
             return h->usage;
@@ -2056,7 +3456,7 @@ static const char * __attribute__((unused)) smallclueLookupHelp(const char *name
 static const char *pager_command_name(const char *name);
 static int pager_read_key(void);
 static char *pagerReadLogicalLine(const PagerBuffer *buffer, size_t line_index, bool *had_newline);
-static void smallclueMenuStartFrame(bool *first_frame);
+static void smallclueMenuStartFrameTo(FILE *out, bool *first_frame);
 
 static void pagerBell(void) {
     fputc('\a', stdout);
@@ -2185,6 +3585,43 @@ static ssize_t smallclueReadStream(FILE *stream, void *buf, size_t count, int *o
     return (ssize_t)read_bytes;
 }
 
+static bool smallclueWriteFullyStream(FILE *stream, const void *buf, size_t count, int *out_errno) {
+    if (out_errno) {
+        *out_errno = 0;
+    }
+    if (!stream || (!buf && count > 0)) {
+        if (out_errno) {
+            *out_errno = EINVAL;
+        }
+        return false;
+    }
+    size_t off = 0;
+    while (off < count) {
+        errno = 0;
+        size_t nw = fwrite((const char *)buf + off, 1, count - off, stream);
+        if (nw > 0) {
+            off += nw;
+            continue;
+        }
+        if (ferror(stream)) {
+            int err = errno ? errno : EIO;
+            if (err == EINTR || err == EAGAIN) {
+                clearerr(stream);
+                continue;
+            }
+            if (out_errno) {
+                *out_errno = err;
+            }
+            return false;
+        }
+        if (out_errno) {
+            *out_errno = EIO;
+        }
+        return false;
+    }
+    return true;
+}
+
 static int smallclueGetcStream(FILE *stream, int *out_errno) {
     if (out_errno) {
         *out_errno = 0;
@@ -2300,34 +3737,123 @@ static ssize_t smallclueGetlineStream(char **line, size_t *cap, FILE *stream, in
     return len;
 }
 
+/* Real xargs (without -0) gives single/double quotes and a backslash real
+ * meaning: a quoted span groups whitespace into one token (the quote chars
+ * themselves are stripped, no escape processing inside), and outside
+ * quotes a backslash escapes the very next character literally -- most
+ * commonly used to keep an embedded space from splitting a token. An
+ * unmatched quote is a hard error, matching real xargs (verified against
+ * GNU findutils xargs in Docker: `'hello world' foo` -> two tokens
+ * "hello world" and "foo"; `a\ b c` -> "a b" and "c"; an unterminated
+ * quote errors and exits 1 rather than silently absorbing the rest of
+ * the input). */
 static bool smallclueReadTokensFromStdin(SmallclueLineVector *vec) {
     char *token = NULL;
     size_t tokcap = 0;
     size_t toklen = 0;
-    int ch;
+    char buf[16384];
     int read_err = 0;
-    while ((ch = smallclueGetcStream(stdin, &read_err)) != EOF) {
-        if (isspace((unsigned char)ch)) {
-            if (toklen > 0) {
+    ssize_t n;
+    char quoteChar = '\0'; /* '\'' or '"' while inside a quoted span, else '\0' */
+    bool sawBackslash = false;
+    bool haveContent = false; /* true once any char (even from an empty "" pair) started this token */
+
+    while ((n = smallclueReadStream(stdin, buf, sizeof(buf), &read_err)) > 0) {
+        for (ssize_t i = 0; i < n; ++i) {
+            int ch = (unsigned char)buf[i];
+            if (sawBackslash) {
+                sawBackslash = false;
+            } else if (quoteChar == '\0' && ch == '\\') {
+                sawBackslash = true;
+                haveContent = true;
+                continue;
+            } else if (quoteChar == '\0' && (ch == '\'' || ch == '"')) {
+                quoteChar = (char)ch;
+                haveContent = true;
+                continue;
+            } else if (quoteChar != '\0' && ch == quoteChar) {
+                quoteChar = '\0';
+                continue;
+            } else if (quoteChar == '\0' && ((ch == ' ') || (ch >= '\t' && ch <= '\r'))) {
+                if (haveContent) {
+                    if (!smallclueLineVectorAppend(vec, token, toklen)) {
+                        free(token);
+                        return false;
+                    }
+                    toklen = 0;
+                    haveContent = false;
+                }
+                continue;
+            }
+            haveContent = true;
+            if (toklen + 1 >= tokcap) {
+                size_t newcap = tokcap ? tokcap * 2 : 64;
+                char *tmp = (char *)realloc(token, newcap);
+                if (!tmp) {
+                    free(token);
+                    return false;
+                }
+                token = tmp;
+                tokcap = newcap;
+            }
+            token[toklen++] = (char)ch;
+        }
+    }
+    if (read_err) {
+        free(token);
+        return false;
+    }
+    if (quoteChar != '\0') {
+        fprintf(stderr, "xargs: unmatched %s quote; by default quotes are special to xargs "
+                        "unless you use the -0 option\n",
+                quoteChar == '\'' ? "single" : "double");
+        free(token);
+        errno = 0; /* signals to the caller that this message is already complete */
+        return false;
+    }
+    if (haveContent) {
+        bool ok = smallclueLineVectorAppend(vec, token, toklen);
+        free(token);
+        return ok;
+    }
+    free(token);
+    return true;
+}
+
+/* xargs -0: tokens are separated by a literal NUL byte instead of
+ * whitespace -- pairs safely with `find -print0`, since it makes no
+ * assumption about filenames not containing spaces/newlines. */
+static bool smallclueReadNulTokensFromStdin(SmallclueLineVector *vec) {
+    char *token = NULL;
+    size_t tokcap = 0;
+    size_t toklen = 0;
+    char buf[16384];
+    int read_err = 0;
+    ssize_t n;
+
+    while ((n = smallclueReadStream(stdin, buf, sizeof(buf), &read_err)) > 0) {
+        for (ssize_t i = 0; i < n; ++i) {
+            char ch = buf[i];
+            if (ch == '\0') {
                 if (!smallclueLineVectorAppend(vec, token, toklen)) {
                     free(token);
                     return false;
                 }
                 toklen = 0;
+                continue;
             }
-            continue;
-        }
-        if (toklen + 1 >= tokcap) {
-            size_t newcap = tokcap ? tokcap * 2 : 64;
-            char *tmp = (char *)realloc(token, newcap);
-            if (!tmp) {
-                free(token);
-                return false;
+            if (toklen + 1 >= tokcap) {
+                size_t newcap = tokcap ? tokcap * 2 : 64;
+                char *tmp = (char *)realloc(token, newcap);
+                if (!tmp) {
+                    free(token);
+                    return false;
+                }
+                token = tmp;
+                tokcap = newcap;
             }
-            token = tmp;
-            tokcap = newcap;
+            token[toklen++] = ch;
         }
-        token[toklen++] = (char)ch;
     }
     if (read_err) {
         free(token);
@@ -2342,10 +3868,76 @@ static bool smallclueReadTokensFromStdin(SmallclueLineVector *vec) {
     return true;
 }
 
+/* xargs -I: each line of input (whole line, not whitespace-split) becomes
+ * one invocation of the command. */
+static bool smallclueReadLinesFromStdin(SmallclueLineVector *vec, bool nulDelimited) {
+    if (nulDelimited) {
+        return smallclueReadNulTokensFromStdin(vec);
+    }
+    char *line = NULL;
+    size_t cap = 0;
+    for (;;) {
+        int read_err = 0;
+        ssize_t len = smallclueGetlineStream(&line, &cap, stdin, &read_err);
+        if (len < 0) {
+            free(line);
+            return read_err == 0;
+        }
+        if (len > 0 && line[len - 1] == '\n') {
+            len--;
+        }
+        if (!smallclueLineVectorAppend(vec, line, (size_t)len)) {
+            free(line);
+            return false;
+        }
+    }
+}
+
+/* Runs one xargs invocation of `cmdArgv` (NULL-terminated, cmdArgv[0] is
+ * the command name). Prefers the in-process builtin-applet dispatch when
+ * the name matches one (fast, no fork), but falls back to fork+execvp for
+ * anything else -- xargs previously could ONLY invoke other smallclue
+ * applets, so `find . | xargs some-external-tool` failed outright even
+ * though external binaries are exactly what a real Linux guest's xargs
+ * needs to be able to run (including other smallclue-multicall symlinks
+ * like ls/rm/grep, which execvp resolves to this same binary anyway). */
+static int smallclueXargsRunOne(char **cmdArgv, int cmdArgc, bool verbose) {
+    if (verbose) {
+        for (int i = 0; i < cmdArgc; ++i) {
+            fprintf(stderr, "%s%s", i > 0 ? " " : "", cmdArgv[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+    const SmallclueApplet *target = smallclueFindApplet(cmdArgv[0]);
+    if (target) {
+        return smallclueDispatchApplet(target, cmdArgc, cmdArgv);
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "xargs: fork: %s\n", strerror(errno));
+        return 1;
+    }
+    if (pid == 0) {
+        execvp(cmdArgv[0], cmdArgv);
+        fprintf(stderr, "xargs: %s: %s\n", cmdArgv[0], strerror(errno));
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        fprintf(stderr, "xargs: waitpid: %s\n", strerror(errno));
+        return 1;
+    }
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    return 1;
+}
+
 typedef struct {
     int pid;
     int ppid;
     uid_t uid;
+    char state;
     char *command;
 } SmallcluePsEntry;
 
@@ -2355,12 +3947,111 @@ static int smallcluePsCompare(const void *a, const void *b) {
     const SmallcluePsEntry *pb = (const SmallcluePsEntry *)b;
     return pa->pid - pb->pid;
 }
+
+static bool smallcluePsParsePidList(const char *s, int **out, size_t *out_count) {
+    size_t cap = 8, count = 0;
+    int *arr = (int *)malloc(cap * sizeof(int));
+    if (!arr) return false;
+    const char *p = s;
+    while (*p) {
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p) {
+            free(arr);
+            return false;
+        }
+        if (count == cap) {
+            cap *= 2;
+            int *resized = (int *)realloc(arr, cap * sizeof(int));
+            if (!resized) {
+                free(arr);
+                return false;
+            }
+            arr = resized;
+        }
+        arr[count++] = (int)v;
+        p = end;
+        if (*p == ',') {
+            p++;
+        } else if (*p != '\0') {
+            free(arr);
+            return false;
+        }
+    }
+    if (count == 0) {
+        free(arr);
+        return false;
+    }
+    *out = arr;
+    *out_count = count;
+    return true;
+}
+
+static bool smallcluePsParseUserList(const char *s, uid_t **out, size_t *out_count) {
+    char *copy = strdup(s);
+    if (!copy) return false;
+    size_t cap = 8, count = 0;
+    uid_t *arr = (uid_t *)malloc(cap * sizeof(uid_t));
+    if (!arr) {
+        free(copy);
+        return false;
+    }
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(copy, ",", &saveptr); tok; tok = strtok_r(NULL, ",", &saveptr)) {
+        uid_t uid;
+        bool resolved = false;
+        if (*tok && strspn(tok, "0123456789") == strlen(tok)) {
+            uid = (uid_t)strtoul(tok, NULL, 10);
+            resolved = true;
+        } else {
+            struct passwd *pw = getpwnam(tok);
+            if (pw) {
+                uid = pw->pw_uid;
+                resolved = true;
+            }
+        }
+        if (!resolved) continue;
+        if (count == cap) {
+            cap *= 2;
+            uid_t *resized = (uid_t *)realloc(arr, cap * sizeof(uid_t));
+            if (!resized) {
+                free(arr);
+                free(copy);
+                return false;
+            }
+            arr = resized;
+        }
+        arr[count++] = uid;
+    }
+    free(copy);
+    if (count == 0) {
+        free(arr);
+        return false;
+    }
+    *out = arr;
+    *out_count = count;
+    return true;
+}
+
+static bool smallcluePsPidMatches(const int *pids, size_t count, int pid) {
+    for (size_t i = 0; i < count; ++i) {
+        if (pids[i] == pid) return true;
+    }
+    return false;
+}
+
+static bool smallcluePsUidMatches(const uid_t *uids, size_t count, uid_t uid) {
+    for (size_t i = 0; i < count; ++i) {
+        if (uids[i] == uid) return true;
+    }
+    return false;
+}
 #endif
 
 static int smallcluePsCommand(int argc, char **argv) {
+#if defined(PSCAL_TARGET_IOS)
     (void)argc;
     (void)argv;
-#if defined(PSCAL_TARGET_IOS)
     size_t cap = vprocSnapshot(NULL, 0);
     VProcSnapshot *snaps = (cap > 0) ? (VProcSnapshot *)calloc(cap, sizeof(VProcSnapshot)) : NULL;
     size_t count = snaps ? vprocSnapshot(snaps, cap) : 0;
@@ -2408,6 +4099,83 @@ static int smallcluePsCommand(int argc, char **argv) {
     free(snaps);
     return 0;
 #else
+    bool fullFormat = false;
+    int *filterPids = NULL;
+    size_t filterPidCount = 0;
+    uid_t *filterUids = NULL;
+    size_t filterUidCount = 0;
+
+    for (int i = 1; i < argc; ++i) {
+        const char *arg = argv[i];
+        if (!arg || !*arg) continue;
+        if (strcmp(arg, "-p") == 0 || strcmp(arg, "--pid") == 0) {
+            if (i + 1 >= argc || !smallcluePsParsePidList(argv[i + 1], &filterPids, &filterPidCount)) {
+                fprintf(stderr, "ps: invalid or missing argument to -p\n");
+                free(filterPids);
+                free(filterUids);
+                return 1;
+            }
+            i++;
+            continue;
+        }
+        if (strncmp(arg, "-p", 2) == 0 && isdigit((unsigned char)arg[2])) {
+            if (!smallcluePsParsePidList(arg + 2, &filterPids, &filterPidCount)) {
+                fprintf(stderr, "ps: invalid argument to -p\n");
+                free(filterPids);
+                free(filterUids);
+                return 1;
+            }
+            continue;
+        }
+        if (strcmp(arg, "-u") == 0 || strcmp(arg, "--user") == 0) {
+            if (i + 1 >= argc || !smallcluePsParseUserList(argv[i + 1], &filterUids, &filterUidCount)) {
+                fprintf(stderr, "ps: invalid or missing argument to -u\n");
+                free(filterPids);
+                free(filterUids);
+                return 1;
+            }
+            i++;
+            continue;
+        }
+        if (strncmp(arg, "-u", 2) == 0 && arg[2] != '\0') {
+            if (!smallcluePsParseUserList(arg + 2, &filterUids, &filterUidCount)) {
+                fprintf(stderr, "ps: invalid argument to -u\n");
+                free(filterPids);
+                free(filterUids);
+                return 1;
+            }
+            continue;
+        }
+        /* Bundled single-char flags, with or without a leading '-' -- real
+         * ps accepts both `ps -ef` and the BSD-legacy `ps aux` spelling,
+         * and the latter is arguably the single most common invocation
+         * in the wild. */
+        const char *flags = (arg[0] == '-') ? arg + 1 : arg;
+        bool recognized = (*flags != '\0');
+        for (const char *fc = flags; recognized && *fc; ++fc) {
+            switch (*fc) {
+                case 'e': case 'E':
+                case 'A': case 'a':
+                case 'x': case 'w': case 'W':
+                    break; /* show-all / no-controlling-tty / wide -- already the default here */
+                case 'f':
+                    fullFormat = true;
+                    break;
+                case 'u': case 'U':
+                    break; /* user-oriented format -- USER column is always shown */
+                default:
+                    recognized = false;
+                    break;
+            }
+        }
+        if (!recognized) {
+            fprintf(stderr, "ps: unsupported option '%s'\n", arg);
+            free(filterPids);
+            free(filterUids);
+            return 1;
+        }
+    }
+
     DIR *dir = opendir("/proc");
     if (dir) {
         SmallcluePsEntry *entries = NULL;
@@ -2419,6 +4187,9 @@ static int smallcluePsCommand(int argc, char **argv) {
             if (!isdigit(ent->d_name[0])) continue;
 
             int pid = atoi(ent->d_name);
+            if (filterPidCount > 0 && !smallcluePsPidMatches(filterPids, filterPidCount, pid)) {
+                continue;
+            }
             char path[PATH_MAX];
 
             snprintf(path, sizeof(path), "/proc/%s/stat", ent->d_name);
@@ -2443,7 +4214,7 @@ static int smallcluePsCommand(int argc, char **argv) {
             char *rest = close_paren + 1;
 
             int ppid = 0;
-            char state_char;
+            char state_char = '?';
             if (sscanf(rest, " %c %d", &state_char, &ppid) != 2) {
                 ppid = 0;
             }
@@ -2453,6 +4224,10 @@ static int smallcluePsCommand(int argc, char **argv) {
             snprintf(path, sizeof(path), "/proc/%s", ent->d_name);
             if (stat(path, &st) == 0) {
                 uid = st.st_uid;
+            }
+            if (filterUidCount > 0 && filterPidCount == 0 &&
+                !smallcluePsUidMatches(filterUids, filterUidCount, uid)) {
+                continue;
             }
 
             char *command = NULL;
@@ -2494,6 +4269,7 @@ static int smallcluePsCommand(int argc, char **argv) {
                 entries[count].pid = pid;
                 entries[count].ppid = ppid;
                 entries[count].uid = uid;
+                entries[count].state = state_char;
                 entries[count].command = command;
                 count++;
             }
@@ -2504,10 +4280,11 @@ static int smallcluePsCommand(int argc, char **argv) {
             qsort(entries, count, sizeof(SmallcluePsEntry), smallcluePsCompare);
         }
 
+        const char *header = fullFormat ? "  PID   PPID USER     S COMMAND" : "  PID   PPID USER     COMMAND";
         if (isatty(STDOUT_FILENO)) {
-            printf("\033[1m  PID   PPID USER     COMMAND\033[0m\n");
+            printf("\033[1m%s\033[0m\n", header);
         } else {
-            printf("  PID   PPID USER     COMMAND\n");
+            printf("%s\n", header);
         }
         for (size_t i = 0; i < count; ++i) {
             struct passwd *pw = getpwuid(entries[i].uid);
@@ -2517,7 +4294,12 @@ static int smallcluePsCommand(int argc, char **argv) {
             } else {
                 snprintf(user_buf, sizeof(user_buf), "%d", (int)entries[i].uid);
             }
-            printf("%5d %6d %-8s %s\n", entries[i].pid, entries[i].ppid, user_buf, entries[i].command);
+            if (fullFormat) {
+                printf("%5d %6d %-8s %c %s\n", entries[i].pid, entries[i].ppid, user_buf,
+                       entries[i].state, entries[i].command);
+            } else {
+                printf("%5d %6d %-8s %s\n", entries[i].pid, entries[i].ppid, user_buf, entries[i].command);
+            }
             free(entries[i].command);
         }
         free(entries);
@@ -2540,6 +4322,8 @@ static int smallcluePsCommand(int argc, char **argv) {
         }
         printf("%5d %6d %-8s %s\n", (int)pid, (int)ppid, user_buf, cmd);
     }
+    free(filterPids);
+    free(filterUids);
     return 0;
 #endif
 }
@@ -2723,9 +4507,16 @@ static int smallclueTopCommand(int argc, char **argv) {
         size_t mem_used_kb = 0, mem_free_kb = 0;
         if (smallclueReadMemStats(&mem_used_kb, &mem_free_kb)) {
             char mem_line[160];
-            int mn = snprintf(mem_line, sizeof(mem_line),
+            int mn;
+            if (isatty(STDOUT_FILENO)) {
+                mn = snprintf(mem_line, sizeof(mem_line),
+                              "\033[7mMem: %zuK used, %zuK free\033[0m\n",
+                              mem_used_kb, mem_free_kb);
+            } else {
+                mn = snprintf(mem_line, sizeof(mem_line),
                               "Mem: %zuK used, %zuK free\n",
                               mem_used_kb, mem_free_kb);
+            }
             if (mn > 0) {
                 (void)smallclueWriteAll(STDOUT_FILENO, mem_line, (size_t)mn);
             }
@@ -2733,9 +4524,16 @@ static int smallclueTopCommand(int argc, char **argv) {
         double cpu_usr = 0, cpu_sys = 0, cpu_nice = 0, cpu_idle = 0;
         if (smallclueReadCpuStats(&cpu_usr, &cpu_sys, &cpu_nice, &cpu_idle)) {
             char cpu_line[160];
-            int cn = snprintf(cpu_line, sizeof(cpu_line),
+            int cn;
+            if (isatty(STDOUT_FILENO)) {
+                cn = snprintf(cpu_line, sizeof(cpu_line),
+                              "\033[7mCPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\033[0m\n\n",
+                              cpu_usr, cpu_sys, cpu_nice, cpu_idle);
+            } else {
+                cn = snprintf(cpu_line, sizeof(cpu_line),
                               "CPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\n\n",
                               cpu_usr, cpu_sys, cpu_nice, cpu_idle);
+            }
             if (cn > 0) {
                 (void)smallclueWriteAll(STDOUT_FILENO, cpu_line, (size_t)cn);
             }
@@ -2746,7 +4544,7 @@ static int smallclueTopCommand(int argc, char **argv) {
         int hn;
         if (isatty(STDOUT_FILENO)) {
             hn = snprintf(header, sizeof(header),
-                          "\033[1m%6s %6s %6s %6s %-3s %-8s %-10s %6s %6s %s\033[0m\n",
+                          "\033[7m%6s %6s %6s %6s %-3s %-8s %-10s %6s %6s %s\033[0m\n",
                           "PID", "PPID", "PGID", "SID", "FG", "PTY", "STATE", "UTIME", "STIME", "CMD");
         } else {
             hn = snprintf(header, sizeof(header),
@@ -2856,6 +4654,392 @@ static int smallclueTopCommand(int argc, char **argv) {
 
     free(snapshots);
     return 0;
+}
+#else
+/* Real /proc-based top for the Linux/aarch64 guest target (and any other
+ * non-iOS build with a /proc filesystem). Reuses the same /proc/[pid]/stat
+ * parsing approach as smallcluePsCommand's non-iOS branch, extended to
+ * also pull utime/stime/rss so per-process %CPU/%MEM can be computed. */
+typedef struct {
+    int pid;
+    int ppid;
+    uid_t uid;
+    char state;
+    unsigned long long cpu_ticks;
+    long rss_kb;
+    char *command;
+    double cpu_percent;
+    double mem_percent;
+} SmallclueTopEntry;
+
+typedef struct {
+    int pid;
+    unsigned long long cpu_ticks;
+} SmallclueTopPrevTicks;
+
+static bool smallclueTopReadProcStatTotal(unsigned long long *total_out, unsigned long long *idle_out) {
+    FILE *fp = fopen("/proc/stat", "r");
+    if (!fp) return false;
+    char line[512];
+    bool ok = false;
+    if (fgets(line, sizeof(line), fp)) {
+        unsigned long long user = 0, nice_ = 0, system_ = 0, idle = 0;
+        unsigned long long iowait = 0, irq = 0, softirq = 0, steal = 0;
+        int n = sscanf(line, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+                        &user, &nice_, &system_, &idle, &iowait, &irq, &softirq, &steal);
+        if (n >= 4) {
+            if (total_out) {
+                *total_out = user + nice_ + system_ + idle + iowait + irq + softirq + steal;
+            }
+            if (idle_out) *idle_out = idle + iowait;
+            ok = true;
+        }
+    }
+    fclose(fp);
+    return ok;
+}
+
+static bool smallclueTopReadMemInfo(size_t *total_kb, size_t *used_kb) {
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) return false;
+    char line[256];
+    unsigned long long total = 0, avail = 0, free_ = 0, buffers = 0, cached = 0;
+    bool haveAvail = false;
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned long long val = 0;
+        if (sscanf(line, "MemTotal: %llu kB", &val) == 1) total = val;
+        else if (sscanf(line, "MemAvailable: %llu kB", &val) == 1) { avail = val; haveAvail = true; }
+        else if (sscanf(line, "MemFree: %llu kB", &val) == 1) free_ = val;
+        else if (sscanf(line, "Buffers: %llu kB", &val) == 1) buffers = val;
+        else if (sscanf(line, "Cached: %llu kB", &val) == 1) cached = val;
+    }
+    fclose(fp);
+    if (total == 0) return false;
+    unsigned long long availTotal = haveAvail ? avail : (free_ + buffers + cached);
+    if (total_kb) *total_kb = (size_t)total;
+    if (used_kb) *used_kb = (size_t)(total > availTotal ? total - availTotal : 0);
+    return true;
+}
+
+static bool smallclueTopReadLoadAvg(double load[3]) {
+    FILE *fp = fopen("/proc/loadavg", "r");
+    if (!fp) return false;
+    bool ok = (fscanf(fp, "%lf %lf %lf", &load[0], &load[1], &load[2]) == 3);
+    fclose(fp);
+    return ok;
+}
+
+static int smallclueTopCompareEntries(const void *a, const void *b) {
+    const SmallclueTopEntry *ea = (const SmallclueTopEntry *)a;
+    const SmallclueTopEntry *eb = (const SmallclueTopEntry *)b;
+    if (ea->cpu_percent != eb->cpu_percent) {
+        return (ea->cpu_percent > eb->cpu_percent) ? -1 : 1;
+    }
+    return ea->pid - eb->pid;
+}
+
+static size_t smallclueTopCollect(SmallclueTopEntry **out_entries) {
+    *out_entries = NULL;
+    DIR *dir = opendir("/proc");
+    if (!dir) return 0;
+
+    SmallclueTopEntry *entries = NULL;
+    size_t count = 0, capacity = 0;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (!isdigit((unsigned char)ent->d_name[0])) continue;
+        int pid = atoi(ent->d_name);
+        char path[PATH_MAX];
+
+        snprintf(path, sizeof(path), "/proc/%s/stat", ent->d_name);
+        FILE *fp = fopen(path, "r");
+        if (!fp) continue;
+        char buf[1024];
+        if (!fgets(buf, sizeof(buf), fp)) {
+            fclose(fp);
+            continue;
+        }
+        fclose(fp);
+
+        char *open_paren = strchr(buf, '(');
+        char *close_paren = strrchr(buf, ')');
+        if (!open_paren || !close_paren || close_paren <= open_paren) continue;
+        *close_paren = '\0';
+        char *comm_short = open_paren + 1;
+        char *rest = close_paren + 1;
+
+        char state = '?';
+        int ppid = 0;
+        unsigned long utime = 0, stime = 0;
+        long rss_pages = 0;
+        int n = sscanf(rest,
+                       " %c %d %*d %*d %*d %*d %*u %*lu %*lu %*lu %*lu"
+                       " %lu %lu %*ld %*ld %*ld %*ld %*ld %*ld %*llu %*lu %ld",
+                       &state, &ppid, &utime, &stime, &rss_pages);
+        if (n < 5) continue;
+
+        struct stat st;
+        uid_t uid = 0;
+        snprintf(path, sizeof(path), "/proc/%s", ent->d_name);
+        if (stat(path, &st) == 0) uid = st.st_uid;
+
+        char *command = NULL;
+        snprintf(path, sizeof(path), "/proc/%s/cmdline", ent->d_name);
+        fp = fopen(path, "r");
+        if (fp) {
+            char cmdline[1024];
+            size_t len = fread(cmdline, 1, sizeof(cmdline) - 1, fp);
+            fclose(fp);
+            if (len > 0) {
+                cmdline[len] = '\0';
+                for (size_t i = 0; i < len; ++i) {
+                    if (cmdline[i] == '\0') cmdline[i] = ' ';
+                }
+                if (cmdline[len - 1] == ' ') cmdline[len - 1] = '\0';
+                if (cmdline[0] != '\0') command = strdup(cmdline);
+            }
+        }
+        if (!command) command = strdup(comm_short);
+        if (!command) continue;
+
+        if (count == capacity) {
+            size_t new_cap = capacity ? capacity * 2 : 32;
+            SmallclueTopEntry *resized = (SmallclueTopEntry *)realloc(entries, new_cap * sizeof(SmallclueTopEntry));
+            if (!resized) {
+                free(command);
+                break;
+            }
+            entries = resized;
+            capacity = new_cap;
+        }
+        entries[count].pid = pid;
+        entries[count].ppid = ppid;
+        entries[count].uid = uid;
+        entries[count].state = state;
+        entries[count].cpu_ticks = (unsigned long long)utime + (unsigned long long)stime;
+        long page_kb = sysconf(_SC_PAGESIZE) / 1024;
+        if (page_kb <= 0) page_kb = 4;
+        entries[count].rss_kb = rss_pages * page_kb;
+        entries[count].command = command;
+        entries[count].cpu_percent = 0.0;
+        entries[count].mem_percent = 0.0;
+        count++;
+    }
+    closedir(dir);
+    *out_entries = entries;
+    return count;
+}
+
+static unsigned long long smallclueTopPrevTicksFor(const SmallclueTopPrevTicks *prev, size_t prev_count, int pid) {
+    for (size_t i = 0; i < prev_count; ++i) {
+        if (prev[i].pid == pid) return prev[i].cpu_ticks;
+    }
+    return 0;
+}
+
+static int smallclueTopCommand(int argc, char **argv) {
+    smallclueResetGetopt();
+    smallclueClearPendingSignals();
+    double delay = 3.0;
+    int max_iterations = -1;
+    bool batch = !isatty(STDOUT_FILENO);
+
+    for (int i = 1; i < argc; ++i) {
+        const char *arg = argv[i];
+        if (strcmp(arg, "-d") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "top: option requires an argument -- 'd'\n");
+                return 1;
+            }
+            char *end = NULL;
+            delay = strtod(argv[++i], &end);
+            if (!end || *end != '\0' || delay <= 0.0) {
+                fprintf(stderr, "top: invalid delay '%s'\n", argv[i]);
+                return 1;
+            }
+        } else if (strcmp(arg, "-n") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "top: option requires an argument -- 'n'\n");
+                return 1;
+            }
+            char *end = NULL;
+            long count = strtol(argv[++i], &end, 10);
+            if (!end || *end != '\0' || count <= 0 || count > INT_MAX) {
+                fprintf(stderr, "top: invalid count '%s'\n", argv[i]);
+                return 1;
+            }
+            max_iterations = (int)count;
+        } else if (strcmp(arg, "-b") == 0) {
+            batch = true;
+        } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+            fputs("top [-d SECONDS] [-n COUNT] [-b]\n"
+                  "  Show real system processes, sorted by %CPU.\n"
+                  "  -d SECONDS refresh delay (default 3)\n"
+                  "  -n COUNT   exit after COUNT frames (default: run until interrupted)\n"
+                  "  -b         batch mode: never clear the screen, print every frame\n",
+                  stdout);
+            return 0;
+        } else {
+            fprintf(stderr, "top: unsupported option '%s'\n", arg);
+            return 1;
+        }
+    }
+
+    long ticks_per_sec = sysconf(_SC_CLK_TCK);
+    if (ticks_per_sec <= 0) ticks_per_sec = 100;
+
+    /* Take a throwaway baseline sample so the first displayed frame has a
+     * meaningful (non-zero) %CPU instead of always reading 0.0 -- matters
+     * for the common single-shot `top -b -n 1` scripted invocation, which
+     * would otherwise never get a second sample to diff against. */
+    SmallclueTopPrevTicks *prev = NULL;
+    size_t prev_count = 0;
+    unsigned long long prev_total_ticks = 0, prev_idle_ticks = 0;
+    struct timespec prev_wall = {0, 0};
+    {
+        SmallclueTopEntry *baseline = NULL;
+        size_t baseline_count = smallclueTopCollect(&baseline);
+        prev = (SmallclueTopPrevTicks *)calloc(baseline_count ? baseline_count : 1, sizeof(SmallclueTopPrevTicks));
+        if (prev) {
+            for (size_t i = 0; i < baseline_count; ++i) {
+                prev[i].pid = baseline[i].pid;
+                prev[i].cpu_ticks = baseline[i].cpu_ticks;
+            }
+            prev_count = baseline_count;
+        }
+        for (size_t i = 0; i < baseline_count; ++i) free(baseline[i].command);
+        free(baseline);
+        smallclueTopReadProcStatTotal(&prev_total_ticks, &prev_idle_ticks);
+        clock_gettime(CLOCK_MONOTONIC, &prev_wall);
+        struct timespec primeSleep = {0, 200 * 1000 * 1000};
+        nanosleep(&primeSleep, NULL);
+    }
+
+    int status = 0;
+    int iterations = 0;
+    while (1) {
+        int abort_status = 0;
+        if (smallclueShouldAbort(&abort_status)) {
+            status = abort_status;
+            break;
+        }
+
+        SmallclueTopEntry *entries = NULL;
+        size_t count = smallclueTopCollect(&entries);
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double wall_delta = (double)(now.tv_sec - prev_wall.tv_sec) +
+                             (double)(now.tv_nsec - prev_wall.tv_nsec) / 1e9;
+        if (wall_delta <= 0.0) wall_delta = 0.001;
+
+        unsigned long long total_ticks = 0, idle_ticks = 0;
+        smallclueTopReadProcStatTotal(&total_ticks, &idle_ticks);
+        unsigned long long total_delta = (total_ticks > prev_total_ticks) ? (total_ticks - prev_total_ticks) : 0;
+        unsigned long long idle_delta = (idle_ticks > prev_idle_ticks) ? (idle_ticks - prev_idle_ticks) : 0;
+        double aggregate_cpu_pct = (total_delta > 0)
+            ? 100.0 * (double)(total_delta - idle_delta) / (double)total_delta
+            : 0.0;
+
+        size_t mem_total_kb = 0, mem_used_kb = 0;
+        bool haveMem = smallclueTopReadMemInfo(&mem_total_kb, &mem_used_kb);
+
+        for (size_t i = 0; i < count; ++i) {
+            unsigned long long prevTicks = smallclueTopPrevTicksFor(prev, prev_count, entries[i].pid);
+            unsigned long long deltaTicks = (entries[i].cpu_ticks > prevTicks) ? (entries[i].cpu_ticks - prevTicks) : 0;
+            /* %CPU relative to a single core over the elapsed wall-clock
+             * interval -- a fully busy single-threaded process reads
+             * ~100%, matching real top/ps convention (can exceed 100% for
+             * multi-threaded processes spanning multiple cores). */
+            entries[i].cpu_percent = 100.0 * (double)deltaTicks / ((double)ticks_per_sec * wall_delta);
+            if (haveMem && mem_total_kb > 0) {
+                entries[i].mem_percent = 100.0 * (double)entries[i].rss_kb / (double)mem_total_kb;
+            }
+        }
+
+        qsort(entries, count, sizeof(SmallclueTopEntry), smallclueTopCompareEntries);
+
+        if (!batch && isatty(STDOUT_FILENO)) {
+            fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
+        }
+
+        double load[3] = {0, 0, 0};
+        bool haveLoad = smallclueTopReadLoadAvg(load);
+        if (haveLoad) {
+            printf("Tasks: %zu total   load average: %.2f, %.2f, %.2f\n", count, load[0], load[1], load[2]);
+        } else {
+            printf("Tasks: %zu total\n", count);
+        }
+        printf("Cpu(s): %.1f%% used, %.1f%% idle\n", aggregate_cpu_pct, 100.0 - aggregate_cpu_pct);
+        if (haveMem) {
+            printf("Mem: %zuK total, %zuK used, %zuK free\n", mem_total_kb,
+                   mem_used_kb, mem_total_kb > mem_used_kb ? mem_total_kb - mem_used_kb : 0);
+        }
+        printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+
+        int rows = -1, cols = -1;
+        if (!batch && isatty(STDOUT_FILENO)) {
+            smallclueGetTerminalSize(&rows, &cols);
+        }
+        size_t visible = count;
+        if (rows > 6) {
+            size_t cap = (size_t)(rows - 6);
+            if (cap < visible) visible = cap;
+        }
+        for (size_t i = 0; i < visible; ++i) {
+            struct passwd *pw = getpwuid(entries[i].uid);
+            char user_buf[32];
+            if (pw) {
+                snprintf(user_buf, sizeof(user_buf), "%s", pw->pw_name);
+            } else {
+                snprintf(user_buf, sizeof(user_buf), "%d", (int)entries[i].uid);
+            }
+            printf("  %5d %5d %-8s %c %7.1f %6.1f %s\n",
+                   entries[i].pid, entries[i].ppid, user_buf, entries[i].state,
+                   entries[i].cpu_percent, entries[i].mem_percent, entries[i].command);
+        }
+        fflush(stdout);
+
+        /* Build next iteration's prev-ticks table directly from the
+         * entries we already have in hand -- no need to re-walk /proc. */
+        free(prev);
+        prev = (SmallclueTopPrevTicks *)calloc(count ? count : 1, sizeof(SmallclueTopPrevTicks));
+        if (prev) {
+            for (size_t i = 0; i < count; ++i) {
+                prev[i].pid = entries[i].pid;
+                prev[i].cpu_ticks = entries[i].cpu_ticks;
+            }
+            prev_count = count;
+        } else {
+            prev_count = 0;
+        }
+        prev_total_ticks = total_ticks;
+        prev_idle_ticks = idle_ticks;
+        prev_wall = now;
+
+        for (size_t i = 0; i < count; ++i) free(entries[i].command);
+        free(entries);
+
+        if (max_iterations > 0) {
+            iterations++;
+            if (iterations >= max_iterations) break;
+        }
+
+        struct timespec ts;
+        ts.tv_sec = (time_t)delay;
+        ts.tv_nsec = (long)((delay - (double)ts.tv_sec) * 1e9);
+        if (ts.tv_nsec < 0) ts.tv_nsec = 0;
+        while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
+            if (smallclueShouldAbort(&abort_status)) {
+                status = abort_status;
+                free(prev);
+                return status;
+            }
+        }
+    }
+
+    free(prev);
+    return status;
 }
 #endif
 
@@ -3052,60 +5236,349 @@ static int smallclueKillCommand(int argc, char **argv) {
     return smallclueKillCommandOriginal(argc, argv);
 }
 
-static int smallclueXargsCommand(int argc, char **argv) {
-    smallclueResetGetopt();
-    int opt;
-    while ((opt = getopt(argc, argv, "")) != -1) {
-        fprintf(stderr, "usage: xargs command [initial-args]\n");
-        return 1;
+/* Parses a duration like "5", "2.5", "3s", "1m", "2h", "1d" into seconds. */
+static bool smallclueTimeoutParseDuration(const char *s, double *out) {
+    if (!s || !*s) return false;
+    char *end = NULL;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (errno != 0 || end == s || v < 0) return false;
+    double mult = 1.0;
+    if (*end != '\0') {
+        if (end[1] != '\0') return false;
+        switch (*end) {
+            case 's': mult = 1.0; break;
+            case 'm': mult = 60.0; break;
+            case 'h': mult = 3600.0; break;
+            case 'd': mult = 86400.0; break;
+            default: return false;
+        }
     }
-    if (optind >= argc) {
+    *out = v * mult;
+    return true;
+}
+
+/* Runs COMMAND in its own process group with a wall-clock time limit,
+ * sending it a signal (default TERM) if it hasn't exited by then, and
+ * escalating to KILL after --kill-after if it's still alive. Polls with
+ * waitpid(WNOHANG) rather than relying on SIGALRM/itimers, matching the
+ * simple portable style used elsewhere in this file (e.g. init's reap
+ * loop) instead of adding signal-handler state. */
+static int smallclueTimeoutCommand(int argc, char **argv) {
+    int signalToSend = SIGTERM;
+    double killAfter = 0.0;
+    bool preserveStatus = false;
+
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        if (strcmp(arg, "-s") == 0 || strcmp(arg, "--signal") == 0) {
+            if (argi + 1 >= argc || !smallclueParseSignal(argv[argi + 1], &signalToSend)) {
+                fprintf(stderr, "timeout: invalid signal\n");
+                return 125;
+            }
+            argi++;
+        } else if (strncmp(arg, "--signal=", 9) == 0) {
+            if (!smallclueParseSignal(arg + 9, &signalToSend)) {
+                fprintf(stderr, "timeout: invalid signal '%s'\n", arg + 9);
+                return 125;
+            }
+        } else if (strncmp(arg, "-s", 2) == 0 && arg[2] != '\0') {
+            if (!smallclueParseSignal(arg + 2, &signalToSend)) {
+                fprintf(stderr, "timeout: invalid signal '%s'\n", arg + 2);
+                return 125;
+            }
+        } else if (strcmp(arg, "-k") == 0 || strcmp(arg, "--kill-after") == 0) {
+            if (argi + 1 >= argc || !smallclueTimeoutParseDuration(argv[argi + 1], &killAfter)) {
+                fprintf(stderr, "timeout: invalid duration\n");
+                return 125;
+            }
+            argi++;
+        } else if (strncmp(arg, "--kill-after=", 13) == 0) {
+            if (!smallclueTimeoutParseDuration(arg + 13, &killAfter)) {
+                fprintf(stderr, "timeout: invalid duration '%s'\n", arg + 13);
+                return 125;
+            }
+        } else if (strcmp(arg, "--preserve-status") == 0) {
+            preserveStatus = true;
+        } else if (arg[0] == '-' && arg[1] != '\0') {
+            fprintf(stderr, "timeout: unknown option '%s'\n", arg);
+            return 125;
+        } else {
+            break;
+        }
+    }
+
+    if (argi >= argc) {
+        fprintf(stderr, "timeout: missing duration\n");
+        return 125;
+    }
+    double duration;
+    if (!smallclueTimeoutParseDuration(argv[argi], &duration)) {
+        fprintf(stderr, "timeout: invalid duration '%s'\n", argv[argi]);
+        return 125;
+    }
+    argi++;
+    if (argi >= argc) {
+        fprintf(stderr, "timeout: missing command\n");
+        return 125;
+    }
+    char **cmdArgv = &argv[argi];
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "timeout: fork: %s\n", strerror(errno));
+        return 125;
+    }
+    if (pid == 0) {
+        setpgid(0, 0);
+        execvp(cmdArgv[0], cmdArgv);
+        fprintf(stderr, "timeout: %s: %s\n", cmdArgv[0], strerror(errno));
+        _exit(127);
+    }
+    setpgid(pid, pid);
+
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    bool timedOut = false;
+    bool killSent = false;
+    struct timespec signalSentAt = {0, 0};
+    int status = 0;
+    for (;;) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid) break;
+        if (r < 0 && errno != EINTR) {
+            fprintf(stderr, "timeout: waitpid: %s\n", strerror(errno));
+            return 125;
+        }
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (double)(now.tv_sec - start.tv_sec) +
+                          (double)(now.tv_nsec - start.tv_nsec) / 1e9;
+        if (!timedOut && elapsed >= duration) {
+            kill(-pid, signalToSend);
+            timedOut = true;
+            signalSentAt = now;
+        } else if (timedOut && killAfter > 0.0 && !killSent) {
+            double sinceSignal = (double)(now.tv_sec - signalSentAt.tv_sec) +
+                                   (double)(now.tv_nsec - signalSentAt.tv_nsec) / 1e9;
+            if (sinceSignal >= killAfter) {
+                kill(-pid, SIGKILL);
+                killSent = true;
+            }
+        }
+        struct timespec pollInterval = {0, 20 * 1000 * 1000};
+        nanosleep(&pollInterval, NULL);
+    }
+
+    if (timedOut) {
+        if (preserveStatus) {
+            if (WIFEXITED(status)) return WEXITSTATUS(status);
+            if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+            return 1;
+        }
+        return 124;
+    }
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return 1;
+}
+
+/* xargs -I REPLACE mode: builds one invocation's argv by substituting
+ * every base-arg token that equals `replaceStr` with `value`. Returns a
+ * NULL-terminated argv the caller must free (each element + the array). */
+/* Replaces every occurrence of `needle` in `haystack` with `value`
+ * (matching GNU xargs -I, which substitutes the placeholder wherever it
+ * appears WITHIN an argument -- e.g. `echo "file: {}"` -- not only when
+ * the entire argument equals the placeholder). Returns a newly allocated
+ * string the caller must free. */
+static char *smallclueXargsSubstitute(const char *haystack, const char *needle, const char *value) {
+    size_t needleLen = strlen(needle);
+    size_t valueLen = strlen(value);
+    size_t count = 0;
+    for (const char *p = haystack; (p = strstr(p, needle)) != NULL; p += needleLen) {
+        count++;
+    }
+    size_t resultLen = strlen(haystack) + count * (valueLen > needleLen ? valueLen - needleLen : 0) + 1;
+    if (valueLen < needleLen) {
+        resultLen = strlen(haystack) + 1;
+    }
+    char *result = (char *)malloc(resultLen);
+    if (!result) return NULL;
+    char *out = result;
+    const char *cursor = haystack;
+    const char *match;
+    while ((match = strstr(cursor, needle)) != NULL) {
+        size_t prefixLen = (size_t)(match - cursor);
+        memcpy(out, cursor, prefixLen);
+        out += prefixLen;
+        memcpy(out, value, valueLen);
+        out += valueLen;
+        cursor = match + needleLen;
+    }
+    strcpy(out, cursor);
+    return result;
+}
+
+static char **smallclueXargsBuildIArgv(char **baseArgs, int baseCount, const char *replaceStr, const char *value) {
+    char **cmdArgv = (char **)calloc((size_t)baseCount + 1, sizeof(char *));
+    if (!cmdArgv) return NULL;
+    for (int i = 0; i < baseCount; ++i) {
+        cmdArgv[i] = smallclueXargsSubstitute(baseArgs[i], replaceStr, value);
+        if (!cmdArgv[i]) {
+            for (int k = 0; k < i; ++k) free(cmdArgv[k]);
+            free(cmdArgv);
+            return NULL;
+        }
+    }
+    return cmdArgv;
+}
+
+static void smallclueXargsFreeArgv(char **cmdArgv, int count) {
+    if (!cmdArgv) return;
+    for (int i = 0; i < count; ++i) {
+        free(cmdArgv[i]);
+    }
+    free(cmdArgv);
+}
+
+static int smallclueXargsCommand(int argc, char **argv) {
+    bool nulDelimited = false;
+    bool verbose = false;
+    const char *replaceStr = NULL;
+    int maxArgsPerInvocation = 0; /* 0 = unlimited (one invocation, all args) */
+
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        if (strcmp(arg, "-0") == 0) {
+            nulDelimited = true;
+        } else if (strcmp(arg, "-t") == 0) {
+            verbose = true;
+        } else if (strncmp(arg, "-I", 2) == 0 && arg[2] != '\0') {
+            /* Attached form, e.g. `-I{}` -- the common real-world spelling
+             * (`find . | xargs -I{} cmd {}`), not just `-I {}` separately. */
+            replaceStr = arg + 2;
+        } else if (strcmp(arg, "-I") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "xargs: -I requires a replacement string\n");
+                return 1;
+            }
+            replaceStr = argv[++argi];
+        } else if (strcmp(arg, "-n") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "xargs: -n requires a count\n");
+                return 1;
+            }
+            maxArgsPerInvocation = atoi(argv[++argi]);
+        } else if (arg[0] == '-' && arg[1] != '\0') {
+            fprintf(stderr, "xargs: unsupported option '%s'\n", arg);
+            return 1;
+        } else {
+            break;
+        }
+    }
+    if (argi >= argc) {
         fprintf(stderr, "xargs: missing command name\n");
         return 1;
     }
-    int base_count = argc - optind;
-    char **base_args = &argv[optind];
-    const SmallclueApplet *target = smallclueFindApplet(base_args[0]);
-    if (!target) {
-        fprintf(stderr, "xargs: '%s' not found\n", base_args[0]);
-        return 127;
-    }
-    SmallclueLineVector extra = {0};
-    if (!smallclueReadTokensFromStdin(&extra)) {
-        perror("xargs");
-        smallclueLineVectorFree(&extra);
-        return 1;
-    }
-    size_t total = (size_t)base_count + extra.count;
-    char **cmd_argv = (char **)calloc(total + 1, sizeof(char *));
-    if (!cmd_argv) {
-        perror("xargs");
-        smallclueLineVectorFree(&extra);
-        return 1;
-    }
-    size_t index = 0;
-    for (int i = 0; i < base_count; ++i) {
-        cmd_argv[index] = strdup(base_args[i]);
-        if (!cmd_argv[index]) {
+    int baseCount = argc - argi;
+    char **baseArgs = &argv[argi];
+
+    int status = 0;
+
+    if (replaceStr) {
+        /* -I mode: one invocation per input LINE (not per whitespace
+         * token), substituting `replaceStr` wherever it appears in the
+         * base command's own args. */
+        SmallclueLineVector lines = {0};
+        if (!smallclueReadLinesFromStdin(&lines, nulDelimited)) {
             perror("xargs");
-            for (size_t k = 0; k < index; ++k) {
-                free(cmd_argv[k]);
+            smallclueLineVectorFree(&lines);
+            return 1;
+        }
+        for (size_t i = 0; i < lines.count; ++i) {
+            if (lines.items[i][0] == '\0') continue;
+            char **cmdArgv = smallclueXargsBuildIArgv(baseArgs, baseCount, replaceStr, lines.items[i]);
+            if (!cmdArgv) {
+                perror("xargs");
+                status = 1;
+                continue;
             }
-            free(cmd_argv);
+            int rc = smallclueXargsRunOne(cmdArgv, baseCount, verbose);
+            if (rc != 0) status = 1;
+            smallclueXargsFreeArgv(cmdArgv, baseCount);
+        }
+        smallclueLineVectorFree(&lines);
+        return status;
+    }
+
+    SmallclueLineVector extra = {0};
+    bool ok = nulDelimited ? smallclueReadNulTokensFromStdin(&extra) : smallclueReadTokensFromStdin(&extra);
+    if (!ok) {
+        /* smallclueReadTokensFromStdin already reports unmatched-quote
+         * errors itself; only an out-of-memory condition reaches here
+         * without having printed anything, so perror() still applies. */
+        if (!nulDelimited && errno == 0) {
+            /* message already printed */
+        } else {
+            perror("xargs");
+        }
+        smallclueLineVectorFree(&extra);
+        return 1;
+    }
+
+    size_t batchSize = maxArgsPerInvocation > 0 ? (size_t)maxArgsPerInvocation : extra.count;
+    if (batchSize == 0) {
+        /* No input tokens at all: still run once with just the base
+         * command (matches traditional xargs, which runs the command
+         * with no extra args rather than skipping it, unless --no-run-
+         * if-empty is requested -- not implemented here). */
+        char **cmdArgv = (char **)calloc((size_t)baseCount + 1, sizeof(char *));
+        if (!cmdArgv) {
+            perror("xargs");
             smallclueLineVectorFree(&extra);
             return 1;
         }
-        index++;
+        for (int i = 0; i < baseCount; ++i) {
+            cmdArgv[i] = strdup(baseArgs[i]);
+        }
+        status = smallclueXargsRunOne(cmdArgv, baseCount, verbose);
+        smallclueXargsFreeArgv(cmdArgv, baseCount);
+        smallclueLineVectorFree(&extra);
+        return status;
     }
-    for (size_t i = 0; i < extra.count; ++i) {
-        cmd_argv[index++] = extra.items[i];
-        extra.items[i] = NULL;
+
+    for (size_t start = 0; start < extra.count; start += batchSize) {
+        size_t end = start + batchSize;
+        if (end > extra.count) end = extra.count;
+        size_t batchCount = end - start;
+        size_t total = (size_t)baseCount + batchCount;
+        char **cmdArgv = (char **)calloc(total + 1, sizeof(char *));
+        if (!cmdArgv) {
+            perror("xargs");
+            status = 1;
+            break;
+        }
+        size_t index = 0;
+        for (int i = 0; i < baseCount; ++i) {
+            cmdArgv[index++] = strdup(baseArgs[i]);
+        }
+        for (size_t i = start; i < end; ++i) {
+            cmdArgv[index++] = strdup(extra.items[i]);
+        }
+        int rc = smallclueXargsRunOne(cmdArgv, (int)total, verbose);
+        if (rc != 0) status = 1;
+        smallclueXargsFreeArgv(cmdArgv, (int)total);
     }
-    int status = smallclueDispatchApplet(target, (int)total, cmd_argv);
-    for (size_t i = 0; i < total; ++i) {
-        free(cmd_argv[i]);
-    }
-    free(cmd_argv);
     smallclueLineVectorFree(&extra);
     return status;
 }
@@ -3141,6 +5614,150 @@ static int smallclueStringCompare(const void *a, const void *b) {
     return strcmp(*lhs, *rhs);
 }
 
+/* qsort's comparator signature has no room for a context pointer, so sort's
+ * extra options (numeric/key-field/separator) live in this file-scope
+ * struct, set immediately before the one qsort() call that uses it. */
+typedef struct {
+    bool numeric;
+    bool haveKey;
+    int keyField; /* 1-based; the key runs from here to end-of-line, matching
+                    * GNU sort's own semantics for a bare "-k N" (no ",M" end
+                    * field) */
+    char keySep;  /* 0 = split on runs of whitespace (GNU sort's default) */
+} SmallclueSortOptions;
+
+static SmallclueSortOptions gSmallclueSortOpts;
+
+/* Returns a pointer into `line` (no copy) at the start of the requested
+ * sort key -- either the whole line, or from the Nth field onward. */
+static const char *smallclueSortKeyOf(const char *line) {
+    if (!gSmallclueSortOpts.haveKey) {
+        return line;
+    }
+    const char *p = line;
+    int field = 1;
+    while (field < gSmallclueSortOpts.keyField && *p) {
+        if (gSmallclueSortOpts.keySep) {
+            while (*p && *p != gSmallclueSortOpts.keySep) p++;
+            if (*p) p++;
+        } else {
+            while (*p && isspace((unsigned char)*p)) p++;
+            while (*p && !isspace((unsigned char)*p)) p++;
+            while (*p && isspace((unsigned char)*p)) p++;
+        }
+        field++;
+    }
+    return p;
+}
+
+static int smallclueSortCompare(const void *a, const void *b) {
+    const char *lhs = *(const char *const *)a;
+    const char *rhs = *(const char *const *)b;
+    const char *lkey = smallclueSortKeyOf(lhs);
+    const char *rkey = smallclueSortKeyOf(rhs);
+    if (gSmallclueSortOpts.numeric) {
+        double lv = strtod(lkey, NULL);
+        double rv = strtod(rkey, NULL);
+        if (lv < rv) return -1;
+        if (lv > rv) return 1;
+        return 0;
+    }
+    return strcmp(lkey, rkey);
+}
+
+/* qsort() isn't guaranteed stable, but GNU sort documents itself as
+ * stable (equal-key lines keep their original relative order). A simple
+ * bottom-up-recursive merge sort gives that for free (merge always
+ * takes the left/earlier run on a tie) without needing to smuggle an
+ * original-index tiebreaker through qsort's context-free comparator. */
+static void smallclueSortStableMerge(char **arr, char **temp, size_t lo, size_t mid, size_t hi) {
+    size_t i = lo, j = mid, k = lo;
+    while (i < mid && j < hi) {
+        if (smallclueSortCompare(&arr[i], &arr[j]) <= 0) {
+            temp[k++] = arr[i++];
+        } else {
+            temp[k++] = arr[j++];
+        }
+    }
+    while (i < mid) temp[k++] = arr[i++];
+    while (j < hi) temp[k++] = arr[j++];
+    for (size_t x = lo; x < hi; ++x) arr[x] = temp[x];
+}
+
+static void smallclueSortStableRec(char **arr, char **temp, size_t lo, size_t hi) {
+    if (hi - lo <= 1) return;
+    size_t mid = lo + (hi - lo) / 2;
+    smallclueSortStableRec(arr, temp, lo, mid);
+    smallclueSortStableRec(arr, temp, mid, hi);
+    smallclueSortStableMerge(arr, temp, lo, mid, hi);
+}
+
+static void smallclueSortStable(char **arr, size_t count) {
+    if (count < 2) return;
+    char **temp = (char **)malloc(count * sizeof(char *));
+    if (!temp) {
+        qsort(arr, count, sizeof(char *), smallclueSortCompare);
+        return;
+    }
+    smallclueSortStableRec(arr, temp, 0, count);
+    free(temp);
+}
+
+/* -c/--check: verifies the input is already ordered per the current
+ * comparator/reverse settings, printing GNU sort's "disorder" diagnostic
+ * (unless quiet) and returning 1 on the first out-of-order pair. */
+static int smallclueSortCheckOrder(const SmallclueLineVector *vec, bool reverse, bool quiet, const char *label) {
+    for (size_t i = 1; i < vec->count; ++i) {
+        int cmp = smallclueSortCompare(&vec->items[i - 1], &vec->items[i]);
+        bool outOfOrder = reverse ? (cmp < 0) : (cmp > 0);
+        if (outOfOrder) {
+            if (!quiet) {
+                char *lineCopy = strdup(vec->items[i]);
+                if (lineCopy) {
+                    size_t len = strlen(lineCopy);
+                    if (len > 0 && lineCopy[len - 1] == '\n') lineCopy[len - 1] = '\0';
+                    fprintf(stderr, "sort: %s:%zu: disorder: %s\n", label ? label : "-", i + 1, lineCopy);
+                    free(lineCopy);
+                }
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static FILE *smallclueOpenTempFile(const char *tag) {
+#if defined(PSCAL_TARGET_IOS)
+    const char *tmp_root = getenv("TMPDIR");
+    if (!tmp_root || !*tmp_root) {
+        tmp_root = "/tmp";
+    }
+    const char *name = (tag && *tag) ? tag : "tmp";
+    char tmpl[PATH_MAX];
+    snprintf(tmpl, sizeof(tmpl), "%s/smallclue-%s-XXXXXX", tmp_root, name);
+    int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        return NULL;
+    }
+    int tracked_fd = vprocHostDup(fd);
+    if (tracked_fd >= 0) {
+        close(fd);
+        fd = tracked_fd;
+    }
+    FILE *fp = fdopen(fd, "w+b");
+    if (!fp) {
+        close(fd);
+        unlink(tmpl);
+        return NULL;
+    }
+    unlink(tmpl);
+    return fp;
+#else
+    (void)tag;
+    return tmpfile();
+#endif
+}
+
 static int pagerCollectLines(const char *cmd_name, const char *path, FILE *stream, PagerBuffer *buffer) {
     if (!stream || !buffer) {
         return 1;
@@ -3159,6 +5776,18 @@ static int pagerCollectLines(const char *cmd_name, const char *path, FILE *strea
                 pager_command_name(cmd_name), strerror(errno));
         return 1;
     }
+#if defined(PSCAL_TARGET_IOS)
+    /*
+     * mkstemp() may bypass vproc's open tracking on iOS. Move the descriptor
+     * to a vproc-tracked duplicate so stdio writes are permitted by shim
+     * fallback hardening.
+     */
+    int tracked_fd = vprocHostDup(fd);
+    if (tracked_fd >= 0) {
+        close(fd);
+        fd = tracked_fd;
+    }
+#endif
     FILE *fp = fdopen(fd, "w+b");
     if (!fp) {
         close(fd);
@@ -3194,10 +5823,11 @@ static int pagerCollectLines(const char *cmd_name, const char *path, FILE *strea
             return 1;
         }
         if (read_bytes > 0) {
-            size_t written = fwrite(buf, 1, (size_t)read_bytes, fp);
-            if (written != (size_t)read_bytes) {
-                fprintf(stderr, "%s: failed to buffer pager input\n",
-                        pager_command_name(cmd_name));
+            int write_err = 0;
+            if (!smallclueWriteFullyStream(fp, buf, (size_t)read_bytes, &write_err)) {
+                fprintf(stderr, "%s: failed to buffer pager input: %s\n",
+                        pager_command_name(cmd_name),
+                        strerror(write_err ? write_err : EIO));
                 free(offsets);
                 fclose(fp);
                 return 1;
@@ -3338,16 +5968,24 @@ static size_t pagerMaxTop(const PagerBuffer *buffer, int page_rows) {
     return buffer->line_count - page;
 }
 
-static int pagerPromptAndRead(const char *cmd_name) {
+static int pagerPromptAndRead(const char *cmd_name, const char *detail) {
     const char *label = pager_command_name(cmd_name);
     bool md_mode = (label && strcmp(label, "md") == 0);
     bool color = isatty(STDOUT_FILENO);
     const char *inv = color ? "\033[7m" : "";
     const char *rst = color ? "\033[0m" : "";
-    if (md_mode) {
-        fprintf(stdout, "\r%s--%s-- (Space=next, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)%s ", inv, label, rst);
+    if (detail && *detail) {
+        if (md_mode) {
+            fprintf(stdout, "\r%s--%s %s-- (Space=advance, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)%s ",
+                    inv, label, detail, rst);
+        } else {
+            fprintf(stdout, "\r%s--%s %s-- (Space=advance, b=prev, arrows=scroll, q=next file, Q=exit)%s ",
+                    inv, label, detail, rst);
+        }
+    } else if (md_mode) {
+        fprintf(stdout, "\r%s--%s-- (Space=advance, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)%s ", inv, label, rst);
     } else {
-        fprintf(stdout, "\r%s--%s-- (Space=next, b=prev, arrows=scroll, q=quit)%s ", inv, label, rst);
+        fprintf(stdout, "\r%s--%s-- (Space=advance, b=prev, arrows=scroll, q=quit)%s ", inv, label, rst);
     }
     fflush(stdout);
     int key = pager_read_key();
@@ -3522,8 +6160,12 @@ static void pagerSigwinchHandler(int signo) {
 }
 
 static int pager_terminal_rows(void);
+static int pager_terminal_cols(void);
 
-static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, int page_rows) {
+static int pagerInteractiveSession(const char *cmd_name,
+                                   const char *detail,
+                                   PagerBuffer *buffer,
+                                   int page_rows) {
     if (!buffer || buffer->line_count == 0) {
         pager_last_exit_key = 'q';
         pager_last_md_link_index = -1;
@@ -3565,7 +6207,7 @@ static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, in
             free(highlight);
             redraw = false;
         }
-        int key = pagerPromptAndRead(cmd_name);
+        int key = pagerPromptAndRead(cmd_name, detail);
         switch (key) {
             case PAGER_KEY_RESIZE:
                 g_pager_sigwinch_received = 0;
@@ -3598,6 +6240,10 @@ static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, in
                     }
                     top = new_top;
                     redraw = true;
+                } else if (key == ' ') {
+                    pager_last_exit_key = ' ';
+                    pager_last_md_link_index = -1;
+                    goto done;
                 } else {
                     pagerBell();
                 }
@@ -3689,8 +6335,10 @@ done:
 }
 
 static int print_file(const char *path, FILE *stream) {
-    char buffer[4096];
+    char buffer[65536];
     bool dbg = getenv("PSCALI_PIPE_DEBUG") != NULL;
+    /* Bolt optimization: Use direct write calls for 'cat' to bypass stdio overhead */
+    fflush(stdout); /* flush any previously buffered stdout data to prevent interleaving */
     while (true) {
         int read_err = 0;
         ssize_t n = smallclueReadStream(stream, buffer, sizeof(buffer), &read_err);
@@ -3703,9 +6351,15 @@ static int print_file(const char *path, FILE *stream) {
         if (n == 0) {
             break;
         }
-        if (fwrite(buffer, 1, (size_t)n, stdout) != (size_t)n) {
-            perror("cat: write error");
-            return 1;
+        size_t total_written = 0;
+        while (total_written < (size_t)n) {
+            ssize_t nw = write(STDOUT_FILENO, buffer + total_written, (size_t)n - total_written);
+            if (nw < 0) {
+                if (errno == EINTR) continue;
+                perror("cat: write error");
+                return 1;
+            }
+            total_written += (size_t)nw;
         }
         if (dbg) {
             fprintf(stderr, "[cat] wrote chunk=%zu bytes\n", (size_t)n);
@@ -3786,6 +6440,8 @@ static _Thread_local int pager_control_fd_value = -2;
 #if defined(PSCAL_TARGET_IOS)
 static _Thread_local bool pager_session_queue_enabled = false;
 #endif
+static _Thread_local int pager_observed_rows = 0;
+static _Thread_local int pager_observed_cols = 0;
 
 // Duplicate an FD for pager control input only if it can be read from.
 static int pagerDupForRead(int fd) {
@@ -4137,10 +6793,29 @@ static int pager_read_key(void) {
     }
     int result = 'q';
     const int seq_timeout_ms = 120;
+    const int resize_poll_ms = 100;
+    if (pager_observed_rows <= 0 || pager_observed_cols <= 0) {
+        int initial_rows = pager_terminal_rows();
+        int initial_cols = pager_terminal_cols();
+        if (initial_rows > 0) {
+            pager_observed_rows = initial_rows;
+        }
+        if (initial_cols > 0) {
+            pager_observed_cols = initial_cols;
+        }
+    }
     for (;;) {
         unsigned char ch = 0;
-        ssize_t n = pagerReadByteWithTimeout(fd, use_session_queue, &ch, true, seq_timeout_ms);
+        ssize_t n = pagerReadByteWithTimeout(fd, use_session_queue, &ch, false, resize_poll_ms);
         if (n == -2) {
+            int rows_now = pager_terminal_rows();
+            int cols_now = pager_terminal_cols();
+            if (rows_now > 0) {
+                pager_observed_rows = rows_now;
+            }
+            if (cols_now > 0) {
+                pager_observed_cols = cols_now;
+            }
             result = PAGER_KEY_RESIZE;
             break;
         }
@@ -4154,6 +6829,22 @@ static int pager_read_key(void) {
             }
         }
         if (n <= 0) {
+            int rows_now = pager_terminal_rows();
+            int cols_now = pager_terminal_cols();
+            if (rows_now > 0 && cols_now > 0) {
+                if (pager_observed_rows <= 0 || pager_observed_cols <= 0) {
+                    pager_observed_rows = rows_now;
+                    pager_observed_cols = cols_now;
+                } else if (rows_now != pager_observed_rows || cols_now != pager_observed_cols) {
+                    pager_observed_rows = rows_now;
+                    pager_observed_cols = cols_now;
+                    result = PAGER_KEY_RESIZE;
+                    break;
+                }
+            }
+            if (n == 0) {
+                continue;
+            }
             break;
         }
         if (ch == '\x1b') {
@@ -4211,11 +6902,6 @@ static int pager_terminal_rows(void) {
     const char *lines = getenv("LINES");
     if (lines && *lines) {
         parsed = atoi(lines);
-#if defined(PSCAL_TARGET_IOS)
-        if (parsed > 0) {
-            return parsed;
-        }
-#endif
     }
     struct winsize ws;
     if (isatty(STDOUT_FILENO) && ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
@@ -4244,11 +6930,6 @@ static int pager_terminal_cols(void) {
     const char *cols = getenv("COLUMNS");
     if (cols && *cols) {
         parsed = atoi(cols);
-#if defined(PSCAL_TARGET_IOS)
-        if (parsed > 0) {
-            return parsed;
-        }
-#endif
     }
     struct winsize ws;
     if (isatty(STDOUT_FILENO) && ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
@@ -4329,7 +7010,11 @@ static bool pagerStreamIsInteractive(FILE *stream) {
     return isatty(fd) != 0;
 }
 
-static int pager_file(const char *cmd_name, const char *path, FILE *stream, bool raw_mode) {
+static int pager_file(const char *cmd_name,
+                      const char *path,
+                      const char *detail,
+                      FILE *stream,
+                      bool raw_mode) {
     pager_control_fd_reset();
     pager_last_exit_key = 'q';
     pager_last_md_link_index = -1;
@@ -4430,10 +7115,10 @@ static int pager_file(const char *cmd_name, const char *path, FILE *stream, bool
 #if defined(PSCAL_TARGET_IOS)
     bool prev_session_queue = pager_session_queue_enabled;
     pager_session_queue_enabled = true;
-    status = pagerInteractiveSession(cmd_name, &buffer, page_rows);
+    status = pagerInteractiveSession(cmd_name, detail, &buffer, page_rows);
     pager_session_queue_enabled = prev_session_queue;
 #else
-    status = pagerInteractiveSession(cmd_name, &buffer, page_rows);
+    status = pagerInteractiveSession(cmd_name, detail, &buffer, page_rows);
 #endif
     pagerBufferFree(&buffer);
     pager_control_fd_reset();
@@ -5472,6 +8157,20 @@ static int markdownTermWidth(void) {
     return MARKDOWN_WRAP_WIDTH;
 }
 
+static int markdownPreferredWrapWidth(void) {
+    int width = markdownTermWidth();
+    if (width <= 20) {
+        return MARKDOWN_WRAP_WIDTH;
+    }
+    if (width > 2) {
+        width -= 2;
+    }
+    if (width < 20) {
+        return MARKDOWN_WRAP_WIDTH;
+    }
+    return width;
+}
+
 static char *markdownTrimInline(char *str) {
     if (!str) return str;
     while (*str && isspace((unsigned char)*str)) {
@@ -5714,14 +8413,14 @@ static char markdownFenceMarker(const char *text) {
     return '\0';
 }
 
-static void markdownWriteHeading(FILE *out, const char *text, int level) {
+static void markdownWriteHeading(FILE *out, const char *text, int level, int wrap_width) {
     if (!text || !*text) return;
     char *formatted = markdownSimplifyInline(text);
     if (!formatted) return;
     fprintf(out, "%s\n", formatted);
     char underline = (level == 1) ? '=' : '-';
     size_t len = strlen(formatted);
-    size_t underline_len = len > MARKDOWN_WRAP_WIDTH ? MARKDOWN_WRAP_WIDTH : len;
+    size_t underline_len = len > (size_t)wrap_width ? (size_t)wrap_width : len;
     for (size_t i = 0; i < underline_len; ++i) {
         fputc(underline, out);
     }
@@ -5803,7 +8502,7 @@ static bool markdownExtractListItem(char *line, char **content, char *firstPrefi
     return false;
 }
 
-static void markdownFlushParagraph(FILE *out, char **paragraph, size_t *length) {
+static void markdownFlushParagraph(FILE *out, char **paragraph, size_t *length, int wrap_width) {
     if (!paragraph || !*paragraph || !length || *length == 0) {
         return;
     }
@@ -5822,7 +8521,7 @@ static void markdownFlushParagraph(FILE *out, char **paragraph, size_t *length) 
     } else {
         char *formatted = markdownSimplifyInline(text);
         if (formatted) {
-            markdownWrapAndWrite(out, formatted, "", "", MARKDOWN_WRAP_WIDTH);
+            markdownWrapAndWrite(out, formatted, "", "", wrap_width);
             free(formatted);
         }
         fputc('\n', out);
@@ -6763,15 +9462,18 @@ static bool markdownLooksLikeWebNoiseLine(const char *line) {
         return true;
     }
     if (len > 8 && probe[len - 1] == ',' &&
+        !strstr(probe, ". ") &&
         (strchr(probe, '.') || strchr(probe, '[') || strchr(probe, ':'))) {
         return true;
     }
     if (len > 1 && len <= 6 && probe[len - 1] == ',' &&
-        isalpha((unsigned char)probe[0]) && !strstr(probe, "://")) {
+        (probe[0] == '.' || probe[0] == '#' || probe[0] == '[' || probe[0] == ':' || probe[0] == '@') &&
+        !strstr(probe, "://")) {
         bool tiny_selector = true;
         for (size_t i = 0; i + 1 < len; ++i) {
             unsigned char ch = (unsigned char)probe[i];
-            if (!(isalnum(ch) || ch == '-' || ch == '_')) {
+            if (!(isalnum(ch) || ch == '-' || ch == '_' ||
+                  ch == '.' || ch == '#' || ch == '[' || ch == ']' || ch == ':')) {
                 tiny_selector = false;
                 break;
             }
@@ -6787,6 +9489,7 @@ static bool markdownLooksLikeWebNoiseLine(const char *line) {
         }
     }
     if (comma_count >= 2 &&
+        !strstr(probe, ". ") &&
         (strchr(probe, '.') || strchr(probe, '[') || strchr(probe, ':') || strstr(probe, "button") || strstr(probe, "html"))) {
         return true;
     }
@@ -6961,12 +9664,13 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
     bool fragmented_link_label_locked = false;
     char fragmented_link_meta[512] = {0};
     bool paragraph_link_only_chain = false;
+    int render_width = markdownPreferredWrapWidth();
 
     if (label && *label) {
         fprintf(output, "%s\n", label);
         size_t underline_len = strlen(label);
-        if (underline_len > MARKDOWN_WRAP_WIDTH) {
-            underline_len = MARKDOWN_WRAP_WIDTH;
+        if (underline_len > (size_t)render_width) {
+            underline_len = (size_t)render_width;
         }
         for (size_t i = 0; i < underline_len; ++i) {
             fputc('=', output);
@@ -7033,7 +9737,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                             paragraph_link_only_chain = false;
                         }
                         if (paragraph_len > 0) {
-                            markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
                             has_blank_separator = true;
                             paragraph_link_only_chain = false;
                         }
@@ -7165,7 +9869,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             if (paragraph_len > 0) {
-                markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
@@ -7183,7 +9887,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             if (paragraph_len > 0) {
-                markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
@@ -7200,7 +9904,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             if (paragraph_len > 0) {
-                markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
@@ -7221,7 +9925,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             if (paragraph_len > 0) {
-                markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
@@ -7232,7 +9936,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
         char fence = markdownFenceMarker(trimmed);
         if (fence != '\0') {
             bool had_paragraph = paragraph_len > 0;
-            markdownFlushParagraph(output, &paragraph, &paragraph_len);
+            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
             if (had_paragraph) {
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
@@ -7264,7 +9968,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             if (paragraph_len > 0) {
-                markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             } else if (!has_blank_separator) {
@@ -7287,7 +9991,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             paragraph[paragraph_len] = '\0';
             char *heading_text = markdownTrimInline(paragraph);
             if (heading_text && *heading_text) {
-                markdownWriteHeading(output, heading_text, setext_heading);
+                markdownWriteHeading(output, heading_text, setext_heading, render_width);
                 has_blank_separator = true;
             }
             paragraph_len = 0;
@@ -7298,12 +10002,12 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
 
         if (markdownIsHorizontalRule(trimmed)) {
             bool had_paragraph = paragraph_len > 0;
-            markdownFlushParagraph(output, &paragraph, &paragraph_len);
+            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
             if (had_paragraph) {
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
-            for (int i = 0; i < MARKDOWN_WRAP_WIDTH; ++i) {
+            for (int i = 0; i < render_width; ++i) {
                 fputc('-', output);
             }
             fputc('\n', output);
@@ -7322,14 +10026,14 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             bool had_paragraph = paragraph_len > 0;
-            markdownFlushParagraph(output, &paragraph, &paragraph_len);
+            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
             if (had_paragraph) {
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
             const char *heading_text = trimmed + heading;
             while (*heading_text == ' ' || *heading_text == '\t') heading_text++;
-            markdownWriteHeading(output, heading_text, heading);
+            markdownWriteHeading(output, heading_text, heading, render_width);
             has_blank_separator = true;
             continue;
         }
@@ -7343,7 +10047,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             bool had_paragraph = paragraph_len > 0;
-            markdownFlushParagraph(output, &paragraph, &paragraph_len);
+            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
             if (had_paragraph) {
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
@@ -7352,7 +10056,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             while (*quote == ' ' || *quote == '\t') quote++;
             char *formatted = markdownSimplifyInline(quote);
             if (formatted) {
-                markdownWrapAndWrite(output, formatted, "> ", "> ", MARKDOWN_WRAP_WIDTH);
+                markdownWrapAndWrite(output, formatted, "> ", "> ", render_width);
                 free(formatted);
             }
             has_blank_separator = true;
@@ -7368,7 +10072,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
         if (pipe_count >= 2) {
             if (!in_table) {
                 bool had_paragraph = paragraph_len > 0;
-                markdownFlushParagraph(output, &paragraph, &paragraph_len);
+                markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
                 if (had_paragraph) {
                     has_blank_separator = true;
                     paragraph_link_only_chain = false;
@@ -7398,14 +10102,14 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
         char prefix_sub[32];
         if (markdownExtractListItem(line, &list_text, prefix_first, sizeof(prefix_first), prefix_sub, sizeof(prefix_sub))) {
             bool had_paragraph = paragraph_len > 0;
-            markdownFlushParagraph(output, &paragraph, &paragraph_len);
+            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
             if (had_paragraph) {
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
             char *formatted = markdownSimplifyInline(list_text);
             if (formatted) {
-                markdownWrapAndWrite(output, formatted, prefix_first, prefix_sub, MARKDOWN_WRAP_WIDTH);
+                markdownWrapAndWrite(output, formatted, prefix_first, prefix_sub, render_width);
                 free(formatted);
             }
             has_blank_separator = false;
@@ -7423,7 +10127,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
     }
 
     bool had_paragraph = paragraph_len > 0;
-    markdownFlushParagraph(output, &paragraph, &paragraph_len);
+    markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
     if (had_paragraph) {
         has_blank_separator = true;
         paragraph_link_only_chain = false;
@@ -7536,7 +10240,7 @@ static int smallclueMarkdownDisplayDataEx(const char *label,
         return 0;
     }
 
-    FILE *source = tmpfile();
+    FILE *source = smallclueOpenTempFile("md-source");
     if (!source) {
         free(converted_html);
         return 1;
@@ -7552,7 +10256,7 @@ static int smallclueMarkdownDisplayDataEx(const char *label,
     fflush(source);
     rewind(source);
 
-    FILE *buffer = tmpfile();
+    FILE *buffer = smallclueOpenTempFile("md-buffer");
     bool direct = false;
     if (!buffer) {
         buffer = stdout;
@@ -7583,7 +10287,7 @@ static int smallclueMarkdownDisplayDataEx(const char *label,
     rewind(buffer);
     const MarkdownLinkList *prev_active_links = pager_active_md_links;
     pagerSetActiveMarkdownLinks(links_out);
-    int status = pager_file("md", label ? label : "(stdin)", buffer, false);
+    int status = pager_file("md", label ? label : "(stdin)", NULL, buffer, false);
     pagerSetActiveMarkdownLinks(prev_active_links);
     if (exit_key_out) {
         *exit_key_out = pagerLastExitKey();
@@ -7652,7 +10356,7 @@ static int markdownFetchUrlToMemory(const char *url, char **data_out, size_t *le
     }
     *data_out = NULL;
     *len_out = 0;
-    if (smallclueHttpFetchToMemory("md", url, data_out, len_out) != 0) {
+    if (smallclueHttpFetchToMemory("md", url, data_out, len_out, NULL) != 0) {
         if (*data_out) {
             free(*data_out);
             *data_out = NULL;
@@ -7798,14 +10502,29 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
             top = (links->count > window) ? (links->count - window) : 0;
         }
 
-        smallclueMenuStartFrame(&first_frame);
+        char *frame = NULL;
+        size_t frame_len = 0;
+        FILE *out = open_memstream(&frame, &frame_len);
+        if (!out) {
+            out = stdout;
+        }
+        smallclueMenuStartFrameTo(out, &first_frame);
+        char header[256];
         if (source_label && *source_label) {
-            printf("Links in %s (%zu/%zu)  [Arrows=move Enter=open q=cancel]\n",
+            snprintf(header, sizeof(header), "Links in %s (%zu/%zu)  [Arrows=move Enter=open q=cancel]",
                    source_label, cursor + 1, links->count);
         } else {
-            printf("Links (%zu/%zu)  [Arrows=move Enter=open q=cancel]\n",
+            snprintf(header, sizeof(header), "Links (%zu/%zu)  [Arrows=move Enter=open q=cancel]",
                    cursor + 1, links->count);
         }
+        fputs("\x1b[7m", out);
+        if (cols > 0 && (int)strlen(header) > cols) {
+            if (cols <= 3) { fwrite(header, 1, (size_t)cols, out); }
+            else { fwrite(header, 1, (size_t)(cols - 3), out); fputs("...", out); }
+        } else {
+            fprintf(out, "%s", header);
+        }
+        fputs("\x1b[0m\n", out);
 
         size_t end = top + window;
         if (end > links->count) end = links->count;
@@ -7815,19 +10534,27 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
             const char *target = links->items[i].target ? links->items[i].target : "";
             char line[PATH_MAX * 3];
             snprintf(line, sizeof(line), "%3zu. %s (%s)", i + 1, text, target);
-            if (active) printf("\x1b[7m");
+            if (active) fputs("\x1b[7m", out);
             if (cols > 0 && (int)strlen(line) > cols) {
                 if (cols > 3) {
-                    fwrite(line, 1, (size_t)(cols - 3), stdout);
-                    fputs("...", stdout);
+                    fwrite(line, 1, (size_t)(cols - 3), out);
+                    fputs("...", out);
                 } else {
-                    fwrite(line, 1, (size_t)cols, stdout);
+                    fwrite(line, 1, (size_t)cols, out);
                 }
-                fputc('\n', stdout);
+                fputc('\n', out);
             } else {
-                printf("%s\n", line);
+                fprintf(out, "%s\n", line);
             }
-            if (active) printf("\x1b[0m");
+            if (active) fputs("\x1b[0m", out);
+        }
+        if (out != stdout) {
+            fflush(out);
+            fclose(out);
+            if (frame && frame_len > 0) {
+                fwrite(frame, 1, frame_len, stdout);
+            }
+            free(frame);
         }
         fflush(stdout);
 
@@ -8134,13 +10861,16 @@ static int smallclueMarkdownListDocuments(void) {
     return 0;
 }
 
-static void smallclueMenuStartFrame(bool *first_frame) {
+static void smallclueMenuStartFrameTo(FILE *out, bool *first_frame) {
+    if (!out) {
+        out = stdout;
+    }
     if (first_frame && *first_frame) {
-        printf("\x1b[2J\x1b[H");
+        fputs("\x1b[2J\x1b[H", out);
         *first_frame = false;
         return;
     }
-    printf("\x1b[H\x1b[J");
+    fputs("\x1b[H\x1b[J", out);
 }
 
 static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
@@ -8152,22 +10882,29 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
                                           int term_cols,
                                           bool show_docs_dir,
                                           bool *first_frame) {
-    smallclueMenuStartFrame(first_frame);
+    char *frame = NULL;
+    size_t frame_len = 0;
+    FILE *out = open_memstream(&frame, &frame_len);
+    if (!out) {
+        out = stdout;
+    }
+    smallclueMenuStartFrameTo(out, first_frame);
     char header[256];
     snprintf(header, sizeof(header),
              "Markdown docs (Arrows=move, Enter=open, q=quit) [%zu/%zu]",
              cursor + 1, count);
+    fputs("\x1b[7m", out);
     if (term_cols > 0 && (int)strlen(header) > term_cols) {
         if (term_cols <= 3) {
-            fwrite(header, 1, (size_t)term_cols, stdout);
+            fwrite(header, 1, (size_t)term_cols, out);
         } else {
-            fwrite(header, 1, (size_t)(term_cols - 3), stdout);
-            fputs("...", stdout);
+            fwrite(header, 1, (size_t)(term_cols - 3), out);
+            fputs("...", out);
         }
-        fputc('\n', stdout);
     } else {
-        printf("%s\n", header);
+        fprintf(out, "%s", header);
     }
+    fputs("\x1b[0m\n", out);
     size_t end = top + window;
     if (end > count) {
         end = count;
@@ -8179,21 +10916,21 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
         const char *title = entries[idx].title ? entries[idx].title : "";
         snprintf(line, sizeof(line), " %-24.24s %s", name, title);
         if (highlight) {
-            printf("\x1b[7m");
+            fputs("\x1b[7m", out);
         }
         if (term_cols > 0 && (int)strlen(line) > term_cols) {
             if (term_cols <= 3) {
-                fwrite(line, 1, (size_t)term_cols, stdout);
+                fwrite(line, 1, (size_t)term_cols, out);
             } else {
-                fwrite(line, 1, (size_t)(term_cols - 3), stdout);
-                fputs("...", stdout);
+                fwrite(line, 1, (size_t)(term_cols - 3), out);
+                fputs("...", out);
             }
-            fputc('\n', stdout);
+            fputc('\n', out);
         } else {
-            printf("%s\n", line);
+            fprintf(out, "%s\n", line);
         }
         if (highlight) {
-            printf("\x1b[0m");
+            fputs("\x1b[0m", out);
         }
     }
     if (show_docs_dir) {
@@ -8203,15 +10940,23 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
         snprintf(footer, sizeof(footer), "Docs: %s", visible_docs_dir);
         if (term_cols > 0 && (int)strlen(footer) > term_cols) {
             if (term_cols <= 3) {
-                fwrite(footer, 1, (size_t)term_cols, stdout);
+                fwrite(footer, 1, (size_t)term_cols, out);
             } else {
-                fwrite(footer, 1, (size_t)(term_cols - 3), stdout);
-                fputs("...", stdout);
+                fwrite(footer, 1, (size_t)(term_cols - 3), out);
+                fputs("...", out);
             }
-            fputc('\n', stdout);
+            fputc('\n', out);
         } else {
-            printf("%s\n", footer);
+            fprintf(out, "%s\n", footer);
         }
+    }
+    if (out != stdout) {
+        fflush(out);
+        fclose(out);
+        if (frame && frame_len > 0) {
+            fwrite(frame, 1, frame_len, stdout);
+        }
+        free(frame);
     }
     fflush(stdout);
 }
@@ -8388,6 +11133,41 @@ static void smallclueCurlApplyCommonOptions(CURL *curl, const char *url) {
 #endif
 }
 
+/* Applies -X/-H/-d (method override, custom headers, POST body) onto a
+ * CURL handle. Returns the built curl_slist (or NULL if no headers were
+ * given) -- caller must curl_slist_free_all() it after curl_easy_perform. */
+static struct curl_slist *smallclueCurlApplyRequestOptions(CURL *curl, const SmallclueHttpRequestOptions *reqOpts) {
+    if (!curl || !reqOpts) return NULL;
+    struct curl_slist *headerList = NULL;
+    for (int i = 0; i < reqOpts->headerCount; ++i) {
+        headerList = curl_slist_append(headerList, reqOpts->headers[i]);
+    }
+    if (headerList) {
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
+    }
+    if (reqOpts->postData) {
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, reqOpts->postData);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(reqOpts->postData));
+    }
+    if (reqOpts->method && *reqOpts->method) {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, reqOpts->method);
+    }
+    if (reqOpts->userpwd && *reqOpts->userpwd) {
+        /* Real curl's default (without --anyauth/--digest/etc.) is
+         * preemptive Basic auth, sent on the first request without
+         * waiting for a 401 challenge -- CURLAUTH_ANY would instead defer
+         * until challenged, which is wrong for the common case and was
+         * caught by comparing against real curl's actual wire behavior. */
+        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, (long)CURLAUTH_BASIC);
+        curl_easy_setopt(curl, CURLOPT_USERPWD, reqOpts->userpwd);
+    }
+    if (reqOpts->insecureTls) {
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
+    return headerList;
+}
+
 static size_t smallclueCurlWriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     FILE *dest = (FILE *)userp;
     size_t bytes = size * nmemb;
@@ -8461,8 +11241,10 @@ static void smallclueUrlSuggestFilename(const char *url, char *buffer, size_t bu
     buffer[len] = '\0';
 }
 
-static int smallclueHttpFetch(const char *cmd_name, const char *url, const char *destinationPath) {
+static int smallclueHttpFetch(const char *cmd_name, const char *url, const char *destinationPath,
+                              const SmallclueHttpRequestOptions *reqOpts) {
 #if !defined(PSCAL_HAS_LIBCURL)
+    (void)reqOpts;
     fprintf(stderr, "%s: networking support is unavailable in this build.\n", cmd_name ? cmd_name : "curl");
     return 1;
 #else
@@ -8487,6 +11269,7 @@ static int smallclueHttpFetch(const char *cmd_name, const char *url, const char 
         close_dest = true;
     }
     smallclueCurlApplyCommonOptions(curl, url);
+    struct curl_slist *headerList = smallclueCurlApplyRequestOptions(curl, reqOpts);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, smallclueCurlWriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, dest);
     CURLcode res = curl_easy_perform(curl);
@@ -8495,6 +11278,7 @@ static int smallclueHttpFetch(const char *cmd_name, const char *url, const char 
     } else {
         fflush(dest);
     }
+    if (headerList) curl_slist_free_all(headerList);
     if (res != CURLE_OK) {
         fprintf(stderr, "%s: %s: %s\n", cmd_name ? cmd_name : "curl", url, curl_easy_strerror(res));
         curl_easy_cleanup(curl);
@@ -8505,10 +11289,12 @@ static int smallclueHttpFetch(const char *cmd_name, const char *url, const char 
 #endif
 }
 
-static int smallclueHttpFetchToMemory(const char *cmd_name, const char *url, char **data_out, size_t *len_out) {
+static int smallclueHttpFetchToMemory(const char *cmd_name, const char *url, char **data_out, size_t *len_out,
+                                      const SmallclueHttpRequestOptions *reqOpts) {
 #if !defined(PSCAL_HAS_LIBCURL)
     (void)data_out;
     (void)len_out;
+    (void)reqOpts;
     fprintf(stderr, "%s: networking support is unavailable in this build.\n", cmd_name ? cmd_name : "curl");
     return 1;
 #else
@@ -8528,6 +11314,7 @@ static int smallclueHttpFetchToMemory(const char *cmd_name, const char *url, cha
     }
     SmallclueCurlMemory buffer = {0};
     smallclueCurlApplyCommonOptions(curl, url);
+    struct curl_slist *headerList = smallclueCurlApplyRequestOptions(curl, reqOpts);
     bool is_md_fetch = (cmd_name && strcmp(cmd_name, "md") == 0);
     if (is_md_fetch) {
         /* Keep md browsing responsive on problematic endpoints. */
@@ -8539,6 +11326,7 @@ static int smallclueHttpFetchToMemory(const char *cmd_name, const char *url, cha
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, smallclueCurlWriteMemoryCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
     CURLcode res = curl_easy_perform(curl);
+    if (headerList) curl_slist_free_all(headerList);
     if (res != CURLE_OK) {
         fprintf(stderr, "%s: %s: %s\n", cmd_name ? cmd_name : "curl", url, curl_easy_strerror(res));
         curl_easy_cleanup(curl);
@@ -8590,6 +11378,77 @@ static int cat_file(const char *path) {
     return status;
 }
 
+typedef struct {
+    bool numberAll;      /* -n */
+    bool numberNonBlank;  /* -b (takes priority over -n if both given) */
+    bool showEnds;        /* -E: '$' at end of line */
+    bool showTabs;        /* -T: tabs as ^I */
+    bool squeezeBlank;    /* -s: collapse runs of blank lines to one */
+} SmallclueCatOptions;
+
+/* Line-based formatting path, used only when any of -n/-b/-A/-E/-T/-s is
+ * given -- the flag-less case keeps using the existing raw-byte-stream
+ * print_file()/cat_file() fast path unchanged. */
+static int smallclueCatFileFormatted(const char *path, const SmallclueCatOptions *opts, long *lineNo, bool *prevBlank) {
+    FILE *fp;
+    const char *label = path ? path : "(stdin)";
+    if (!path || strcmp(path, "-") == 0) {
+        fp = stdin;
+    } else {
+        char resolved[PATH_MAX];
+        const char *open_path = smallclueResolvePath(path, resolved, sizeof(resolved));
+        if (!open_path || *open_path == '\0') open_path = path;
+        fp = fopen(open_path, "rb");
+        if (!fp) {
+            fprintf(stderr, "cat: %s: %s\n", path, strerror(errno));
+            return 1;
+        }
+    }
+    char *line = NULL;
+    size_t cap = 0;
+    int status = 0;
+    for (;;) {
+        int read_err = 0;
+        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
+        if (len < 0) {
+            if (read_err) {
+                fprintf(stderr, "cat: %s: %s\n", label, strerror(read_err));
+                status = 1;
+            }
+            break;
+        }
+        bool hadNewline = (len > 0 && line[len - 1] == '\n');
+        if (hadNewline) {
+            line[len - 1] = '\0';
+            len--;
+        }
+        bool isBlank = (len == 0);
+        if (opts->squeezeBlank && isBlank && *prevBlank) {
+            continue;
+        }
+        *prevBlank = isBlank;
+
+        if (opts->numberAll || opts->numberNonBlank) {
+            if (!opts->numberNonBlank || !isBlank) {
+                printf("%6ld\t", ++(*lineNo));
+            }
+        }
+        if (opts->showTabs) {
+            for (ssize_t i = 0; i < len; ++i) {
+                if (line[i] == '\t') fputs("^I", stdout);
+                else putchar(line[i]);
+            }
+        } else {
+            fwrite(line, 1, (size_t)len, stdout);
+        }
+        if (opts->showEnds) putchar('$');
+        if (hadNewline) putchar('\n');
+    }
+    free(line);
+    if (fp != stdin) fclose(fp);
+    return status;
+}
+
 static void print_permissions(mode_t mode) {
     putchar(S_ISDIR(mode) ? 'd' : S_ISLNK(mode) ? 'l' : '-');
     putchar(mode & S_IRUSR ? 'r' : '-');
@@ -8603,7 +11462,10 @@ static void print_permissions(mode_t mode) {
     putchar(mode & S_IXOTH ? 'x' : '-');
 }
 
-static void print_long_listing(const char *filename, const struct stat *s, bool human, bool numeric_ids, const char *color) {
+static void print_long_listing(const char *filename, const struct stat *s, bool human, bool numeric_ids, bool show_inode, const char *color) {
+    if (show_inode) {
+        printf("%8llu ", (unsigned long long)s->st_ino);
+    }
     print_permissions(s->st_mode);
     printf(" %2llu", (unsigned long long)s->st_nlink);
 
@@ -8660,7 +11522,8 @@ static int print_path_entry_with_stat(const char *path,
                                       bool numeric_ids,
                                       const struct stat *stat_buf,
                                       int color_mode,
-                                      int classify) {
+                                      int classify,
+                                      bool show_inode) {
     struct stat local_stat;
     const struct stat *st = stat_buf;
     if (!st) {
@@ -8693,8 +11556,11 @@ static int print_path_entry_with_stat(const char *path,
         }
     }
     if (long_format) {
-        print_long_listing(out, st, human, numeric_ids, color);
+        print_long_listing(out, st, human, numeric_ids, show_inode, color);
     } else {
+        if (show_inode) {
+            printf("%8llu ", (unsigned long long)st->st_ino);
+        }
         if (color)
             printf("\033[%sm%s\033[0m\n", color, out);
         else
@@ -8723,7 +11589,7 @@ static char *join_path(const char *base, const char *name) {
 }
 
 static __attribute__((unused)) int print_path_entry(const char *path, const char *label, bool long_format, bool human, int color_mode, int classify) {
-    return print_path_entry_with_stat(path, label, long_format, human, false, NULL, color_mode, classify);
+    return print_path_entry_with_stat(path, label, long_format, human, false, NULL, color_mode, classify, false);
 }
 
 typedef struct {
@@ -8789,12 +11655,72 @@ static int compare_ls_entries_group_dirs_mtime(const void *lhs, const void *rhs)
     return strcmp(a->name, b->name);
 }
 
+static int compare_ls_entries_by_size(const void *lhs, const void *rhs) {
+    const SmallclueLsEntry *a = (const SmallclueLsEntry *)lhs;
+    const SmallclueLsEntry *b = (const SmallclueLsEntry *)rhs;
+    if (a->stat_buf.st_size > b->stat_buf.st_size) return -1;
+    if (a->stat_buf.st_size < b->stat_buf.st_size) return 1;
+    return strcmp(a->name, b->name);
+}
+
+static const char *smallclueLsExtensionOf(const char *name) {
+    const char *dot = strrchr(name, '.');
+    return (dot && dot != name) ? dot + 1 : "";
+}
+
+static int compare_ls_entries_by_extension(const void *lhs, const void *rhs) {
+    const SmallclueLsEntry *a = (const SmallclueLsEntry *)lhs;
+    const SmallclueLsEntry *b = (const SmallclueLsEntry *)rhs;
+    int cmp = strcmp(smallclueLsExtensionOf(a->name), smallclueLsExtensionOf(b->name));
+    if (cmp != 0) return cmp;
+    return strcmp(a->name, b->name);
+}
+
+/* Natural/version sort (GNU ls -v): compares runs of digits numerically
+ * so "file2" sorts before "file10", falling back to plain lexical
+ * comparison for non-digit runs. Implemented by hand rather than via
+ * glibc's strverscmp(3) since that's not available on macOS (this
+ * project builds here for dev even though the deploy target is Linux). */
+static int smallclueNaturalCompare(const char *a, const char *b) {
+    while (*a && *b) {
+        if (isdigit((unsigned char)*a) && isdigit((unsigned char)*b)) {
+            const char *a_start = a, *b_start = b;
+            while (*a == '0') a++;
+            while (*b == '0') b++;
+            const char *a_digits = a, *b_digits = b;
+            while (isdigit((unsigned char)*a)) a++;
+            while (isdigit((unsigned char)*b)) b++;
+            size_t a_len = (size_t)(a - a_digits);
+            size_t b_len = (size_t)(b - b_digits);
+            if (a_len != b_len) return (a_len < b_len) ? -1 : 1;
+            int cmp = strncmp(a_digits, b_digits, a_len);
+            if (cmp != 0) return cmp;
+            /* Equal numeric value: fewer leading zeros sorts first
+             * (matches GNU strverscmp's own tie-break convention). */
+            size_t a_zeros = (size_t)(a_digits - a_start);
+            size_t b_zeros = (size_t)(b_digits - b_start);
+            if (a_zeros != b_zeros) return (a_zeros < b_zeros) ? -1 : 1;
+            continue;
+        }
+        if (*a != *b) return (unsigned char)*a - (unsigned char)*b;
+        a++;
+        b++;
+    }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
+static int compare_ls_entries_by_version(const void *lhs, const void *rhs) {
+    const SmallclueLsEntry *a = (const SmallclueLsEntry *)lhs;
+    const SmallclueLsEntry *b = (const SmallclueLsEntry *)rhs;
+    return smallclueNaturalCompare(a->name, b->name);
+}
+
 #define LS_FORMAT_AUTO 0
 #define LS_FORMAT_LONG 1
 #define LS_FORMAT_COLUMNS 2
 #define LS_FORMAT_SINGLE 3
 
-static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int color_mode, int classify) {
+static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int color_mode, int classify, bool show_inode) {
     if (count == 0) {
         return;
     }
@@ -8804,9 +11730,23 @@ static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int 
         term_cols = 80;
     }
 
+    size_t inode_width = 0;
+    if (show_inode) {
+        for (size_t i = 0; i < count; ++i) {
+            char inobuf[32];
+            int w = snprintf(inobuf, sizeof(inobuf), "%llu", (unsigned long long)entries[i].stat_buf.st_ino);
+            if (w > 0 && (size_t)w > inode_width) {
+                inode_width = (size_t)w;
+            }
+        }
+    }
+
     size_t max_len = 0;
     for (size_t i = 0; i < count; ++i) {
         size_t len = strlen(entries[i].name);
+        if (show_inode) {
+            len += inode_width + 1; /* inode digits + one separating space */
+        }
         if (len > max_len) {
             max_len = len;
         }
@@ -8831,8 +11771,15 @@ static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int 
             }
             const struct stat *st = &entries[idx].stat_buf;
             const char *name = entries[idx].name;
+            char withInode[PATH_MAX];
+            const char *base = name;
+            if (show_inode) {
+                snprintf(withInode, sizeof(withInode), "%*llu %s",
+                         (int)inode_width, (unsigned long long)st->st_ino, name);
+                base = withInode;
+            }
             char decorated[PATH_MAX];
-            const char *out = name;
+            const char *out = base;
             if (classify) {
                 char suffix = '\0';
                 if (S_ISDIR(st->st_mode)) suffix = '/';
@@ -8841,7 +11788,7 @@ static void print_ls_columns(const SmallclueLsEntry *entries, size_t count, int 
                 else if (S_ISFIFO(st->st_mode)) suffix = '|';
                 else if (st->st_mode & S_IXUSR) suffix = '*';
                 if (suffix != '\0') {
-                    snprintf(decorated, sizeof(decorated), "%s%c", name, suffix);
+                    snprintf(decorated, sizeof(decorated), "%s%c", base, suffix);
                     decorated[sizeof(decorated) - 1] = '\0';
                     out = decorated;
                 }
@@ -8870,7 +11817,13 @@ static int list_directory(const char *path,
                           bool human,
                           bool numeric_ids,
                           int color_mode,
-                          int classify) {
+                          int classify,
+                          bool sort_by_size,
+                          bool sort_by_extension,
+                          bool reverse_sort,
+                          bool recursive,
+                          bool show_inode,
+                          bool sort_by_version) {
     DIR *d = opendir(path);
     if (!d) {
         fprintf(stderr, "ls: %s: %s\n", path, strerror(errno));
@@ -8951,8 +11904,21 @@ static int list_directory(const char *path,
             }
         } else if (sort_by_time) {
             comparator = compare_ls_entries_by_mtime;
+        } else if (sort_by_size) {
+            comparator = compare_ls_entries_by_size;
+        } else if (sort_by_extension) {
+            comparator = compare_ls_entries_by_extension;
+        } else if (sort_by_version) {
+            comparator = compare_ls_entries_by_version;
         }
         qsort(entries, count, sizeof(entries[0]), comparator);
+        if (reverse_sort) {
+            for (size_t i = 0; i < count / 2; ++i) {
+                SmallclueLsEntry tmp = entries[i];
+                entries[i] = entries[count - 1 - i];
+                entries[count - 1 - i] = tmp;
+            }
+        }
     }
 
     if (format_mode == LS_FORMAT_LONG) {
@@ -8964,7 +11930,8 @@ static int list_directory(const char *path,
                                                  numeric_ids,
                                                  &entries[i].stat_buf,
                                                  color_mode,
-                                                 classify);
+                                                 classify,
+                                                 show_inode);
         }
     } else if (format_mode == LS_FORMAT_SINGLE) {
         for (size_t i = 0; i < count; ++i) {
@@ -8975,10 +11942,23 @@ static int list_directory(const char *path,
                                                  numeric_ids,
                                                  &entries[i].stat_buf,
                                                  color_mode,
-                                                 classify);
+                                                 classify,
+                                                 show_inode);
         }
     } else {
-        print_ls_columns(entries, count, color_mode, classify);
+        print_ls_columns(entries, count, color_mode, classify, show_inode);
+    }
+
+    if (recursive) {
+        for (size_t i = 0; i < count; ++i) {
+            if (!S_ISDIR(entries[i].stat_buf.st_mode)) continue;
+            if (strcmp(entries[i].name, ".") == 0 || strcmp(entries[i].name, "..") == 0) continue;
+            printf("\n%s:\n", entries[i].full_path);
+            status |= list_directory(entries[i].full_path, show_all, show_almost_all, format_mode,
+                                     sort_by_time, group_directories_first, human, numeric_ids,
+                                     color_mode, classify, sort_by_size, sort_by_extension,
+                                     reverse_sort, recursive, show_inode, sort_by_version);
+        }
     }
 
     free_ls_entries(entries, count);
@@ -9015,20 +11995,101 @@ static void print_usage(void) {
     fprintf(stderr, "\nYou can symlink applets to 'smallclue' or invoke them directly.\n");
 }
 
+/* Expands bash-echo-style backslash escapes (\a \b \e \f \n \r \t \v \\,
+ * plus \0NNN octal and \xHH hex) while printing directly to stdout.
+ * Returns true if \c was encountered, meaning the caller should stop all
+ * further output immediately (no trailing space/newline, no more args). */
+static bool smallclueEchoPrintExpanded(const char *s) {
+    for (const char *p = s; *p; ++p) {
+        if (*p == '\\' && p[1]) {
+            switch (p[1]) {
+                case 'a': putchar('\a'); p++; continue;
+                case 'b': putchar('\b'); p++; continue;
+                case 'c': return true;
+                case 'e': putchar('\033'); p++; continue;
+                case 'f': putchar('\f'); p++; continue;
+                case 'n': putchar('\n'); p++; continue;
+                case 'r': putchar('\r'); p++; continue;
+                case 't': putchar('\t'); p++; continue;
+                case 'v': putchar('\v'); p++; continue;
+                case '\\': putchar('\\'); p++; continue;
+                case '0': {
+                    int val = 0, digits = 0;
+                    const char *q = p + 2;
+                    while (digits < 3 && *q >= '0' && *q <= '7') {
+                        val = val * 8 + (*q - '0');
+                        q++;
+                        digits++;
+                    }
+                    putchar(val);
+                    p = q - 1;
+                    continue;
+                }
+                case 'x': {
+                    int val = 0, digits = 0;
+                    const char *q = p + 2;
+                    while (digits < 2 && isxdigit((unsigned char)*q)) {
+                        char hc = *q;
+                        int hv = (hc >= '0' && hc <= '9') ? hc - '0' : (tolower((unsigned char)hc) - 'a' + 10);
+                        val = val * 16 + hv;
+                        q++;
+                        digits++;
+                    }
+                    if (digits > 0) {
+                        putchar(val);
+                        p = q - 1;
+                        continue;
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+        putchar(*p);
+    }
+    return false;
+}
+
 static int smallclueEchoCommand(int argc, char **argv) {
     int print_newline = 1;
+    bool interpret_escapes = false;
     int start_index = 1;
-    if (argc > 1 && strcmp(argv[1], "-n") == 0) {
-        print_newline = 0;
-        start_index = 2;
+
+    /* Matches bash's builtin echo option scanning: a leading arg is only
+     * an option cluster if EVERY character after the '-' is one of
+     * n/e/E; anything else (including a bare "-") stops option scanning
+     * and is treated as the first operand. */
+    for (; start_index < argc; ++start_index) {
+        const char *arg = argv[start_index];
+        if (!arg || arg[0] != '-' || arg[1] == '\0') break;
+        bool all_flags = true;
+        for (const char *c = arg + 1; *c; ++c) {
+            if (*c != 'n' && *c != 'e' && *c != 'E') {
+                all_flags = false;
+                break;
+            }
+        }
+        if (!all_flags) break;
+        for (const char *c = arg + 1; *c; ++c) {
+            if (*c == 'n') print_newline = 0;
+            else if (*c == 'e') interpret_escapes = true;
+            else if (*c == 'E') interpret_escapes = false;
+        }
     }
-    for (int i = start_index; i < argc; i++) {
-        printf("%s", argv[i]);
-        if (i < argc - 1) {
+
+    bool stop = false;
+    for (int i = start_index; i < argc && !stop; i++) {
+        if (interpret_escapes) {
+            stop = smallclueEchoPrintExpanded(argv[i]);
+        } else {
+            fputs(argv[i], stdout);
+        }
+        if (!stop && i < argc - 1) {
             putchar(' ');
         }
     }
-    if (print_newline) {
+    if (print_newline && !stop) {
         putchar('\n');
     }
     return 0;
@@ -9042,7 +12103,13 @@ static bool smallclueLsValidateShortOptions(const char *arg,
                                             int *list_dirs_only,
                                             int *human_sizes,
                                             int *classify,
-                                            int *numeric_ids) {
+                                            int *numeric_ids,
+                                            int *sort_by_size,
+                                            int *sort_by_extension,
+                                            int *reverse_sort,
+                                            int *recursive,
+                                            int *show_inode,
+                                            int *sort_by_version) {
     if (!arg) {
         return true;
     }
@@ -9081,6 +12148,24 @@ static bool smallclueLsValidateShortOptions(const char *arg,
             case 'n':
                 *numeric_ids = 1;
                 *format = LS_FORMAT_LONG;
+                break;
+            case 'S':
+                *sort_by_size = 1;
+                break;
+            case 'X':
+                *sort_by_extension = 1;
+                break;
+            case 'r':
+                *reverse_sort = 1;
+                break;
+            case 'R':
+                *recursive = 1;
+                break;
+            case 'i':
+                *show_inode = 1;
+                break;
+            case 'v':
+                *sort_by_version = 1;
                 break;
             default:
                 fprintf(stderr, "ls: invalid option -- '%c'\n", *cursor);
@@ -9142,6 +12227,12 @@ static int smallclueLsCommand(int argc, char **argv) {
     int classify = 0;
     int numeric_ids = 0;
     int color_mode = 0; /* 0=auto, 1=always, -1=never */
+    int sort_by_size = 0;
+    int sort_by_extension = 0;
+    int reverse_sort = 0;
+    int recursive = 0;
+    int show_inode = 0;
+    int sort_by_version = 0;
     smallclueResetGetopt();
 
     int idx = 1;
@@ -9184,7 +12275,13 @@ static int smallclueLsCommand(int argc, char **argv) {
                                              &list_dirs_only,
                                              &human_sizes,
                                              &classify,
-                                             &numeric_ids)) {
+                                             &numeric_ids,
+                                             &sort_by_size,
+                                             &sort_by_extension,
+                                             &reverse_sort,
+                                             &recursive,
+                                             &show_inode,
+                                             &sort_by_version)) {
             return 1;
         }
         idx++;
@@ -9206,10 +12303,11 @@ static int smallclueLsCommand(int argc, char **argv) {
     int paths_start = idx;
     if (paths_start >= argc) {
         if (list_dirs_only) {
-            return print_path_entry_with_stat(".", ".", format == LS_FORMAT_LONG, human_sizes, numeric_ids, NULL, color_mode, classify) ? 1 : 0;
+            return print_path_entry_with_stat(".", ".", format == LS_FORMAT_LONG, human_sizes, numeric_ids, NULL, color_mode, classify, show_inode) ? 1 : 0;
         }
         return list_directory(".", show_all, show_almost_all, format,
-                              sort_by_time, group_directories_first, human_sizes, numeric_ids, color_mode, classify);
+                              sort_by_time, group_directories_first, human_sizes, numeric_ids, color_mode, classify,
+                              sort_by_size, sort_by_extension, reverse_sort, recursive, show_inode, sort_by_version);
     }
 
     int remaining = argc - paths_start;
@@ -9230,9 +12328,10 @@ static int smallclueLsCommand(int argc, char **argv) {
                 printf("%s:\n", path);
             }
             status |= list_directory(path, show_all, show_almost_all, format,
-                                     sort_by_time, group_directories_first, human_sizes, numeric_ids, color_mode, classify);
+                                     sort_by_time, group_directories_first, human_sizes, numeric_ids, color_mode, classify,
+                                     sort_by_size, sort_by_extension, reverse_sort, recursive, show_inode, sort_by_version);
         } else {
-            status |= print_path_entry_with_stat(path, path, format == LS_FORMAT_LONG, human_sizes, numeric_ids, &stat_buf, color_mode, classify);
+            status |= print_path_entry_with_stat(path, path, format == LS_FORMAT_LONG, human_sizes, numeric_ids, &stat_buf, color_mode, classify, show_inode);
         }
     }
     return status ? 1 : 0;
@@ -9401,33 +12500,83 @@ static int smallclueChmodApplySymbolic(const SmallclueChmodSpec *spec, const cha
     return 0;
 }
 
+static int smallclueChmodApplyOne(const char *path, bool useOctal, mode_t octalMode,
+                                  const SmallclueChmodSpec *symbolicSpec) {
+    if (useOctal) {
+        if (chmod(path, octalMode) != 0) {
+            fprintf(stderr, "chmod: %s: %s\n", path, strerror(errno));
+            return 1;
+        }
+        return 0;
+    }
+    return smallclueChmodApplySymbolic(symbolicSpec, path);
+}
+
+static int smallclueChmodApplyRecursive(const char *path, bool useOctal, mode_t octalMode,
+                                        const SmallclueChmodSpec *symbolicSpec) {
+    int status = smallclueChmodApplyOne(path, useOctal, octalMode, symbolicSpec);
+    struct stat st;
+    if (lstat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        return status;
+    }
+    DIR *dir = opendir(path);
+    if (!dir) {
+        fprintf(stderr, "chmod: %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        char child[PATH_MAX];
+        if (smallclueBuildPath(child, sizeof(child), path, entry->d_name) != 0) {
+            fprintf(stderr, "chmod: %s/%s: %s\n", path, entry->d_name, strerror(errno));
+            status = 1;
+            continue;
+        }
+        if (smallclueChmodApplyRecursive(child, useOctal, octalMode, symbolicSpec) != 0) {
+            status = 1;
+        }
+    }
+    closedir(dir);
+    return status;
+}
+
 static int smallclueChmodCommand(int argc, char **argv) {
-    if (argc < 3) {
-        fprintf(stderr, "usage: chmod mode file...\n");
+    bool recursive = false;
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        if (strcmp(argv[argi], "-R") == 0 || strcmp(argv[argi], "-r") == 0 ||
+            strcmp(argv[argi], "--recursive") == 0) {
+            recursive = true;
+        } else {
+            break;
+        }
+    }
+    if (argc - argi < 2) {
+        fprintf(stderr, "usage: chmod [-R] mode file...\n");
         return 1;
     }
     mode_t octalMode = 0;
     SmallclueChmodSpec symbolicSpec;
-    bool useOctal = smallclueChmodParseOctal(argv[1], &octalMode);
+    bool useOctal = smallclueChmodParseOctal(argv[argi], &octalMode);
     bool useSymbolic = false;
     if (!useOctal) {
-        useSymbolic = smallclueChmodParseSymbolic(argv[1], &symbolicSpec);
+        useSymbolic = smallclueChmodParseSymbolic(argv[argi], &symbolicSpec);
     }
     if (!useOctal && !useSymbolic) {
-        fprintf(stderr, "chmod: invalid mode: %s\n", argv[1]);
+        fprintf(stderr, "chmod: invalid mode: %s\n", argv[argi]);
         return 1;
     }
+    argi++;
     int status = 0;
-    for (int i = 2; i < argc; ++i) {
-        if (useOctal) {
-            if (chmod(argv[i], octalMode) != 0) {
-                fprintf(stderr, "chmod: %s: %s\n", argv[i], strerror(errno));
-                status = 1;
-            }
-        } else {
-            if (smallclueChmodApplySymbolic(&symbolicSpec, argv[i]) != 0) {
-                status = 1;
-            }
+    for (int i = argi; i < argc; ++i) {
+        int rc = recursive
+                     ? smallclueChmodApplyRecursive(argv[i], useOctal, octalMode, &symbolicSpec)
+                     : smallclueChmodApplyOne(argv[i], useOctal, octalMode, &symbolicSpec);
+        if (rc != 0) {
+            status = 1;
         }
     }
     return status;
@@ -9574,11 +12723,45 @@ typedef enum {
 static uint16_t smallclueBsdSum(FILE *f, unsigned long long *out_blocks) {
     uint16_t sum = 0;
     unsigned long long total = 0;
-    int c;
-    while ((c = fgetc(f)) != EOF) {
-        sum = (uint16_t)((sum >> 1) | ((sum & 1) << 15));
-        sum = (uint16_t)((sum + (uint16_t)c) & 0xFFFF);
-        total++;
+    char buf[16384];
+    int read_err = 0;
+    ssize_t n;
+
+    while ((n = smallclueReadStream(f, buf, sizeof(buf), &read_err)) > 0) {
+        ssize_t i = 0;
+        /* Bolt optimization: Loop unrolling for BSD sum to reduce branching overhead */
+        #define PROCESS_BSD_CHAR(idx) do { \
+            unsigned char c = (unsigned char)buf[idx]; \
+            sum = (uint16_t)((sum >> 1) | ((sum & 1) << 15)); \
+            sum = (uint16_t)((sum + (uint16_t)c) & 0xFFFF); \
+        } while (0)
+
+        for (; i + 15 < n; i += 16) {
+            PROCESS_BSD_CHAR(i);
+            PROCESS_BSD_CHAR(i+1);
+            PROCESS_BSD_CHAR(i+2);
+            PROCESS_BSD_CHAR(i+3);
+            PROCESS_BSD_CHAR(i+4);
+            PROCESS_BSD_CHAR(i+5);
+            PROCESS_BSD_CHAR(i+6);
+            PROCESS_BSD_CHAR(i+7);
+            PROCESS_BSD_CHAR(i+8);
+            PROCESS_BSD_CHAR(i+9);
+            PROCESS_BSD_CHAR(i+10);
+            PROCESS_BSD_CHAR(i+11);
+            PROCESS_BSD_CHAR(i+12);
+            PROCESS_BSD_CHAR(i+13);
+            PROCESS_BSD_CHAR(i+14);
+            PROCESS_BSD_CHAR(i+15);
+        }
+        #undef PROCESS_BSD_CHAR
+
+        for (; i < n; ++i) {
+            unsigned char c = (unsigned char)buf[i];
+            sum = (uint16_t)((sum >> 1) | ((sum & 1) << 15));
+            sum = (uint16_t)((sum + (uint16_t)c) & 0xFFFF);
+        }
+        total += (unsigned long long)n;
     }
     if (out_blocks) {
         *out_blocks = (total + 1023ULL) / 1024ULL; /* 1K blocks */
@@ -9589,10 +12772,23 @@ static uint16_t smallclueBsdSum(FILE *f, unsigned long long *out_blocks) {
 static uint16_t smallclueSysvSum(FILE *f, unsigned long long *out_blocks) {
     uint32_t sum = 0;
     unsigned long long total = 0;
-    int c;
-    while ((c = fgetc(f)) != EOF) {
-        sum += (uint8_t)c;
-        total++;
+    char buf[16384];
+    int read_err = 0;
+    ssize_t n;
+
+    while ((n = smallclueReadStream(f, buf, sizeof(buf), &read_err)) > 0) {
+        ssize_t i = 0;
+        /* Bolt optimization: Loop unrolling for SysV sum to reduce branching overhead */
+        for (; i + 15 < n; i += 16) {
+            sum += (uint8_t)buf[i] + (uint8_t)buf[i+1] + (uint8_t)buf[i+2] + (uint8_t)buf[i+3] +
+                   (uint8_t)buf[i+4] + (uint8_t)buf[i+5] + (uint8_t)buf[i+6] + (uint8_t)buf[i+7] +
+                   (uint8_t)buf[i+8] + (uint8_t)buf[i+9] + (uint8_t)buf[i+10] + (uint8_t)buf[i+11] +
+                   (uint8_t)buf[i+12] + (uint8_t)buf[i+13] + (uint8_t)buf[i+14] + (uint8_t)buf[i+15];
+        }
+        for (; i < n; ++i) {
+            sum += (uint8_t)buf[i];
+        }
+        total += (unsigned long long)n;
     }
     /* Fold to 16 bits */
     sum = (sum & 0xFFFF) + (sum >> 16);
@@ -9728,6 +12924,13 @@ static int smallclueVersionCommand(int argc, char **argv) {
     } else {
         printf("version: %s\n", version);
     }
+#if defined(PSCAL_HAS_LIBGIT2)
+    int lg2_major = 0;
+    int lg2_minor = 0;
+    int lg2_rev = 0;
+    git_libgit2_version(&lg2_major, &lg2_minor, &lg2_rev);
+    printf("libgit2: %d.%d.%d\n", lg2_major, lg2_minor, lg2_rev);
+#endif
     free(version);
     return 0;
 }
@@ -9741,6 +12944,7 @@ typedef struct {
 
 static const SmallclueLicense kSmallclueLicenses[] = {
     {"PSCAL", "pscal_LICENSE.txt"},
+    {"libgit2", "libgit2_LICENSE.txt"},
     {"OpenSSH", "openssh_LICENSE.txt"},
     {"curl", "curl_LICENSE.txt"},
     {"OpenSSL", "openssl_LICENSE.txt"},
@@ -9787,7 +12991,7 @@ static bool smallclueLicensesResolvePath(const char *filename, char *out, size_t
 }
 
 static void smallclueLicensesRenderMenu(size_t selected, bool *first_frame) {
-    smallclueMenuStartFrame(first_frame);
+    smallclueMenuStartFrameTo(stdout, first_frame);
     printf("PSCAL & Third-Party Licenses\n");
     printf("Use arrows to navigate, Enter to view, q to quit.\n\n");
     size_t total = smallclueLicensesCount();
@@ -9881,7 +13085,7 @@ static int smallclueHelpCommand(int argc, char **argv) {
                 status = 1;
                 continue;
             }
-            const char *usage = smallclueLookupHelp(applet->name);
+            const char *usage = smallclueLookupAppletUsage(applet->name);
             fprintf(mem, "%s - %s\n", applet->name, applet->description ? applet->description : "");
             if (usage) {
                 fprintf(mem, "Usage:\n%s\n", usage);
@@ -9913,7 +13117,7 @@ static int smallclueHelpCommand(int argc, char **argv) {
                 if (*p == '\n') line_count++;
             }
             if (line_count >= rows) {
-                pager_file("smallclue-help", "(internal)", r, false);
+                pager_file("smallclue-help", "(internal)", NULL, r, false);
             } else {
                 // Print directly if it fits on one screen
                 fwrite(buffer, 1, buflen, stdout);
@@ -10203,16 +13407,75 @@ static void smallclueTimePrintMetric(const char *label, double seconds) {
     printf("%s\t%ldm%.3fs\n", label, minutes, remainder);
 }
 
+static int smallclueTimeRunCommand(int argc, char **argv) {
+    if (argc <= 0 || !argv || !argv[0] || argv[0][0] == '\0') {
+        return 127;
+    }
+
+    const SmallclueApplet *applet = smallclueFindApplet(argv[0]);
+    if (applet) {
+        return smallclueDispatchApplet(applet, argc, argv);
+    }
+
+#if defined(PSCAL_TARGET_IOS)
+    char exec_path[PATH_MAX];
+    char shell_cwd[PATH_MAX];
+    const char *resolve_cwd = NULL;
+    if (vprocShellGetcwdShim(shell_cwd, sizeof(shell_cwd)) != NULL && shell_cwd[0] == '/') {
+        resolve_cwd = shell_cwd;
+    }
+    if (smallclueResolveExecutableFromBaseCwd(resolve_cwd,
+                                              argv[0],
+                                              exec_path,
+                                              sizeof(exec_path)) &&
+        smallcluePathHasShebang(exec_path)) {
+        int status = smallclueRunShebangTool(exec_path, argv);
+        if (status >= 0) {
+            return status;
+        }
+    }
+
+    fprintf(stderr, "time: %s: command not found\n", argv[0]);
+    return 127;
+#else
+    /* Not a built-in applet -- fork+execvp it like a real shell would,
+     * instead of just reporting "command not found". The iOS build has
+     * its own shebang-aware resolver above; on Linux/generic Unix,
+     * execvp already handles PATH search and the kernel handles
+     * shebangs directly, so a plain fork+execvp is sufficient (same
+     * pattern already used by xargs's external-binary fallback and by
+     * timeout's child). */
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "time: fork: %s\n", strerror(errno));
+        return 126;
+    }
+    if (pid == 0) {
+        execvp(argv[0], argv);
+        int err = errno;
+        fprintf(stderr, "time: %s: %s\n", argv[0], strerror(err));
+        _exit((err == ENOENT) ? 127 : 126);
+    }
+    int wait_status = 0;
+    while (waitpid(pid, &wait_status, 0) < 0) {
+        if (errno == EINTR) continue;
+        fprintf(stderr, "time: waitpid: %s\n", strerror(errno));
+        return 126;
+    }
+    if (WIFEXITED(wait_status)) {
+        return WEXITSTATUS(wait_status);
+    }
+    if (WIFSIGNALED(wait_status)) {
+        return 128 + WTERMSIG(wait_status);
+    }
+    return 1;
+#endif
+}
+
 static int smallclueTimeCommand(int argc, char **argv) {
     if (argc < 2 || !argv[1] || argv[1][0] == '\0') {
         fprintf(stderr, "usage: time command [args...]\n");
         return 1;
-    }
-
-    const SmallclueApplet *applet = smallclueFindApplet(argv[1]);
-    if (!applet) {
-        fprintf(stderr, "time: %s: command not found\n", argv[1]);
-        return 127;
     }
 
     struct timespec start_real = {0};
@@ -10222,7 +13485,7 @@ static int smallclueTimeCommand(int argc, char **argv) {
     bool have_real = (clock_gettime(CLOCK_MONOTONIC, &start_real) == 0);
     bool have_usage = (getrusage(RUSAGE_SELF, &start_usage) == 0);
 
-    int status = smallclueDispatchApplet(applet, argc - 1, &argv[1]);
+    int status = smallclueTimeRunCommand(argc - 1, &argv[1]);
 
     if (have_real) {
         have_real = (clock_gettime(CLOCK_MONOTONIC, &end_real) == 0);
@@ -10441,8 +13704,12 @@ static int smallclueWatchCommand(int argc, char **argv) {
         }
         /* Match the clear behavior of the standalone `clear` applet: clear
          * scrollback, home cursor, then clear the visible viewport. */
-        fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
-        printf("Every %.2fs: %s\n\n", interval, cmdline ? cmdline : argv[idx]);
+        if (isatty(STDOUT_FILENO)) {
+            fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
+            printf("\033[7mEvery %.2fs: %s\033[0m\n\n", interval, cmdline ? cmdline : argv[idx]);
+        } else {
+            printf("\nEvery %.2fs: %s\n\n", interval, cmdline ? cmdline : argv[idx]);
+        }
         fflush(stdout);
 #if defined(PSCAL_TARGET_IOS)
         status = smallclueWatchRunCommand(cmd_argc, &argv[idx]);
@@ -10564,40 +13831,131 @@ static int smallclueSleepCommand(int argc, char **argv) {
     return 0;
 }
 
+static char *smallclueBasenameOne(const char *input, const char *suffix) {
+    char *path = strdup(input);
+    if (!path) return NULL;
+    char *base = basename(path);
+    char *result = strdup(base ? base : "");
+    free(path);
+    if (!result) return NULL;
+    if (suffix && *suffix) {
+        size_t blen = strlen(result);
+        size_t slen = strlen(suffix);
+        /* GNU basename: only strip if it wouldn't leave an empty result. */
+        if (blen > slen && strcmp(result + blen - slen, suffix) == 0) {
+            result[blen - slen] = '\0';
+        }
+    }
+    return result;
+}
+
 static int smallclueBasenameCommand(int argc, char **argv) {
-    if (argc < 2) {
+    bool multiple = false;
+    const char *suffix = NULL;
+    bool nul_terminate = false;
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        if (strcmp(arg, "-a") == 0 || strcmp(arg, "--multiple") == 0) {
+            multiple = true;
+        } else if (strcmp(arg, "-s") == 0 || strcmp(arg, "--suffix") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "basename: option '%s' requires an argument\n", arg);
+                return 1;
+            }
+            suffix = argv[++argi];
+            multiple = true;
+        } else if (strncmp(arg, "--suffix=", 9) == 0) {
+            suffix = arg + 9;
+            multiple = true;
+        } else if (strcmp(arg, "-z") == 0 || strcmp(arg, "--zero") == 0) {
+            nul_terminate = true;
+        } else if (arg[0] == '-' && arg[1] != '\0') {
+            fprintf(stderr, "basename: unsupported option '%s'\n", arg);
+            return 1;
+        } else {
+            break;
+        }
+    }
+    if (argi >= argc) {
         fprintf(stderr, "basename: missing operand\n");
         return 1;
     }
-    char *path = strdup(argv[1]);
-    if (!path) {
-        perror("basename");
-        return 1;
+
+    if (!multiple) {
+        const char *name = argv[argi++];
+        const char *singleSuffix = suffix;
+        if (argi < argc) {
+            singleSuffix = argv[argi++];
+        }
+        if (argi < argc) {
+            fprintf(stderr, "basename: extra operand '%s'\n", argv[argi]);
+            return 1;
+        }
+        char *result = smallclueBasenameOne(name, singleSuffix);
+        if (!result) {
+            perror("basename");
+            return 1;
+        }
+        fputs(result, stdout);
+        putchar(nul_terminate ? '\0' : '\n');
+        free(result);
+        return 0;
     }
-    char *base = basename(path);
-    if (base) {
-        puts(base);
+
+    for (; argi < argc; ++argi) {
+        char *result = smallclueBasenameOne(argv[argi], suffix);
+        if (!result) {
+            perror("basename");
+            return 1;
+        }
+        fputs(result, stdout);
+        putchar(nul_terminate ? '\0' : '\n');
+        free(result);
     }
-    free(path);
-    return base ? 0 : 1;
+    return 0;
 }
 
 static int smallclueDirnameCommand(int argc, char **argv) {
-    if (argc < 2) {
+    bool nul_terminate = false;
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        if (strcmp(arg, "-z") == 0 || strcmp(arg, "--zero") == 0) {
+            nul_terminate = true;
+        } else if (arg[0] == '-' && arg[1] != '\0') {
+            fprintf(stderr, "dirname: unsupported option '%s'\n", arg);
+            return 1;
+        } else {
+            break;
+        }
+    }
+    if (argi >= argc) {
         fprintf(stderr, "dirname: missing operand\n");
         return 1;
     }
-    char *path = strdup(argv[1]);
-    if (!path) {
-        perror("dirname");
-        return 1;
+    for (; argi < argc; ++argi) {
+        char *path = strdup(argv[argi]);
+        if (!path) {
+            perror("dirname");
+            return 1;
+        }
+        char *dir = dirname(path);
+        if (dir) {
+            fputs(dir, stdout);
+            putchar(nul_terminate ? '\0' : '\n');
+        }
+        free(path);
     }
-    char *dir = dirname(path);
-    if (dir) {
-        puts(dir);
-    }
-    free(path);
-    return dir ? 0 : 1;
+    return 0;
 }
 
 static int smallclueTeeCommand(int argc, char **argv) {
@@ -10613,27 +13971,29 @@ static int smallclueTeeCommand(int argc, char **argv) {
         }
     }
     int file_count = argc - optind;
-    FILE **files = NULL;
+    int *files = NULL;
     if (file_count > 0) {
-        files = (FILE **)calloc((size_t)file_count, sizeof(FILE *));
+        files = (int *)calloc((size_t)file_count, sizeof(int));
         if (!files) {
             perror("tee");
             return 1;
         }
         for (int i = 0; i < file_count; ++i) {
-            const char *mode = append ? "ab" : "wb";
-            files[i] = fopen(argv[optind + i], mode);
-            if (!files[i]) {
+            int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
+            files[i] = open(argv[optind + i], flags, 0666);
+            if (files[i] < 0) {
                 fprintf(stderr, "tee: %s: %s\n", argv[optind + i], strerror(errno));
             }
         }
     }
     int status = 0;
-    char buffer[4096];
+    char buffer[65536];
+    bool stdout_failed = false;
+    fflush(stdout); /* flush before transitioning to direct fd writes */
     while (true) {
-        int read_err = 0;
-        ssize_t nread = smallclueReadStream(stdin, buffer, sizeof(buffer), &read_err);
+        ssize_t nread = read(STDIN_FILENO, buffer, sizeof(buffer));
         if (nread < 0) {
+            if (errno == EINTR) continue;
             perror("tee");
             status = 1;
             break;
@@ -10641,32 +14001,41 @@ static int smallclueTeeCommand(int argc, char **argv) {
         if (nread == 0) {
             break;
         }
-        if (fwrite(buffer, 1, (size_t)nread, stdout) != (size_t)nread) {
-            perror("tee");
-            status = 1;
-            break;
+        ssize_t total_written = 0;
+        while (!stdout_failed && total_written < nread) {
+            ssize_t nw = write(STDOUT_FILENO, buffer + total_written, (size_t)(nread - total_written));
+            if (nw < 0) {
+                if (errno == EINTR) continue;
+                perror("tee: write error");
+                status = 1;
+                stdout_failed = true;
+                break;
+            }
+            total_written += nw;
         }
         for (int i = 0; i < file_count; ++i) {
-            if (!files[i]) {
+            if (files[i] < 0) {
                 continue;
             }
-            if (fwrite(buffer, 1, (size_t)nread, files[i]) != (size_t)nread) {
-                fprintf(stderr, "tee: %s: %s\n", argv[optind + i], strerror(errno));
-                fclose(files[i]);
-                files[i] = NULL;
-                status = 1;
+            ssize_t file_written = 0;
+            while (file_written < nread) {
+                ssize_t nw = write(files[i], buffer + file_written, (size_t)(nread - file_written));
+                if (nw < 0) {
+                    if (errno == EINTR) continue;
+                    fprintf(stderr, "tee: %s: %s\n", argv[optind + i], strerror(errno));
+                    close(files[i]);
+                    files[i] = -1;
+                    status = 1;
+                    break;
+                }
+                file_written += nw;
             }
-        }
-        if (read_err) {
-            perror("tee");
-            status = 1;
-            break;
         }
     }
     if (files) {
         for (int i = 0; i < file_count; ++i) {
-            if (files[i]) {
-                fclose(files[i]);
+            if (files[i] >= 0) {
+                close(files[i]);
             }
         }
         free(files);
@@ -10765,8 +14134,368 @@ static int smallclueAddTabCommand(int argc, char **argv) {
 #endif
 #if SMALLCLUE_HAS_IFADDRS
 static void smallclueIpAddrUsage(void) {
-    fputs("usage: ipaddr [-4|-6] [-a]\n", stderr);
+    fputs("usage: ipaddr [-4|-6] [-a]\n"
+          "       ipaddr add|del ADDR/PREFIXLEN dev IFACE\n"
+          "       ipaddr flush dev IFACE\n"
+          "       ipaddr link set IFACE up|down\n"
+          "       ipaddr route add|del DEST/PREFIXLEN|default [via GATEWAY] [dev IFACE]\n",
+          stderr);
 }
+
+#if defined(__linux__) || defined(linux) || defined(__linux)
+/* IPv4-only netlink RTM_NEWADDR/RTM_DELADDR sender for `ipaddr add/del`.
+ * Uses a real NETLINK_ROUTE socket (not ioctl SIOCSIFADDR) specifically
+ * because ioctl's single-primary-address model can't add a SECOND
+ * address to an interface that already has one without clobbering it --
+ * netlink supports proper multi-address semantics matching real `ip addr
+ * add/del`. IPv6 and CIDR-notation validation beyond a plain prefix
+ * length are out of scope. Requires CAP_NET_ADMIN. */
+struct smallclueNlAddAddrReq {
+    struct nlmsghdr nh;
+    struct ifaddrmsg ifa;
+    struct rtattr rta_local;
+    uint32_t addr_local;
+    struct rtattr rta_address;
+    uint32_t addr_address;
+};
+
+static int smallclueIpAddrModify(const char *ifaceName, const char *addrSpec, bool isAdd) {
+    char addrPart[64];
+    const char *slash = strchr(addrSpec, '/');
+    if (!slash) {
+        fprintf(stderr, "ipaddr: %s: expected ADDR/PREFIXLEN\n", addrSpec);
+        return 1;
+    }
+    size_t addrLen = (size_t)(slash - addrSpec);
+    if (addrLen == 0 || addrLen >= sizeof(addrPart)) {
+        fprintf(stderr, "ipaddr: %s: invalid address\n", addrSpec);
+        return 1;
+    }
+    memcpy(addrPart, addrSpec, addrLen);
+    addrPart[addrLen] = '\0';
+    int prefixLen = atoi(slash + 1);
+    if (prefixLen < 0 || prefixLen > 32) {
+        fprintf(stderr, "ipaddr: %s: invalid prefix length\n", addrSpec);
+        return 1;
+    }
+    struct in_addr addr4;
+    if (inet_pton(AF_INET, addrPart, &addr4) != 1) {
+        fprintf(stderr, "ipaddr: %s: not a valid IPv4 address\n", addrPart);
+        return 1;
+    }
+    unsigned int ifindex = if_nametoindex(ifaceName);
+    if (ifindex == 0) {
+        fprintf(stderr, "ipaddr: %s: %s\n", ifaceName, strerror(errno));
+        return 1;
+    }
+
+    int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (sock < 0) {
+        fprintf(stderr, "ipaddr: netlink socket: %s\n", strerror(errno));
+        return 1;
+    }
+
+    struct smallclueNlAddAddrReq req;
+    memset(&req, 0, sizeof(req));
+    req.nh.nlmsg_len = sizeof(req);
+    req.nh.nlmsg_type = isAdd ? RTM_NEWADDR : RTM_DELADDR;
+    req.nh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    if (isAdd) {
+        req.nh.nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
+    }
+    req.nh.nlmsg_seq = 1;
+    req.ifa.ifa_family = AF_INET;
+    req.ifa.ifa_prefixlen = (unsigned char)prefixLen;
+    req.ifa.ifa_scope = 0;
+    req.ifa.ifa_index = ifindex;
+    req.rta_local.rta_len = RTA_LENGTH(sizeof(req.addr_local));
+    req.rta_local.rta_type = IFA_LOCAL;
+    req.addr_local = addr4.s_addr;
+    req.rta_address.rta_len = RTA_LENGTH(sizeof(req.addr_address));
+    req.rta_address.rta_type = IFA_ADDRESS;
+    req.addr_address = addr4.s_addr;
+
+    struct sockaddr_nl dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.nl_family = AF_NETLINK;
+
+    if (sendto(sock, &req, req.nh.nlmsg_len, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+        fprintf(stderr, "ipaddr: netlink send: %s\n", strerror(errno));
+        close(sock);
+        return 1;
+    }
+
+    char replyBuf[4096];
+    ssize_t n = recv(sock, replyBuf, sizeof(replyBuf), 0);
+    close(sock);
+    if (n < 0) {
+        fprintf(stderr, "ipaddr: netlink recv: %s\n", strerror(errno));
+        return 1;
+    }
+    for (struct nlmsghdr *nh = (struct nlmsghdr *)replyBuf; NLMSG_OK(nh, (size_t)n); nh = NLMSG_NEXT(nh, n)) {
+        if (nh->nlmsg_type == NLMSG_ERROR) {
+            const struct nlmsgerr *err = (const struct nlmsgerr *)NLMSG_DATA(nh);
+            if (err->error != 0) {
+                fprintf(stderr, "ipaddr: %s %s/%d on %s: %s\n",
+                        isAdd ? "add" : "del", addrPart, prefixLen, ifaceName, strerror(-err->error));
+                return 1;
+            }
+            return 0;
+        }
+    }
+    fprintf(stderr, "ipaddr: no netlink ACK received\n");
+    return 1;
+}
+
+/* Counts set bits in a netmask -- correct regardless of host/network
+ * byte order, since only the bit *count* matters for a prefix length,
+ * not which byte holds which bits. */
+static int smallclueNetmaskToPrefixLen(uint32_t mask) {
+    int count = 0;
+    while (mask) {
+        count += (int)(mask & 1);
+        mask >>= 1;
+    }
+    return count;
+}
+
+/* `ipaddr flush dev IFACE`: enumerates every IPv4 address currently on
+ * IFACE (via getifaddrs, matching the "show" path's enumeration) and
+ * RTM_DELADDRs each one via the existing smallclueIpAddrModify(), the
+ * same real netlink delete `ipaddr del` already uses. IPv6 is out of
+ * scope, matching add/del's existing IPv4-only scope. Interfaces with
+ * no addresses are a silent no-op success, matching real `ip addr
+ * flush`. */
+static int smallclueIpAddrFlush(const char *ifaceName) {
+    struct ifaddrs *ifaddr = NULL;
+    if (getifaddrs(&ifaddr) != 0) {
+        fprintf(stderr, "ipaddr: getifaddrs failed: %s\n", strerror(errno));
+        return 1;
+    }
+    int removed = 0;
+    int failures = 0;
+    for (struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || !ifa->ifa_name || !ifa->ifa_netmask) continue;
+        if (ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (strcmp(ifa->ifa_name, ifaceName) != 0) continue;
+
+        char addrStr[INET_ADDRSTRLEN];
+        struct in_addr addr4 = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+        if (!inet_ntop(AF_INET, &addr4, addrStr, sizeof(addrStr))) continue;
+        uint32_t mask = ((struct sockaddr_in *)ifa->ifa_netmask)->sin_addr.s_addr;
+        int prefixLen = smallclueNetmaskToPrefixLen(mask);
+
+        char addrSpec[80];
+        snprintf(addrSpec, sizeof(addrSpec), "%s/%d", addrStr, prefixLen);
+        if (smallclueIpAddrModify(ifaceName, addrSpec, false) == 0) {
+            removed++;
+        } else {
+            failures++;
+        }
+    }
+    freeifaddrs(ifaddr);
+    if (failures > 0) return 1;
+    (void)removed;
+    return 0;
+}
+
+/* Reads one netlink ACK/error reply and reports it; shared by the link
+ * and route senders below (smallclueIpAddrModify above has its own
+ * inline copy, predating this helper). */
+static int smallclueNlReadAck(int sock, const char *context) {
+    char replyBuf[4096];
+    ssize_t n = recv(sock, replyBuf, sizeof(replyBuf), 0);
+    if (n < 0) {
+        fprintf(stderr, "ipaddr: netlink recv: %s\n", strerror(errno));
+        return 1;
+    }
+    for (struct nlmsghdr *nh = (struct nlmsghdr *)replyBuf; NLMSG_OK(nh, (size_t)n); nh = NLMSG_NEXT(nh, n)) {
+        if (nh->nlmsg_type == NLMSG_ERROR) {
+            const struct nlmsgerr *err = (const struct nlmsgerr *)NLMSG_DATA(nh);
+            if (err->error != 0) {
+                fprintf(stderr, "ipaddr: %s: %s\n", context, strerror(-err->error));
+                return 1;
+            }
+            return 0;
+        }
+    }
+    fprintf(stderr, "ipaddr: no netlink ACK received\n");
+    return 1;
+}
+
+struct smallclueNlLinkReq {
+    struct nlmsghdr nh;
+    struct ifinfomsg ifi;
+};
+
+static int smallclueIpLinkSetUpDown(const char *ifaceName, bool up) {
+    unsigned int ifindex = if_nametoindex(ifaceName);
+    if (ifindex == 0) {
+        fprintf(stderr, "ipaddr: %s: %s\n", ifaceName, strerror(errno));
+        return 1;
+    }
+    int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (sock < 0) {
+        fprintf(stderr, "ipaddr: netlink socket: %s\n", strerror(errno));
+        return 1;
+    }
+    struct smallclueNlLinkReq req;
+    memset(&req, 0, sizeof(req));
+    req.nh.nlmsg_len = sizeof(req);
+    req.nh.nlmsg_type = RTM_NEWLINK;
+    req.nh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    req.nh.nlmsg_seq = 1;
+    req.ifi.ifi_family = AF_UNSPEC;
+    req.ifi.ifi_index = (int)ifindex;
+    req.ifi.ifi_flags = up ? IFF_UP : 0;
+    req.ifi.ifi_change = IFF_UP; /* only the UP bit is being changed */
+
+    struct sockaddr_nl dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.nl_family = AF_NETLINK;
+    if (sendto(sock, &req, req.nh.nlmsg_len, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+        fprintf(stderr, "ipaddr: netlink send: %s\n", strerror(errno));
+        close(sock);
+        return 1;
+    }
+    char ctx[256];
+    snprintf(ctx, sizeof(ctx), "link set %s %s", ifaceName, up ? "up" : "down");
+    int rc = smallclueNlReadAck(sock, ctx);
+    close(sock);
+    return rc;
+}
+
+/* IPv4-only netlink RTM_NEWROUTE/RTM_DELROUTE sender for `ipaddr route
+ * add/del`. Supports the common forms: a plain destination network
+ * (DEST/PREFIXLEN or the "default" shorthand for 0.0.0.0/0), an
+ * optional gateway (`via ADDR`), and/or an optional outgoing interface
+ * (`dev IFACE`) -- at least one of the two must be given, matching real
+ * `ip route`. */
+struct smallclueNlRouteReq {
+    struct nlmsghdr nh;
+    struct rtmsg rt;
+    struct rtattr rta_dst;
+    uint32_t addr_dst;
+    /* RTA_GATEWAY and RTA_OIF appended dynamically after this fixed part,
+     * sized generously in the buffer below. */
+};
+
+static int smallclueIpRouteModify(const char *destSpec, const char *gateway, const char *iface, bool isAdd) {
+    struct in_addr dstAddr;
+    int prefixLen;
+    if (strcmp(destSpec, "default") == 0) {
+        dstAddr.s_addr = 0;
+        prefixLen = 0;
+    } else {
+        char addrPart[64];
+        const char *slash = strchr(destSpec, '/');
+        if (!slash) {
+            fprintf(stderr, "ipaddr: %s: expected DEST/PREFIXLEN or 'default'\n", destSpec);
+            return 1;
+        }
+        size_t addrLen = (size_t)(slash - destSpec);
+        if (addrLen == 0 || addrLen >= sizeof(addrPart)) {
+            fprintf(stderr, "ipaddr: %s: invalid destination\n", destSpec);
+            return 1;
+        }
+        memcpy(addrPart, destSpec, addrLen);
+        addrPart[addrLen] = '\0';
+        prefixLen = atoi(slash + 1);
+        if (prefixLen < 0 || prefixLen > 32) {
+            fprintf(stderr, "ipaddr: %s: invalid prefix length\n", destSpec);
+            return 1;
+        }
+        if (inet_pton(AF_INET, addrPart, &dstAddr) != 1) {
+            fprintf(stderr, "ipaddr: %s: not a valid IPv4 address\n", addrPart);
+            return 1;
+        }
+    }
+    struct in_addr gwAddr;
+    bool haveGw = false;
+    if (gateway) {
+        if (inet_pton(AF_INET, gateway, &gwAddr) != 1) {
+            fprintf(stderr, "ipaddr: %s: not a valid IPv4 gateway address\n", gateway);
+            return 1;
+        }
+        haveGw = true;
+    }
+    unsigned int ifindex = 0;
+    if (iface) {
+        ifindex = if_nametoindex(iface);
+        if (ifindex == 0) {
+            fprintf(stderr, "ipaddr: %s: %s\n", iface, strerror(errno));
+            return 1;
+        }
+    }
+    if (!haveGw && ifindex == 0) {
+        fprintf(stderr, "ipaddr: route needs at least 'via GATEWAY' or 'dev IFACE'\n");
+        return 1;
+    }
+
+    int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (sock < 0) {
+        fprintf(stderr, "ipaddr: netlink socket: %s\n", strerror(errno));
+        return 1;
+    }
+
+    unsigned char buf[512];
+    memset(buf, 0, sizeof(buf));
+    struct nlmsghdr *nh = (struct nlmsghdr *)buf;
+    struct rtmsg *rt = (struct rtmsg *)NLMSG_DATA(nh);
+    nh->nlmsg_type = isAdd ? RTM_NEWROUTE : RTM_DELROUTE;
+    nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    if (isAdd) nh->nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
+    nh->nlmsg_seq = 1;
+    nh->nlmsg_len = NLMSG_LENGTH(sizeof(*rt));
+
+    rt->rtm_family = AF_INET;
+    rt->rtm_dst_len = (unsigned char)prefixLen;
+    rt->rtm_src_len = 0;
+    rt->rtm_tos = 0;
+    rt->rtm_table = RT_TABLE_MAIN;
+    rt->rtm_protocol = RTPROT_STATIC;
+    rt->rtm_scope = haveGw ? RT_SCOPE_UNIVERSE : RT_SCOPE_LINK;
+    rt->rtm_type = RTN_UNICAST;
+    rt->rtm_flags = 0;
+
+    if (prefixLen > 0 || strcmp(destSpec, "default") != 0) {
+        struct rtattr *rta = (struct rtattr *)((char *)nh + NLMSG_ALIGN(nh->nlmsg_len));
+        rta->rta_type = RTA_DST;
+        rta->rta_len = RTA_LENGTH(sizeof(uint32_t));
+        memcpy(RTA_DATA(rta), &dstAddr.s_addr, sizeof(uint32_t));
+        nh->nlmsg_len = NLMSG_ALIGN(nh->nlmsg_len) + RTA_LENGTH(sizeof(uint32_t));
+    }
+    if (haveGw) {
+        struct rtattr *rta = (struct rtattr *)((char *)nh + NLMSG_ALIGN(nh->nlmsg_len));
+        rta->rta_type = RTA_GATEWAY;
+        rta->rta_len = RTA_LENGTH(sizeof(uint32_t));
+        memcpy(RTA_DATA(rta), &gwAddr.s_addr, sizeof(uint32_t));
+        nh->nlmsg_len = NLMSG_ALIGN(nh->nlmsg_len) + RTA_LENGTH(sizeof(uint32_t));
+    }
+    if (ifindex != 0) {
+        struct rtattr *rta = (struct rtattr *)((char *)nh + NLMSG_ALIGN(nh->nlmsg_len));
+        rta->rta_type = RTA_OIF;
+        uint32_t idx = ifindex;
+        rta->rta_len = RTA_LENGTH(sizeof(uint32_t));
+        memcpy(RTA_DATA(rta), &idx, sizeof(uint32_t));
+        nh->nlmsg_len = NLMSG_ALIGN(nh->nlmsg_len) + RTA_LENGTH(sizeof(uint32_t));
+    }
+
+    struct sockaddr_nl dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.nl_family = AF_NETLINK;
+    if (sendto(sock, buf, nh->nlmsg_len, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+        fprintf(stderr, "ipaddr: netlink send: %s\n", strerror(errno));
+        close(sock);
+        return 1;
+    }
+    char ctx[256];
+    snprintf(ctx, sizeof(ctx), "route %s %s", isAdd ? "add" : "del", destSpec);
+    int rc = smallclueNlReadAck(sock, ctx);
+    close(sock);
+    return rc;
+}
+#endif
 
 static bool smallclueShouldSkipInterface(const struct ifaddrs *ifa, int family, bool show_all) {
     if (show_all || !ifa) {
@@ -10787,6 +14516,77 @@ static bool smallclueShouldSkipInterface(const struct ifaddrs *ifa, int family, 
 }
 
 static int smallclueIpAddrCommand(int argc, char **argv) {
+    if (argc >= 2 && (strcmp(argv[1], "add") == 0 || strcmp(argv[1], "del") == 0)) {
+#if defined(__linux__) || defined(linux) || defined(__linux)
+        bool isAdd = strcmp(argv[1], "add") == 0;
+        /* ADDR/PREFIXLEN dev IFACE */
+        if (argc != 5 || strcmp(argv[3], "dev") != 0) {
+            smallclueIpAddrUsage();
+            return 1;
+        }
+        return smallclueIpAddrModify(argv[4], argv[2], isAdd);
+#else
+        fprintf(stderr, "ipaddr: add/del is only supported on Linux (needs netlink)\n");
+        return 1;
+#endif
+    }
+    if (argc >= 2 && strcmp(argv[1], "flush") == 0) {
+#if defined(__linux__) || defined(linux) || defined(__linux)
+        /* flush dev IFACE */
+        if (argc != 4 || strcmp(argv[2], "dev") != 0) {
+            smallclueIpAddrUsage();
+            return 1;
+        }
+        return smallclueIpAddrFlush(argv[3]);
+#else
+        fprintf(stderr, "ipaddr: flush is only supported on Linux (needs netlink)\n");
+        return 1;
+#endif
+    }
+    if (argc >= 2 && strcmp(argv[1], "link") == 0) {
+#if defined(__linux__) || defined(linux) || defined(__linux)
+        /* link set IFACE up|down */
+        if (argc != 5 || strcmp(argv[2], "set") != 0 ||
+            (strcmp(argv[4], "up") != 0 && strcmp(argv[4], "down") != 0)) {
+            smallclueIpAddrUsage();
+            return 1;
+        }
+        return smallclueIpLinkSetUpDown(argv[3], strcmp(argv[4], "up") == 0);
+#else
+        fprintf(stderr, "ipaddr: link set is only supported on Linux (needs netlink)\n");
+        return 1;
+#endif
+    }
+    if (argc >= 2 && strcmp(argv[1], "route") == 0) {
+#if defined(__linux__) || defined(linux) || defined(__linux)
+        /* route add|del DEST[/PREFIXLEN]|default [via GATEWAY] [dev IFACE] */
+        if (argc < 4 || (strcmp(argv[2], "add") != 0 && strcmp(argv[2], "del") != 0)) {
+            smallclueIpAddrUsage();
+            return 1;
+        }
+        bool isAdd = strcmp(argv[2], "add") == 0;
+        const char *dest = argv[3];
+        const char *gateway = NULL;
+        const char *iface = NULL;
+        int i = 4;
+        while (i < argc) {
+            if (strcmp(argv[i], "via") == 0 && i + 1 < argc) {
+                gateway = argv[i + 1];
+                i += 2;
+            } else if (strcmp(argv[i], "dev") == 0 && i + 1 < argc) {
+                iface = argv[i + 1];
+                i += 2;
+            } else {
+                smallclueIpAddrUsage();
+                return 1;
+            }
+        }
+        return smallclueIpRouteModify(dest, gateway, iface, isAdd);
+#else
+        fprintf(stderr, "ipaddr: route add/del is only supported on Linux (needs netlink)\n");
+        return 1;
+#endif
+    }
     bool request_v4 = false;
     bool request_v6 = false;
     bool show_all = false;
@@ -10938,6 +14738,81 @@ static bool smallclueDfQuery(const char *path, SmallclueDfStats *out) {
     return true;
 }
 
+/* Enumerates every mounted filesystem so bare `df` (no path arguments)
+ * lists all mounts like the real tool, instead of only reporting the
+ * current directory's filesystem. Returns a malloc'd array of malloc'd
+ * mount-point strings; caller frees each element and the array. */
+#if defined(__linux__) || defined(linux) || defined(__linux)
+static char **smallclueDfEnumerateMounts(size_t *outCount) {
+    FILE *fp = fopen("/proc/mounts", "r");
+    if (!fp) fp = fopen("/etc/mtab", "r");
+    if (!fp) {
+        *outCount = 0;
+        return NULL;
+    }
+    char **list = NULL;
+    size_t count = 0, capacity = 0;
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        char device[256], mountpoint[512], fstype[64];
+        if (sscanf(line, "%255s %511s %63s", device, mountpoint, fstype) != 3) continue;
+        /* Skip pseudo/virtual filesystems with no meaningful disk usage,
+         * matching real df's own dummy-filesystem exclusion. */
+        static const char *skipTypes[] = {
+            "proc", "sysfs", "devtmpfs", "cgroup", "cgroup2", "devpts",
+            "securityfs", "debugfs", "tracefs", "pstore", "mqueue",
+            "hugetlbfs", "configfs", "bpf", "autofs", "fusectl", "tmpfs",
+            "overlay", "squashfs", "binfmt_misc", "efivarfs", "rpc_pipefs",
+        };
+        bool skip = false;
+        for (size_t s = 0; s < sizeof(skipTypes) / sizeof(skipTypes[0]); ++s) {
+            if (strcmp(fstype, skipTypes[s]) == 0) {
+                skip = true;
+                break;
+            }
+        }
+        if (skip) continue;
+        if (count == capacity) {
+            capacity = capacity ? capacity * 2 : 16;
+            char **resized = (char **)realloc(list, capacity * sizeof(char *));
+            if (!resized) break;
+            list = resized;
+        }
+        list[count] = strdup(mountpoint);
+        if (list[count]) count++;
+    }
+    fclose(fp);
+    *outCount = count;
+    return list;
+}
+#elif defined(SMALLCLUE_HAVE_STATFS)
+static char **smallclueDfEnumerateMounts(size_t *outCount) {
+    struct statfs *mounts = NULL;
+    int n = getmntinfo(&mounts, MNT_NOWAIT);
+    if (n <= 0) {
+        *outCount = 0;
+        return NULL;
+    }
+    char **list = (char **)calloc((size_t)n, sizeof(char *));
+    if (!list) {
+        *outCount = 0;
+        return NULL;
+    }
+    size_t count = 0;
+    for (int i = 0; i < n; ++i) {
+        list[count] = strdup(mounts[i].f_mntonname);
+        if (list[count]) count++;
+    }
+    *outCount = count;
+    return list;
+}
+#else
+static char **smallclueDfEnumerateMounts(size_t *outCount) {
+    *outCount = 0;
+    return NULL;
+}
+#endif
+
 static void smallclueDfFormatSize(char *buf, size_t bufsize,
                                   unsigned long long bytes, bool human) {
     if (!buf || bufsize == 0) {
@@ -11006,8 +14881,25 @@ static int smallclueDfCommand(int argc, char **argv) {
     int path_count = (optind < argc) ? (argc - optind) : 0;
     smallclueDfPrintHeader(human);
     int status = 0;
-    for (int i = 0; i < (path_count > 0 ? path_count : 1); ++i) {
-        const char *path = (path_count > 0) ? argv[path_start + i] : ".";
+
+    char **allMounts = NULL;
+    size_t allMountsCount = 0;
+    if (path_count == 0) {
+        allMounts = smallclueDfEnumerateMounts(&allMountsCount);
+    }
+    size_t iterCount = (path_count > 0) ? (size_t)path_count
+                        : (allMountsCount > 0) ? allMountsCount
+                        : 1;
+
+    for (size_t i = 0; i < iterCount; ++i) {
+        const char *path;
+        if (path_count > 0) {
+            path = argv[path_start + i];
+        } else if (allMountsCount > 0) {
+            path = allMounts[i];
+        } else {
+            path = ".";
+        }
         SmallclueDfStats stats;
         if (!smallclueDfQuery(path, &stats)) {
             fprintf(stderr, "df: %s: %s\n", path ? path : "(null)", strerror(errno));
@@ -11034,101 +14926,239 @@ static int smallclueDfCommand(int argc, char **argv) {
                percent,
                path ? path : stats.mount_point);
     }
+
+    if (allMounts) {
+        for (size_t i = 0; i < allMountsCount; ++i) free(allMounts[i]);
+        free(allMounts);
+    }
     return status;
 }
-static int smallcluePingAttempt(const struct sockaddr *addr, socklen_t addrlen, int family, int timeout_ms, double *out_ms, int probe_port) {
-    int sock = socket(family, SOCK_STREAM, IPPROTO_TCP);
+enum {
+    SMALLCLUE_PING_PAYLOAD_SIZE = 56
+};
+
+static uint16_t smallclueInternetChecksum(const void *data, size_t len) {
+    const uint8_t *bytes = (const uint8_t *)data;
+    uint32_t sum = 0;
+    while (len > 1) {
+        sum += (uint32_t)((bytes[0] << 8) | bytes[1]);
+        bytes += 2;
+        len -= 2;
+    }
+    if (len > 0) {
+        sum += (uint32_t)(bytes[0] << 8);
+    }
+    while ((sum >> 16) != 0) {
+        sum = (sum & 0xffffu) + (sum >> 16);
+    }
+    return (uint16_t)~sum;
+}
+
+/* Note on the `ident` parameter: Linux's unprivileged ICMP "ping socket"
+ * (SOCK_DGRAM + IPPROTO_ICMP/IPPROTO_ICMPV6) rewrites the packet's id
+ * field to the socket's kernel-assigned local port on send -- confirmed
+ * against a real Linux kernel in Docker, where the reply's id never
+ * matched the id we set. Validating the reply's id against our original
+ * value is therefore unreliable and was a real (if previously untriggered
+ * on this dev machine's non-Linux ping stack) bug. Each attempt already
+ * uses a freshly connected, exclusive socket for exactly one request/
+ * reply, so the OS itself guarantees this reply belongs to us; only the
+ * sequence number (which the kernel does NOT rewrite) is checked here. */
+static bool smallcluePingDecodeReply(const unsigned char *buf, size_t len,
+        uint16_t seq, size_t *out_reply_len) {
+    const struct icmp *icmp_hdr = NULL;
+    size_t reply_len = len;
+
+    if (len >= sizeof(struct ip)) {
+        const struct ip *ip_hdr = (const struct ip *)buf;
+        if (ip_hdr->ip_v == 4) {
+            size_t ip_len = (size_t)ip_hdr->ip_hl << 2;
+            if (ip_len >= sizeof(struct ip) && len >= ip_len + ICMP_MINLEN) {
+                icmp_hdr = (const struct icmp *)(buf + ip_len);
+                reply_len = len - ip_len;
+            }
+        }
+    }
+    if (!icmp_hdr && len >= ICMP_MINLEN) {
+        icmp_hdr = (const struct icmp *)buf;
+        reply_len = len;
+    }
+    if (!icmp_hdr) {
+        errno = EPROTO;
+        return false;
+    }
+    if (icmp_hdr->icmp_type != ICMP_ECHOREPLY) {
+        errno = EPROTO;
+        return false;
+    }
+    if (ntohs((uint16_t)icmp_hdr->icmp_seq) != seq) {
+        errno = EPROTO;
+        return false;
+    }
+    if (out_reply_len) {
+        *out_reply_len = reply_len;
+    }
+    return true;
+}
+
+/* ICMPv6 "ping socket" (SOCK_DGRAM, IPPROTO_ICMPV6) replies deliver just
+ * the ICMPv6 payload with no IPv6 header prepended (unlike the IPv4 path
+ * above, which defensively handles both cases) -- verified against a real
+ * Linux kernel in Docker. See smallcluePingDecodeReply's comment on why
+ * the id field isn't checked. */
+static bool smallcluePing6DecodeReply(const unsigned char *buf, size_t len,
+        uint16_t seq, size_t *out_reply_len) {
+    if (len < sizeof(struct icmp6_hdr)) {
+        errno = EPROTO;
+        return false;
+    }
+    const struct icmp6_hdr *icmp6 = (const struct icmp6_hdr *)buf;
+    if (icmp6->icmp6_type != ICMP6_ECHO_REPLY) {
+        errno = EPROTO;
+        return false;
+    }
+    if (ntohs(icmp6->icmp6_seq) != seq) {
+        errno = EPROTO;
+        return false;
+    }
+    if (out_reply_len) {
+        *out_reply_len = len;
+    }
+    return true;
+}
+
+static int smallcluePingAttempt(int family, const struct sockaddr *target_addr, socklen_t target_len,
+        int timeout_ms, uint16_t ident, uint16_t seq, double *out_ms, size_t *out_reply_len) {
+    if (!target_addr) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int sock = socket(family, SOCK_DGRAM, family == AF_INET6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP);
     if (sock < 0) {
         return -1;
     }
-    int flags = fcntl(sock, F_GETFL, 0);
-    if (flags >= 0) {
-        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-    }
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    int rc = -1;
-    // If a specific port was provided, override it in the sockaddr.
-    if (probe_port > 0) {
-        if (addr->sa_family == AF_INET && addrlen >= sizeof(struct sockaddr_in)) {
-            struct sockaddr_in tmp;
-            memcpy(&tmp, addr, sizeof(tmp));
-            tmp.sin_port = htons((uint16_t)probe_port);
-            rc = connect(sock, (struct sockaddr *)&tmp, sizeof(tmp));
-        } else if (addr->sa_family == AF_INET6 && addrlen >= sizeof(struct sockaddr_in6)) {
-            struct sockaddr_in6 tmp6;
-            memcpy(&tmp6, addr, sizeof(tmp6));
-            tmp6.sin6_port = htons((uint16_t)probe_port);
-            rc = connect(sock, (struct sockaddr *)&tmp6, sizeof(tmp6));
-        } else {
-            rc = connect(sock, addr, addrlen);
-        }
-    } else {
-        rc = connect(sock, addr, addrlen);
-    }
-    if (rc < 0 && errno == EINPROGRESS) {
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        FD_SET(sock, &wfds);
-        struct timeval tv;
-        tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-        rc = select(sock + 1, NULL, &wfds, NULL, &tv);
-        if (rc <= 0) {
-            close(sock);
-            errno = (rc == 0) ? ETIMEDOUT : errno;
-            return -1;
-        }
-        int so_error = 0;
-        socklen_t slen = sizeof(so_error);
-        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &slen) < 0 || so_error != 0) {
-            if (so_error != 0) {
-                errno = so_error;
-            }
-            close(sock);
-            return -1;
-        }
-    } else if (rc < 0) {
+
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
         close(sock);
         return -1;
     }
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    close(sock);
-    if (out_ms) {
-        double start_ms = (double)start.tv_sec * 1000.0 + (double)start.tv_nsec / 1e6;
-        double end_ms = (double)end.tv_sec * 1000.0 + (double)end.tv_nsec / 1e6;
-        *out_ms = end_ms - start_ms;
+
+    if (connect(sock, target_addr, target_len) < 0) {
+        close(sock);
+        return -1;
     }
-    return 0;
+
+    unsigned char packet[sizeof(struct icmp6_hdr) + SMALLCLUE_PING_PAYLOAD_SIZE];
+    size_t hdrLen = (family == AF_INET6) ? sizeof(struct icmp6_hdr) : ICMP_MINLEN;
+    size_t packetLen = hdrLen + SMALLCLUE_PING_PAYLOAD_SIZE;
+    memset(packet, 0, sizeof(packet));
+    for (size_t i = hdrLen; i < packetLen; ++i) {
+        packet[i] = (unsigned char)(i & 0xffu);
+    }
+    if (family == AF_INET6) {
+        struct icmp6_hdr *icmp6 = (struct icmp6_hdr *)packet;
+        icmp6->icmp6_type = ICMP6_ECHO_REQUEST;
+        icmp6->icmp6_code = 0;
+        icmp6->icmp6_id = htons(ident);
+        icmp6->icmp6_seq = htons(seq);
+        /* icmp6_cksum is left at 0: the kernel computes it for ICMPv6
+         * ping sockets since only the kernel knows the real source
+         * address needed for the IPv6 pseudo-header. */
+    } else {
+        struct icmp *icmp_hdr = (struct icmp *)packet;
+        icmp_hdr->icmp_type = ICMP_ECHO;
+        icmp_hdr->icmp_code = 0;
+        icmp_hdr->icmp_id = htons(ident);
+        icmp_hdr->icmp_seq = htons(seq);
+        icmp_hdr->icmp_cksum = 0;
+        icmp_hdr->icmp_cksum = smallclueInternetChecksum(packet, packetLen);
+    }
+
+    struct timespec start;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        close(sock);
+        return -1;
+    }
+
+    ssize_t sent = send(sock, packet, packetLen, 0);
+    if (sent != (ssize_t)packetLen) {
+        if (sent >= 0) {
+            errno = EIO;
+        }
+        close(sock);
+        return -1;
+    }
+
+    unsigned char reply[1500];
+    for (;;) {
+        ssize_t received = recv(sock, reply, sizeof(reply), 0);
+        if (received < 0) {
+            close(sock);
+            return -1;
+        }
+
+        struct timespec end;
+        if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+            close(sock);
+            return -1;
+        }
+
+        size_t reply_len = 0;
+        bool ok = (family == AF_INET6)
+            ? smallcluePing6DecodeReply(reply, (size_t)received, seq, &reply_len)
+            : smallcluePingDecodeReply(reply, (size_t)received, seq, &reply_len);
+        if (!ok) {
+            continue;
+        }
+
+        if (out_ms) {
+            double start_ms = (double)start.tv_sec * 1000.0 + (double)start.tv_nsec / 1e6;
+            double end_ms = (double)end.tv_sec * 1000.0 + (double)end.tv_nsec / 1e6;
+            *out_ms = end_ms - start_ms;
+        }
+        if (out_reply_len) {
+            *out_reply_len = reply_len;
+        }
+        close(sock);
+        return 0;
+    }
 }
 
 static int smallcluePingCommand(int argc, char **argv) {
-    const char *usage = "usage: ping [-c count] [-p port] [-t timeout_ms] host\n";
+    const char *usage = "usage: ping [-4|-6] [-c count] [-t timeout_ms] host\n";
     if (argc <= 1) {
         fputs(usage, stderr);
         return 1;
     }
+
     smallclueResetGetopt();
     int count = 4;
     int timeout_ms = 3000;
-    int probe_port = 80;
+    int forceFamily = AF_UNSPEC;
     int opt;
-    while ((opt = getopt(argc, argv, "c:p:t:")) != -1) {
+    while ((opt = getopt(argc, argv, "46c:t:")) != -1) {
         switch (opt) {
+            case '4':
+                forceFamily = AF_INET;
+                break;
+            case '6':
+                forceFamily = AF_INET6;
+                break;
             case 'c':
                 count = atoi(optarg);
-                if (count <= 0) count = 4;
-                break;
-            case 'p':
-                probe_port = atoi(optarg);
-                if (probe_port <= 0 || probe_port > 65535) {
-                    fprintf(stderr, "ping: invalid port '%s'\n", optarg);
-                    return 1;
+                if (count <= 0) {
+                    count = 4;
                 }
                 break;
             case 't':
                 timeout_ms = atoi(optarg);
-                if (timeout_ms <= 0) timeout_ms = 3000;
+                if (timeout_ms <= 0) {
+                    timeout_ms = 3000;
+                }
                 break;
             default:
                 fputs(usage, stderr);
@@ -11139,63 +15169,99 @@ static int smallcluePingCommand(int argc, char **argv) {
         fputs(usage, stderr);
         return 1;
     }
+
     const char *host = argv[optind];
+#if defined(PSCAL_TARGET_IOS)
+    if (PSCALRuntimePingHost) {
+        char *output = NULL;
+        int status = PSCALRuntimePingHost(host, count, timeout_ms, &output);
+        if (output) {
+            fputs(output, stdout);
+            free(output);
+        }
+        return status;
+    }
+#endif
+
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_family = AF_UNSPEC;
+
     struct addrinfo *res = NULL;
-    char portbuf[16];
-    snprintf(portbuf, sizeof(portbuf), "%d", probe_port);
-    int gai = pscalHostsGetAddrInfo(host, portbuf, &hints, &res);
+    int gai = pscalHostsGetAddrInfo(host, NULL, &hints, &res);
     if (gai != 0) {
         fprintf(stderr, "ping: %s: %s\n", host, gai_strerror(gai));
         return 1;
     }
-    struct addrinfo *selected = res;
+
+    struct addrinfo *selected = NULL;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        if (forceFamily != AF_UNSPEC && ai->ai_family != forceFamily) continue;
+        if ((ai->ai_family == AF_INET && ai->ai_addrlen >= sizeof(struct sockaddr_in)) ||
+            (ai->ai_family == AF_INET6 && ai->ai_addrlen >= sizeof(struct sockaddr_in6))) {
+            selected = ai;
+            break;
+        }
+    }
     if (!selected) {
-        fprintf(stderr, "ping: no addresses resolved for %s\n", host);
-        freeaddrinfo(res);
+        fprintf(stderr, "ping: %s: no ICMP-capable address resolved\n", host);
+        pscalHostsFreeAddrInfo(res);
         return 1;
     }
+
     struct sockaddr_storage target_addr;
-    memcpy(&target_addr, selected->ai_addr, selected->ai_addrlen);
     socklen_t target_len = (socklen_t)selected->ai_addrlen;
+    memcpy(&target_addr, selected->ai_addr, target_len);
+    int family = selected->ai_family;
+
     char addrbuf[NI_MAXHOST];
     if (getnameinfo((struct sockaddr *)&target_addr, target_len,
             addrbuf, sizeof(addrbuf), NULL, 0, NI_NUMERICHOST) != 0) {
         strncpy(addrbuf, "unknown", sizeof(addrbuf));
         addrbuf[sizeof(addrbuf) - 1] = '\0';
     }
-    printf("PING %s (%s) TCP port %d, %d probes, timeout %d ms\n",
-        host, addrbuf, probe_port, count, timeout_ms);
+
+    printf("PING %s (%s): %d data bytes\n", host, addrbuf, SMALLCLUE_PING_PAYLOAD_SIZE);
+
     int successes = 0;
-    double min_ms = 0.0, max_ms = 0.0, total_ms = 0.0;
+    double min_ms = 0.0;
+    double max_ms = 0.0;
+    double total_ms = 0.0;
+    uint16_t ident = (uint16_t)(getpid() & 0xffff);
+
     for (int i = 0; i < count; ++i) {
-        double elapsed = 0.0;
-        int rc = smallcluePingAttempt((struct sockaddr *)&target_addr, target_len,
-            selected->ai_family, timeout_ms, &elapsed, probe_port);
+        double elapsed_ms = 0.0;
+        size_t reply_len = 0;
+        int rc = smallcluePingAttempt(family, (struct sockaddr *)&target_addr, target_len,
+            timeout_ms, ident, (uint16_t)(i + 1), &elapsed_ms, &reply_len);
         if (rc == 0) {
             successes++;
-            if (successes == 1 || elapsed < min_ms) min_ms = elapsed;
-            if (elapsed > max_ms) max_ms = elapsed;
-            total_ms += elapsed;
-            printf("attempt %d: connected in %.2f ms\n", i + 1, elapsed);
+            if (successes == 1 || elapsed_ms < min_ms) {
+                min_ms = elapsed_ms;
+            }
+            if (elapsed_ms > max_ms) {
+                max_ms = elapsed_ms;
+            }
+            total_ms += elapsed_ms;
+            printf("%zu bytes from %s: icmp_seq=%d time=%.3f ms\n",
+                reply_len, addrbuf, i + 1, elapsed_ms);
         } else {
-            printf("attempt %d: failed (%s)\n", i + 1, strerror(errno));
+            printf("Request timeout for icmp_seq %d (%s)\n", i + 1, strerror(errno));
         }
         fflush(stdout);
         if (i + 1 < count) {
-            usleep(500000);
+            usleep(1000000);
         }
     }
+
     printf("--- %s ping statistics ---\n", host);
-    printf("%d probes sent, %d successful, %d failed\n",
-        count, successes, count - successes);
+    printf("%d packets transmitted, %d packets received, %.1f%% packet loss\n",
+        count, successes, count > 0 ? ((double)(count - successes) * 100.0 / (double)count) : 0.0);
     if (successes > 0) {
-        printf("round-trip min/avg/max = %.2f/%.2f/%.2f ms (TCP port %d)\n",
-            min_ms, total_ms / successes, max_ms, probe_port);
+        printf("round-trip min/avg/max = %.3f/%.3f/%.3f ms\n",
+            min_ms, total_ms / (double)successes, max_ms);
     }
+
     pscalHostsFreeAddrInfo(res);
     return (successes > 0) ? 0 : 1;
 }
@@ -11203,7 +15269,98 @@ static int smallcluePingCommand(int argc, char **argv) {
 #define TELNET_DEFAULT_PORT 23
 #define TELNET_BUF_SIZE 4096
 
+/* Telnet protocol constants (RFC 854) -- defined locally rather than
+ * pulled from <arpa/telnet.h> since that header isn't guaranteed to
+ * exist on every target libc (e.g. musl, used on the actual deployment
+ * target). Only the handful this minimal client actually needs. */
+#define TELNET_IAC  255
+#define TELNET_DONT 254
+#define TELNET_DO   253
+#define TELNET_WONT 252
+#define TELNET_WILL 251
+#define TELNET_SB   250
+#define TELNET_SE   240
+
+typedef enum {
+    TELNET_PARSE_DATA,
+    TELNET_PARSE_IAC,
+    TELNET_PARSE_CMD,   /* saw IAC DO/DONT/WILL/WONT, waiting for the option byte */
+    TELNET_PARSE_SB,     /* inside IAC SB ... waiting for IAC SE to close it */
+    TELNET_PARSE_SB_IAC, /* inside SB, saw an IAC, check if next is SE */
+} SmallclueTelnetParseState;
+
+typedef struct {
+    SmallclueTelnetParseState state;
+    unsigned char pendingCmd; /* the DO/DONT/WILL/WONT byte, valid in TELNET_PARSE_CMD */
+} SmallclueTelnetParser;
+
+/* Feeds one byte of server output through the telnet negotiation state
+ * machine. Plain data bytes are appended to `out`; IAC-prefixed option
+ * negotiation (DO/DONT/WILL/WONT <option>) is intercepted and answered
+ * immediately on `sock` (this client declines every option: WONT in
+ * reply to DO, DONT in reply to WILL -- the standard minimal-client
+ * response when there's nothing to actually negotiate), and IAC SB ...
+ * IAC SE subnegotiation blocks are consumed without being echoed. A
+ * doubled IAC IAC in the data stream is the escape for a literal 0xFF
+ * byte and is unescaped back to a single 0xFF. */
+static void smallclueTelnetFeedByte(SmallclueTelnetParser *p, unsigned char c, int sock,
+                                    unsigned char *out, size_t *outLen) {
+    switch (p->state) {
+        case TELNET_PARSE_DATA:
+            if (c == TELNET_IAC) {
+                p->state = TELNET_PARSE_IAC;
+            } else {
+                out[(*outLen)++] = c;
+            }
+            break;
+        case TELNET_PARSE_IAC:
+            if (c == TELNET_IAC) {
+                out[(*outLen)++] = TELNET_IAC;
+                p->state = TELNET_PARSE_DATA;
+            } else if (c == TELNET_DO || c == TELNET_DONT || c == TELNET_WILL || c == TELNET_WONT) {
+                p->pendingCmd = c;
+                p->state = TELNET_PARSE_CMD;
+            } else if (c == TELNET_SB) {
+                p->state = TELNET_PARSE_SB;
+            } else {
+                /* Single-byte commands (NOP, AYT, etc.) and anything else
+                 * unrecognized: consume and return to plain data. */
+                p->state = TELNET_PARSE_DATA;
+            }
+            break;
+        case TELNET_PARSE_CMD: {
+            unsigned char reply[3] = { TELNET_IAC, 0, c };
+            if (p->pendingCmd == TELNET_DO) {
+                reply[1] = TELNET_WONT;
+                (void)write(sock, reply, sizeof(reply));
+            } else if (p->pendingCmd == TELNET_WILL) {
+                reply[1] = TELNET_DONT;
+                (void)write(sock, reply, sizeof(reply));
+            }
+            /* DONT/WONT from the server need no reply -- we already
+             * aren't doing whatever it is. */
+            p->state = TELNET_PARSE_DATA;
+            break;
+        }
+        case TELNET_PARSE_SB:
+            if (c == TELNET_IAC) {
+                p->state = TELNET_PARSE_SB_IAC;
+            }
+            break;
+        case TELNET_PARSE_SB_IAC:
+            if (c == TELNET_SE) {
+                p->state = TELNET_PARSE_DATA;
+            } else {
+                /* Not actually the closing IAC SE -- back into the
+                 * subnegotiation body. */
+                p->state = TELNET_PARSE_SB;
+            }
+            break;
+    }
+}
+
 static int smallclueTelnetCommand(int argc, char **argv) {
+    signal(SIGPIPE, SIG_IGN);
     smallclueResetGetopt();
     int port = TELNET_DEFAULT_PORT;
     int opt;
@@ -11261,6 +15418,9 @@ static int smallclueTelnetCommand(int argc, char **argv) {
 
     int status = 0;
     bool running = true;
+    SmallclueTelnetParser parser;
+    memset(&parser, 0, sizeof(parser));
+    parser.state = TELNET_PARSE_DATA;
     while (running) {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -11274,14 +15434,19 @@ static int smallclueTelnetCommand(int argc, char **argv) {
             break;
         }
         if (FD_ISSET(sock, &rfds)) {
-            char buf[TELNET_BUF_SIZE];
+            unsigned char buf[TELNET_BUF_SIZE];
             ssize_t n = read(sock, buf, sizeof(buf));
             if (n <= 0) {
                 running = false;
             } else {
+                unsigned char plain[TELNET_BUF_SIZE];
+                size_t plainLen = 0;
+                for (ssize_t i = 0; i < n; ++i) {
+                    smallclueTelnetFeedByte(&parser, buf[i], sock, plain, &plainLen);
+                }
                 ssize_t off = 0;
-                while (off < n) {
-                    ssize_t w = write(STDOUT_FILENO, buf + off, (size_t)(n - off));
+                while (off < (ssize_t)plainLen) {
+                    ssize_t w = write(STDOUT_FILENO, plain + off, plainLen - (size_t)off);
                     if (w < 0) {
                         if (errno == EINTR) continue;
                         running = false;
@@ -11341,6 +15506,10 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
         return 1;
     }
     const char *host = argv[optind];
+#if defined(PSCAL_TARGET_IOS)
+    pthread_t bypass_tid = pthread_self();
+    vprocRegisterInterposeBypassThread(bypass_tid);
+#endif
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -11352,6 +15521,9 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
     int gai = pscalHostsGetAddrInfo(host, portbuf, &hints, &res);
     if (gai != 0 || !res) {
         fprintf(stderr, "traceroute: %s: %s\n", host, gai_strerror(gai));
+#if defined(PSCAL_TARGET_IOS)
+        vprocUnregisterInterposeBypassThread(bypass_tid);
+#endif
         return 1;
     }
 
@@ -11359,6 +15531,9 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
     if (recv_sock < 0) {
         fprintf(stderr, "traceroute: unable to open ICMP socket: %s\n", strerror(errno));
         pscalHostsFreeAddrInfo(res);
+#if defined(PSCAL_TARGET_IOS)
+        vprocUnregisterInterposeBypassThread(bypass_tid);
+#endif
         return 1;
     }
 
@@ -11367,6 +15542,9 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
         fprintf(stderr, "traceroute: unable to open UDP socket: %s\n", strerror(errno));
         close(recv_sock);
         pscalHostsFreeAddrInfo(res);
+#if defined(PSCAL_TARGET_IOS)
+        vprocUnregisterInterposeBypassThread(bypass_tid);
+#endif
         return 1;
     }
 
@@ -11431,7 +15609,10 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
 
     close(send_sock);
     close(recv_sock);
-    freeaddrinfo(res);
+    pscalHostsFreeAddrInfo(res);
+#if defined(PSCAL_TARGET_IOS)
+    vprocUnregisterInterposeBypassThread(bypass_tid);
+#endif
     return reached ? 0 : 1;
 }
 
@@ -11602,14 +15783,61 @@ static int smallclueDmesgCommand(int argc, char **argv) {
 }
 
 static int smallclueCatCommand(int argc, char **argv) {
-    int status = 0;
-    if (argc <= 1) {
-        return cat_file(NULL);
+    SmallclueCatOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (!arg || arg[0] != '-' || strcmp(arg, "-") == 0) break;
+        if (strcmp(arg, "--") == 0) { argi++; break; }
+        for (const char *p = arg + 1; *p; ++p) {
+            switch (*p) {
+                case 'n': opts.numberAll = true; break;
+                case 'b': opts.numberNonBlank = true; break;
+                case 'E': opts.showEnds = true; break;
+                case 'T': opts.showTabs = true; break;
+                case 's': opts.squeezeBlank = true; break;
+                case 'A': opts.showEnds = true; opts.showTabs = true; break;
+                default:
+                    fprintf(stderr, "cat: unsupported option -%c\n", *p);
+                    return 1;
+            }
+        }
     }
-    for (int i = 1; i < argc; ++i) {
-        status |= cat_file(argv[i]);
+
+    bool anyFlag = opts.numberAll || opts.numberNonBlank || opts.showEnds ||
+                  opts.showTabs || opts.squeezeBlank;
+    int status = 0;
+    if (!anyFlag) {
+        if (argi >= argc) {
+            return cat_file(NULL);
+        }
+        for (int i = argi; i < argc; ++i) {
+            status |= cat_file(argv[i]);
+        }
+        return status ? 1 : 0;
+    }
+
+    long lineNo = 0;
+    bool prevBlank = false;
+    if (argi >= argc) {
+        return smallclueCatFileFormatted(NULL, &opts, &lineNo, &prevBlank);
+    }
+    for (int i = argi; i < argc; ++i) {
+        status |= smallclueCatFileFormatted(argv[i], &opts, &lineNo, &prevBlank);
     }
     return status ? 1 : 0;
+}
+
+static const char *smallcluePagerDisplayName(const char *path) {
+    if (!path || !*path || strcmp(path, "(stdin)") == 0) {
+        return "(stdin)";
+    }
+    const char *slash = strrchr(path, '/');
+    if (slash && slash[1] != '\0') {
+        return slash + 1;
+    }
+    return path;
 }
 
 static int smallcluePagerCommand(int argc, char **argv) {
@@ -11630,17 +15858,31 @@ static int smallcluePagerCommand(int argc, char **argv) {
     }
 
     int status = 0;
+    int file_count = argc - optind;
     if (optind >= argc) {
         if (pscalRuntimeStdinIsInteractive()) {
             fprintf(stderr, "%s: missing filename\n", cmd_name);
             return 1;
         }
-        return pager_file(cmd_name, "(stdin)", stdin, raw_mode);
+        return pager_file(cmd_name, "(stdin)", NULL, stdin, raw_mode);
     }
     for (int i = optind; i < argc; ++i) {
         const char *path = argv[i];
+        char detail[PATH_MAX + 32];
+        const char *detail_ptr = NULL;
+        if (file_count > 1) {
+            snprintf(detail, sizeof(detail), "%s (%d/%d)",
+                     smallcluePagerDisplayName(path && strcmp(path, "-") != 0 ? path : "(stdin)"),
+                     (i - optind) + 1,
+                     file_count);
+            detail_ptr = detail;
+        }
         if (!path || strcmp(path, "-") == 0) {
-            status |= pager_file(cmd_name, "(stdin)", stdin, raw_mode);
+            status |= pager_file(cmd_name, "(stdin)", detail_ptr, stdin, raw_mode);
+            int exit_key = pagerLastExitKey();
+            if (exit_key == 'Q' || exit_key == 3 || exit_key == 4) {
+                break;
+            }
             continue;
         }
         FILE *fp = fopen(path, "r");
@@ -11649,8 +15891,14 @@ static int smallcluePagerCommand(int argc, char **argv) {
             status = 1;
             continue;
         }
-        status |= pager_file(cmd_name, path, fp, raw_mode);
+        status |= pager_file(cmd_name, path, detail_ptr, fp, raw_mode);
         fclose(fp);
+        {
+            int exit_key = pagerLastExitKey();
+            if (exit_key == 'Q' || exit_key == 3 || exit_key == 4) {
+                break;
+            }
+        }
     }
     return status ? 1 : 0;
 }
@@ -11694,7 +15942,14 @@ static int smallclueMarkdownCommand(int argc, char **argv) {
         return smallclueMarkdownListDocuments();
     }
     int status = 0;
+    int file_count = argc - optind;
     for (int i = optind; i < argc; ++i) {
+        if (file_count > 1) {
+            if (i > optind) {
+                putchar('\n');
+            }
+            printf("==> %s <==\n", argv[i]);
+        }
         status |= smallclueMarkdownBrowseTarget(argv[i], output_raw);
     }
     return status ? 1 : 0;
@@ -11704,8 +15959,15 @@ static int smallclueCurlCommand(int argc, char **argv) {
     smallclueResetGetopt();
     const char *output_path = NULL;
     int use_remote_name = 0;
+    const char *method = NULL;
+    char **headers = NULL;
+    int headerCount = 0, headerCap = 0;
+    char *postData = NULL;
+    size_t postDataLen = 0;
+    const char *userpwd = NULL;
+    bool insecureTls = false;
     int opt;
-    while ((opt = getopt(argc, argv, "o:O")) != -1) {
+    while ((opt = getopt(argc, argv, "o:OX:H:d:u:k")) != -1) {
         switch (opt) {
             case 'o':
                 output_path = optarg;
@@ -11713,23 +15975,83 @@ static int smallclueCurlCommand(int argc, char **argv) {
             case 'O':
                 use_remote_name = 1;
                 break;
+            case 'X':
+                method = optarg;
+                break;
+            case 'u':
+                userpwd = optarg;
+                break;
+            case 'k':
+                insecureTls = true;
+                break;
+            case 'H': {
+                if (headerCount == headerCap) {
+                    headerCap = headerCap ? headerCap * 2 : 8;
+                    char **resized = (char **)realloc(headers, (size_t)headerCap * sizeof(char *));
+                    if (!resized) {
+                        fprintf(stderr, "curl: out of memory\n");
+                        free(headers);
+                        free(postData);
+                        return 1;
+                    }
+                    headers = resized;
+                }
+                headers[headerCount++] = optarg;
+                break;
+            }
+            case 'd': {
+                /* Real curl joins repeated -d values with '&', like
+                 * concatenating form fields. */
+                size_t addLen = strlen(optarg);
+                size_t sepLen = (postDataLen > 0) ? 1 : 0;
+                char *resized = (char *)realloc(postData, postDataLen + sepLen + addLen + 1);
+                if (!resized) {
+                    fprintf(stderr, "curl: out of memory\n");
+                    free(headers);
+                    free(postData);
+                    return 1;
+                }
+                postData = resized;
+                if (sepLen) postData[postDataLen++] = '&';
+                memcpy(postData + postDataLen, optarg, addLen);
+                postDataLen += addLen;
+                postData[postDataLen] = '\0';
+                break;
+            }
             default:
-                fprintf(stderr, "usage: curl [-o file | -O] url...\n");
+                fprintf(stderr, "usage: curl [-o file | -O] [-X METHOD] [-H HEADER]... [-d DATA]... [-u USER:PASS] [-k] url...\n");
+                free(headers);
+                free(postData);
                 return 1;
         }
     }
     if (output_path && use_remote_name) {
         fprintf(stderr, "curl: -o and -O may not be used together\n");
+        free(headers);
+        free(postData);
         return 1;
     }
     if (optind >= argc) {
         fprintf(stderr, "curl: missing URL\n");
+        free(headers);
+        free(postData);
         return 1;
     }
     if (output_path && (argc - optind) != 1) {
         fprintf(stderr, "curl: -o is only supported with a single URL\n");
+        free(headers);
+        free(postData);
         return 1;
     }
+    SmallclueHttpRequestOptions reqOpts;
+    memset(&reqOpts, 0, sizeof(reqOpts));
+    reqOpts.method = method;
+    reqOpts.headers = headers;
+    reqOpts.headerCount = headerCount;
+    reqOpts.postData = postData;
+    reqOpts.userpwd = userpwd;
+    reqOpts.insecureTls = insecureTls;
+
     int status = 0;
     for (int i = optind; i < argc; ++i) {
         const char *url = argv[i];
@@ -11741,12 +16063,84 @@ static int smallclueCurlCommand(int argc, char **argv) {
             smallclueUrlSuggestFilename(url, derived, sizeof(derived));
             destination = derived;
         }
-        status |= smallclueHttpFetch("curl", url, destination);
+        status |= smallclueHttpFetch("curl", url, destination, &reqOpts);
     }
+    free(headers);
+    free(postData);
     return status ? 1 : 0;
 }
 
 static int smallclueWgetCommand(int argc, char **argv) {
+    const char *method = NULL;
+    char **headers = NULL;
+    int headerCount = 0, headerCap = 0;
+    char *postData = NULL;
+    const char *wgetUser = NULL;
+    const char *wgetPassword = NULL;
+    bool insecureTls = false;
+    char userpwdBuf[512];
+    userpwdBuf[0] = '\0';
+
+    /* Real wget has no short forms for these, only --header=/--post-data=/
+     * --method=/--user=/--password=/--no-check-certificate (repeated GNU
+     * long options with no getopt()-friendly short equivalent) -- strip
+     * them out before calling getopt(), matching the convention used
+     * elsewhere in this file (e.g. stat's --format=). */
+    for (int i = 1; i < argc; ) {
+        if (strncmp(argv[i], "--header=", 9) == 0) {
+            if (headerCount == headerCap) {
+                headerCap = headerCap ? headerCap * 2 : 8;
+                char **resized = (char **)realloc(headers, (size_t)headerCap * sizeof(char *));
+                if (!resized) {
+                    fprintf(stderr, "wget: out of memory\n");
+                    free(headers);
+                    free(postData);
+                    return 1;
+                }
+                headers = resized;
+            }
+            headers[headerCount++] = argv[i] + 9;
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            argc--;
+            continue;
+        }
+        if (strncmp(argv[i], "--post-data=", 12) == 0) {
+            free(postData);
+            postData = strdup(argv[i] + 12);
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            argc--;
+            continue;
+        }
+        if (strncmp(argv[i], "--method=", 9) == 0) {
+            method = argv[i] + 9;
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            argc--;
+            continue;
+        }
+        if (strncmp(argv[i], "--user=", 7) == 0) {
+            wgetUser = argv[i] + 7;
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            argc--;
+            continue;
+        }
+        if (strncmp(argv[i], "--password=", 11) == 0) {
+            wgetPassword = argv[i] + 11;
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            argc--;
+            continue;
+        }
+        if (strcmp(argv[i], "--no-check-certificate") == 0) {
+            insecureTls = true;
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            argc--;
+            continue;
+        }
+        i++;
+    }
+    if (wgetUser) {
+        snprintf(userpwdBuf, sizeof(userpwdBuf), "%s:%s", wgetUser, wgetPassword ? wgetPassword : "");
+    }
+
     smallclueResetGetopt();
     const char *output_path = NULL;
     int opt;
@@ -11756,18 +16150,35 @@ static int smallclueWgetCommand(int argc, char **argv) {
                 output_path = optarg;
                 break;
             default:
-                fprintf(stderr, "usage: wget [-O file] url...\n");
+                fprintf(stderr, "usage: wget [-O file] [--method=METHOD] [--header=HEADER]... [--post-data=DATA]\n"
+                                "            [--user=USER] [--password=PASS] [--no-check-certificate] url...\n");
+                free(headers);
+                free(postData);
                 return 1;
         }
     }
     if (optind >= argc) {
         fprintf(stderr, "wget: missing URL\n");
+        free(headers);
+        free(postData);
         return 1;
     }
     if (output_path && (argc - optind) != 1) {
         fprintf(stderr, "wget: -O is only supported with a single URL\n");
+        free(headers);
+        free(postData);
         return 1;
     }
+
+    SmallclueHttpRequestOptions reqOpts;
+    memset(&reqOpts, 0, sizeof(reqOpts));
+    reqOpts.method = method;
+    reqOpts.headers = headers;
+    reqOpts.headerCount = headerCount;
+    reqOpts.postData = postData;
+    reqOpts.userpwd = wgetUser ? userpwdBuf : NULL;
+    reqOpts.insecureTls = insecureTls;
+
     int status = 0;
     for (int i = optind; i < argc; ++i) {
         const char *url = argv[i];
@@ -11777,12 +16188,14 @@ static int smallclueWgetCommand(int argc, char **argv) {
             smallclueUrlSuggestFilename(url, derived, sizeof(derived));
             destination = derived;
         }
-        int rc = smallclueHttpFetch("wget", url, destination);
+        int rc = smallclueHttpFetch("wget", url, destination, &reqOpts);
         if (rc == 0) {
             printf("Saved %s -> %s\n", url, destination ? destination : "(stdout)");
         }
         status |= rc;
     }
+    free(headers);
+    free(postData);
     return status ? 1 : 0;
 }
 
@@ -11795,15 +16208,51 @@ static int smallclueClearCommand(int argc, char **argv) {
     return 0;
 }
 
+/* Forward declaration: the ISO-8601-ish string parser was originally
+ * written for `touch -d`, but the same shapes are exactly what `date -d`
+ * / `date -s` need too -- defined later in this file (touch's section),
+ * reused here rather than duplicated. */
+static bool smallclueTouchParseDashD(const char *spec, struct tm *out);
+
 static int smallclueDateCommand(int argc, char **argv) {
     int arg_index = 1;
     int use_utc = 0;
     const char *format = "%a %b %e %T %Z %Y";
+    const char *date_spec = NULL;
+    const char *set_spec = NULL;
 
     while (arg_index < argc && argv[arg_index] && argv[arg_index][0] == '-') {
         const char *opt = argv[arg_index];
         if (strcmp(opt, "-u") == 0 || strcmp(opt, "--utc") == 0 || strcmp(opt, "--universal") == 0) {
             use_utc = 1;
+            arg_index++;
+            continue;
+        }
+        if (strcmp(opt, "-d") == 0 || strcmp(opt, "--date") == 0) {
+            if (arg_index + 1 >= argc) {
+                fprintf(stderr, "date: option '%s' requires an argument\n", opt);
+                return 1;
+            }
+            date_spec = argv[arg_index + 1];
+            arg_index += 2;
+            continue;
+        }
+        if (strncmp(opt, "--date=", 7) == 0) {
+            date_spec = opt + 7;
+            arg_index++;
+            continue;
+        }
+        if (strcmp(opt, "-s") == 0 || strcmp(opt, "--set") == 0) {
+            if (arg_index + 1 >= argc) {
+                fprintf(stderr, "date: option '%s' requires an argument\n", opt);
+                return 1;
+            }
+            set_spec = argv[arg_index + 1];
+            arg_index += 2;
+            continue;
+        }
+        if (strncmp(opt, "--set=", 6) == 0) {
+            set_spec = opt + 6;
             arg_index++;
             continue;
         }
@@ -11831,12 +16280,36 @@ static int smallclueDateCommand(int argc, char **argv) {
         return 1;
     }
 
-    time_t now = time(NULL);
-    if (now == (time_t)-1) {
-        perror("date");
-        return 1;
-    }
     struct tm tm_buf;
+    memset(&tm_buf, 0, sizeof(tm_buf));
+    time_t now;
+
+    const char *parse_spec = set_spec ? set_spec : date_spec;
+    if (parse_spec) {
+        if (!smallclueTouchParseDashD(parse_spec, &tm_buf)) {
+            fprintf(stderr, "date: invalid date '%s'\n", parse_spec);
+            return 1;
+        }
+        now = use_utc ? timegm(&tm_buf) : mktime(&tm_buf);
+        if (now == (time_t)-1) {
+            fprintf(stderr, "date: invalid date '%s'\n", parse_spec);
+            return 1;
+        }
+        if (set_spec) {
+            struct timespec ts = {.tv_sec = now, .tv_nsec = 0};
+            if (clock_settime(CLOCK_REALTIME, &ts) != 0) {
+                fprintf(stderr, "date: cannot set date: %s\n", strerror(errno));
+                return 1;
+            }
+        }
+    } else {
+        now = time(NULL);
+        if (now == (time_t)-1) {
+            perror("date");
+            return 1;
+        }
+    }
+
     struct tm *tm_val = use_utc ? gmtime(&now) : localtime(&now);
     if (!tm_val) {
         perror("date");
@@ -12155,35 +16628,163 @@ static bool smallclueParseDashLineCount(const char *arg, long *value) {
     return true;
 }
 
+/* Parses the value passed to `-n` when it may carry a leading sign with
+ * tool-specific meaning: BSD/GNU tail's "-n +NUM" starts output at line
+ * NUM (relative to the beginning), and GNU head's "-n -NUM" prints all
+ * but the last NUM lines. A bare "+NUM" for head has no special GNU
+ * meaning and is treated as an ordinary positive count. */
+static bool smallclueParseSignedLineCount(const char *text, char *signOut, long *valueOut) {
+    if (!text || !*text) return false;
+    char sign = '\0';
+    const char *p = text;
+    if (*p == '+' || *p == '-') {
+        sign = *p;
+        p++;
+    }
+    if (!*p) return false;
+    char *endptr = NULL;
+    long v = strtol(p, &endptr, 10);
+    if (!endptr || *endptr != '\0' || v < 0) return false;
+    if (signOut) *signOut = sign;
+    if (valueOut) *valueOut = v;
+    return true;
+}
+
 static int smallclueHeadStream(FILE *fp, const char *label, long lines) {
     if (lines <= 0) {
         return 0;
     }
+    char buf[16384];
+    long remaining = lines;
+    int read_err = 0;
+    ssize_t n;
+    int status = 0;
+
+    while (remaining > 0 && (n = smallclueReadStream(fp, buf, sizeof(buf), &read_err)) > 0) {
+        ssize_t i = 0;
+        ssize_t end_idx = -1;
+
+        /* Bolt optimization: unrolled loop for head line scanning */
+        #define CHECK_NL(idx) do { \
+            if (buf[i + (idx)] == '\n') { \
+                remaining--; \
+                if (remaining == 0) { \
+                    end_idx = i + (idx); \
+                    goto found; \
+                } \
+            } \
+        } while(0)
+
+        for (; i + 15 < n; i += 16) {
+            CHECK_NL(0); CHECK_NL(1); CHECK_NL(2); CHECK_NL(3);
+            CHECK_NL(4); CHECK_NL(5); CHECK_NL(6); CHECK_NL(7);
+            CHECK_NL(8); CHECK_NL(9); CHECK_NL(10); CHECK_NL(11);
+            CHECK_NL(12); CHECK_NL(13); CHECK_NL(14); CHECK_NL(15);
+        }
+        #undef CHECK_NL
+
+        for (; i < n; ++i) {
+            if (buf[i] == '\n') {
+                remaining--;
+                if (remaining == 0) {
+                    end_idx = i;
+                    goto found;
+                }
+            }
+        }
+found:
+        if (end_idx >= 0) {
+            fwrite(buf, 1, (size_t)(end_idx + 1), stdout);
+            break;
+        } else {
+            fwrite(buf, 1, (size_t)n, stdout);
+        }
+    }
+
+    if (read_err) {
+        fprintf(stderr, "head: %s: %s\n",
+                label ? label : "(stdin)",
+                strerror(read_err));
+        status = 1;
+    }
+    return status;
+}
+
+/* GNU head's "-n -NUM": print all but the last NUM lines. Since head
+ * doesn't know where the end is until EOF, this streams via a NUM-sized
+ * ring buffer of line contents -- a line is only printed once NUM more
+ * lines have arrived after it (proving it isn't among the final NUM),
+ * and whatever remains buffered at EOF (exactly the excluded trailing
+ * lines) is discarded rather than printed. */
+static int smallclueHeadStreamAllButLast(FILE *fp, const char *label, long excludeCount) {
+    if (excludeCount <= 0) {
+        char *line = NULL;
+        size_t cap = 0;
+        int status = 0;
+        while (1) {
+            int read_err = 0;
+            ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
+            if (len < 0) {
+                if (read_err) {
+                    fprintf(stderr, "head: %s: %s\n", label ? label : "(stdin)", strerror(read_err));
+                    status = 1;
+                }
+                break;
+            }
+            fwrite(line, 1, (size_t)len, stdout);
+        }
+        free(line);
+        return status;
+    }
+
+    char **ring = (char **)calloc((size_t)excludeCount, sizeof(char *));
+    if (!ring) {
+        fprintf(stderr, "head: %s: out of memory\n", label ? label : "(stdin)");
+        return 1;
+    }
     char *line = NULL;
     size_t cap = 0;
-    long remaining = lines;
+    long count = 0;
     int status = 0;
-    while (remaining > 0) {
+    while (1) {
         int read_err = 0;
         ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
         if (len < 0) {
             if (read_err) {
-                fprintf(stderr, "head: %s: %s\n",
-                        label ? label : "(stdin)",
-                        strerror(read_err));
+                fprintf(stderr, "head: %s: %s\n", label ? label : "(stdin)", strerror(read_err));
                 status = 1;
             }
             break;
         }
-        fwrite(line, 1, (size_t)len, stdout);
-        remaining--;
+        long slot = count % excludeCount;
+        if (count >= excludeCount && ring[slot]) {
+            fputs(ring[slot], stdout);
+            free(ring[slot]);
+            ring[slot] = NULL;
+        }
+        char *copy = (char *)malloc((size_t)len + 1);
+        if (!copy) {
+            fprintf(stderr, "head: %s: out of memory\n", label ? label : "(stdin)");
+            status = 1;
+            break;
+        }
+        memcpy(copy, line, (size_t)len);
+        copy[len] = '\0';
+        ring[slot] = copy;
+        count++;
     }
     free(line);
+    for (long i = 0; i < excludeCount; ++i) {
+        free(ring[i]);
+    }
+    free(ring);
     return status;
 }
 
 static int smallclueHeadCommand(int argc, char **argv) {
     long lines = 10;
+    bool allButLast = false;
+    long excludeCount = 0;
     int index = 1;
     while (index < argc) {
         const char *arg = argv[index];
@@ -12199,18 +16800,43 @@ static int smallclueHeadCommand(int argc, char **argv) {
                 fprintf(stderr, "head: option requires an argument -- n\n");
                 return 1;
             }
-            char *endptr = NULL;
-            lines = strtol(argv[index + 1], &endptr, 10);
-            if (!endptr || *endptr != '\0') {
+            char sign = '\0';
+            long value = 0;
+            if (!smallclueParseSignedLineCount(argv[index + 1], &sign, &value)) {
                 fprintf(stderr, "head: invalid line count '%s'\n", argv[index + 1]);
                 return 1;
             }
+            if (sign == '-') {
+                allButLast = true;
+                excludeCount = value;
+            } else {
+                allButLast = false;
+                lines = value;
+            }
             index += 2;
+            continue;
+        }
+        if (strncmp(arg, "-n", 2) == 0 && arg[2] != '\0') {
+            char sign = '\0';
+            long value = 0;
+            if (!smallclueParseSignedLineCount(arg + 2, &sign, &value)) {
+                fprintf(stderr, "head: invalid line count '%s'\n", arg + 2);
+                return 1;
+            }
+            if (sign == '-') {
+                allButLast = true;
+                excludeCount = value;
+            } else {
+                allButLast = false;
+                lines = value;
+            }
+            index += 1;
             continue;
         }
         long dashLines = 0;
         if (smallclueParseDashLineCount(arg, &dashLines)) {
             lines = dashLines;
+            allButLast = false;
             index += 1;
             continue;
         }
@@ -12219,8 +16845,10 @@ static int smallclueHeadCommand(int argc, char **argv) {
     }
 
     int status = 0;
-    if (index >= argc) {
-        status = smallclueHeadStream(stdin, "(stdin)", lines);
+    int file_count = argc - index;
+    if (file_count <= 0) {
+        status = allButLast ? smallclueHeadStreamAllButLast(stdin, "(stdin)", excludeCount)
+                             : smallclueHeadStream(stdin, "(stdin)", lines);
     } else {
         for (int i = index; i < argc; ++i) {
             const char *path = argv[i];
@@ -12230,7 +16858,14 @@ static int smallclueHeadCommand(int argc, char **argv) {
                 status = 1;
                 continue;
             }
-            status |= smallclueHeadStream(fp, path, lines);
+            if (file_count > 1) {
+                if (i > index) {
+                    putchar('\n');
+                }
+                printf("==> %s <==\n", path);
+            }
+            status |= allButLast ? smallclueHeadStreamAllButLast(fp, path, excludeCount)
+                                  : smallclueHeadStream(fp, path, lines);
             fclose(fp);
         }
     }
@@ -12289,6 +16924,37 @@ static int smallclueTailStream(FILE *fp, const char *label, long lines) {
         free(ring[i]);
     }
     free(ring);
+    return status;
+}
+
+/* BSD/GNU tail's "-n +NUM": start output at line NUM (1-based, relative
+ * to the start of input) rather than counting back from the end. Unlike
+ * the last-N-lines mode, this needs no buffering at all -- just count
+ * lines as they stream by and start printing once the target is hit. */
+static int smallclueTailStreamFromLine(FILE *fp, const char *label, long startLine) {
+    if (startLine < 1) {
+        startLine = 1;
+    }
+    char *line = NULL;
+    size_t cap = 0;
+    long count = 0;
+    int status = 0;
+    while (1) {
+        int read_err = 0;
+        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
+        if (len < 0) {
+            if (read_err) {
+                fprintf(stderr, "tail: %s: %s\n", label ? label : "(stdin)", strerror(read_err));
+                status = 1;
+            }
+            break;
+        }
+        count++;
+        if (count >= startLine) {
+            fwrite(line, 1, (size_t)len, stdout);
+        }
+    }
+    free(line);
     return status;
 }
 
@@ -12427,6 +17093,8 @@ static int smallclueTailCommand(int argc, char **argv) {
     smallclueClearPendingSignals();
     long lines = 10;
     bool follow = false;
+    bool fromLineStart = false;
+    long startLine = 1;
     int index = 1;
     while (index < argc) {
         const char *arg = argv[index];
@@ -12447,18 +17115,43 @@ static int smallclueTailCommand(int argc, char **argv) {
                 fprintf(stderr, "tail: option requires an argument -- n\n");
                 return 1;
             }
-            char *endptr = NULL;
-            lines = strtol(argv[index + 1], &endptr, 10);
-            if (!endptr || *endptr != '\0') {
+            char sign = '\0';
+            long value = 0;
+            if (!smallclueParseSignedLineCount(argv[index + 1], &sign, &value)) {
                 fprintf(stderr, "tail: invalid line count '%s'\n", argv[index + 1]);
                 return 1;
             }
+            if (sign == '+') {
+                fromLineStart = true;
+                startLine = value;
+            } else {
+                fromLineStart = false;
+                lines = value;
+            }
             index += 2;
+            continue;
+        }
+        if (strncmp(arg, "-n", 2) == 0 && arg[2] != '\0') {
+            char sign = '\0';
+            long value = 0;
+            if (!smallclueParseSignedLineCount(arg + 2, &sign, &value)) {
+                fprintf(stderr, "tail: invalid line count '%s'\n", arg + 2);
+                return 1;
+            }
+            if (sign == '+') {
+                fromLineStart = true;
+                startLine = value;
+            } else {
+                fromLineStart = false;
+                lines = value;
+            }
+            index += 1;
             continue;
         }
         long dashLines = 0;
         if (smallclueParseDashLineCount(arg, &dashLines)) {
             lines = dashLines;
+            fromLineStart = false;
             index += 1;
             continue;
         }
@@ -12469,9 +17162,15 @@ static int smallclueTailCommand(int argc, char **argv) {
         fprintf(stderr, "tail: -f currently supports a single input\n");
         return 1;
     }
+    if (follow && fromLineStart) {
+        fprintf(stderr, "tail: -f cannot be combined with -n +NUM\n");
+        return 1;
+    }
     int status = 0;
-    if (index >= argc) {
+    int file_count = argc - index;
+    if (file_count <= 0) {
         status = follow ? smallclueTailFollow(stdin, "(stdin)", lines)
+                : fromLineStart ? smallclueTailStreamFromLine(stdin, "(stdin)", startLine)
                         : smallclueTailStream(stdin, "(stdin)", lines);
     } else {
         for (int i = index; i < argc; ++i) {
@@ -12483,10 +17182,19 @@ static int smallclueTailCommand(int argc, char **argv) {
                 status = 1;
                 continue;
             }
+            if (file_count > 1) {
+                if (i > index) {
+                    putchar('\n');
+                }
+                printf("==> %s <==\n", path);
+            }
             if (follow) {
                 status |= smallclueTailFollow(fp, path, lines);
                 fclose(fp);
                 break;
+            } else if (fromLineStart) {
+                status |= smallclueTailStreamFromLine(fp, path, startLine);
+                fclose(fp);
             } else {
                 status |= smallclueTailStream(fp, path, lines);
                 fclose(fp);
@@ -12496,19 +17204,191 @@ static int smallclueTailCommand(int argc, char **argv) {
     return status ? 1 : 0;
 }
 
+/* Parses touch -t's [[CC]YY]MMDDhhmm[.ss] compact timestamp form. The
+ * digit count before an optional ".ss" suffix tells us which of the three
+ * year-width variants we're looking at. */
+static bool smallclueTouchParseDashT(const char *spec, struct tm *out) {
+    memset(out, 0, sizeof(*out));
+    out->tm_isdst = -1;
+    char digits[13];
+    int seconds = 0;
+    const char *dot = strchr(spec, '.');
+    size_t digitLen = dot ? (size_t)(dot - spec) : strlen(spec);
+    if (dot) {
+        if (strlen(dot + 1) != 2 || !isdigit((unsigned char)dot[1]) || !isdigit((unsigned char)dot[2])) {
+            return false;
+        }
+        seconds = (dot[1] - '0') * 10 + (dot[2] - '0');
+    }
+    if (digitLen != 8 && digitLen != 10 && digitLen != 12) {
+        return false;
+    }
+    if (digitLen >= sizeof(digits)) {
+        return false;
+    }
+    for (size_t i = 0; i < digitLen; ++i) {
+        if (!isdigit((unsigned char)spec[i])) {
+            return false;
+        }
+        digits[i] = spec[i];
+    }
+    digits[digitLen] = '\0';
+
+    int year = -1;
+    const char *rest = digits;
+    if (digitLen == 12) {
+        char century[3] = {digits[0], digits[1], '\0'};
+        char yy[3] = {digits[2], digits[3], '\0'};
+        year = atoi(century) * 100 + atoi(yy);
+        rest = digits + 4;
+    } else if (digitLen == 10) {
+        char yy[3] = {digits[0], digits[1], '\0'};
+        int yyVal = atoi(yy);
+        year = (yyVal < 69) ? 2000 + yyVal : 1900 + yyVal; /* POSIX pivot */
+        rest = digits + 2;
+    } else {
+        time_t now = time(NULL);
+        struct tm nowTm;
+        localtime_r(&now, &nowTm);
+        year = nowTm.tm_year + 1900;
+    }
+    char mm[3] = {rest[0], rest[1], '\0'};
+    char dd[3] = {rest[2], rest[3], '\0'};
+    char hh[3] = {rest[4], rest[5], '\0'};
+    char min[3] = {rest[6], rest[7], '\0'};
+    out->tm_year = year - 1900;
+    out->tm_mon = atoi(mm) - 1;
+    out->tm_mday = atoi(dd);
+    out->tm_hour = atoi(hh);
+    out->tm_min = atoi(min);
+    out->tm_sec = seconds;
+    return true;
+}
+
+/* Supports the common, unambiguous date-string shapes real scripts use.
+ * Full natural-language parsing (GNU coreutils' "getdate" grammar --
+ * "yesterday", "next monday", "+1 day") is a much larger feature and out
+ * of scope here; this covers explicit ISO-8601-ish timestamps. */
+static bool smallclueTouchParseDashD(const char *spec, struct tm *out) {
+    static const char *formats[] = {
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d",
+    };
+    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); ++i) {
+        memset(out, 0, sizeof(*out));
+        out->tm_isdst = -1;
+        char *end = strptime(spec, formats[i], out);
+        if (end && *end == '\0') {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int smallclueTouchCommand(int argc, char **argv) {
-    if (argc < 2) {
+    bool noCreate = false;
+    bool accessOnly = false;
+    bool modifyOnly = false;
+    const char *refFile = NULL;
+    const char *tSpec = NULL;
+    const char *dSpec = NULL;
+
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        if (strcmp(arg, "-c") == 0 || strcmp(arg, "--no-create") == 0) {
+            noCreate = true;
+        } else if (strcmp(arg, "-a") == 0) {
+            accessOnly = true;
+        } else if (strcmp(arg, "-m") == 0) {
+            modifyOnly = true;
+        } else if (strcmp(arg, "-r") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "touch: -r requires a reference file\n");
+                return 1;
+            }
+            refFile = argv[++argi];
+        } else if (strncmp(arg, "-r", 2) == 0 && arg[2] != '\0') {
+            refFile = arg + 2;
+        } else if (strcmp(arg, "-t") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "touch: -t requires a timestamp argument\n");
+                return 1;
+            }
+            tSpec = argv[++argi];
+        } else if (strcmp(arg, "-d") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "touch: -d requires a date string\n");
+                return 1;
+            }
+            dSpec = argv[++argi];
+        } else if (arg[0] == '-' && arg[1] != '\0') {
+            fprintf(stderr, "touch: unsupported option '%s'\n", arg);
+            return 1;
+        } else {
+            break;
+        }
+    }
+    if (argi >= argc) {
         fprintf(stderr, "touch: missing file operand\n");
         return 1;
     }
-    int status = 0;
+
     struct timeval times[2];
-    if (gettimeofday(&times[0], NULL) != 0) {
-        times[0].tv_sec = time(NULL);
+    if (refFile) {
+        struct stat refStat;
+        if (stat(refFile, &refStat) != 0) {
+            fprintf(stderr, "touch: %s: %s\n", refFile, strerror(errno));
+            return 1;
+        }
+        times[0].tv_sec = refStat.st_atime;
         times[0].tv_usec = 0;
+        times[1].tv_sec = refStat.st_mtime;
+        times[1].tv_usec = 0;
+    } else if (tSpec) {
+        struct tm tmVal;
+        if (!smallclueTouchParseDashT(tSpec, &tmVal)) {
+            fprintf(stderr, "touch: invalid -t timestamp '%s'\n", tSpec);
+            return 1;
+        }
+        time_t t = mktime(&tmVal);
+        if (t == (time_t)-1) {
+            fprintf(stderr, "touch: invalid -t timestamp '%s'\n", tSpec);
+            return 1;
+        }
+        times[0].tv_sec = times[1].tv_sec = t;
+        times[0].tv_usec = times[1].tv_usec = 0;
+    } else if (dSpec) {
+        struct tm tmVal;
+        if (!smallclueTouchParseDashD(dSpec, &tmVal)) {
+            fprintf(stderr, "touch: unrecognized -d date string '%s'\n", dSpec);
+            return 1;
+        }
+        time_t t = mktime(&tmVal);
+        if (t == (time_t)-1) {
+            fprintf(stderr, "touch: invalid -d date string '%s'\n", dSpec);
+            return 1;
+        }
+        times[0].tv_sec = times[1].tv_sec = t;
+        times[0].tv_usec = times[1].tv_usec = 0;
+    } else {
+        if (gettimeofday(&times[0], NULL) != 0) {
+            times[0].tv_sec = time(NULL);
+            times[0].tv_usec = 0;
+        }
+        times[1] = times[0];
     }
-    times[1] = times[0];
-    for (int i = 1; i < argc; ++i) {
+
+    int status = 0;
+    for (int i = argi; i < argc; ++i) {
         const char *path = argv[i];
         if (!path || !*path) {
             fprintf(stderr, "touch: invalid path\n");
@@ -12522,6 +17402,23 @@ static int smallclueTouchCommand(int argc, char **argv) {
             target = expanded;
         }
 #endif
+        struct timeval useTimes[2] = {times[0], times[1]};
+        if (accessOnly || modifyOnly) {
+            struct stat existing;
+            if (stat(target, &existing) == 0) {
+                if (accessOnly && !modifyOnly) {
+                    useTimes[1].tv_sec = existing.st_mtime;
+                    useTimes[1].tv_usec = 0;
+                } else if (modifyOnly && !accessOnly) {
+                    useTimes[0].tv_sec = existing.st_atime;
+                    useTimes[0].tv_usec = 0;
+                }
+            }
+        }
+
+        if (noCreate && access(target, F_OK) != 0) {
+            continue;
+        }
         int fd = openat(AT_FDCWD, target, O_WRONLY | O_CREAT, 0666);
         if (fd < 0) {
             fprintf(stderr, "touch: %s: %s\n", target, strerror(errno));
@@ -12531,7 +17428,7 @@ static int smallclueTouchCommand(int argc, char **argv) {
             status = 1;
             continue;
         }
-        if (futimes(fd, times) != 0) {
+        if (futimes(fd, useTimes) != 0) {
             fprintf(stderr, "touch: %s: %s\n", target, strerror(errno));
 #if defined(PSCAL_TARGET_IOS)
             smallclueLogPathExpansion("touch-futimes-failed", target);
@@ -13168,6 +18065,10 @@ static int smallclueResizeCommand(int argc, char **argv) {
 
 static int smallclueSortCommand(int argc, char **argv) {
     int reverse = 0;
+    bool uniqueOnly = false;
+    bool checkOnly = false;
+    bool checkQuiet = false;
+    memset(&gSmallclueSortOpts, 0, sizeof(gSmallclueSortOpts));
     int index = 1;
     while (index < argc) {
         const char *arg = argv[index];
@@ -13181,6 +18082,75 @@ static int smallclueSortCommand(int argc, char **argv) {
         if (strcmp(arg, "-r") == 0) {
             reverse = 1;
             index++;
+            continue;
+        }
+        if (strcmp(arg, "-n") == 0) {
+            gSmallclueSortOpts.numeric = true;
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-u") == 0) {
+            uniqueOnly = true;
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-c") == 0 || strcmp(arg, "--check") == 0 || strcmp(arg, "--check=diagnose-first") == 0) {
+            checkOnly = true;
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-C") == 0 || strcmp(arg, "--check=quiet") == 0 || strcmp(arg, "--check=silent") == 0) {
+            checkOnly = true;
+            checkQuiet = true;
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-m") == 0 || strcmp(arg, "--merge") == 0) {
+            /* Accepted for compatibility: treated as a full re-sort of
+             * the (assumed-sorted) inputs rather than a true multiway
+             * merge. Output is identical either way -- this just skips
+             * the presorted-runs optimization, matching this codebase's
+             * established scope trade-offs (e.g. diff's O(n*m) DP
+             * instead of full Myers). Nothing else to do here: the
+             * existing full-sort path below already produces the
+             * correct result. */
+            index++;
+            continue;
+        }
+        if (strncmp(arg, "-t", 2) == 0) {
+            if (arg[2] != '\0') {
+                gSmallclueSortOpts.keySep = arg[2];
+                index++;
+            } else {
+                if (index + 1 >= argc || !argv[index + 1][0]) {
+                    fprintf(stderr, "sort: missing separator for -t\n");
+                    return 1;
+                }
+                gSmallclueSortOpts.keySep = argv[index + 1][0];
+                index += 2;
+            }
+            continue;
+        }
+        if (strncmp(arg, "-k", 2) == 0) {
+            const char *valStr = NULL;
+            if (arg[2] != '\0') {
+                valStr = arg + 2;
+                index++;
+            } else {
+                if (index + 1 >= argc) {
+                    fprintf(stderr, "sort: missing field for -k\n");
+                    return 1;
+                }
+                valStr = argv[index + 1];
+                index += 2;
+            }
+            int field = (int)strtol(valStr, NULL, 10);
+            if (field <= 0) {
+                fprintf(stderr, "sort: invalid -k field '%s'\n", valStr);
+                return 1;
+            }
+            gSmallclueSortOpts.haveKey = true;
+            gSmallclueSortOpts.keyField = field;
             continue;
         }
         fprintf(stderr, "sort: unsupported option '%s'\n", arg);
@@ -13203,25 +18173,92 @@ static int smallclueSortCommand(int argc, char **argv) {
             fclose(fp);
         }
     }
+    if (status == 0 && checkOnly) {
+        /* GNU sort's -c reports FILE:LINE; with a single input source
+         * that's unambiguous, so use the real name. With stdin or
+         * multiple concatenated files there's no one file the global
+         * line number maps to, so fall back to "-". */
+        const char *label = (index < argc && index == argc - 1) ? argv[index] : "-";
+        int rc = smallclueSortCheckOrder(&vec, reverse != 0, checkQuiet, label);
+        smallclueLineVectorFree(&vec);
+        return rc;
+    }
     if (status == 0 && vec.count > 1) {
-        qsort(vec.items, vec.count, sizeof(char *), smallclueStringCompare);
+        smallclueSortStable(vec.items, vec.count);
     }
     if (status == 0) {
-        if (reverse) {
-            for (size_t i = vec.count; i-- > 0;) {
-                fputs(vec.items[i], stdout);
+        char *lastPrinted = NULL;
+        for (size_t k = 0; k < vec.count; ++k) {
+            size_t i = reverse ? (vec.count - 1 - k) : k;
+            if (uniqueOnly && lastPrinted && smallclueSortCompare(&lastPrinted, &vec.items[i]) == 0) {
+                continue;
             }
-        } else {
-            for (size_t i = 0; i < vec.count; ++i) {
-                fputs(vec.items[i], stdout);
-            }
+            fputs(vec.items[i], stdout);
+            lastPrinted = vec.items[i];
         }
     }
     smallclueLineVectorFree(&vec);
     return status;
 }
 
-static int smallclueUniqStream(FILE *fp, const char *path, int print_counts) {
+typedef struct {
+    bool printCounts;
+    bool duplicatesOnly; /* -d: only print lines that had at least one repeat */
+    bool uniquesOnly;    /* -u: only print lines that had NO repeats */
+    bool ignoreCase;     /* -i */
+    int skipFields;      /* -f N: skip N leading whitespace-separated fields */
+    int skipChars;       /* -s N: additionally skip N leading characters */
+    int maxChars;         /* -w N: compare at most N characters (0 = rest of line) */
+} SmallclueUniqOptions;
+
+/* Skips `fields` leading whitespace-separated fields (blanks before each
+ * field, then the field's non-blank run), matching GNU uniq -f: blanks
+ * strictly between the skipped fields and the next one are NOT skipped
+ * further, they just become part of the comparison key. */
+static const char *smallclueUniqSkipFields(const char *line, int fields) {
+    const char *p = line;
+    for (int i = 0; i < fields; ++i) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        while (*p && *p != ' ' && *p != '\t') p++;
+    }
+    return p;
+}
+
+static const char *smallclueUniqComparisonKey(const SmallclueUniqOptions *opts, const char *line) {
+    const char *key = line;
+    if (opts->skipFields > 0) {
+        key = smallclueUniqSkipFields(key, opts->skipFields);
+    }
+    if (opts->skipChars > 0) {
+        size_t len = strlen(key);
+        size_t skip = (size_t)opts->skipChars;
+        key += (skip < len) ? skip : len;
+    }
+    return key;
+}
+
+static int smallclueUniqCompareLines(const SmallclueUniqOptions *opts, const char *a, const char *b) {
+    const char *ka = smallclueUniqComparisonKey(opts, a);
+    const char *kb = smallclueUniqComparisonKey(opts, b);
+    if (opts->maxChars > 0) {
+        return opts->ignoreCase ? strncasecmp(ka, kb, (size_t)opts->maxChars)
+                                 : strncmp(ka, kb, (size_t)opts->maxChars);
+    }
+    return opts->ignoreCase ? strcasecmp(ka, kb) : strcmp(ka, kb);
+}
+
+static void smallclueUniqEmit(const SmallclueUniqOptions *opts, const char *line, long count) {
+    if (opts->duplicatesOnly && count < 2) return;
+    if (opts->uniquesOnly && count > 1) return;
+    if (opts->printCounts) {
+        printf("%7ld %s", count, line);
+    } else {
+        fputs(line, stdout);
+    }
+}
+
+static int smallclueUniqStream(FILE *fp, const char *path, const SmallclueUniqOptions *opts) {
     char *line = NULL;
     size_t cap = 0;
     char *prev = NULL;
@@ -13239,13 +18276,9 @@ static int smallclueUniqStream(FILE *fp, const char *path, int print_counts) {
             }
             break;
         }
-        if (!prev || strcmp(prev, line) != 0) {
+        if (!prev || smallclueUniqCompareLines(opts, prev, line) != 0) {
             if (prev) {
-                if (print_counts) {
-                    printf("%7ld %s", count, prev);
-                } else {
-                    fputs(prev, stdout);
-                }
+                smallclueUniqEmit(opts, prev, count);
                 free(prev);
             }
             prev = strdup(line);
@@ -13260,11 +18293,7 @@ static int smallclueUniqStream(FILE *fp, const char *path, int print_counts) {
         }
     }
     if (status == 0 && prev) {
-        if (print_counts) {
-            printf("%7ld %s", count, prev);
-        } else {
-            fputs(prev, stdout);
-        }
+        smallclueUniqEmit(opts, prev, count);
     }
     free(prev);
     free(line);
@@ -13272,7 +18301,8 @@ static int smallclueUniqStream(FILE *fp, const char *path, int print_counts) {
 }
 
 static int smallclueUniqCommand(int argc, char **argv) {
-    int print_counts = 0;
+    SmallclueUniqOptions opts;
+    memset(&opts, 0, sizeof(opts));
     int index = 1;
     while (index < argc) {
         const char *arg = argv[index];
@@ -13284,7 +18314,79 @@ static int smallclueUniqCommand(int argc, char **argv) {
             break;
         }
         if (strcmp(arg, "-c") == 0) {
-            print_counts = 1;
+            opts.printCounts = true;
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-d") == 0) {
+            opts.duplicatesOnly = true;
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-u") == 0) {
+            opts.uniquesOnly = true;
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-i") == 0) {
+            opts.ignoreCase = true;
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-f") == 0 || strcmp(arg, "--skip-fields") == 0) {
+            if (index + 1 >= argc) {
+                fprintf(stderr, "uniq: option '%s' requires an argument\n", arg);
+                return 1;
+            }
+            opts.skipFields = atoi(argv[++index]);
+            index++;
+            continue;
+        }
+        if (strncmp(arg, "-f", 2) == 0 && isdigit((unsigned char)arg[2])) {
+            opts.skipFields = atoi(arg + 2);
+            index++;
+            continue;
+        }
+        if (strncmp(arg, "--skip-fields=", 14) == 0) {
+            opts.skipFields = atoi(arg + 14);
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-s") == 0 || strcmp(arg, "--skip-chars") == 0) {
+            if (index + 1 >= argc) {
+                fprintf(stderr, "uniq: option '%s' requires an argument\n", arg);
+                return 1;
+            }
+            opts.skipChars = atoi(argv[++index]);
+            index++;
+            continue;
+        }
+        if (strncmp(arg, "-s", 2) == 0 && isdigit((unsigned char)arg[2])) {
+            opts.skipChars = atoi(arg + 2);
+            index++;
+            continue;
+        }
+        if (strncmp(arg, "--skip-chars=", 13) == 0) {
+            opts.skipChars = atoi(arg + 13);
+            index++;
+            continue;
+        }
+        if (strcmp(arg, "-w") == 0 || strcmp(arg, "--check-chars") == 0) {
+            if (index + 1 >= argc) {
+                fprintf(stderr, "uniq: option '%s' requires an argument\n", arg);
+                return 1;
+            }
+            opts.maxChars = atoi(argv[++index]);
+            index++;
+            continue;
+        }
+        if (strncmp(arg, "-w", 2) == 0 && isdigit((unsigned char)arg[2])) {
+            opts.maxChars = atoi(arg + 2);
+            index++;
+            continue;
+        }
+        if (strncmp(arg, "--check-chars=", 14) == 0) {
+            opts.maxChars = atoi(arg + 14);
             index++;
             continue;
         }
@@ -13292,7 +18394,7 @@ static int smallclueUniqCommand(int argc, char **argv) {
         return 1;
     }
     if (index >= argc) {
-        return smallclueUniqStream(stdin, "(stdin)", print_counts);
+        return smallclueUniqStream(stdin, "(stdin)", &opts);
     }
     int status = 0;
     for (int i = index; i < argc; ++i) {
@@ -13302,13 +18404,218 @@ static int smallclueUniqCommand(int argc, char **argv) {
             status = 1;
             continue;
         }
-        status |= smallclueUniqStream(fp, argv[i], print_counts);
+        status |= smallclueUniqStream(fp, argv[i], &opts);
         fclose(fp);
     }
     return status;
 }
 
-static bool smallclueSedParseExpr(const char *expr, char **pattern, char **replacement, bool *global) {
+typedef enum {
+    SED_ADDR_NONE,        /* applies to every line */
+    SED_ADDR_LINE,        /* line == line1 */
+    SED_ADDR_LAST,        /* line == last line ($) */
+    SED_ADDR_REGEX,       /* single line matching regex1 */
+    SED_ADDR_LINE_RANGE,  /* line1 <= line <= line2 (line2 == -1: "to end") */
+    SED_ADDR_REGEX_RANGE, /* from first line matching regex1 to the next
+                           * line matching regex2 (or reaching line2, or
+                           * "to end" if neither given) */
+} SmallclueSedAddrType;
+
+typedef struct {
+    SmallclueSedAddrType type;
+    long line1;
+    long line2; /* -1 = unbounded ("to end") for the *_RANGE types */
+    regex_t regex1;
+    regex_t regex2;
+    bool haveRegex1;
+    bool haveRegex2;
+    bool rangeActive; /* mutable run-time state for the *_RANGE types */
+} SmallclueSedAddr;
+
+typedef struct SmallclueSedExpr {
+    SmallclueSedAddr addr;
+    char cmdChar; /* 's', 'y', 'd', or 'p' */
+    regex_t re;
+    bool reValid;
+    char *replacement;
+    bool global;
+    bool caseInsensitive;
+    unsigned char yFrom[256];
+    unsigned char yTo[256];
+    bool yUsed[256];
+} SmallclueSedExpr;
+
+static const char *smallclueSedSkipWs(const char *p) {
+    while (*p == ' ' || *p == '\t') p++;
+    return p;
+}
+
+/* Parses one address TERM (a line number, '$', or a /regex/) at *pp,
+ * advancing *pp past it. Returns false only on a malformed /regex/; a
+ * term simply not being present is reported via the return value too,
+ * so callers must check whether *pp actually advanced. */
+static bool smallclueSedParseAddrTerm(const char **pp, bool extendedRegex, SmallclueSedAddr *out, bool *found) {
+    const char *p = *pp;
+    *found = false;
+    if (*p == '$') {
+        out->type = SED_ADDR_LAST;
+        *pp = p + 1;
+        *found = true;
+        return true;
+    }
+    if (isdigit((unsigned char)*p)) {
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        out->type = SED_ADDR_LINE;
+        out->line1 = v;
+        *pp = end;
+        *found = true;
+        return true;
+    }
+    if (*p == '/') {
+        const char *start = p + 1;
+        const char *end = strchr(start, '/');
+        if (!end) {
+            fprintf(stderr, "sed: unterminated address regex\n");
+            return false;
+        }
+        size_t len = (size_t)(end - start);
+        char *pat = (char *)malloc(len + 1);
+        if (!pat) return false;
+        memcpy(pat, start, len);
+        pat[len] = '\0';
+        int flags = extendedRegex ? REG_EXTENDED : 0;
+        int rc = regcomp(&out->regex1, pat, flags);
+        free(pat);
+        if (rc != 0) {
+            fprintf(stderr, "sed: invalid address regex\n");
+            return false;
+        }
+        out->type = SED_ADDR_REGEX;
+        out->haveRegex1 = true;
+        *pp = end + 1;
+        *found = true;
+        return true;
+    }
+    return true; /* no term present -- not an error, just nothing to parse */
+}
+
+/* Parses an optional address prefix (N, $, /re/, N,M, N,$, /re1/,/re2/,
+ * /re1/,N, /re1/,$) at *pp. Absence of any address is not an error (it
+ * means "every line") -- only a malformed address is. */
+static bool smallclueSedParseAddress(const char **pp, bool extendedRegex, SmallclueSedAddr *out) {
+    memset(out, 0, sizeof(*out));
+    out->type = SED_ADDR_NONE;
+    out->line2 = -1;
+    const char *p = smallclueSedSkipWs(*pp);
+    SmallclueSedAddr first;
+    memset(&first, 0, sizeof(first));
+    first.line2 = -1;
+    bool found = false;
+    if (!smallclueSedParseAddrTerm(&p, extendedRegex, &first, &found)) {
+        return false;
+    }
+    if (!found) {
+        *pp = p;
+        return true;
+    }
+    p = smallclueSedSkipWs(p);
+    if (*p != ',') {
+        *out = first;
+        *pp = p;
+        return true;
+    }
+    p++;
+    p = smallclueSedSkipWs(p);
+    SmallclueSedAddr second;
+    memset(&second, 0, sizeof(second));
+    second.line2 = -1;
+    bool foundSecond = false;
+    if (!smallclueSedParseAddrTerm(&p, extendedRegex, &second, &foundSecond) || !foundSecond) {
+        fprintf(stderr, "sed: expected address after ','\n");
+        return false;
+    }
+    if (first.type == SED_ADDR_LINE) {
+        out->type = SED_ADDR_LINE_RANGE;
+        out->line1 = first.line1;
+        out->line2 = (second.type == SED_ADDR_LINE) ? second.line1 : -1;
+    } else if (first.type == SED_ADDR_REGEX) {
+        out->type = SED_ADDR_REGEX_RANGE;
+        out->regex1 = first.regex1;
+        out->haveRegex1 = true;
+        if (second.type == SED_ADDR_REGEX) {
+            out->regex2 = second.regex1;
+            out->haveRegex2 = true;
+        } else if (second.type == SED_ADDR_LINE) {
+            out->line2 = second.line1;
+        } else {
+            out->line2 = -1;
+        }
+    } else {
+        fprintf(stderr, "sed: unsupported address range combination\n");
+        return false;
+    }
+    *pp = p;
+    return true;
+}
+
+static bool smallclueSedAddrMatches(SmallclueSedAddr *addr, long lineNo, bool isLastLine, const char *line) {
+    switch (addr->type) {
+        case SED_ADDR_NONE:
+            return true;
+        case SED_ADDR_LINE:
+            return lineNo == addr->line1;
+        case SED_ADDR_LAST:
+            return isLastLine;
+        case SED_ADDR_REGEX: {
+            regmatch_t m;
+            return regexec(&addr->regex1, line, 1, &m, 0) == 0;
+        }
+        case SED_ADDR_LINE_RANGE: {
+            if (!addr->rangeActive) {
+                if (lineNo != addr->line1) return false;
+                addr->rangeActive = true;
+            }
+            if (addr->line2 >= 0 && lineNo >= addr->line2) {
+                addr->rangeActive = false;
+            }
+            return true;
+        }
+        case SED_ADDR_REGEX_RANGE: {
+            if (!addr->rangeActive) {
+                regmatch_t m;
+                if (addr->haveRegex1 && regexec(&addr->regex1, line, 1, &m, 0) == 0) {
+                    addr->rangeActive = true;
+                    return true; /* the opening line itself; don't also
+                                  * check the closing condition on it */
+                }
+                return false;
+            }
+            if (addr->haveRegex2) {
+                regmatch_t m;
+                if (regexec(&addr->regex2, line, 1, &m, 0) == 0) {
+                    addr->rangeActive = false;
+                }
+            } else if (addr->line2 >= 0 && lineNo >= addr->line2) {
+                addr->rangeActive = false;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+/* s<delim>PATTERN<delim>REPLACEMENT<delim>[flags] -- delim is whatever
+ * character immediately follows 's'. Flags after the closing delimiter are
+ * scanned one character at a time (fixing a real bug in the previous
+ * literal-substring implementation, which treated ANY 'g' appearing
+ * anywhere in the flags tail as enabling global mode): 'g' = global, 'i'/
+ * 'I' = case-insensitive. Compiles PATTERN as a POSIX regex (basic by
+ * default, extended when extendedRegex is set, i.e. -E/-r) instead of the
+ * previous literal-substring-only match. Fills in the s-command fields of
+ * an already-allocated SmallclueSedExpr (its address/cmdChar are set by
+ * the caller separately). */
+static bool smallclueSedParseExpr(const char *expr, bool extendedRegex, SmallclueSedExpr *out) {
     if (!expr || expr[0] != 's' || expr[1] == '\0') {
         return false;
     }
@@ -13325,180 +18632,783 @@ static bool smallclueSedParseExpr(const char *expr, char **pattern, char **repla
     }
     size_t pat_len = (size_t)(pat_end - pat_start);
     size_t rep_len = (size_t)(rep_end - rep_start);
-    *pattern = (char *)malloc(pat_len + 1);
-    *replacement = (char *)malloc(rep_len + 1);
-    if (!*pattern || !*replacement) {
-        free(*pattern);
-        free(*replacement);
+
+    for (const char *f = rep_end + 1; *f; ++f) {
+        if (*f == 'g') {
+            out->global = true;
+        } else if (*f == 'i' || *f == 'I') {
+            out->caseInsensitive = true;
+        } else {
+            fprintf(stderr, "sed: unsupported flag '%c'\n", *f);
+            return false;
+        }
+    }
+
+    char *pattern = (char *)malloc(pat_len + 1);
+    out->replacement = (char *)malloc(rep_len + 1);
+    if (!pattern || !out->replacement) {
+        free(pattern);
+        free(out->replacement);
+        out->replacement = NULL;
         return false;
     }
-    memcpy(*pattern, pat_start, pat_len);
-    (*pattern)[pat_len] = '\0';
-    memcpy(*replacement, rep_start, rep_len);
-    (*replacement)[rep_len] = '\0';
-    *global = (strchr(rep_end + 1, 'g') != NULL);
+    memcpy(pattern, pat_start, pat_len);
+    pattern[pat_len] = '\0';
+    memcpy(out->replacement, rep_start, rep_len);
+    out->replacement[rep_len] = '\0';
+
+    int flags = (extendedRegex ? REG_EXTENDED : 0) | (out->caseInsensitive ? REG_ICASE : 0);
+    int rc = regcomp(&out->re, pattern, flags);
+    if (rc != 0) {
+        char errbuf[256];
+        regerror(rc, &out->re, errbuf, sizeof(errbuf));
+        fprintf(stderr, "sed: invalid pattern '%s': %s\n", pattern, errbuf);
+        free(pattern);
+        free(out->replacement);
+        out->replacement = NULL;
+        return false;
+    }
+    free(pattern);
+    out->reValid = true;
     return true;
 }
 
-static char *smallclueSedApply(const char *line, const char *pattern, const char *replacement, bool global) {
-    size_t pat_len = strlen(pattern);
-    size_t rep_len = strlen(replacement);
-    size_t line_len = strlen(line);
-    size_t cap = line_len + 1 + ((rep_len > pat_len) ? (rep_len - pat_len) * 4 : 0);
-    char *out = (char *)malloc(cap);
-    if (!out) {
-        return NULL;
+/* y<delim>SET1<delim>SET2<delim> -- transliterates characters like tr.
+ * SET1 and SET2 must be the same length (real sed requires this too). */
+static bool smallclueSedParseYExpr(const char *expr, SmallclueSedExpr *out) {
+    if (!expr || expr[0] != 'y' || expr[1] == '\0') return false;
+    char delim = expr[1];
+    const char *set1Start = expr + 2;
+    const char *set1End = strchr(set1Start, delim);
+    if (!set1End) return false;
+    const char *set2Start = set1End + 1;
+    const char *set2End = strchr(set2Start, delim);
+    if (!set2End) return false;
+    size_t len1 = (size_t)(set1End - set1Start);
+    size_t len2 = (size_t)(set2End - set2Start);
+    if (len1 != len2) {
+        fprintf(stderr, "sed: y command's two sets must be the same length\n");
+        return false;
     }
-    size_t out_len = 0;
-    const char *cursor = line;
-    bool replaced = false;
-    while (*cursor) {
-        if (pat_len > 0 && strncmp(cursor, pattern, pat_len) == 0) {
-            size_t needed = out_len + rep_len + (line_len - (cursor - line)) + 1;
-            if (needed > cap) {
-                cap = needed + 32;
-                char *resized = (char *)realloc(out, cap);
-                if (!resized) {
-                    free(out);
-                    return NULL;
-                }
-                out = resized;
+    for (size_t i = 0; i < len1; ++i) {
+        unsigned char from = (unsigned char)set1Start[i];
+        out->yFrom[i] = from;
+        out->yTo[i] = (unsigned char)set2Start[i];
+        out->yUsed[i] = true;
+    }
+    return true;
+}
+
+static char *smallclueSedApplyY(const char *line, const SmallclueSedExpr *expr) {
+    size_t len = strlen(line);
+    char *out = (char *)malloc(len + 1);
+    if (!out) return NULL;
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = (unsigned char)line[i];
+        char replaced = (char)c;
+        for (size_t j = 0; j < sizeof(expr->yUsed) && expr->yUsed[j]; ++j) {
+            if (expr->yFrom[j] == c) {
+                replaced = (char)expr->yTo[j];
+                break;
             }
-            memcpy(out + out_len, replacement, rep_len);
-            out_len += rep_len;
-            cursor += pat_len;
-            replaced = true;
-            if (!global) {
-                memcpy(out + out_len, cursor, strlen(cursor) + 1);
-                return out;
-            }
-            continue;
         }
-        if (out_len + 2 > cap) {
-            cap *= 2;
-            char *resized = (char *)realloc(out, cap);
-            if (!resized) {
+        out[i] = replaced;
+    }
+    out[len] = '\0';
+    return out;
+}
+
+static void smallclueSedExprFree(SmallclueSedExpr *e) {
+    if (e->reValid) {
+        regfree(&e->re);
+        e->reValid = false;
+    }
+    free(e->replacement);
+    e->replacement = NULL;
+    if (e->addr.haveRegex1) {
+        regfree(&e->addr.regex1);
+        e->addr.haveRegex1 = false;
+    }
+    if (e->addr.haveRegex2) {
+        regfree(&e->addr.regex2);
+        e->addr.haveRegex2 = false;
+    }
+}
+
+static bool smallclueSedAppend(char **out, size_t *outLen, size_t *cap, const char *data, size_t len) {
+    if (*outLen + len + 1 > *cap) {
+        size_t newCap = (*outLen + len + 1) * 2;
+        char *resized = (char *)realloc(*out, newCap);
+        if (!resized) return false;
+        *out = resized;
+        *cap = newCap;
+    }
+    memcpy(*out + *outLen, data, len);
+    *outLen += len;
+    return true;
+}
+
+/* Expands & (whole match) and \1-\9 (submatch) backreferences in the
+ * replacement text against the current regexec match. */
+static bool smallclueSedAppendReplacement(char **out, size_t *outLen, size_t *cap,
+                                          const char *line, const char *replacement,
+                                          const regmatch_t *pmatch, size_t nmatch) {
+    for (const char *r = replacement; *r; ++r) {
+        if (*r == '\\' && r[1] >= '1' && r[1] <= '9') {
+            size_t idx = (size_t)(r[1] - '0');
+            r++;
+            if (idx < nmatch && pmatch[idx].rm_so >= 0) {
+                if (!smallclueSedAppend(out, outLen, cap, line + pmatch[idx].rm_so,
+                                       (size_t)(pmatch[idx].rm_eo - pmatch[idx].rm_so))) {
+                    return false;
+                }
+            }
+        } else if (*r == '\\' && r[1] == '&') {
+            if (!smallclueSedAppend(out, outLen, cap, "&", 1)) return false;
+            r++;
+        } else if (*r == '&') {
+            if (!smallclueSedAppend(out, outLen, cap, line + pmatch[0].rm_so,
+                                   (size_t)(pmatch[0].rm_eo - pmatch[0].rm_so))) {
+                return false;
+            }
+        } else {
+            if (!smallclueSedAppend(out, outLen, cap, r, 1)) return false;
+        }
+    }
+    return true;
+}
+
+static char *smallclueSedApply(const char *line, const SmallclueSedExpr *expr) {
+    size_t lineLen = strlen(line);
+    size_t cap = lineLen + 32;
+    size_t outLen = 0;
+    char *out = (char *)malloc(cap);
+    if (!out) return NULL;
+    out[0] = '\0';
+
+    const char *cursor = line;
+    bool replacedAny = false;
+    bool firstMatch = true;
+    while (*cursor || firstMatch) {
+        regmatch_t pmatch[10];
+        int eflags = (cursor == line) ? 0 : REG_NOTBOL;
+        int rc = regexec(&expr->re, cursor, 10, pmatch, eflags);
+        if (rc != 0) {
+            break;
+        }
+        firstMatch = false;
+        if (!smallclueSedAppend(&out, &outLen, &cap, cursor, (size_t)pmatch[0].rm_so)) {
+            free(out);
+            return NULL;
+        }
+        if (!smallclueSedAppendReplacement(&out, &outLen, &cap, cursor, expr->replacement, pmatch, 10)) {
+            free(out);
+            return NULL;
+        }
+        replacedAny = true;
+        if (pmatch[0].rm_eo == pmatch[0].rm_so) {
+            /* Zero-length match (e.g. pattern "x*" on non-x text): copy one
+             * char forward to guarantee progress, matching sed's own
+             * empty-match handling. */
+            if (cursor[pmatch[0].rm_eo] == '\0') {
+                cursor += pmatch[0].rm_eo;
+                break;
+            }
+            if (!smallclueSedAppend(&out, &outLen, &cap, cursor + pmatch[0].rm_eo, 1)) {
                 free(out);
                 return NULL;
             }
-            out = resized;
+            cursor += pmatch[0].rm_eo + 1;
+        } else {
+            cursor += pmatch[0].rm_eo;
         }
-        out[out_len++] = *cursor++;
+        if (!expr->global) {
+            break;
+        }
     }
-    out[out_len] = '\0';
-    if (!replaced) {
+    if (!smallclueSedAppend(&out, &outLen, &cap, cursor, strlen(cursor))) {
+        free(out);
+        return NULL;
+    }
+    out[outLen] = '\0';
+    if (!replacedAny) {
         free(out);
         return strdup(line);
     }
     return out;
 }
 
-static int smallclueSedCommand(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "sed: missing expression\n");
-        return 1;
-    }
-    char *pattern = NULL;
-    char *replacement = NULL;
-    bool global = false;
-    if (!smallclueSedParseExpr(argv[1], &pattern, &replacement, &global)) {
-        fprintf(stderr, "sed: invalid expression '%s'\n", argv[1]);
-        return 1;
-    }
-    int status = 0;
-    char *line = NULL;
-    size_t cap = 0;
-    int index = 2;
-    if (index >= argc) {
-        while (!status) {
-            int read_err = 0;
-            ssize_t len = smallclueGetlineStream(&line, &cap, stdin, &read_err);
-            if (len < 0) {
-                if (read_err) {
-                    fprintf(stderr, "sed: %s\n", strerror(read_err));
-                    status = 1;
-                }
-                break;
-            }
-            char *out = smallclueSedApply(line, pattern, replacement, global);
-            if (!out) {
-                fprintf(stderr, "sed: out of memory\n");
-                status = 1;
-                break;
-            }
-            fputs(out, stdout);
-            free(out);
+/* Runs every command in `cmds` (in order) against one line, honoring
+ * each command's address. Returns the transformed line (caller frees);
+ * sets *deleted if a 'd' command fired (auto-print should be skipped).
+ * `line` is consumed/freed internally as commands chain. */
+static char *smallclueSedRunCommandsOnLine(char *line, SmallclueSedExpr *cmds, size_t cmdCount,
+                                           long lineNo, bool isLastLine, FILE *out,
+                                           bool suppressAutoPrint, bool *deleted) {
+    *deleted = false;
+    for (size_t i = 0; i < cmdCount; ++i) {
+        SmallclueSedExpr *cmd = &cmds[i];
+        if (!smallclueSedAddrMatches(&cmd->addr, lineNo, isLastLine, line)) {
+            continue;
         }
+        switch (cmd->cmdChar) {
+            case 's': {
+                char *transformed = smallclueSedApply(line, cmd);
+                free(line);
+                line = transformed;
+                break;
+            }
+            case 'y': {
+                char *transformed = smallclueSedApplyY(line, cmd);
+                free(line);
+                line = transformed;
+                break;
+            }
+            case 'd': {
+                *deleted = true;
+                return line; /* real sed stops processing this cycle immediately */
+            }
+            case 'p': {
+                fputs(line, out);
+                fputc('\n', out);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    (void)suppressAutoPrint;
+    return line;
+}
+
+static int smallclueSedProcessStream(FILE *in, FILE *out, SmallclueSedExpr *cmds, size_t cmdCount,
+                                     bool suppressAutoPrint, const char *label, int *status) {
+    char *curLine = NULL;
+    size_t curCap = 0;
+    char *nextLine = NULL;
+    size_t nextCap = 0;
+    int read_err = 0;
+    ssize_t curLen = smallclueGetlineStream(&curLine, &curCap, in, &read_err);
+    if (curLen < 0) {
+        if (read_err) {
+            fprintf(stderr, "sed: %s: %s\n", label, strerror(read_err));
+            *status = 1;
+        }
+        free(curLine);
+        free(nextLine);
+        return *status;
+    }
+
+    long lineNo = 0;
+    for (;;) {
+        lineNo++;
+        /* smallclueGetlineStream keeps the trailing '\n' in the buffer.
+         * Matching against that embedded newline is wrong for both `$`
+         * (which should anchor to the logical end of line, not after an
+         * embedded newline) and `.` (a POSIX regex `.` matches '\n' too
+         * without REG_NEWLINE, so a greedy `.*` would swallow it) -- strip
+         * it before applying the substitution and re-add it after,
+         * preserving a final line with no trailing newline as-is. */
+        bool hadNewline = (curLen > 0 && curLine[(size_t)curLen - 1] == '\n');
+        if (hadNewline) {
+            curLine[(size_t)curLen - 1] = '\0';
+        }
+
+        /* One-line lookahead so `$` (last line) is known before this
+         * line is processed -- otherwise a streaming pass has no way to
+         * tell whether the current line is the last one. */
+        int nextReadErr = 0;
+        ssize_t nextLen = smallclueGetlineStream(&nextLine, &nextCap, in, &nextReadErr);
+        bool isLast = (nextLen < 0);
+
+        char *lineBuf = strdup(curLine);
+        if (!lineBuf) {
+            fprintf(stderr, "sed: out of memory\n");
+            *status = 1;
+            break;
+        }
+        bool deleted = false;
+        lineBuf = smallclueSedRunCommandsOnLine(lineBuf, cmds, cmdCount, lineNo, isLast, out,
+                                                suppressAutoPrint, &deleted);
+        if (!lineBuf) {
+            fprintf(stderr, "sed: out of memory\n");
+            *status = 1;
+            break;
+        }
+        if (!deleted && !suppressAutoPrint) {
+            fputs(lineBuf, out);
+            if (hadNewline) {
+                fputc('\n', out);
+            }
+        }
+        free(lineBuf);
+
+        if (isLast) {
+            if (nextReadErr) {
+                fprintf(stderr, "sed: %s: %s\n", label, strerror(nextReadErr));
+                *status = 1;
+            }
+            break;
+        }
+        /* Shift the lookahead line into position for the next pass. */
+        char *tmpLine = curLine;
+        curLine = nextLine;
+        nextLine = tmpLine;
+        size_t tmpCap = curCap;
+        curCap = nextCap;
+        nextCap = tmpCap;
+        curLen = nextLen;
+    }
+    free(curLine);
+    free(nextLine);
+    return *status;
+}
+
+/* Parses a combined script buffer (all -e SCRIPTs and -f FILE contents
+ * concatenated, newline-separated) into a list of commands. Commands
+ * are separated by ';' or newline; '#'-led lines are comments. Only 's',
+ * 'y', 'd', and 'p' command letters are recognized. */
+static bool smallclueSedParseScript(const char *script, bool extendedRegex,
+                                    SmallclueSedExpr **outCmds, size_t *outCount) {
+    size_t cap = 8, count = 0;
+    SmallclueSedExpr *cmds = (SmallclueSedExpr *)calloc(cap, sizeof(SmallclueSedExpr));
+    if (!cmds) return false;
+    const char *p = script;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == ';') p++;
+        if (!*p) break;
+        if (*p == '#') {
+            while (*p && *p != '\n') p++;
+            continue;
+        }
+        SmallclueSedExpr cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.addr.line2 = -1;
+        if (!smallclueSedParseAddress(&p, extendedRegex, &cmd.addr)) {
+            free(cmds);
+            return false;
+        }
+        p = smallclueSedSkipWs(p);
+        if (!*p || *p == '\n' || *p == ';') {
+            fprintf(stderr, "sed: missing command\n");
+            free(cmds);
+            return false;
+        }
+        cmd.cmdChar = *p;
+        if (*p == 's') {
+            const char *flagsEnd = p;
+            char delim = p[1];
+            if (!delim) {
+                fprintf(stderr, "sed: malformed s command\n");
+                free(cmds);
+                return false;
+            }
+            const char *patStart = p + 2;
+            const char *patEnd = strchr(patStart, delim);
+            if (!patEnd) {
+                fprintf(stderr, "sed: unterminated s command\n");
+                free(cmds);
+                return false;
+            }
+            const char *repStart = patEnd + 1;
+            const char *repEnd = strchr(repStart, delim);
+            if (!repEnd) {
+                fprintf(stderr, "sed: unterminated s command\n");
+                free(cmds);
+                return false;
+            }
+            flagsEnd = repEnd + 1;
+            while (*flagsEnd && *flagsEnd != ';' && *flagsEnd != '\n' &&
+                   *flagsEnd != ' ' && *flagsEnd != '\t') {
+                flagsEnd++;
+            }
+            size_t exprLen = (size_t)(flagsEnd - p);
+            char *exprCopy = (char *)malloc(exprLen + 1);
+            if (!exprCopy) {
+                free(cmds);
+                return false;
+            }
+            memcpy(exprCopy, p, exprLen);
+            exprCopy[exprLen] = '\0';
+            bool ok = smallclueSedParseExpr(exprCopy, extendedRegex, &cmd);
+            free(exprCopy);
+            if (!ok) {
+                fprintf(stderr, "sed: invalid expression\n");
+                free(cmds);
+                return false;
+            }
+            p = flagsEnd;
+        } else if (*p == 'y') {
+            const char *flagsEnd = p;
+            char delim = p[1];
+            if (!delim) {
+                fprintf(stderr, "sed: malformed y command\n");
+                free(cmds);
+                return false;
+            }
+            const char *set1Start = p + 2;
+            const char *set1End = strchr(set1Start, delim);
+            if (!set1End) {
+                fprintf(stderr, "sed: unterminated y command\n");
+                free(cmds);
+                return false;
+            }
+            const char *set2Start = set1End + 1;
+            const char *set2End = strchr(set2Start, delim);
+            if (!set2End) {
+                fprintf(stderr, "sed: unterminated y command\n");
+                free(cmds);
+                return false;
+            }
+            flagsEnd = set2End + 1;
+            size_t exprLen = (size_t)(flagsEnd - p);
+            char *exprCopy = (char *)malloc(exprLen + 1);
+            if (!exprCopy) {
+                free(cmds);
+                return false;
+            }
+            memcpy(exprCopy, p, exprLen);
+            exprCopy[exprLen] = '\0';
+            bool ok = smallclueSedParseYExpr(exprCopy, &cmd);
+            free(exprCopy);
+            if (!ok) {
+                free(cmds);
+                return false;
+            }
+            p = flagsEnd;
+        } else if (*p == 'd' || *p == 'p') {
+            p++;
+        } else {
+            fprintf(stderr, "sed: unsupported command '%c'\n", *p);
+            free(cmds);
+            return false;
+        }
+        if (count == cap) {
+            cap *= 2;
+            SmallclueSedExpr *resized = (SmallclueSedExpr *)realloc(cmds, cap * sizeof(SmallclueSedExpr));
+            if (!resized) {
+                free(cmds);
+                return false;
+            }
+            cmds = resized;
+        }
+        cmds[count++] = cmd;
+    }
+    *outCmds = cmds;
+    *outCount = count;
+    return true;
+}
+
+static char *smallclueSedReadFileContents(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return NULL;
+    size_t cap = 4096, len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) {
+        fclose(fp);
+        return NULL;
+    }
+    size_t n;
+    while ((n = fread(buf + len, 1, cap - len, fp)) > 0) {
+        len += n;
+        if (len == cap) {
+            cap *= 2;
+            char *resized = (char *)realloc(buf, cap);
+            if (!resized) {
+                free(buf);
+                fclose(fp);
+                return NULL;
+            }
+            buf = resized;
+        }
+    }
+    fclose(fp);
+    buf[len] = '\0';
+    return buf;
+}
+
+static int smallclueSedCommand(int argc, char **argv) {
+    bool extendedRegex = false;
+    bool inPlace = false;
+    bool suppressAutoPrint = false;
+    const char *inPlaceSuffix = NULL;
+    char *scriptBuf = NULL;
+    size_t scriptLen = 0;
+    bool haveExplicitScript = false;
+    int argi = 1;
+
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        if (strcmp(arg, "-E") == 0 || strcmp(arg, "-r") == 0) {
+            extendedRegex = true;
+        } else if (strcmp(arg, "-n") == 0) {
+            suppressAutoPrint = true;
+        } else if (strcmp(arg, "-i") == 0) {
+            inPlace = true;
+        } else if (strncmp(arg, "-i", 2) == 0 && arg[2] != '\0') {
+            inPlace = true;
+            inPlaceSuffix = arg + 2;
+        } else if (strcmp(arg, "-e") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "sed: option requires an argument -- 'e'\n");
+                free(scriptBuf);
+                return 1;
+            }
+            const char *piece = argv[++argi];
+            size_t pieceLen = strlen(piece);
+            char *resized = (char *)realloc(scriptBuf, scriptLen + pieceLen + 2);
+            if (!resized) {
+                free(scriptBuf);
+                return 1;
+            }
+            scriptBuf = resized;
+            memcpy(scriptBuf + scriptLen, piece, pieceLen);
+            scriptLen += pieceLen;
+            scriptBuf[scriptLen++] = '\n';
+            scriptBuf[scriptLen] = '\0';
+            haveExplicitScript = true;
+        } else if (strncmp(arg, "-e", 2) == 0 && arg[2] != '\0') {
+            const char *piece = arg + 2;
+            size_t pieceLen = strlen(piece);
+            char *resized = (char *)realloc(scriptBuf, scriptLen + pieceLen + 2);
+            if (!resized) {
+                free(scriptBuf);
+                return 1;
+            }
+            scriptBuf = resized;
+            memcpy(scriptBuf + scriptLen, piece, pieceLen);
+            scriptLen += pieceLen;
+            scriptBuf[scriptLen++] = '\n';
+            scriptBuf[scriptLen] = '\0';
+            haveExplicitScript = true;
+        } else if (strcmp(arg, "-f") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "sed: option requires an argument -- 'f'\n");
+                free(scriptBuf);
+                return 1;
+            }
+            const char *scriptFile = argv[++argi];
+            char *fileContents = smallclueSedReadFileContents(scriptFile);
+            if (!fileContents) {
+                fprintf(stderr, "sed: %s: %s\n", scriptFile, strerror(errno));
+                free(scriptBuf);
+                return 1;
+            }
+            size_t pieceLen = strlen(fileContents);
+            char *resized = (char *)realloc(scriptBuf, scriptLen + pieceLen + 2);
+            if (!resized) {
+                free(fileContents);
+                free(scriptBuf);
+                return 1;
+            }
+            scriptBuf = resized;
+            memcpy(scriptBuf + scriptLen, fileContents, pieceLen);
+            scriptLen += pieceLen;
+            scriptBuf[scriptLen++] = '\n';
+            scriptBuf[scriptLen] = '\0';
+            free(fileContents);
+            haveExplicitScript = true;
+        } else if (arg[0] == '-' && arg[1] != '\0') {
+            fprintf(stderr, "sed: unsupported option '%s'\n", arg);
+            free(scriptBuf);
+            return 1;
+        } else {
+            break;
+        }
+    }
+
+    if (!haveExplicitScript) {
+        if (argi >= argc) {
+            fprintf(stderr, "sed: missing expression\n");
+            free(scriptBuf);
+            return 1;
+        }
+        scriptBuf = strdup(argv[argi]);
+        argi++;
+    }
+
+    SmallclueSedExpr *cmds = NULL;
+    size_t cmdCount = 0;
+    if (!smallclueSedParseScript(scriptBuf, extendedRegex, &cmds, &cmdCount)) {
+        fprintf(stderr, "sed: invalid script\n");
+        free(scriptBuf);
+        return 1;
+    }
+    free(scriptBuf);
+
+    int status = 0;
+    if (argi >= argc) {
+        if (inPlace) {
+            fprintf(stderr, "sed: -i requires a file argument (cannot edit stdin in place)\n");
+            for (size_t i = 0; i < cmdCount; ++i) smallclueSedExprFree(&cmds[i]);
+            free(cmds);
+            return 1;
+        }
+        smallclueSedProcessStream(stdin, stdout, cmds, cmdCount, suppressAutoPrint, "(stdin)", &status);
     } else {
-        for (int i = index; i < argc && status == 0; ++i) {
+        for (int i = argi; i < argc && status == 0; ++i) {
             FILE *fp = fopen(argv[i], "r");
             if (!fp) {
                 fprintf(stderr, "sed: %s: %s\n", argv[i], strerror(errno));
                 status = 1;
                 break;
             }
-            while (true) {
-                int read_err = 0;
-                ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
-                if (len < 0) {
-                    if (read_err) {
-                        fprintf(stderr, "sed: %s: %s\n", argv[i], strerror(read_err));
-                        status = 1;
-                    }
-                    break;
-                }
-                char *out = smallclueSedApply(line, pattern, replacement, global);
-                if (!out) {
-                    fprintf(stderr, "sed: out of memory\n");
-                    status = 1;
-                    break;
-                }
-                fputs(out, stdout);
-                free(out);
+            if (!inPlace) {
+                smallclueSedProcessStream(fp, stdout, cmds, cmdCount, suppressAutoPrint, argv[i], &status);
+                fclose(fp);
+                continue;
             }
+            char tmpPath[PATH_MAX];
+            snprintf(tmpPath, sizeof(tmpPath), "%s.sedtmp.XXXXXX", argv[i]);
+            int tmpFd = mkstemp(tmpPath);
+            if (tmpFd < 0) {
+                fprintf(stderr, "sed: %s: %s\n", argv[i], strerror(errno));
+                status = 1;
+                fclose(fp);
+                continue;
+            }
+            FILE *tmpFp = fdopen(tmpFd, "w");
+            if (!tmpFp) {
+                fprintf(stderr, "sed: %s: %s\n", tmpPath, strerror(errno));
+                close(tmpFd);
+                unlink(tmpPath);
+                status = 1;
+                fclose(fp);
+                continue;
+            }
+            smallclueSedProcessStream(fp, tmpFp, cmds, cmdCount, suppressAutoPrint, argv[i], &status);
             fclose(fp);
+            fclose(tmpFp);
+            if (status != 0) {
+                unlink(tmpPath);
+                continue;
+            }
+            if (inPlaceSuffix && *inPlaceSuffix) {
+                char backupPath[PATH_MAX];
+                snprintf(backupPath, sizeof(backupPath), "%s%s", argv[i], inPlaceSuffix);
+                if (rename(argv[i], backupPath) != 0) {
+                    fprintf(stderr, "sed: %s: %s\n", backupPath, strerror(errno));
+                    status = 1;
+                    unlink(tmpPath);
+                    continue;
+                }
+            }
+            if (rename(tmpPath, argv[i]) != 0) {
+                fprintf(stderr, "sed: %s: %s\n", argv[i], strerror(errno));
+                status = 1;
+                unlink(tmpPath);
+            }
         }
     }
-    free(pattern);
-    free(replacement);
-    free(line);
+    for (size_t i = 0; i < cmdCount; ++i) smallclueSedExprFree(&cmds[i]);
+    free(cmds);
     return status;
 }
 
-static void smallclueCutPrintField(const char *line, char delim, int field) {
-    if (field <= 0) {
+#define SMALLCLUE_CUT_MAX_RANGES 64
+
+typedef struct {
+    int start; /* 1-based, inclusive */
+    int end;   /* 1-based, inclusive; -1 = unbounded ("N-") */
+} SmallclueCutRange;
+
+/* Parses a cut -f/-c LIST: comma-separated N, N-M, N-, or -M (meaning 1-M). */
+static bool smallclueCutParseList(const char *spec, SmallclueCutRange *ranges, size_t *count, size_t maxRanges) {
+    *count = 0;
+    const char *p = spec;
+    while (*p) {
+        while (*p == ',') p++;
+        if (!*p) break;
+        if (*count >= maxRanges) return false;
+        int start, end;
+        if (*p == '-') {
+            start = 1;
+            p++;
+            char *endp;
+            end = (int)strtol(p, &endp, 10);
+            if (endp == p) return false;
+            p = endp;
+        } else {
+            char *endp;
+            start = (int)strtol(p, &endp, 10);
+            if (endp == p || start <= 0) return false;
+            p = endp;
+            if (*p == '-') {
+                p++;
+                if (*p == '\0' || *p == ',') {
+                    end = -1; /* "N-" unbounded */
+                } else {
+                    char *endp2;
+                    end = (int)strtol(p, &endp2, 10);
+                    if (endp2 == p) return false;
+                    p = endp2;
+                }
+            } else {
+                end = start;
+            }
+        }
+        ranges[*count].start = start;
+        ranges[*count].end = end;
+        (*count)++;
+    }
+    return *count > 0;
+}
+
+static bool smallclueCutRangesContain(const SmallclueCutRange *ranges, size_t count, int pos) {
+    for (size_t i = 0; i < count; ++i) {
+        if (pos >= ranges[i].start && (ranges[i].end == -1 || pos <= ranges[i].end)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void smallclueCutPrintFields(const char *line, char delim, const SmallclueCutRange *ranges,
+                                    size_t rangeCount, bool suppressNoDelim) {
+    if (!strchr(line, delim)) {
+        if (!suppressNoDelim) {
+            printf("%s\n", line);
+        }
         return;
     }
-    int current = 1;
+    int fieldNo = 1;
     const char *start = line;
-    const char *ptr = line;
-    while (true) {
-        if (*ptr == delim || *ptr == '\0' || *ptr == '\n') {
-            if (current == field) {
-                size_t slice = (size_t)(ptr - start);
-                fwrite(start, 1, slice, stdout);
-                if (slice == 0 || start[slice - 1] != '\n') {
-                    putchar('\n');
-                }
-                return;
+    bool printedAny = false;
+    for (const char *p = line;; ++p) {
+        if (*p == delim || *p == '\0') {
+            if (smallclueCutRangesContain(ranges, rangeCount, fieldNo)) {
+                if (printedAny) putchar(delim);
+                fwrite(start, 1, (size_t)(p - start), stdout);
+                printedAny = true;
             }
-            if (*ptr == '\0') {
-                break;
-            }
-            current++;
-            start = ptr + 1;
+            if (*p == '\0') break;
+            fieldNo++;
+            start = p + 1;
         }
-        if (*ptr == '\0') {
-            break;
+    }
+    putchar('\n');
+}
+
+static void smallclueCutPrintChars(const char *line, const SmallclueCutRange *ranges, size_t rangeCount) {
+    size_t len = strlen(line);
+    for (size_t i = 0; i < len; ++i) {
+        if (smallclueCutRangesContain(ranges, rangeCount, (int)(i + 1))) {
+            putchar(line[i]);
         }
-        ptr++;
     }
     putchar('\n');
 }
 
 static int smallclueCutCommand(int argc, char **argv) {
     char delimiter = '\t';
-    int field = -1;
+    bool haveFieldList = false, haveCharList = false, suppressNoDelim = false;
+    SmallclueCutRange ranges[SMALLCLUE_CUT_MAX_RANGES];
+    size_t rangeCount = 0;
+
     int index = 1;
     while (index < argc) {
         const char *arg = argv[index];
@@ -13508,6 +19418,11 @@ static int smallclueCutCommand(int argc, char **argv) {
         if (strcmp(arg, "--") == 0) {
             index++;
             break;
+        }
+        if (strcmp(arg, "-s") == 0) {
+            suppressNoDelim = true;
+            index++;
+            continue;
         }
         if (strncmp(arg, "-d", 2) == 0) {
             if (arg[2] != '\0') {
@@ -13523,126 +19438,254 @@ static int smallclueCutCommand(int argc, char **argv) {
             index += 2;
             continue;
         }
-        if (strncmp(arg, "-f", 2) == 0) {
-            const char *val_str = NULL;
+        if (strncmp(arg, "-f", 2) == 0 || strncmp(arg, "-c", 2) == 0) {
+            bool isChar = (arg[1] == 'c');
+            const char *listStr = NULL;
             if (arg[2] != '\0') {
-                val_str = arg + 2;
+                listStr = arg + 2;
                 index++;
             } else {
                 if (index + 1 >= argc) {
-                    fprintf(stderr, "cut: missing field number\n");
+                    fprintf(stderr, "cut: missing %s list\n", isChar ? "-c" : "-f");
                     return 1;
                 }
-                val_str = argv[index + 1];
+                listStr = argv[index + 1];
                 index += 2;
             }
-            field = (int)smallclueParseLong(val_str);
-            if (field <= 0) {
-                fprintf(stderr, "cut: invalid field '%s'\n", val_str);
+            if (!smallclueCutParseList(listStr, ranges, &rangeCount, SMALLCLUE_CUT_MAX_RANGES)) {
+                fprintf(stderr, "cut: invalid %s list '%s'\n", isChar ? "-c" : "-f", listStr);
                 return 1;
             }
+            if (isChar) haveCharList = true; else haveFieldList = true;
             continue;
         }
         fprintf(stderr, "cut: unsupported option '%s'\n", arg);
         return 1;
     }
-    if (field <= 0) {
-        fprintf(stderr, "cut: missing -f option\n");
+    if (!haveFieldList && !haveCharList) {
+        fprintf(stderr, "cut: you must specify a list of -f fields or -c characters\n");
         return 1;
     }
+    if (haveFieldList && haveCharList) {
+        fprintf(stderr, "cut: only one of -f or -c may be given\n");
+        return 1;
+    }
+
     char *line = NULL;
     size_t cap = 0;
     int status = 0;
-    if (index >= argc) {
+    int fileCount = argc - index;
+    for (int fi = 0; fi < (fileCount > 0 ? fileCount : 1); ++fi) {
+        FILE *fp = stdin;
+        const char *label = "-";
+        if (fileCount > 0) {
+            label = argv[index + fi];
+            fp = fopen(label, "r");
+            if (!fp) {
+                fprintf(stderr, "cut: %s: %s\n", label, strerror(errno));
+                status = 1;
+                continue;
+            }
+        }
         while (true) {
             int read_err = 0;
-            ssize_t len = smallclueGetlineStream(&line, &cap, stdin, &read_err);
+            ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
             if (len < 0) {
                 if (read_err) {
-                    fprintf(stderr, "cut: %s\n", strerror(read_err));
+                    fprintf(stderr, "cut: %s: %s\n", label, strerror(read_err));
                     status = 1;
                 }
                 break;
             }
-            smallclueCutPrintField(line, delimiter, field);
-        }
-    } else {
-        for (int i = index; i < argc; ++i) {
-            FILE *fp = fopen(argv[i], "r");
-            if (!fp) {
-                fprintf(stderr, "cut: %s: %s\n", argv[i], strerror(errno));
-                status = 1;
-                continue;
+            if (len > 0 && line[len - 1] == '\n') {
+                line[len - 1] = '\0';
             }
-            while (true) {
-                int read_err = 0;
-                ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
-                if (len < 0) {
-                    if (read_err) {
-                        fprintf(stderr, "cut: %s: %s\n", argv[i], strerror(read_err));
-                        status = 1;
-                    }
-                    break;
-                }
-                smallclueCutPrintField(line, delimiter, field);
+            if (haveCharList) {
+                smallclueCutPrintChars(line, ranges, rangeCount);
+            } else {
+                smallclueCutPrintFields(line, delimiter, ranges, rangeCount, suppressNoDelim);
             }
-            fclose(fp);
         }
+        if (fp != stdin) fclose(fp);
     }
     free(line);
     return status;
 }
 
+/* Expands a tr SET specification into a flat, ORDER-PRESERVING array of
+ * bytes: character ranges (a-z), POSIX classes ([:alpha:] etc), [c*n]/
+ * [c*] repeats, and \n/\t/\\ backslash escapes. Order matters for
+ * translate mode (SET1[i] -> SET2[i]), so classes/ranges expand in
+ * ascending byte order, matching the conventional interpretation. */
+static bool smallclueTrExpandSet(const char *spec, unsigned char *outBuf, size_t outCap, size_t *outLen) {
+    *outLen = 0;
+    size_t i = 0;
+    size_t specLen = strlen(spec);
+    while (i < specLen && *outLen < outCap) {
+        if (spec[i] == '[' && i + 1 < specLen && spec[i + 1] == ':') {
+            const char *end = strstr(spec + i + 2, ":]");
+            if (end) {
+                size_t nameLen = (size_t)(end - (spec + i + 2));
+                const char *name = spec + i + 2;
+                int (*pred)(int) = NULL;
+                if (nameLen == 5 && strncmp(name, "alpha", 5) == 0) pred = isalpha;
+                else if (nameLen == 5 && strncmp(name, "digit", 5) == 0) pred = isdigit;
+                else if (nameLen == 5 && strncmp(name, "upper", 5) == 0) pred = isupper;
+                else if (nameLen == 5 && strncmp(name, "lower", 5) == 0) pred = islower;
+                else if (nameLen == 5 && strncmp(name, "space", 5) == 0) pred = isspace;
+                else if (nameLen == 5 && strncmp(name, "punct", 5) == 0) pred = ispunct;
+                else if (nameLen == 5 && strncmp(name, "alnum", 5) == 0) pred = isalnum;
+                else if (nameLen == 5 && strncmp(name, "blank", 5) == 0) pred = isblank;
+                else if (nameLen == 5 && strncmp(name, "cntrl", 5) == 0) pred = iscntrl;
+                else if (nameLen == 5 && strncmp(name, "print", 5) == 0) pred = isprint;
+                else if (nameLen == 5 && strncmp(name, "graph", 5) == 0) pred = isgraph;
+                else if (nameLen == 6 && strncmp(name, "xdigit", 6) == 0) pred = isxdigit;
+                if (pred) {
+                    for (int c = 0; c < 256 && *outLen < outCap; ++c) {
+                        if (pred(c)) outBuf[(*outLen)++] = (unsigned char)c;
+                    }
+                    i = (size_t)((end + 2) - spec);
+                    continue;
+                }
+            }
+        }
+        if (spec[i] == '[' && i + 2 < specLen && spec[i + 2] == '*') {
+            unsigned char repChar = (unsigned char)spec[i + 1];
+            size_t j = i + 3;
+            long count = 0;
+            bool hasCount = false;
+            while (j < specLen && isdigit((unsigned char)spec[j])) {
+                count = count * 10 + (spec[j] - '0');
+                hasCount = true;
+                j++;
+            }
+            if (j < specLen && spec[j] == ']') {
+                if (!hasCount) count = 1; /* "[c*]" (fill-to-length) -- caller pads with the last char anyway */
+                for (long k = 0; k < count && *outLen < outCap; ++k) {
+                    outBuf[(*outLen)++] = repChar;
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        if (i + 2 < specLen && spec[i + 1] == '-' && spec[i] != '\\') {
+            unsigned char from = (unsigned char)spec[i];
+            unsigned char to = (unsigned char)spec[i + 2];
+            if (from <= to) {
+                for (unsigned int c = from; c <= to && *outLen < outCap; ++c) {
+                    outBuf[(*outLen)++] = (unsigned char)c;
+                }
+                i += 3;
+                continue;
+            }
+        }
+        if (spec[i] == '\\' && i + 1 < specLen) {
+            unsigned char actual;
+            switch (spec[i + 1]) {
+                case 'n': actual = '\n'; break;
+                case 't': actual = '\t'; break;
+                case 'r': actual = '\r'; break;
+                case '\\': actual = '\\'; break;
+                case '0': actual = '\0'; break;
+                default: actual = (unsigned char)spec[i + 1]; break;
+            }
+            outBuf[(*outLen)++] = actual;
+            i += 2;
+            continue;
+        }
+        outBuf[(*outLen)++] = (unsigned char)spec[i];
+        i++;
+    }
+    return true;
+}
+
 static int smallclueTrCommand(int argc, char **argv) {
-    if (argc < 3) {
+    bool deleteMode = false, squeezeMode = false, complementMode = false;
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (strcmp(arg, "--") == 0) { argi++; break; }
+        if (arg[0] != '-' || arg[1] == '\0') break;
+        for (const char *p = arg + 1; *p; ++p) {
+            if (*p == 'd') deleteMode = true;
+            else if (*p == 's') squeezeMode = true;
+            else if (*p == 'c' || *p == 'C') complementMode = true;
+            else {
+                fprintf(stderr, "tr: unsupported option '%c'\n", *p);
+                return 1;
+            }
+        }
+    }
+    int operandCount = argc - argi;
+    if (operandCount < 1) {
         fprintf(stderr, "tr: missing operand\n");
         return 1;
     }
-    const char *set1 = argv[1];
-    const char *set2 = argv[2];
-    size_t len1 = strlen(set1);
-    size_t len2 = strlen(set2);
+
+    unsigned char expanded1[512], expanded2[512];
+    size_t len1 = 0, len2 = 0;
+    smallclueTrExpandSet(argv[argi], expanded1, sizeof(expanded1), &len1);
+    bool haveSet2 = (operandCount >= 2);
+    if (haveSet2) {
+        smallclueTrExpandSet(argv[argi + 1], expanded2, sizeof(expanded2), &len2);
+    }
+
+    if (complementMode) {
+        bool inSet[256] = {false};
+        for (size_t i = 0; i < len1; ++i) inSet[expanded1[i]] = true;
+        size_t newLen = 0;
+        for (int c = 0; c < 256; ++c) {
+            if (!inSet[c]) expanded1[newLen++] = (unsigned char)c;
+        }
+        len1 = newLen;
+    }
+
+    bool set1Member[256] = {false};
+    for (size_t i = 0; i < len1; ++i) set1Member[expanded1[i]] = true;
+    bool set2Member[256] = {false};
+    for (size_t i = 0; i < len2; ++i) set2Member[expanded2[i]] = true;
+
     unsigned char map[256];
-    bool delete_map[256];
-    bool delete_only = (len2 == 0);
-    for (int i = 0; i < 256; ++i) {
-        map[i] = (unsigned char)i;
-        delete_map[i] = false;
-    }
-    if (delete_only) {
+    for (int i = 0; i < 256; ++i) map[i] = (unsigned char)i;
+    if (!deleteMode && haveSet2 && len2 > 0) {
         for (size_t i = 0; i < len1; ++i) {
-            delete_map[(unsigned char)set1[i]] = true;
+            unsigned char to = (unsigned char)(i < len2 ? expanded2[i] : expanded2[len2 - 1]);
+            map[expanded1[i]] = to;
         }
-    } else {
-        for (size_t i = 0; i < len1; ++i) {
-            unsigned char from = (unsigned char)set1[i];
-            unsigned char to = (unsigned char)(i < len2 ? set2[i] : set2[len2 - 1]);
-            map[from] = to;
-        }
+    } else if (!deleteMode && !haveSet2 && !squeezeMode) {
+        fprintf(stderr, "tr: missing operand after '%s'\n", argv[argi]);
+        return 1;
     }
+
+    int lastOutput = -1;
     char buf[16384];
-    char out_buf[16384];
+    char outBuf[16384];
     ssize_t n;
     int read_err = 0;
 
     while ((n = smallclueReadStream(stdin, buf, sizeof(buf), &read_err)) > 0) {
-        if (delete_only) {
-            size_t out_idx = 0;
-            for (ssize_t i = 0; i < n; ++i) {
-                unsigned char c = (unsigned char)buf[i];
-                if (!delete_map[c]) {
-                    out_buf[out_idx++] = c;
-                }
+        size_t outIdx = 0;
+        for (ssize_t i = 0; i < n; ++i) {
+            unsigned char c = (unsigned char)buf[i];
+            bool squeezeCandidate;
+            if (deleteMode) {
+                if (set1Member[c]) continue;
+                squeezeCandidate = squeezeMode && haveSet2 && set2Member[c];
+            } else if (haveSet2) {
+                c = map[c];
+                squeezeCandidate = squeezeMode && set2Member[c];
+            } else {
+                /* squeeze-only, no translation */
+                squeezeCandidate = squeezeMode && set1Member[c];
             }
-            if (out_idx > 0) {
-                fwrite(out_buf, 1, out_idx, stdout);
+            if (squeezeCandidate && lastOutput == (int)c) {
+                continue;
             }
-        } else {
-            for (ssize_t i = 0; i < n; ++i) {
-                unsigned char c = (unsigned char)buf[i];
-                buf[i] = map[c];
-            }
-            fwrite(buf, 1, (size_t)n, stdout);
+            outBuf[outIdx++] = (char)c;
+            lastOutput = squeezeCandidate ? (int)c : -1;
+        }
+        if (outIdx > 0) {
+            fwrite(outBuf, 1, outIdx, stdout);
         }
     }
 
@@ -13650,7 +19693,6 @@ static int smallclueTrCommand(int argc, char **argv) {
         fprintf(stderr, "tr: read error: %s\n", strerror(read_err));
         return 1;
     }
-
     return 0;
 }
 
@@ -13772,7 +19814,49 @@ static int smallclueEnvCommand(int argc, char **argv) {
     return 126;
 }
 
-static void smallclueGrepPrintMatch(const char *line, size_t len, const char *pattern, int ignore_case, int color_enabled, const char *prefix_path, long line_number) {
+/* Highlights every non-overlapping regex match in [line, line+len) using
+ * the already-compiled pattern. `len` is the byte length actually being
+ * searched (the caller has already excluded any trailing '\n' so `$`/`.`
+ * behave as end-of-line, not end-of-buffer -- see smallclueGrepMatches). */
+static void smallclueGrepHighlightMatches(const char *line, size_t len, const regex_t *re) {
+    const char *cursor = line;
+    const char *end = line + len;
+    while (cursor <= end) {
+        regmatch_t pmatch[1];
+        /* regexec needs a NUL-terminated string; searching from `cursor`
+         * within the original NUL-terminated line buffer is safe as long
+         * as we never search past `end`. */
+        int eflags = (cursor == line) ? 0 : REG_NOTBOL;
+        int rc = regexec(re, cursor, 1, pmatch, eflags);
+        if (rc != 0 || cursor + pmatch[0].rm_so >= end) {
+            fwrite(cursor, 1, (size_t)(end - cursor), stdout);
+            return;
+        }
+        if (pmatch[0].rm_so > 0) {
+            fwrite(cursor, 1, (size_t)pmatch[0].rm_so, stdout);
+        }
+        const char *matchStart = cursor + pmatch[0].rm_so;
+        size_t matchLen = (size_t)(pmatch[0].rm_eo - pmatch[0].rm_so);
+        if (matchStart + matchLen > end) {
+            matchLen = (size_t)(end - matchStart);
+        }
+        fputs("\033[1;31m", stdout);
+        fwrite(matchStart, 1, matchLen, stdout);
+        fputs("\033[0m", stdout);
+        if (matchLen == 0) {
+            /* Zero-length match: emit one char verbatim to guarantee
+             * forward progress. */
+            if (matchStart >= end) return;
+            fwrite(matchStart, 1, 1, stdout);
+            cursor = matchStart + 1;
+        } else {
+            cursor = matchStart + matchLen;
+        }
+    }
+}
+
+static void smallclueGrepPrintMatch(const char *line, size_t len, const regex_t *re, int color_enabled,
+                                    const char *prefix_path, long line_number) {
     if (prefix_path) {
         if (color_enabled) fputs("\033[35m", stdout);
         printf("%s", prefix_path);
@@ -13786,45 +19870,224 @@ static void smallclueGrepPrintMatch(const char *line, size_t len, const char *pa
         else putchar(':');
     }
 
-    if (!color_enabled || !pattern || !*pattern) {
+    if (!color_enabled) {
         fwrite(line, 1, len, stdout);
         return;
     }
+    smallclueGrepHighlightMatches(line, len, re);
+}
 
-    const char *cursor = line;
-    const char *end = line + len;
-    while (cursor < end) {
-        /* Note: smallclueStrCaseStr stops at null terminator, so matches after embedded nulls in binary files are ignored (matching existing behavior). */
-        const char *match = smallclueStrCaseStr(cursor, pattern, ignore_case);
-        if (!match || match >= end) {
-            fwrite(cursor, 1, (size_t)(end - cursor), stdout);
+static bool smallclueGrepIsWordChar(char c) {
+    return isalnum((unsigned char)c) || c == '_';
+}
+
+/* Finds the first match satisfying -w's word-boundary constraint: the
+ * match must not be immediately preceded or followed by a word
+ * character. Retries at subsequent positions if the first regexec hit
+ * isn't word-bounded, since the "real" word match may occur later in
+ * the line. Portable (checks boundaries manually rather than relying on
+ * \< \> regex extensions, which aren't guaranteed across regex(3)
+ * implementations). */
+static bool smallclueGrepFindWordMatch(const char *line, size_t lineLen, const regex_t *re, regmatch_t *outMatch) {
+    size_t offset = 0;
+    while (offset <= lineLen) {
+        regmatch_t m;
+        int eflags = (offset > 0) ? REG_NOTBOL : 0;
+        if (regexec(re, line + offset, 1, &m, eflags) != 0) return false;
+        size_t start = offset + (size_t)m.rm_so;
+        size_t end = offset + (size_t)m.rm_eo;
+        bool leftOk = (start == 0) || !smallclueGrepIsWordChar(line[start - 1]);
+        bool rightOk = (end == lineLen) || !smallclueGrepIsWordChar(line[end]);
+        if (leftOk && rightOk) {
+            outMatch->rm_so = (regoff_t)start;
+            outMatch->rm_eo = (regoff_t)end;
+            return true;
+        }
+        size_t advance = (end > offset) ? (end - offset) : 1;
+        offset += advance;
+    }
+    return false;
+}
+
+/* Matches `line` (length lineLen, WITHOUT any trailing '\n' -- callers
+ * must strip it first) against the compiled pattern, honoring -w
+ * (whole word) / -x (whole line) if requested. Returns the match bounds
+ * (relative to `line`) via outMatch when non-NULL. */
+static bool smallclueGrepMatchesEx(const char *line, size_t lineLen, const regex_t *re,
+                                   bool wordMode, bool lineMode, regmatch_t *outMatch) {
+    regmatch_t m;
+    if (lineMode) {
+        if (regexec(re, line, 1, &m, 0) != 0) return false;
+        if ((size_t)m.rm_so != 0 || (size_t)m.rm_eo != lineLen) return false;
+    } else if (wordMode) {
+        if (!smallclueGrepFindWordMatch(line, lineLen, re, &m)) return false;
+    } else {
+        if (regexec(re, line, 1, &m, 0) != 0) return false;
+    }
+    if (outMatch) *outMatch = m;
+    return true;
+}
+
+static bool smallclueGrepMatches(const char *line, size_t lineLen, const regex_t *re) {
+    return smallclueGrepMatchesEx(line, lineLen, re, false, false, NULL);
+}
+
+/* -o: prints every non-overlapping match on the line (honoring -w/-x),
+ * one per output line, instead of the whole line. */
+static void smallclueGrepPrintAllMatches(const char *line, size_t lineLen, const regex_t *re,
+                                         bool wordMode, bool lineMode,
+                                         const char *prefixPath, long lineNo, bool numberLines) {
+    size_t offset = 0;
+    while (offset <= lineLen) {
+        regmatch_t m;
+        int eflags = (offset > 0) ? REG_NOTBOL : 0;
+        if (regexec(re, line + offset, 1, &m, eflags) != 0) break;
+        size_t start = offset + (size_t)m.rm_so;
+        size_t end = offset + (size_t)m.rm_eo;
+        bool ok = true;
+        if (lineMode) {
+            ok = (start == 0 && end == lineLen);
+        } else if (wordMode) {
+            bool leftOk = (start == 0) || !smallclueGrepIsWordChar(line[start - 1]);
+            bool rightOk = (end == lineLen) || !smallclueGrepIsWordChar(line[end]);
+            ok = leftOk && rightOk;
+        }
+        if (ok && end > start) {
+            if (prefixPath) printf("%s:", prefixPath);
+            if (numberLines) printf("%ld:", lineNo);
+            fwrite(line + start, 1, end - start, stdout);
+            putchar('\n');
+        }
+        size_t advance = (end > offset) ? (end - offset) : 1;
+        offset += advance;
+    }
+}
+
+typedef struct SmallclueGrepOptions {
+    bool numberLines;
+    bool invertMatch;
+    bool useColor;
+    bool recursive;
+    bool multiplePaths; /* prefix matched lines with the file path */
+    bool countOnly;      /* -c */
+    bool matchOnly;      /* -o */
+    bool wordMatch;      /* -w */
+    bool lineMatch;      /* -x */
+} SmallclueGrepOptions;
+
+static int smallclueGrepScanStream(FILE *fp, const char *label, const regex_t *re,
+                                   const SmallclueGrepOptions *opts) {
+    int status = 1;
+    char *line = NULL;
+    size_t cap = 0;
+    long lineNo = 0;
+    long matchCount = 0;
+    for (;;) {
+        int read_err = 0;
+        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
+        if (len < 0) {
+            if (read_err) {
+                fprintf(stderr, "grep: %s: %s\n", label, strerror(read_err));
+            }
             break;
         }
-
-        /* Print prefix */
-        if (match > cursor) {
-            fwrite(cursor, 1, (size_t)(match - cursor), stdout);
+        lineNo++;
+        /* Strip any trailing '\n' before matching so `$`/`.` behave against
+         * the logical end of line, not an embedded newline (the same bug
+         * class fixed in sed) -- but still print with the original length
+         * so output formatting is unaffected. */
+        size_t matchLen = (size_t)len;
+        if (matchLen > 0 && line[matchLen - 1] == '\n') {
+            line[matchLen - 1] = '\0';
+            matchLen--;
         }
-
-        /* Print match in color */
-        size_t pat_len = strlen(pattern);
-        if (match + pat_len > end) {
-            pat_len = (size_t)(end - match);
+        bool found = smallclueGrepMatchesEx(line, matchLen, re, opts->wordMatch, opts->lineMatch, NULL);
+        if (opts->invertMatch ? !found : found) {
+            status = 0;
+            if (opts->countOnly) {
+                matchCount++;
+            } else if (opts->matchOnly && !opts->invertMatch) {
+                smallclueGrepPrintAllMatches(line, matchLen, re, opts->wordMatch, opts->lineMatch,
+                                             opts->multiplePaths ? label : NULL,
+                                             opts->numberLines ? lineNo : 0, opts->numberLines);
+            } else {
+                /* Print only up to matchLen (line[] now has a NUL where the
+                 * original '\n' was), then re-add the newline explicitly --
+                 * printing the original `len` bytes here would emit that
+                 * stray NUL byte in place of the newline. */
+                smallclueGrepPrintMatch(line, matchLen, re, opts->useColor && !opts->invertMatch,
+                                        opts->multiplePaths ? label : NULL,
+                                        opts->numberLines ? lineNo : 0);
+                if (matchLen < (size_t)len) {
+                    fputc('\n', stdout);
+                }
+            }
         }
+    }
+    if (opts->countOnly) {
+        if (opts->multiplePaths) printf("%s:", label);
+        printf("%ld\n", matchCount);
+    }
+    free(line);
+    return status;
+}
 
-        fputs("\033[1;31m", stdout); /* Bold Red */
-        fwrite(match, 1, pat_len, stdout);
-        fputs("\033[0m", stdout); /* Reset */
-
-        cursor = match + pat_len;
+static void smallclueGrepWalkPath(const char *path, const regex_t *re, const SmallclueGrepOptions *opts, int *status) {
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
+        *status = *status == 0 ? 0 : 2;
+        return;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        if (!opts->recursive) {
+            fprintf(stderr, "grep: %s: is a directory\n", path);
+            *status = *status == 0 ? 0 : 2;
+            return;
+        }
+        DIR *dir = opendir(path);
+        if (!dir) {
+            fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
+            *status = *status == 0 ? 0 : 2;
+            return;
+        }
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            char child[PATH_MAX];
+            if (smallclueBuildPath(child, sizeof(child), path, entry->d_name) != 0) {
+                fprintf(stderr, "grep: %s/%s: %s\n", path, entry->d_name, strerror(errno));
+                *status = *status == 0 ? 0 : 2;
+                continue;
+            }
+            smallclueGrepWalkPath(child, re, opts, status);
+        }
+        closedir(dir);
+        return;
+    }
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
+        *status = *status == 0 ? 0 : 2;
+        return;
+    }
+    int rc = smallclueGrepScanStream(fp, path, re, opts);
+    fclose(fp);
+    if (rc == 0) {
+        *status = 0;
+    } else if (*status != 0) {
+        *status = 1;
     }
 }
 
 static int smallclueGrepCommand(int argc, char **argv) {
     int index = 1;
-    int number_lines = 0;
-    int ignore_case = 0;
-    int invert_match = 0;
+    SmallclueGrepOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    bool extendedRegex = false;
+    bool ignoreCase = false;
     int color_mode = 0; /* 0=auto, 1=always, -1=never */
 
     while (index < argc) {
@@ -13839,17 +20102,47 @@ static int smallclueGrepCommand(int argc, char **argv) {
         if (strncmp(arg, "--", 2) == 0) {
             /* Support common long forms and treat unknown long opts as end of options. */
             if (strcmp(arg, "--ignore-case") == 0 || strcmp(arg, "--ignore") == 0) {
-                ignore_case = 1;
+                ignoreCase = true;
                 index++;
                 continue;
             }
             if (strcmp(arg, "--invert-match") == 0 || strcmp(arg, "--invert") == 0) {
-                invert_match = 1;
+                opts.invertMatch = true;
                 index++;
                 continue;
             }
             if (strcmp(arg, "--line-number") == 0 || strcmp(arg, "--number") == 0) {
-                number_lines = 1;
+                opts.numberLines = true;
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--recursive") == 0) {
+                opts.recursive = true;
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--extended-regexp") == 0) {
+                extendedRegex = true;
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--count") == 0) {
+                opts.countOnly = true;
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--only-matching") == 0) {
+                opts.matchOnly = true;
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--word-regexp") == 0) {
+                opts.wordMatch = true;
+                index++;
+                continue;
+            }
+            if (strcmp(arg, "--line-regexp") == 0) {
+                opts.lineMatch = true;
                 index++;
                 continue;
             }
@@ -13871,11 +20164,23 @@ static int smallclueGrepCommand(int argc, char **argv) {
         }
         for (const char *opt = arg + 1; *opt; ++opt) {
             if (*opt == 'n') {
-                number_lines = 1;
+                opts.numberLines = true;
             } else if (*opt == 'i') {
-                ignore_case = 1;
+                ignoreCase = true;
             } else if (*opt == 'v') {
-                invert_match = 1;
+                opts.invertMatch = true;
+            } else if (*opt == 'r' || *opt == 'R') {
+                opts.recursive = true;
+            } else if (*opt == 'E') {
+                extendedRegex = true;
+            } else if (*opt == 'c') {
+                opts.countOnly = true;
+            } else if (*opt == 'o') {
+                opts.matchOnly = true;
+            } else if (*opt == 'w') {
+                opts.wordMatch = true;
+            } else if (*opt == 'x') {
+                opts.lineMatch = true;
             } else {
                 fprintf(stderr, "grep: unsupported option -%c\n", *opt);
                 return 1;
@@ -13889,64 +20194,33 @@ static int smallclueGrepCommand(int argc, char **argv) {
     }
     const char *pattern = argv[index++];
 
+    regex_t re;
+    int reFlags = (extendedRegex ? REG_EXTENDED : 0) | (ignoreCase ? REG_ICASE : 0);
+    int rc = regcomp(&re, pattern, reFlags);
+    if (rc != 0) {
+        char errbuf[256];
+        regerror(rc, &re, errbuf, sizeof(errbuf));
+        fprintf(stderr, "grep: invalid pattern '%s': %s\n", pattern, errbuf);
+        return 2;
+    }
+
     if (color_mode == 0) {
         color_mode = pscalRuntimeStdoutIsInteractive() ? 1 : -1;
     }
-    int use_color = (color_mode == 1) && !invert_match;
+    opts.useColor = (color_mode == 1);
 
     int paths = argc - index;
-    int status = 1;
-    char *line = NULL;
-    size_t cap = 0;
+    int status;
     if (paths <= 0) {
-        ssize_t len;
-        long line_no = 0;
-        while (true) {
-            int read_err = 0;
-            len = smallclueGetlineStream(&line, &cap, stdin, &read_err);
-            if (len < 0) {
-                if (read_err) {
-                    fprintf(stderr, "grep: %s\n", strerror(read_err));
-                }
-                break;
-            }
-            line_no++;
-            int found = smallclueStrCaseStr(line, pattern, ignore_case) != NULL;
-            if (invert_match ? !found : found) {
-                smallclueGrepPrintMatch(line, (size_t)len, pattern, ignore_case, use_color, NULL, number_lines ? line_no : 0);
-                status = 0;
-            }
-        }
+        status = smallclueGrepScanStream(stdin, "(standard input)", &re, &opts);
     } else {
+        opts.multiplePaths = (paths > 1) || opts.recursive;
+        status = 1;
         for (int i = index; i < argc; ++i) {
-            const char *path = argv[i];
-            FILE *fp = fopen(path, "r");
-            if (!fp) {
-                fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
-                continue;
-            }
-            ssize_t len;
-            long line_no = 0;
-            while (true) {
-                int read_err = 0;
-                len = smallclueGetlineStream(&line, &cap, fp, &read_err);
-                if (len < 0) {
-                    if (read_err) {
-                        fprintf(stderr, "grep: %s: %s\n", path, strerror(read_err));
-                    }
-                    break;
-                }
-                line_no++;
-                int found = smallclueStrCaseStr(line, pattern, ignore_case) != NULL;
-                if (invert_match ? !found : found) {
-                    smallclueGrepPrintMatch(line, (size_t)len, pattern, ignore_case, use_color, (paths > 1) ? path : NULL, number_lines ? line_no : 0);
-                    status = 0;
-                }
-            }
-            fclose(fp);
+            smallclueGrepWalkPath(argv[i], &re, &opts, &status);
         }
     }
-    free(line);
+    regfree(&re);
     return status;
 }
 
@@ -13954,9 +20228,179 @@ typedef struct {
     uint64_t lines;
     uint64_t words;
     uint64_t bytes;
+    uint64_t chars;
+    uint64_t max_line_length;
 } SmallclueWcCounts;
 
-static int smallclueWcProcessFile(const char *path, SmallclueWcCounts *counts) {
+static int smallclueWcProcessFileFast(const char *path, FILE *fp, SmallclueWcCounts *counts) {
+    uint64_t lines = 0;
+    uint64_t words = 0;
+    uint64_t bytes = 0;
+    int in_word = 0;
+    int read_err = 0;
+    char buf[16384];
+    ssize_t n;
+
+    while ((n = smallclueReadStream(fp, buf, sizeof(buf), &read_err)) > 0) {
+        bytes += (uint64_t)n;
+        ssize_t i = 0;
+        /* Bolt optimization: loop unrolling for wc */
+        #define PROCESS_CHAR(idx) do { \
+            unsigned char c = (unsigned char)buf[idx]; \
+            lines += (c == '\n'); \
+            if ((c == ' ') || (c >= '\t' && c <= '\r')) { \
+                in_word = 0; \
+            } else if (!in_word) { \
+                words++; \
+                in_word = 1; \
+            } \
+        } while (0)
+
+        for (; i + 15 < n; i += 16) {
+            PROCESS_CHAR(i);
+            PROCESS_CHAR(i+1);
+            PROCESS_CHAR(i+2);
+            PROCESS_CHAR(i+3);
+            PROCESS_CHAR(i+4);
+            PROCESS_CHAR(i+5);
+            PROCESS_CHAR(i+6);
+            PROCESS_CHAR(i+7);
+            PROCESS_CHAR(i+8);
+            PROCESS_CHAR(i+9);
+            PROCESS_CHAR(i+10);
+            PROCESS_CHAR(i+11);
+            PROCESS_CHAR(i+12);
+            PROCESS_CHAR(i+13);
+            PROCESS_CHAR(i+14);
+            PROCESS_CHAR(i+15);
+        }
+        #undef PROCESS_CHAR
+        for (; i < n; ++i) {
+            unsigned char c = (unsigned char)buf[i];
+            if (c == '\n') {
+                lines++;
+            }
+
+            /* Bolt optimization: inline space check instead of isspace() to avoid function call overhead */
+            int is_sp = (c == ' ') || (c >= '\t' && c <= '\r');
+            if (is_sp) {
+                in_word = 0;
+            } else if (!in_word) {
+                words++;
+                in_word = 1;
+            }
+        }
+    }
+
+    counts->lines = lines;
+    counts->words = words;
+    counts->bytes = bytes;
+    counts->chars = bytes;
+    counts->max_line_length = 0;
+    return read_err ? 1 : 0;
+}
+
+/* Slower path used only when -m/-L are requested: decodes multibyte
+ * characters via mbrtowc (honoring the process locale) so -m's character
+ * count and -L's column-based max-line-length match GNU wc under a UTF-8
+ * locale, instead of just approximating them as raw byte counts. -L expands
+ * tabs to the next multiple of 8 columns, matching GNU coreutils' actual
+ * behavior (verified against Linux wc). */
+static int smallclueWcProcessFileWide(const char *path, FILE *fp, SmallclueWcCounts *counts) {
+    uint64_t lines = 0;
+    uint64_t words = 0;
+    uint64_t bytes = 0;
+    uint64_t chars = 0;
+    uint64_t max_line_length = 0;
+    uint64_t cur_line_length = 0;
+    int in_word = 0;
+    int read_err = 0;
+    char buf[16384];
+    ssize_t n;
+    mbstate_t mbs;
+    memset(&mbs, 0, sizeof(mbs));
+    unsigned char carry[16];
+    size_t carryLen = 0;
+
+    while ((n = smallclueReadStream(fp, buf, sizeof(buf), &read_err)) > 0) {
+        bytes += (uint64_t)n;
+
+        for (int i = 0; i < n; ++i) {
+            unsigned char c = (unsigned char)buf[i];
+            if (c == '\n') {
+                lines++;
+            }
+            int is_sp = (c == ' ') || (c >= '\t' && c <= '\r');
+            if (is_sp) {
+                in_word = 0;
+            } else if (!in_word) {
+                words++;
+                in_word = 1;
+            }
+        }
+
+        /* Character decode: work off a carry buffer so a multibyte
+         * sequence split across two reads still decodes correctly. */
+        size_t avail = carryLen + (size_t)n;
+        unsigned char *scratch = (unsigned char *)malloc(avail > 0 ? avail : 1);
+        if (!scratch) {
+            fprintf(stderr, "wc: out of memory\n");
+            return 1;
+        }
+        if (carryLen) memcpy(scratch, carry, carryLen);
+        memcpy(scratch + carryLen, buf, (size_t)n);
+
+        size_t pos = 0;
+        while (pos < avail) {
+            wchar_t wc;
+            size_t rc = mbrtowc(&wc, (const char *)scratch + pos, avail - pos, &mbs);
+            if (rc == (size_t)-2) {
+                /* Incomplete sequence at the end of the buffer -- carry the
+                 * remaining bytes over to the next read. */
+                size_t remain = avail - pos;
+                if (remain > sizeof(carry)) remain = sizeof(carry);
+                memcpy(carry, scratch + pos, remain);
+                carryLen = remain;
+                pos = avail;
+                break;
+            }
+            if (rc == (size_t)-1) {
+                /* Invalid sequence -- count the single byte as one
+                 * character and resync, matching GNU wc's behavior. */
+                memset(&mbs, 0, sizeof(mbs));
+                chars++;
+                cur_line_length++;
+                pos++;
+                carryLen = 0;
+                continue;
+            }
+            if (rc == 0) rc = 1; /* embedded NUL still counts as a character */
+            chars++;
+            if (wc == L'\n') {
+                if (cur_line_length > max_line_length) max_line_length = cur_line_length;
+                cur_line_length = 0;
+            } else if (wc == L'\t') {
+                cur_line_length = (cur_line_length / 8 + 1) * 8;
+            } else {
+                cur_line_length++;
+            }
+            pos += rc;
+            carryLen = 0;
+        }
+        free(scratch);
+    }
+
+    if (cur_line_length > max_line_length) max_line_length = cur_line_length;
+
+    counts->lines = lines;
+    counts->words = words;
+    counts->bytes = bytes;
+    counts->chars = chars;
+    counts->max_line_length = max_line_length;
+    return read_err ? 1 : 0;
+}
+
+static int smallclueWcProcessFile(const char *path, SmallclueWcCounts *counts, bool needWide) {
     FILE *fp = NULL;
     if (path) {
         fp = fopen(path, "r");
@@ -13968,47 +20412,35 @@ static int smallclueWcProcessFile(const char *path, SmallclueWcCounts *counts) {
         fp = stdin;
     }
 
-    counts->lines = counts->words = counts->bytes = 0;
-    int in_word = 0;
-    int read_err = 0;
-    char buf[16384];
-    ssize_t n;
-
-    while ((n = smallclueReadStream(fp, buf, sizeof(buf), &read_err)) > 0) {
-        counts->bytes += (uint64_t)n;
-        for (ssize_t i = 0; i < n; ++i) {
-            unsigned char c = (unsigned char)buf[i];
-            if (c == '\n') {
-                counts->lines++;
-            }
-            if (isspace(c)) {
-                in_word = 0;
-            } else if (!in_word) {
-                counts->words++;
-                in_word = 1;
-            }
-        }
-    }
+    int rc = needWide ? smallclueWcProcessFileWide(path, fp, counts)
+                       : smallclueWcProcessFileFast(path, fp, counts);
 
     if (fp != stdin) {
         fclose(fp);
     }
-    if (read_err) {
+    if (rc != 0) {
         fprintf(stderr, "wc: %s: read error\n", path ? path : "(stdin)");
         return 1;
     }
     return 0;
 }
 
-static void smallclueWcPrint(const SmallclueWcCounts *counts, int show_lines, int show_words, int show_bytes, const char *label) {
+static void smallclueWcPrint(const SmallclueWcCounts *counts, int show_lines, int show_words,
+                              int show_chars, int show_bytes, int show_maxline, const char *label) {
     if (show_lines) {
         printf("%12" PRIu64, counts->lines);
     }
     if (show_words) {
         printf("%12" PRIu64, counts->words);
     }
+    if (show_chars) {
+        printf("%12" PRIu64, counts->chars);
+    }
     if (show_bytes) {
         printf("%12" PRIu64, counts->bytes);
+    }
+    if (show_maxline) {
+        printf("%12" PRIu64, counts->max_line_length);
     }
     if (label) {
         printf(" %s", label);
@@ -14017,7 +20449,7 @@ static void smallclueWcPrint(const SmallclueWcCounts *counts, int show_lines, in
 }
 
 static int smallclueWcCommand(int argc, char **argv) {
-    int show_lines = 0, show_words = 0, show_bytes = 0;
+    int show_lines = 0, show_words = 0, show_bytes = 0, show_chars = 0, show_maxline = 0;
     int index = 1;
     while (index < argc) {
         const char *arg = argv[index];
@@ -14032,6 +20464,8 @@ static int smallclueWcCommand(int argc, char **argv) {
             if (*opt == 'l') show_lines = 1;
             else if (*opt == 'w') show_words = 1;
             else if (*opt == 'c') show_bytes = 1;
+            else if (*opt == 'm') show_chars = 1;
+            else if (*opt == 'L') show_maxline = 1;
             else {
                 fprintf(stderr, "wc: invalid option -- %c\n", *opt);
                 return 1;
@@ -14039,31 +20473,39 @@ static int smallclueWcCommand(int argc, char **argv) {
         }
         index++;
     }
-    if (!show_lines && !show_words && !show_bytes) {
+    if (!show_lines && !show_words && !show_bytes && !show_chars && !show_maxline) {
         show_lines = show_words = show_bytes = 1;
+    }
+    bool needWide = show_chars || show_maxline;
+    if (needWide) {
+        setlocale(LC_CTYPE, "");
     }
     int paths = argc - index;
     int status = 0;
     SmallclueWcCounts counts;
-    SmallclueWcCounts total = {0, 0, 0};
+    SmallclueWcCounts total = {0, 0, 0, 0, 0};
     if (paths <= 0) {
-        if (smallclueWcProcessFile(NULL, &counts) != 0) {
+        if (smallclueWcProcessFile(NULL, &counts, needWide) != 0) {
             return 1;
         }
-        smallclueWcPrint(&counts, show_lines, show_words, show_bytes, NULL);
+        smallclueWcPrint(&counts, show_lines, show_words, show_chars, show_bytes, show_maxline, NULL);
     } else {
         for (int i = index; i < argc; ++i) {
-            if (smallclueWcProcessFile(argv[i], &counts) != 0) {
+            if (smallclueWcProcessFile(argv[i], &counts, needWide) != 0) {
                 status = 1;
                 continue;
             }
-            smallclueWcPrint(&counts, show_lines, show_words, show_bytes, argv[i]);
+            smallclueWcPrint(&counts, show_lines, show_words, show_chars, show_bytes, show_maxline, argv[i]);
             total.lines += counts.lines;
             total.words += counts.words;
             total.bytes += counts.bytes;
+            total.chars += counts.chars;
+            if (counts.max_line_length > total.max_line_length) {
+                total.max_line_length = counts.max_line_length;
+            }
         }
         if (paths > 1) {
-            smallclueWcPrint(&total, show_lines, show_words, show_bytes, "total");
+            smallclueWcPrint(&total, show_lines, show_words, show_chars, show_bytes, show_maxline, "total");
         }
     }
     return status;
@@ -14073,6 +20515,10 @@ typedef struct {
     int summarize_only;
     int use_kilobytes;
     int human_readable;
+    int max_depth;      /* -1 = unlimited */
+    int grand_total;    /* -c */
+    int one_filesystem; /* -x */
+    dev_t root_dev;     /* set per top-level argument when -x is active */
 } SmallclueDuOptions;
 
 static void smallclueDuPrintSize(long long bytes,
@@ -14101,6 +20547,14 @@ static void smallclueDuPrintSize(long long bytes,
         } else {
             value = -(((-value) + 1023) / 1024);
         }
+    } else {
+        /* POSIX/real du's actual default unit is 512-byte blocks, not
+         * raw bytes (matches `ls -s`'s own block-count column). */
+        if (value >= 0) {
+            value = (value + 511) / 512;
+        } else {
+            value = -(((-value) + 511) / 512);
+        }
     }
     printf("%lld\t%s\n", value, path);
 }
@@ -14115,7 +20569,10 @@ static long long smallclueDuVisit(const char *path,
         if (status) *status = 1;
         return 0;
     }
-    long long total = st.st_size;
+    /* Real du measures actual disk usage (allocated 512-byte blocks),
+     * not apparent file size -- st_size would badly undercount small
+     * files on filesystems with block sizes larger than the file. */
+    long long total = (long long)st.st_blocks * 512;
     if (S_ISDIR(st.st_mode)) {
         DIR *dir = opendir(path);
         if (!dir) {
@@ -14134,21 +20591,57 @@ static long long smallclueDuVisit(const char *path,
                 if (status) *status = 1;
                 continue;
             }
+            if (opts && opts->one_filesystem) {
+                struct stat childSt;
+                if (lstat(child, &childSt) == 0 && childSt.st_dev != opts->root_dev) {
+                    continue; /* -x: don't cross onto a different filesystem */
+                }
+            }
             total += smallclueDuVisit(child, status, opts, depth + 1);
         }
         closedir(dir);
     }
-    if (!opts || !opts->summarize_only || depth == 0) {
-        smallclueDuPrintSize(total, path, opts);
+
+    bool isDir = S_ISDIR(st.st_mode);
+    if (opts && opts->summarize_only) {
+        if (depth == 0) {
+            smallclueDuPrintSize(total, path, opts);
+        }
+    } else {
+        /* GNU du's real default: print a subtotal for every DIRECTORY at
+         * every depth, but never an individual file -- the top-level
+         * operand itself is always printed even if it's a plain file
+         * (matching `du somefile` still reporting that file's size). */
+        bool withinDepth = !opts || opts->max_depth < 0 || depth <= opts->max_depth;
+        if ((isDir || depth == 0) && withinDepth) {
+            smallclueDuPrintSize(total, path, opts);
+        }
     }
     return total;
 }
 
 static int smallclueDuCommand(int argc, char **argv) {
-    SmallclueDuOptions opts = {0, 0, 0};
+    SmallclueDuOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.max_depth = -1;
+
+    /* --max-depth=N is a GNU long option with no getopt()-friendly
+     * short form other than -d N (which getopt handles fine); strip the
+     * "=N" long form out first, matching the convention used elsewhere
+     * in this file (e.g. stat's --format=). */
+    for (int i = 1; i < argc; ) {
+        if (strncmp(argv[i], "--max-depth=", 12) == 0) {
+            opts.max_depth = atoi(argv[i] + 12);
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            argc--;
+            continue;
+        }
+        i++;
+    }
+
     int opt;
     smallclueResetGetopt();
-    while ((opt = getopt(argc, argv, "skh")) != -1) {
+    while ((opt = getopt(argc, argv, "skhcxd:")) != -1) {
         switch (opt) {
             case 's':
                 opts.summarize_only = 1;
@@ -14159,80 +20652,583 @@ static int smallclueDuCommand(int argc, char **argv) {
             case 'h':
                 opts.human_readable = 1;
                 break;
+            case 'c':
+                opts.grand_total = 1;
+                break;
+            case 'x':
+                opts.one_filesystem = 1;
+                break;
+            case 'd':
+                opts.max_depth = atoi(optarg);
+                break;
             default:
                 return 1;
         }
     }
 
     int status = 0;
-    if (optind >= argc) {
-        smallclueDuVisit(".", &status, &opts, 0);
-    } else {
-        for (int i = optind; i < argc; ++i) {
-            smallclueDuVisit(argv[i], &status, &opts, 0);
+    long long grandTotal = 0;
+    int pathCount = (optind < argc) ? (argc - optind) : 1;
+    for (int i = 0; i < pathCount; ++i) {
+        const char *path = (optind < argc) ? argv[optind + i] : ".";
+        if (opts.one_filesystem) {
+            struct stat rootSt;
+            if (lstat(path, &rootSt) == 0) {
+                opts.root_dev = rootSt.st_dev;
+            }
         }
+        grandTotal += smallclueDuVisit(path, &status, &opts, 0);
+    }
+    if (opts.grand_total) {
+        smallclueDuPrintSize(grandTotal, "total", &opts);
     }
     return status ? 1 : 0;
 }
 
-static int smallclueFindVisit(const char *path, const char *pattern, int *status) {
+/* Boolean expression tree for find's predicate language: -a/-and (implicit
+ * between adjacent terms too), -o/-or, !/-not, and parenthesized grouping.
+ * Precedence (loosest to tightest, matching real find): OR, AND, NOT.
+ * Actions (-print/-print0/-delete/-exec) are themselves expression terms
+ * that perform a side effect and evaluate true -- this is what makes
+ * `find . -name '*.c' -o -name '*.h'` and `find . -name '*.o' -delete`
+ * both fall out of the same evaluator instead of needing special cases. */
+typedef enum {
+    FIND_NODE_TEST,
+    FIND_NODE_AND,
+    FIND_NODE_OR,
+    FIND_NODE_NOT,
+    FIND_NODE_PRINT,
+    FIND_NODE_PRINT0,
+    FIND_NODE_DELETE,
+    FIND_NODE_EXEC,
+} SmallclueFindNodeType;
+
+typedef enum {
+    FIND_TEST_NAME,
+    FIND_TEST_INAME,
+    FIND_TEST_TYPE,
+    FIND_TEST_MTIME,
+    FIND_TEST_NEWER,
+    FIND_TEST_SIZE,
+} SmallclueFindTestKind;
+
+typedef struct SmallclueFindNode {
+    SmallclueFindNodeType type;
+    SmallclueFindTestKind testKind;
+    const char *strArg;   /* -name/-iname pattern */
+    char typeFilter;      /* -type: 'f', 'd', 'l' */
+    char sign;            /* -mtime/-size: '+', '-', or '\0' for exact */
+    long long value;      /* -mtime days or -size threshold */
+    bool isBlockUnit;     /* -size: bare/b vs c/k/M/G/w */
+    time_t newerMtime;    /* -newer: reference mtime */
+    char **execArgv;      /* -exec: argv slice up to (not including) ';' */
+    int execArgc;
+    struct SmallclueFindNode *left;
+    struct SmallclueFindNode *right; /* AND/OR right operand, NOT's child */
+} SmallclueFindNode;
+
+typedef struct SmallclueFindOptions {
+    int maxDepth; /* -1 = unlimited */
+    int minDepth; /* 0 = no minimum */
+    SmallclueFindNode *root;
+} SmallclueFindOptions;
+
+/* Parses find's -size [+-]N[ckMGwb] spec. Confirmed against the real
+ * system find with /usr/bin/find explicitly (this shell has a `find`
+ * function that redirects to an unrelated bfs-based tool -- an earlier
+ * pass through that shadowed `find` produced self-contradictory
+ * results and had to be discarded and redone): only the bare/`b` form
+ * rounds the file's size UP to whole 512-byte blocks and compares that
+ * block COUNT to N. `c` compares the exact byte count to N. `k`/`M`/`G`/`w`
+ * compare the exact byte count to N scaled by the suffix -- NOT
+ * rounded to a block boundary (e.g. -size -1k matches a 1000-byte file
+ * directly against the 1024-byte threshold, no rounding involved). */
+static bool smallclueFindParseSize(const char *s, char *signOut, long long *valueOut, bool *isBlockUnit) {
+    if (!s || !*s) return false;
+    char sign = '\0';
+    const char *p = s;
+    if (*p == '+' || *p == '-') {
+        sign = *p;
+        p++;
+    }
+    char *end = NULL;
+    long long v = strtoll(p, &end, 10);
+    if (end == p) return false;
+    long long multiplier = 1; /* bare: block count itself, not bytes */
+    bool blockUnit = true;
+    if (*end != '\0') {
+        switch (*end) {
+            case 'c': multiplier = 1; blockUnit = false; break;
+            case 'k': multiplier = 1024; blockUnit = false; break;
+            case 'M': multiplier = 1024LL * 1024; blockUnit = false; break;
+            case 'G': multiplier = 1024LL * 1024 * 1024; blockUnit = false; break;
+            case 'w': multiplier = 2; blockUnit = false; break;
+            case 'b': multiplier = 1; blockUnit = true; break;
+            default: return false;
+        }
+        if (end[1] != '\0') return false;
+    }
+    *signOut = sign;
+    *valueOut = v * multiplier;
+    *isBlockUnit = blockUnit;
+    return true;
+}
+
+static bool smallclueFindParseSignedInt(const char *s, char *signOut, long long *valueOut) {
+    if (!s || !*s) return false;
+    char sign = '\0';
+    const char *p = s;
+    if (*p == '+' || *p == '-') {
+        sign = *p;
+        p++;
+    }
+    char *end = NULL;
+    long long v = strtoll(p, &end, 10);
+    if (!end || end == p || *end != '\0') return false;
+    *signOut = sign;
+    *valueOut = v;
+    return true;
+}
+
+static bool smallclueFindCompareSigned(char sign, long long actual, long long spec) {
+    if (sign == '+') return actual > spec;
+    if (sign == '-') return actual < spec;
+    return actual == spec;
+}
+
+static bool smallclueFindTestMatches(const SmallclueFindNode *node, const char *path, const struct stat *st) {
+    switch (node->testKind) {
+        case FIND_TEST_NAME:
+        case FIND_TEST_INAME: {
+            const char *leaf = smallclueLeafName(path);
+            int flags = (node->testKind == FIND_TEST_INAME) ? FNM_CASEFOLD : 0;
+            return fnmatch(node->strArg, leaf, flags) == 0;
+        }
+        case FIND_TEST_TYPE:
+            switch (node->typeFilter) {
+                case 'f': return S_ISREG(st->st_mode);
+                case 'd': return S_ISDIR(st->st_mode);
+                case 'l': return S_ISLNK(st->st_mode);
+                default: return true;
+            }
+        case FIND_TEST_MTIME: {
+            long long ageSeconds = (long long)time(NULL) - (long long)st->st_mtime;
+            long long daysAgo = ageSeconds / 86400;
+            return smallclueFindCompareSigned(node->sign, daysAgo, node->value);
+        }
+        case FIND_TEST_NEWER:
+            return st->st_mtime > node->newerMtime;
+        case FIND_TEST_SIZE: {
+            long long measure = node->isBlockUnit
+                ? (((long long)st->st_size + 511) / 512)
+                : (long long)st->st_size;
+            return smallclueFindCompareSigned(node->sign, measure, node->value);
+        }
+    }
+    return false;
+}
+
+static int smallclueFindRunExec(const char *path, char **execArgv, int execArgc);
+
+/* Evaluates the expression tree for one visited path. AND/OR short-circuit
+ * via C's &&/|| exactly like real find: a term after a false -a (or after a
+ * true -o) is never evaluated, so its side effects (an -exec or -delete
+ * later in the expression) don't run -- matching real find's actual
+ * behavior for e.g. `find . -name '*.tmp' -delete` only deleting matches,
+ * or `find . -name a -o -name b` only ever testing the first name. */
+static bool smallclueFindEval(const SmallclueFindNode *node, const char *path, const struct stat *st, int *status) {
+    switch (node->type) {
+        case FIND_NODE_TEST:
+            return smallclueFindTestMatches(node, path, st);
+        case FIND_NODE_AND:
+            return smallclueFindEval(node->left, path, st, status) &&
+                   smallclueFindEval(node->right, path, st, status);
+        case FIND_NODE_OR:
+            return smallclueFindEval(node->left, path, st, status) ||
+                   smallclueFindEval(node->right, path, st, status);
+        case FIND_NODE_NOT:
+            return !smallclueFindEval(node->right, path, st, status);
+        case FIND_NODE_PRINT:
+            fputs(path, stdout);
+            putchar('\n');
+            return true;
+        case FIND_NODE_PRINT0:
+            fputs(path, stdout);
+            putchar('\0');
+            return true;
+        case FIND_NODE_DELETE: {
+            int rc = S_ISDIR(st->st_mode) ? rmdir(path) : unlink(path);
+            if (rc != 0) {
+                fprintf(stderr, "find: %s: %s\n", path, strerror(errno));
+                if (status) *status = 1;
+                return false;
+            }
+            return true;
+        }
+        case FIND_NODE_EXEC:
+            return smallclueFindRunExec(path, node->execArgv, node->execArgc) == 0;
+    }
+    return false;
+}
+
+/* Recursive-descent parser for find's expression grammar, precedence
+ * loosest-to-tightest: OR ("-o"/"-or"), AND ("-a"/"-and", or nothing at all
+ * between two adjacent terms -- find's implicit AND), NOT ("!"/"-not"),
+ * primary (a test/action, or a parenthesized sub-expression). Returns NULL
+ * on a parse error (after printing a message to stderr) -- *hadAction is
+ * set true if any -print/-print0/-delete/-exec term is found anywhere in
+ * the expression, so the caller knows whether to add an implicit -print. */
+static SmallclueFindNode *smallclueFindParseOr(char **argv, int argc, int *idx, bool *hadAction);
+
+static SmallclueFindNode *smallclueFindParsePrimary(char **argv, int argc, int *idx, bool *hadAction) {
+    if (*idx >= argc) {
+        fprintf(stderr, "find: unexpected end of expression\n");
+        return NULL;
+    }
+    const char *arg = argv[*idx];
+    if (strcmp(arg, "(") == 0) {
+        (*idx)++;
+        SmallclueFindNode *inner = smallclueFindParseOr(argv, argc, idx, hadAction);
+        if (!inner) return NULL;
+        if (*idx >= argc || strcmp(argv[*idx], ")") != 0) {
+            fprintf(stderr, "find: missing closing ')'\n");
+            return NULL;
+        }
+        (*idx)++;
+        return inner;
+    }
+    if (strcmp(arg, "-name") == 0 || strcmp(arg, "-iname") == 0) {
+        bool isIname = (arg[1] == 'i');
+        (*idx)++;
+        if (*idx >= argc) {
+            fprintf(stderr, "find: missing argument to %s\n", arg);
+            return NULL;
+        }
+        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
+        node->type = FIND_NODE_TEST;
+        node->testKind = isIname ? FIND_TEST_INAME : FIND_TEST_NAME;
+        node->strArg = argv[(*idx)++];
+        return node;
+    }
+    if (strcmp(arg, "-type") == 0) {
+        (*idx)++;
+        if (*idx >= argc) {
+            fprintf(stderr, "find: missing argument to -type\n");
+            return NULL;
+        }
+        const char *typeArg = argv[(*idx)++];
+        if (strcmp(typeArg, "f") != 0 && strcmp(typeArg, "d") != 0 && strcmp(typeArg, "l") != 0) {
+            fprintf(stderr, "find: unsupported -type '%s' (only f/d/l)\n", typeArg);
+            return NULL;
+        }
+        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
+        node->type = FIND_NODE_TEST;
+        node->testKind = FIND_TEST_TYPE;
+        node->typeFilter = typeArg[0];
+        return node;
+    }
+    if (strcmp(arg, "-mtime") == 0) {
+        (*idx)++;
+        if (*idx >= argc) {
+            fprintf(stderr, "find: missing argument to -mtime\n");
+            return NULL;
+        }
+        char sign;
+        long long value;
+        if (!smallclueFindParseSignedInt(argv[(*idx)++], &sign, &value)) {
+            fprintf(stderr, "find: invalid -mtime argument\n");
+            return NULL;
+        }
+        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
+        node->type = FIND_NODE_TEST;
+        node->testKind = FIND_TEST_MTIME;
+        node->sign = sign;
+        node->value = value;
+        return node;
+    }
+    if (strcmp(arg, "-newer") == 0) {
+        (*idx)++;
+        if (*idx >= argc) {
+            fprintf(stderr, "find: missing argument to -newer\n");
+            return NULL;
+        }
+        const char *refPath = argv[(*idx)++];
+        struct stat refSt;
+        if (stat(refPath, &refSt) != 0) {
+            fprintf(stderr, "find: %s: %s\n", refPath, strerror(errno));
+            return NULL;
+        }
+        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
+        node->type = FIND_NODE_TEST;
+        node->testKind = FIND_TEST_NEWER;
+        node->newerMtime = refSt.st_mtime;
+        return node;
+    }
+    if (strcmp(arg, "-size") == 0) {
+        (*idx)++;
+        if (*idx >= argc) {
+            fprintf(stderr, "find: missing argument to -size\n");
+            return NULL;
+        }
+        char sign;
+        long long value;
+        bool isBlockUnit;
+        if (!smallclueFindParseSize(argv[(*idx)++], &sign, &value, &isBlockUnit)) {
+            fprintf(stderr, "find: invalid -size argument\n");
+            return NULL;
+        }
+        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
+        node->type = FIND_NODE_TEST;
+        node->testKind = FIND_TEST_SIZE;
+        node->sign = sign;
+        node->value = value;
+        node->isBlockUnit = isBlockUnit;
+        return node;
+    }
+    if (strcmp(arg, "-print") == 0) {
+        (*idx)++;
+        *hadAction = true;
+        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
+        node->type = FIND_NODE_PRINT;
+        return node;
+    }
+    if (strcmp(arg, "-print0") == 0) {
+        (*idx)++;
+        *hadAction = true;
+        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
+        node->type = FIND_NODE_PRINT0;
+        return node;
+    }
+    if (strcmp(arg, "-delete") == 0) {
+        (*idx)++;
+        *hadAction = true;
+        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
+        node->type = FIND_NODE_DELETE;
+        return node;
+    }
+    if (strcmp(arg, "-exec") == 0) {
+        (*idx)++;
+        int execStart = *idx;
+        while (*idx < argc && strcmp(argv[*idx], ";") != 0) {
+            (*idx)++;
+        }
+        if (*idx >= argc) {
+            fprintf(stderr, "find: -exec requires a terminating ';'\n");
+            return NULL;
+        }
+        int execArgc = *idx - execStart;
+        if (execArgc == 0) {
+            fprintf(stderr, "find: -exec requires a command\n");
+            return NULL;
+        }
+        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
+        node->type = FIND_NODE_EXEC;
+        node->execArgv = &argv[execStart];
+        node->execArgc = execArgc;
+        (*idx)++; /* consume the ';' */
+        *hadAction = true;
+        return node;
+    }
+    fprintf(stderr, "find: unsupported predicate '%s'\n", arg);
+    return NULL;
+}
+
+static SmallclueFindNode *smallclueFindParseNot(char **argv, int argc, int *idx, bool *hadAction) {
+    if (*idx < argc && (strcmp(argv[*idx], "!") == 0 || strcmp(argv[*idx], "-not") == 0)) {
+        (*idx)++;
+        SmallclueFindNode *child = smallclueFindParseNot(argv, argc, idx, hadAction);
+        if (!child) return NULL;
+        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
+        node->type = FIND_NODE_NOT;
+        node->right = child;
+        return node;
+    }
+    return smallclueFindParsePrimary(argv, argc, idx, hadAction);
+}
+
+static bool smallclueFindAtExprBoundary(char **argv, int argc, int idx) {
+    if (idx >= argc) return true;
+    const char *tok = argv[idx];
+    return strcmp(tok, "-o") == 0 || strcmp(tok, "-or") == 0 || strcmp(tok, ")") == 0;
+}
+
+static SmallclueFindNode *smallclueFindParseAnd(char **argv, int argc, int *idx, bool *hadAction) {
+    SmallclueFindNode *left = smallclueFindParseNot(argv, argc, idx, hadAction);
+    if (!left) return NULL;
+    while (!smallclueFindAtExprBoundary(argv, argc, *idx)) {
+        if (strcmp(argv[*idx], "-a") == 0 || strcmp(argv[*idx], "-and") == 0) {
+            (*idx)++;
+        }
+        /* else: implicit AND -- another term follows directly, no operator token */
+        SmallclueFindNode *right = smallclueFindParseNot(argv, argc, idx, hadAction);
+        if (!right) return NULL;
+        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
+        node->type = FIND_NODE_AND;
+        node->left = left;
+        node->right = right;
+        left = node;
+    }
+    return left;
+}
+
+static SmallclueFindNode *smallclueFindParseOr(char **argv, int argc, int *idx, bool *hadAction) {
+    SmallclueFindNode *left = smallclueFindParseAnd(argv, argc, idx, hadAction);
+    if (!left) return NULL;
+    while (*idx < argc && (strcmp(argv[*idx], "-o") == 0 || strcmp(argv[*idx], "-or") == 0)) {
+        (*idx)++;
+        SmallclueFindNode *right = smallclueFindParseAnd(argv, argc, idx, hadAction);
+        if (!right) return NULL;
+        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
+        node->type = FIND_NODE_OR;
+        node->left = left;
+        node->right = right;
+        left = node;
+    }
+    return left;
+}
+
+static int smallclueFindRunExec(const char *path, char **execArgv, int execArgc) {
+    char **argvCopy = calloc((size_t)execArgc + 1, sizeof(char *));
+    if (!argvCopy) {
+        fprintf(stderr, "find: out of memory\n");
+        return 1;
+    }
+    for (int i = 0; i < execArgc; ++i) {
+        if (strcmp(execArgv[i], "{}") == 0) {
+            argvCopy[i] = (char *)path;
+        } else {
+            argvCopy[i] = execArgv[i];
+        }
+    }
+    argvCopy[execArgc] = NULL;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "find: fork: %s\n", strerror(errno));
+        free(argvCopy);
+        return 1;
+    }
+    if (pid == 0) {
+        execvp(argvCopy[0], argvCopy);
+        fprintf(stderr, "find: %s: %s\n", argvCopy[0], strerror(errno));
+        _exit(127);
+    }
+    free(argvCopy);
+    int childStatus = 0;
+    if (waitpid(pid, &childStatus, 0) < 0) {
+        fprintf(stderr, "find: waitpid: %s\n", strerror(errno));
+        return 1;
+    }
+    if (!WIFEXITED(childStatus) || WEXITSTATUS(childStatus) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static int smallclueFindVisit(const char *path, const SmallclueFindOptions *opts,
+                              int *status, int depth) {
     struct stat st;
     if (lstat(path, &st) != 0) {
         fprintf(stderr, "find: %s: %s\n", path, strerror(errno));
         if (status) *status = 1;
         return 1;
     }
-    const char *leaf = smallclueLeafName(path);
-    if (!pattern || fnmatch(pattern, leaf, 0) == 0) {
-        printf("%s\n", path);
-    }
-    if (S_ISDIR(st.st_mode)) {
+
+    bool isDir = S_ISDIR(st.st_mode);
+    bool descendFirst = isDir && (opts->maxDepth < 0 || depth < opts->maxDepth);
+    /* -delete requires an empty directory, so recurse (and delete children)
+     * before acting on this entry -- matches GNU find's depth-first order
+     * for -delete. */
+    if (descendFirst) {
         DIR *dir = opendir(path);
         if (!dir) {
             fprintf(stderr, "find: %s: %s\n", path, strerror(errno));
             if (status) *status = 1;
-            return 1;
-        }
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL) {
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-                continue;
+        } else {
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != NULL) {
+                if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                    continue;
+                }
+                char child[PATH_MAX];
+                if (smallclueBuildPath(child, sizeof(child), path, entry->d_name) != 0) {
+                    fprintf(stderr, "find: %s/%s: %s\n", path, entry->d_name, strerror(errno));
+                    if (status) *status = 1;
+                    continue;
+                }
+                smallclueFindVisit(child, opts, status, depth + 1);
             }
-            char child[PATH_MAX];
-            if (smallclueBuildPath(child, sizeof(child), path, entry->d_name) != 0) {
-                fprintf(stderr, "find: %s/%s: %s\n", path, entry->d_name, strerror(errno));
-                if (status) *status = 1;
-                continue;
-            }
-            smallclueFindVisit(child, pattern, status);
+            closedir(dir);
         }
-        closedir(dir);
+    }
+
+    if (depth >= opts->minDepth) {
+        smallclueFindEval(opts->root, path, &st, status);
     }
     return 0;
 }
 
 static int smallclueFindCommand(int argc, char **argv) {
     const char *start = ".";
-    const char *pattern = NULL;
+    SmallclueFindOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.maxDepth = -1;
+
     int index = 1;
     if (index < argc && argv[index] && argv[index][0] != '-') {
         start = argv[index++];
     }
-    while (index < argc) {
-        const char *arg = argv[index++];
-        if (strcmp(arg, "-name") == 0) {
-            if (index >= argc) {
-                fprintf(stderr, "find: missing argument to -name\n");
+
+    /* -maxdepth/-mindepth are global traversal options in real find, not
+     * expression terms -- pull them out of argv wherever they appear
+     * (compacting the array in place) before handing the rest to the
+     * boolean-expression parser. */
+    for (int i = index; i < argc; ) {
+        if (strcmp(argv[i], "-maxdepth") == 0 || strcmp(argv[i], "-mindepth") == 0) {
+            bool isMax = (argv[i][2] == 'a');
+            if (i + 1 >= argc) {
+                fprintf(stderr, "find: missing argument to %s\n", argv[i]);
                 return 1;
             }
-            pattern = argv[index++];
-        } else {
-            fprintf(stderr, "find: unsupported predicate '%s'\n", arg);
+            int value = atoi(argv[i + 1]);
+            if (isMax) opts.maxDepth = value; else opts.minDepth = value;
+            for (int j = i; j + 2 < argc; ++j) argv[j] = argv[j + 2];
+            argc -= 2;
+            continue;
+        }
+        i++;
+    }
+
+    bool hadAction = false;
+    int parseIdx = index;
+    SmallclueFindNode *root = NULL;
+    if (parseIdx < argc) {
+        root = smallclueFindParseOr(argv, argc, &parseIdx, &hadAction);
+        if (!root) {
+            return 1;
+        }
+        if (parseIdx != argc) {
+            fprintf(stderr, "find: unexpected token '%s'\n", argv[parseIdx]);
             return 1;
         }
     }
+    if (!hadAction) {
+        SmallclueFindNode *printNode = (SmallclueFindNode *)calloc(1, sizeof(*printNode));
+        printNode->type = FIND_NODE_PRINT;
+        if (root) {
+            SmallclueFindNode *andNode = (SmallclueFindNode *)calloc(1, sizeof(*andNode));
+            andNode->type = FIND_NODE_AND;
+            andNode->left = root;
+            andNode->right = printNode;
+            root = andNode;
+        } else {
+            root = printNode;
+        }
+    }
+    opts.root = root;
+
     int status = 0;
-    smallclueFindVisit(start, pattern, &status);
+    smallclueFindVisit(start, &opts, &status, 0);
     return status ? 1 : 0;
 }
 
@@ -14311,7 +21307,11 @@ static bool smallclueConfirmDelete(const char *label, const char *path) {
                 label, path);
         return false;
     }
-    fprintf(stderr, "%s: remove '\033[1;31m%s\033[0m'? [y/N] ", label, path);
+    if (isatty(STDERR_FILENO)) {
+        fprintf(stderr, "%s: remove '\033[1;31m%s\033[0m'? [y/N] ", label, path);
+    } else {
+        fprintf(stderr, "%s: remove '%s'? [y/N] ", label, path);
+    }
     fflush(stderr);
     int c = getchar();
     /* consume the rest of the line */
@@ -14348,8 +21348,13 @@ static int smallclueRemovePathWithLabel(const char *label, const char *path, boo
             fprintf(stderr, "%s: %s: is a directory\n", label, target);
             return -1;
         }
-        if ((interactive || !force) && !smallclueConfirmDelete(label, target)) {
-            return interactive ? 0 : 1;
+        /* When interactive, the "prompt for all files" check above already
+         * confirmed this exact same path -- asking again here would prompt
+         * the user twice for one directory. Only prompt here for the bare
+         * `rm -r DIR` case (neither -i nor -f given), which is intended as
+         * a lightweight safety net before recursing. */
+        if (!interactive && !force && !smallclueConfirmDelete(label, target)) {
+            return 1;
         }
         DIR *dir = opendir(target);
         if (!dir) {
@@ -14382,9 +21387,10 @@ static int smallclueRemovePathWithLabel(const char *label, const char *path, boo
         }
         return 0;
     }
-    if (interactive && !smallclueConfirmDelete(label, target)) {
-        return 0;
-    }
+    /* No separate confirm here: the "prompt for all files" check at the
+     * top of this function already asked about this exact path and
+     * would have returned early if declined -- re-asking here was a
+     * second, redundant prompt for the same plain-file removal. */
     if (unlink(target) != 0) {
         if (!force) {
             fprintf(stderr, "%s: %s: %s\n", label, target, strerror(errno));
@@ -14457,6 +21463,91 @@ static int smallclueCopyFile(const char *label, const char *src, const char *dst
     return status;
 }
 
+static void smallclueCopyPreserveTimes(const char *src, const char *dst, const struct stat *srcStat) {
+    struct timeval times[2];
+    times[0].tv_sec = srcStat->st_atime;
+    times[0].tv_usec = 0;
+    times[1].tv_sec = srcStat->st_mtime;
+    times[1].tv_usec = 0;
+    if (utimes(dst, times) != 0) {
+        fprintf(stderr, "cp: %s: failed to preserve timestamps from %s: %s\n", dst, src, strerror(errno));
+    }
+}
+
+/* Recursive copy for `cp -r`/`-a`/`-R`: files copy via smallclueCopyFile,
+ * symlinks are recreated pointing at the same target (not followed and
+ * copied as file content), directories are made then walked. preserveTimes
+ * corresponds to -p/-a (mode is always preserved by smallclueCopyFile). */
+static int smallclueCopyRecursive(const char *label, const char *src, const char *dst, bool preserveTimes) {
+    struct stat srcStat;
+    if (lstat(src, &srcStat) != 0) {
+        fprintf(stderr, "%s: %s: %s\n", label, src, strerror(errno));
+        return -1;
+    }
+
+    if (S_ISLNK(srcStat.st_mode)) {
+        char linkTarget[PATH_MAX];
+        ssize_t n = readlink(src, linkTarget, sizeof(linkTarget) - 1);
+        if (n < 0) {
+            fprintf(stderr, "%s: %s: %s\n", label, src, strerror(errno));
+            return -1;
+        }
+        linkTarget[n] = '\0';
+        unlink(dst);
+        if (symlink(linkTarget, dst) != 0) {
+            fprintf(stderr, "%s: %s: %s\n", label, dst, strerror(errno));
+            return -1;
+        }
+        return 0;
+    }
+
+    if (S_ISDIR(srcStat.st_mode)) {
+        if (mkdir(dst, srcStat.st_mode & 07777) != 0 && errno != EEXIST) {
+            fprintf(stderr, "%s: %s: %s\n", label, dst, strerror(errno));
+            return -1;
+        }
+        DIR *dir = opendir(src);
+        if (!dir) {
+            fprintf(stderr, "%s: %s: %s\n", label, src, strerror(errno));
+            return -1;
+        }
+        struct dirent *entry;
+        int status = 0;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            char childSrc[PATH_MAX];
+            char childDst[PATH_MAX];
+            if (smallclueBuildPath(childSrc, sizeof(childSrc), src, entry->d_name) != 0 ||
+                smallclueBuildPath(childDst, sizeof(childDst), dst, entry->d_name) != 0) {
+                fprintf(stderr, "%s: %s/%s: %s\n", label, src, entry->d_name, strerror(errno));
+                status = -1;
+                continue;
+            }
+            if (smallclueCopyRecursive(label, childSrc, childDst, preserveTimes) != 0) {
+                status = -1;
+            }
+        }
+        closedir(dir);
+        if (preserveTimes) {
+            smallclueCopyPreserveTimes(src, dst, &srcStat);
+        }
+        return status;
+    }
+
+    if (S_ISREG(srcStat.st_mode)) {
+        int rc = smallclueCopyFile(label, src, dst);
+        if (rc == 0 && preserveTimes) {
+            smallclueCopyPreserveTimes(src, dst, &srcStat);
+        }
+        return rc;
+    }
+
+    fprintf(stderr, "%s: %s: unsupported file type, skipping\n", label, src);
+    return 0;
+}
+
 static int smallclueMkdirParents(const char *path, mode_t mode, bool verbose) {
     if (!path || !*path) {
         errno = EINVAL;
@@ -14517,15 +21608,49 @@ static int smallclueMkdirParents(const char *path, mode_t mode, bool verbose) {
     return 0;
 }
 
+/* GNU rm's failsafe against `rm -rf /`-class disasters: recursive removal
+ * of a path that resolves to exactly "/" is refused unless the caller
+ * explicitly opts out via --no-preserve-root. On by default, matching GNU
+ * coreutils (not an opt-in flag). */
+static bool smallclueRmIsPreservedRoot(const char *path) {
+    if (!path) return false;
+    char resolved[PATH_MAX];
+    const char *target = realpath(path, resolved) ? resolved : path;
+    return strcmp(target, "/") == 0;
+}
+
 static int smallclueRmCommand(int argc, char **argv) {
     int recursive = 0;
     int force = 0;
     int interactive = 0;
+    bool preserve_root = true;
+
+    /* --preserve-root/--no-preserve-root are GNU long options with no
+     * short-flag equivalent -- getopt() doesn't understand "--"-prefixed
+     * long options and hard-errors on them, so strip them out first
+     * (same convention used by stat's --format=). */
+    for (int i = 1; i < argc; ) {
+        if (strcmp(argv[i], "--preserve-root") == 0) {
+            preserve_root = true;
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            argc--;
+            continue;
+        }
+        if (strcmp(argv[i], "--no-preserve-root") == 0) {
+            preserve_root = false;
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            argc--;
+            continue;
+        }
+        i++;
+    }
+
     int opt;
     smallclueResetGetopt();
-    while ((opt = getopt(argc, argv, "rfi")) != -1) {
+    while ((opt = getopt(argc, argv, "rRfi")) != -1) {
         switch (opt) {
             case 'r':
+            case 'R':
                 recursive = 1;
                 break;
             case 'f':
@@ -14558,6 +21683,12 @@ static int smallclueRmCommand(int argc, char **argv) {
             expanded = pathbuf;
         }
 #endif
+        if (recursive && preserve_root && smallclueRmIsPreservedRoot(expanded)) {
+            fprintf(stderr, "rm: it is dangerous to operate recursively on '%s'\n", expanded);
+            fprintf(stderr, "rm: use --no-preserve-root to override this failsafe\n");
+            status = 1;
+            continue;
+        }
         if (strpbrk(expanded, "*?[")) {
             glob_t matches;
             memset(&matches, 0, sizeof(matches));
@@ -14570,6 +21701,12 @@ static int smallclueRmCommand(int argc, char **argv) {
                 continue;
             }
             for (size_t m = 0; m < matches.gl_pathc; ++m) {
+                if (recursive && preserve_root && smallclueRmIsPreservedRoot(matches.gl_pathv[m])) {
+                    fprintf(stderr, "rm: it is dangerous to operate recursively on '%s'\n", matches.gl_pathv[m]);
+                    fprintf(stderr, "rm: use --no-preserve-root to override this failsafe\n");
+                    status = 1;
+                    continue;
+                }
                 if (smallclueRemovePathWithLabel("rm", matches.gl_pathv[m], recursive != 0, force != 0, interactive != 0) != 0) {
                     if (!force) {
                         status = 1;
@@ -14793,6 +21930,173 @@ static bool smallclueFstabEncodeField(const char *input, char *out, size_t out_s
     return true;
 }
 
+static bool smallclueFstabBufferAppend(char **buffer,
+                                       size_t *length,
+                                       size_t *capacity,
+                                       const char *data,
+                                       size_t data_len) {
+    if (!buffer || !length || !capacity) {
+        errno = EINVAL;
+        return false;
+    }
+    if (data_len == 0) {
+        return true;
+    }
+    if (!data) {
+        errno = EINVAL;
+        return false;
+    }
+    if (*length > SIZE_MAX - data_len) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    size_t needed = *length + data_len + 1;
+    if (needed > *capacity) {
+        size_t new_capacity = (*capacity > 0) ? *capacity : 1024;
+        while (new_capacity < needed) {
+            if (new_capacity > SIZE_MAX / 2) {
+                new_capacity = needed;
+                break;
+            }
+            new_capacity *= 2;
+        }
+        char *resized = (char *)realloc(*buffer, new_capacity);
+        if (!resized) {
+            errno = ENOMEM;
+            return false;
+        }
+        *buffer = resized;
+        *capacity = new_capacity;
+    }
+    memcpy(*buffer + *length, data, data_len);
+    *length += data_len;
+    (*buffer)[*length] = '\0';
+    return true;
+}
+
+static bool smallclueFstabReadWholeFile(int fd, char **out_data, size_t *out_len) {
+    if (fd < 0 || !out_data || !out_len) {
+        errno = EINVAL;
+        return false;
+    }
+    if (vprocHostLseek(fd, 0, SEEK_SET) < 0) {
+        return false;
+    }
+
+    char *buffer = NULL;
+    size_t length = 0;
+    size_t capacity = 0;
+    char chunk[2048];
+    while (true) {
+        ssize_t read_bytes = vprocHostRead(fd, chunk, sizeof(chunk));
+        if (read_bytes < 0) {
+            int saved_errno = errno;
+            free(buffer);
+            errno = saved_errno;
+            return false;
+        }
+        if (read_bytes == 0) {
+            break;
+        }
+        if (!smallclueFstabBufferAppend(&buffer,
+                                        &length,
+                                        &capacity,
+                                        chunk,
+                                        (size_t)read_bytes)) {
+            int saved_errno = errno;
+            free(buffer);
+            errno = saved_errno;
+            return false;
+        }
+    }
+
+    if (!buffer) {
+        buffer = (char *)calloc(1, 1);
+        if (!buffer) {
+            errno = ENOMEM;
+            return false;
+        }
+    }
+    buffer[length] = '\0';
+    *out_data = buffer;
+    *out_len = length;
+    return true;
+}
+
+static bool smallclueFstabRewriteWholeFile(int fd, const char *data, size_t data_len) {
+    if (fd < 0 || (!data && data_len > 0)) {
+        errno = EINVAL;
+        return false;
+    }
+    if (vprocHostLseek(fd, 0, SEEK_SET) < 0) {
+        return false;
+    }
+    if (ftruncate(fd, 0) != 0) {
+        return false;
+    }
+    if (vprocHostLseek(fd, 0, SEEK_SET) < 0) {
+        return false;
+    }
+    size_t written = 0;
+    while (written < data_len) {
+        ssize_t rc = vprocHostWrite(fd, data + written, data_len - written);
+        if (rc <= 0) {
+            if (rc == 0) {
+                errno = EIO;
+            }
+            return false;
+        }
+        written += (size_t)rc;
+    }
+    (void)vprocHostFsync(fd);
+    return true;
+}
+
+static bool smallclueFstabLineEquals(const char *line, size_t line_len, const char *value) {
+    if (!line || !value) {
+        return false;
+    }
+    while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) {
+        line_len--;
+    }
+    size_t value_len = strlen(value);
+    return line_len == value_len && memcmp(line, value, value_len) == 0;
+}
+
+static bool smallclueFstabLineMatchesTarget(const char *line,
+                                            size_t line_len,
+                                            const char *target_encoded) {
+    if (!line || !target_encoded) {
+        return false;
+    }
+    while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) {
+        line_len--;
+    }
+    char *scratch = (char *)malloc(line_len + 1);
+    if (!scratch) {
+        return false;
+    }
+    memcpy(scratch, line, line_len);
+    scratch[line_len] = '\0';
+
+    char *cursor = scratch;
+    while (*cursor && isspace((unsigned char)*cursor)) {
+        cursor++;
+    }
+    if (*cursor == '\0' || *cursor == '#') {
+        free(scratch);
+        return false;
+    }
+
+    char *saveptr = NULL;
+    char *source_field = strtok_r(cursor, " \t", &saveptr);
+    char *target_field = strtok_r(NULL, " \t", &saveptr);
+    (void)source_field;
+    bool match = (target_field && strcmp(target_field, target_encoded) == 0);
+    free(scratch);
+    return match;
+}
+
 static bool smallclueMountPersistFstabEntry(const char *source,
                                             const char *target,
                                             const char *type,
@@ -14829,63 +22133,170 @@ static bool smallclueMountPersistFstabEntry(const char *source,
         return false;
     }
 
-    FILE *fp = fopen("/etc/fstab", "a+");
-    if (!fp) {
+    int fd = vprocHostOpen("/etc/fstab", O_RDWR | O_CREAT, 0666);
+    if (fd < 0) {
+        return false;
+    }
+
+    char *existing = NULL;
+    size_t existing_len = 0;
+    if (!smallclueFstabReadWholeFile(fd, &existing, &existing_len)) {
+        int saved_errno = errno;
+        vprocHostClose(fd);
+        errno = saved_errno;
         return false;
     }
 
     bool exists = false;
-    rewind(fp);
-    char line[(PATH_MAX * 8) + 128];
-    while (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (strcmp(line, entry_line) == 0) {
+    const char *cursor = existing;
+    const char *end = existing + existing_len;
+    while (cursor < end) {
+        const char *newline = memchr(cursor, '\n', (size_t)(end - cursor));
+        size_t raw_len = newline ? (size_t)(newline - cursor + 1) : (size_t)(end - cursor);
+        size_t line_len = newline ? raw_len - 1 : raw_len;
+        if (smallclueFstabLineEquals(cursor, line_len, entry_line)) {
             exists = true;
             break;
         }
+        cursor += raw_len;
     }
+
     if (!exists) {
-        if (fseek(fp, 0, SEEK_END) != 0) {
+        char *updated = NULL;
+        size_t updated_len = 0;
+        size_t updated_capacity = 0;
+        if (!smallclueFstabBufferAppend(&updated,
+                                        &updated_len,
+                                        &updated_capacity,
+                                        existing,
+                                        existing_len)) {
             int saved_errno = errno;
-            fclose(fp);
+            free(existing);
+            vprocHostClose(fd);
             errno = saved_errno;
             return false;
         }
-        long end = ftell(fp);
-        if (end > 0) {
-            if (fseek(fp, end - 1, SEEK_SET) != 0) {
+        if (updated_len > 0 && updated[updated_len - 1] != '\n') {
+            if (!smallclueFstabBufferAppend(&updated,
+                                            &updated_len,
+                                            &updated_capacity,
+                                            "\n",
+                                            1)) {
                 int saved_errno = errno;
-                fclose(fp);
+                free(updated);
+                free(existing);
+                vprocHostClose(fd);
                 errno = saved_errno;
                 return false;
-            }
-            int last = fgetc(fp);
-            if (last == EOF && ferror(fp)) {
-                int saved_errno = errno;
-                fclose(fp);
-                errno = saved_errno;
-                return false;
-            }
-            if (last != '\n') {
-                if (fseek(fp, 0, SEEK_END) != 0 || fputc('\n', fp) == EOF) {
-                    int saved_errno = errno;
-                    fclose(fp);
-                    errno = saved_errno;
-                    return false;
-                }
             }
         }
-        if (fprintf(fp, "%s\n", entry_line) < 0 || fflush(fp) != 0) {
+        if (!smallclueFstabBufferAppend(&updated,
+                                        &updated_len,
+                                        &updated_capacity,
+                                        entry_line,
+                                        strlen(entry_line)) ||
+            !smallclueFstabBufferAppend(&updated,
+                                        &updated_len,
+                                        &updated_capacity,
+                                        "\n",
+                                        1)) {
             int saved_errno = errno;
-            fclose(fp);
+            free(updated);
+            free(existing);
+            vprocHostClose(fd);
             errno = saved_errno;
             return false;
         }
+        if (!smallclueFstabRewriteWholeFile(fd, updated, updated_len)) {
+            int saved_errno = errno;
+            free(updated);
+            free(existing);
+            vprocHostClose(fd);
+            errno = saved_errno;
+            return false;
+        }
+        free(updated);
     }
-    fclose(fp);
+
+    free(existing);
+    vprocHostClose(fd);
+    return true;
+}
+
+static bool smallclueMountRemoveFstabEntry(const char *target) {
+    if (!target || target[0] != '/') {
+        errno = EINVAL;
+        return false;
+    }
+
+    char target_encoded[PATH_MAX * 4];
+    if (!smallclueFstabEncodeField(target, target_encoded, sizeof(target_encoded))) {
+        return false;
+    }
+
+    int fd = vprocHostOpen("/etc/fstab", O_RDWR | O_CREAT, 0666);
+    if (fd < 0) {
+        return false;
+    }
+
+    char *existing = NULL;
+    size_t existing_len = 0;
+    if (!smallclueFstabReadWholeFile(fd, &existing, &existing_len)) {
+        int saved_errno = errno;
+        vprocHostClose(fd);
+        errno = saved_errno;
+        return false;
+    }
+
+    bool removed = false;
+    char *updated = NULL;
+    size_t updated_len = 0;
+    size_t updated_capacity = 0;
+    const char *cursor = existing;
+    const char *end = existing + existing_len;
+    while (cursor < end) {
+        const char *newline = memchr(cursor, '\n', (size_t)(end - cursor));
+        size_t raw_len = newline ? (size_t)(newline - cursor + 1) : (size_t)(end - cursor);
+        size_t line_len = newline ? raw_len - 1 : raw_len;
+        if (!smallclueFstabLineMatchesTarget(cursor, line_len, target_encoded)) {
+            if (!smallclueFstabBufferAppend(&updated,
+                                            &updated_len,
+                                            &updated_capacity,
+                                            cursor,
+                                            raw_len)) {
+                int saved_errno = errno;
+                free(updated);
+                free(existing);
+                vprocHostClose(fd);
+                errno = saved_errno;
+                return false;
+            }
+        } else {
+            removed = true;
+        }
+        cursor += raw_len;
+    }
+
+    if (!removed) {
+        free(updated);
+        free(existing);
+        vprocHostClose(fd);
+        errno = ENOENT;
+        return false;
+    }
+
+    if (!smallclueFstabRewriteWholeFile(fd, updated ? updated : "", updated_len)) {
+        int saved_errno = errno;
+        free(updated);
+        free(existing);
+        vprocHostClose(fd);
+        errno = saved_errno;
+        return false;
+    }
+
+    free(updated);
+    free(existing);
+    vprocHostClose(fd);
     return true;
 }
 #endif
@@ -15241,6 +22652,114 @@ static int smallclueMountCommand(int argc, char **argv) {
 #endif
 }
 
+static int smallclueUmountCommand(int argc, char **argv) {
+#if defined(__linux__) || defined(linux) || defined(__linux)
+    const char *usage = "usage: umount [-l] [-f] dir\n";
+    bool lazy = false;
+    bool force = false;
+    smallclueResetGetopt();
+    int opt;
+    while ((opt = getopt(argc, argv, "lf")) != -1) {
+        switch (opt) {
+            case 'l':
+                lazy = true;
+                break;
+            case 'f':
+                force = true;
+                break;
+            default:
+                fputs(usage, stderr);
+                return 1;
+        }
+    }
+    if (optind + 1 != argc) {
+        fputs(usage, stderr);
+        return 1;
+    }
+    const char *target = argv[optind];
+    int flags = 0;
+    if (lazy) flags |= MNT_DETACH;
+    if (force) flags |= MNT_FORCE;
+    int rc = flags ? umount2(target, flags) : umount(target);
+    if (rc != 0) {
+        perror("umount");
+        return 1;
+    }
+    return 0;
+#elif defined(PSCAL_TARGET_IOS)
+    const char *usage = "usage: umount [-p] dir\n";
+    bool persist_to_fstab = false;
+
+    smallclueResetGetopt();
+    int opt;
+    while ((opt = getopt(argc, argv, "p")) != -1) {
+        switch (opt) {
+            case 'p':
+                persist_to_fstab = true;
+                break;
+            default:
+                fputs(usage, stderr);
+                return 1;
+        }
+    }
+    if (optind + 1 != argc) {
+        fputs(usage, stderr);
+        return 1;
+    }
+
+    const char *target = argv[optind];
+    char target_virtual[PATH_MAX];
+    bool have_target_virtual = false;
+    if (realpath(target, target_virtual)) {
+        have_target_virtual = true;
+    } else {
+        if (target[0] == '/') {
+            int n = snprintf(target_virtual, sizeof(target_virtual), "%s", target);
+            if (n > 0 && (size_t)n < sizeof(target_virtual)) {
+                have_target_virtual = true;
+            }
+        } else {
+            char cwd[PATH_MAX];
+            if (getcwd(cwd, sizeof(cwd))) {
+                int n = snprintf(target_virtual, sizeof(target_virtual), "%s/%s", cwd, target);
+                if (n > 0 && (size_t)n < sizeof(target_virtual)) {
+                    have_target_virtual = true;
+                }
+            }
+        }
+    }
+    if (!have_target_virtual) {
+        fprintf(stderr, "umount: %s: %s\n", target, strerror(errno));
+        return 1;
+    }
+
+    if (!pathTruncateMountRemove(target_virtual)) {
+        int saved_errno = errno;
+        fprintf(stderr,
+                "umount: %s: %s\n",
+                target,
+                strerror(saved_errno ? saved_errno : EINVAL));
+        return 1;
+    }
+
+    if (persist_to_fstab) {
+        if (!smallclueMountRemoveFstabEntry(target_virtual)) {
+            int saved_errno = errno;
+            fprintf(stderr,
+                    "umount: unmounted but failed to update /etc/fstab: %s\n",
+                    strerror(saved_errno ? saved_errno : EIO));
+            return 1;
+        }
+    }
+    return 0;
+#else
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "umount: not supported on this platform\n");
+    return 1;
+#endif
+}
+
 static int smallclueFileCommand(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "file: missing operand\n");
@@ -15390,17 +22909,102 @@ static int smallclueStatPath(const char *path, bool follow) {
     return 0;
 }
 
+/* GNU-stat-style custom format string (-c/--format), e.g. '%s' / '%Y' /
+ * '%n (%a)'. Directives: n=name s=size(bytes) b=blocks(512B units)
+ * B=block size(bytes) f=raw mode(hex) F=type description a=perms(octal)
+ * A=perms(rwx string) u/g=uid/gid U/G=user/group name i=inode h=hardlink
+ * count d=device X/Y/Z=atime/mtime/ctime(epoch seconds). %% is a literal
+ * '%'; \n and \t are recognized as escapes in the format string itself
+ * (matching GNU stat, which supports both since the format is usually
+ * passed already-interpreted by the shell, but a smallclue script/rc
+ * invocation may pass it raw). */
+static void smallclueStatPrintFormatted(const char *path, const struct stat *st, const char *format) {
+    for (const char *p = format; *p; ++p) {
+        if (*p == '\\' && p[1] == 'n') {
+            putchar('\n');
+            p++;
+        } else if (*p == '\\' && p[1] == 't') {
+            putchar('\t');
+            p++;
+        } else if (*p == '%' && p[1]) {
+            char directive = *++p;
+            switch (directive) {
+                case '%': putchar('%'); break;
+                case 'n': fputs(path, stdout); break;
+                case 's': printf("%lld", (long long)st->st_size); break;
+                case 'b': printf("%lld", (long long)st->st_blocks); break;
+                case 'B': printf("%ld", (long)st->st_blksize); break;
+                case 'f': printf("%x", (unsigned)st->st_mode); break;
+                case 'F': fputs(smallclueStatTypeLabel(st), stdout); break;
+                case 'a': printf("%03o", (unsigned)(st->st_mode & 07777)); break;
+                case 'A': {
+                    char perms[11];
+                    smallclueStatFormatPerms(perms, sizeof(perms), st->st_mode);
+                    fputs(perms, stdout);
+                    break;
+                }
+                case 'u': printf("%u", (unsigned)st->st_uid); break;
+                case 'g': printf("%u", (unsigned)st->st_gid); break;
+                case 'U': {
+                    struct passwd *pw = getpwuid(st->st_uid);
+                    fputs(pw ? pw->pw_name : "?", stdout);
+                    break;
+                }
+                case 'G': {
+                    struct group *gr = getgrgid(st->st_gid);
+                    fputs(gr ? gr->gr_name : "?", stdout);
+                    break;
+                }
+                case 'i': printf("%llu", (unsigned long long)st->st_ino); break;
+                case 'h': printf("%llu", (unsigned long long)st->st_nlink); break;
+                case 'd': printf("%llu", (unsigned long long)st->st_dev); break;
+                case 'X': printf("%lld", (long long)st->st_atime); break;
+                case 'Y': printf("%lld", (long long)st->st_mtime); break;
+                case 'Z': printf("%lld", (long long)st->st_ctime); break;
+                default:
+                    putchar('%');
+                    putchar(directive);
+                    break;
+            }
+        } else {
+            putchar(*p);
+        }
+    }
+    putchar('\n');
+}
+
 static int smallclueStatCommand(int argc, char **argv) {
-    smallclueResetGetopt();
     int follow = 0;
+    const char *format = NULL;
+
+    /* Strip out the GNU long form --format=FORMAT before getopt() ever
+     * sees it -- getopt() doesn't understand "--"-prefixed long options
+     * with an "=" value and hard-errors on it ("illegal option"), so this
+     * has to happen first, not as a post-getopt scan. */
+    for (int i = 1; i < argc; ) {
+        if (strncmp(argv[i], "--format=", 9) == 0) {
+            format = argv[i] + 9;
+            for (int j = i; j + 1 < argc; ++j) {
+                argv[j] = argv[j + 1];
+            }
+            argc--;
+            continue;
+        }
+        i++;
+    }
+
+    smallclueResetGetopt();
     int opt;
-    while ((opt = getopt(argc, argv, "L")) != -1) {
+    while ((opt = getopt(argc, argv, "Lc:")) != -1) {
         switch (opt) {
             case 'L':
                 follow = 1;
                 break;
+            case 'c':
+                format = optarg;
+                break;
             default:
-                fprintf(stderr, "stat: usage: stat [-L] FILE...\n");
+                fprintf(stderr, "stat: usage: stat [-L] [-c FORMAT] FILE...\n");
                 return 1;
         }
     }
@@ -15410,6 +23014,21 @@ static int smallclueStatCommand(int argc, char **argv) {
     }
     int status = 0;
     for (int i = optind; i < argc; ++i) {
+        char resolved[PATH_MAX];
+        const char *target = smallclueResolvePath(argv[i], resolved, sizeof(resolved));
+        if (!target || *target == '\0') {
+            target = argv[i];
+        }
+        if (format) {
+            struct stat st;
+            if ((follow ? stat(target, &st) : lstat(target, &st)) != 0) {
+                fprintf(stderr, "stat: %s: %s\n", argv[i], strerror(errno));
+                status = 1;
+                continue;
+            }
+            smallclueStatPrintFormatted(argv[i], &st, format);
+            continue;
+        }
         if (smallclueStatPath(argv[i], follow) != 0) {
             status = 1;
         } else if (i + 1 < argc) {
@@ -15419,35 +23038,74 @@ static int smallclueStatCommand(int argc, char **argv) {
     return status;
 }
 
+static int smallclueLnCreateOne(const char *target, const char *linkname, bool symbolic, bool force) {
+    if (force) {
+        unlink(linkname);
+    }
+    if (symbolic) {
+        if (symlink(target, linkname) != 0) {
+            fprintf(stderr, "ln: cannot create symbolic link '%s': %s\n", linkname, strerror(errno));
+            return 1;
+        }
+    } else {
+        if (link(target, linkname) != 0) {
+            fprintf(stderr, "ln: cannot create link '%s': %s\n", linkname, strerror(errno));
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int smallclueLnCommand(int argc, char **argv) {
     int symbolic = 0;
+    int force = 0;
     int opt;
     smallclueResetGetopt();
-    while ((opt = getopt(argc, argv, "s")) != -1) {
+    while ((opt = getopt(argc, argv, "sf")) != -1) {
         switch (opt) {
             case 's':
                 symbolic = 1;
+                break;
+            case 'f':
+                force = 1;
                 break;
             default:
                 fprintf(stderr, "ln: invalid option -- %c\n", optopt);
                 return 1;
         }
     }
-    if (argc - optind < 2) {
+    int nOperands = argc - optind;
+    if (nOperands < 2) {
         fprintf(stderr, "ln: missing file operand\n");
         return 1;
     }
-    const char *target = argv[optind];
-    const char *linkname = argv[optind + 1];
+
+    const char *lastArg = argv[argc - 1];
+    struct stat destStat;
+    bool destIsDir = (nOperands > 2) || (stat(lastArg, &destStat) == 0 && S_ISDIR(destStat.st_mode));
+
+    if (!destIsDir) {
+        /* Classic two-operand form: `ln [-s] TARGET LINKNAME`. */
+        return smallclueLnCreateOne(argv[optind], argv[optind + 1], symbolic, force);
+    }
+
+    /* `ln [-s] TARGET... DIRECTORY` -- matches GNU ln's auto-append of each
+     * target's basename inside the destination directory instead of
+     * requiring the caller to spell out the link path (e.g.
+     * `ln -s /usr/bin/foo /usr/local/bin/` now creates
+     * /usr/local/bin/foo, rather than failing with EEXIST against the
+     * directory itself). */
     int status = 0;
-    if (symbolic) {
-        if (symlink(target, linkname) != 0) {
-            fprintf(stderr, "ln: cannot create symbolic link '%s': %s\n", linkname, strerror(errno));
+    for (int i = optind; i < argc - 1; ++i) {
+        const char *target = argv[i];
+        const char *base = smallclueLeafName(target);
+        char linkname[PATH_MAX];
+        if (smallclueBuildPath(linkname, sizeof(linkname), lastArg, base) != 0) {
+            fprintf(stderr, "ln: %s/%s: %s\n", lastArg, base, strerror(errno));
             status = 1;
+            continue;
         }
-    } else {
-        if (link(target, linkname) != 0) {
-            fprintf(stderr, "ln: cannot create link '%s': %s\n", linkname, strerror(errno));
+        if (smallclueLnCreateOne(target, linkname, symbolic, force) != 0) {
             status = 1;
         }
     }
@@ -15576,7 +23234,39 @@ static int smallclueTypeCommand(int argc, char **argv) {
 }
 
 static int smallclueCpCommand(int argc, char **argv) {
-    if (argc < 3) {
+    bool recursive = false;
+    bool preserveTimes = false;
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (arg[0] != '-' || strcmp(arg, "-") == 0) {
+            break;
+        }
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        for (const char *p = arg + 1; *p; ++p) {
+            switch (*p) {
+                case 'r':
+                case 'R':
+                    recursive = true;
+                    break;
+                case 'a':
+                    recursive = true;
+                    preserveTimes = true;
+                    break;
+                case 'p':
+                    preserveTimes = true;
+                    break;
+                default:
+                    fprintf(stderr, "cp: unsupported option '%c'\n", *p);
+                    return 1;
+            }
+        }
+    }
+
+    if (argc - argi < 2) {
         fprintf(stderr, "cp: missing file operand\n");
         return 1;
     }
@@ -15586,23 +23276,23 @@ static int smallclueCpCommand(int argc, char **argv) {
     struct stat dest_stat;
     int dest_exists = (stat(dest_real, &dest_stat) == 0);
     bool dest_is_dir = dest_exists && S_ISDIR(dest_stat.st_mode);
-    int source_count = argc - 2;
+    int source_count = (argc - 1) - argi;
     if (source_count > 1 && !dest_is_dir) {
         fprintf(stderr, "cp: target '%s' is not a directory\n", dest);
         return 1;
     }
     int status = 0;
-    for (int i = 1; i <= source_count; ++i) {
+    for (int i = argi; i < argi + source_count; ++i) {
         char resolved_src[PATH_MAX];
         const char *src = smallclueResolvePath(argv[i], resolved_src, sizeof(resolved_src));
         struct stat src_stat;
-        if (stat(src, &src_stat) != 0) {
+        if (lstat(src, &src_stat) != 0) {
             fprintf(stderr, "cp: %s: %s\n", src, strerror(errno));
             status = 1;
             continue;
         }
-        if (S_ISDIR(src_stat.st_mode)) {
-            fprintf(stderr, "cp: %s: is a directory\n", src);
+        if (S_ISDIR(src_stat.st_mode) && !recursive) {
+            fprintf(stderr, "cp: -r not specified; omitting directory '%s'\n", src);
             status = 1;
             continue;
         }
@@ -15625,8 +23315,14 @@ static int smallclueCpCommand(int argc, char **argv) {
                 continue;
             }
         }
-        if (smallclueCopyFile("cp", src, target) != 0) {
+        if (S_ISDIR(src_stat.st_mode)) {
+            if (smallclueCopyRecursive("cp", src, target, preserveTimes) != 0) {
+                status = 1;
+            }
+        } else if (smallclueCopyFile("cp", src, target) != 0) {
             status = 1;
+        } else if (preserveTimes) {
+            smallclueCopyPreserveTimes(src, target, &src_stat);
         }
     }
     return status;
@@ -15672,11 +23368,18 @@ static int smallclueMvCommand(int argc, char **argv) {
             continue;
         }
         if (errno == EXDEV) {
-            if (smallclueCopyFile("mv", src, target) != 0) {
+            struct stat src_stat;
+            bool src_is_dir = (lstat(src, &src_stat) == 0) && S_ISDIR(src_stat.st_mode);
+            if (src_is_dir) {
+                if (smallclueCopyRecursive("mv", src, target, true) != 0) {
+                    status = 1;
+                    continue;
+                }
+            } else if (smallclueCopyFile("mv", src, target) != 0) {
                 status = 1;
                 continue;
             }
-            if (smallclueRemovePathWithLabel("mv", src, false, true, false) != 0) {
+            if (smallclueRemovePathWithLabel("mv", src, src_is_dir, true, false) != 0) {
                 fprintf(stderr, "mv: %s: unable to remove after copy\n", src);
                 status = 1;
             }
@@ -15686,6 +23389,1216 @@ static int smallclueMvCommand(int argc, char **argv) {
         }
     }
     return status;
+}
+
+/* install(1): `make install` targets very commonly invoke this directly
+ * rather than cp+chmod+mkdir -p, so its absence is a real gap for a
+ * self-hosted build environment. Supports the common subset: copying
+ * (optionally into a directory, or with -D creating the destination's
+ * parent directories first) with a settable mode, and -d for creating
+ * directories outright instead of copying files. -o/-g (owner/group) are
+ * not implemented -- they require root in the common case and add scope
+ * without being load-bearing for a single-user guest. */
+static int smallclueInstallCommand(int argc, char **argv) {
+    mode_t mode = 0755;
+    bool makeDirs = false;      /* -d: create directories, don't copy files */
+    bool makeParentDirs = false; /* -D: create DEST's parent dirs first */
+    bool verbose = false;
+
+    int argi = 1;
+    for (; argi < argc; ++argi) {
+        const char *arg = argv[argi];
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        if (strcmp(arg, "-m") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "install: -m requires a mode argument\n");
+                return 1;
+            }
+            mode_t parsed;
+            if (!smallclueChmodParseOctal(argv[++argi], &parsed)) {
+                fprintf(stderr, "install: invalid mode '%s'\n", argv[argi]);
+                return 1;
+            }
+            mode = parsed;
+        } else if (strcmp(arg, "-d") == 0) {
+            makeDirs = true;
+        } else if (strcmp(arg, "-D") == 0) {
+            makeParentDirs = true;
+        } else if (strcmp(arg, "-v") == 0) {
+            verbose = true;
+        } else if (arg[0] == '-' && arg[1] != '\0') {
+            fprintf(stderr, "install: unsupported option '%s'\n", arg);
+            return 1;
+        } else {
+            break;
+        }
+    }
+
+    if (makeDirs) {
+        if (argi >= argc) {
+            fprintf(stderr, "install: -d requires at least one directory\n");
+            return 1;
+        }
+        int status = 0;
+        for (int i = argi; i < argc; ++i) {
+            if (verbose) {
+                printf("install: creating directory %s\n", argv[i]);
+            }
+            if (smallclueMkdirParents(argv[i], mode, verbose) != 0) {
+                fprintf(stderr, "install: %s: %s\n", argv[i], strerror(errno));
+                status = 1;
+            }
+        }
+        return status;
+    }
+
+    if (argc - argi < 2) {
+        fprintf(stderr, "install: missing file operand\n");
+        return 1;
+    }
+    const char *dest = argv[argc - 1];
+    int sourceCount = (argc - 1) - argi;
+    struct stat destStat;
+    bool destIsDir = stat(dest, &destStat) == 0 && S_ISDIR(destStat.st_mode);
+    if (sourceCount > 1 && !destIsDir) {
+        fprintf(stderr, "install: target '%s' is not a directory\n", dest);
+        return 1;
+    }
+
+    int status = 0;
+    for (int i = argi; i < argi + sourceCount; ++i) {
+        const char *src = argv[i];
+        char targetPath[PATH_MAX];
+        const char *target = dest;
+        if (destIsDir) {
+            if (smallclueBuildPath(targetPath, sizeof(targetPath), dest, smallclueLeafName(src)) != 0) {
+                fprintf(stderr, "install: %s/%s: %s\n", dest, smallclueLeafName(src), strerror(errno));
+                status = 1;
+                continue;
+            }
+            target = targetPath;
+        } else if (makeParentDirs) {
+            char parentBuf[PATH_MAX];
+            snprintf(parentBuf, sizeof(parentBuf), "%s", dest);
+            char *slash = strrchr(parentBuf, '/');
+            if (slash && slash != parentBuf) {
+                *slash = '\0';
+                if (smallclueMkdirParents(parentBuf, 0777, verbose) != 0) {
+                    fprintf(stderr, "install: %s: %s\n", parentBuf, strerror(errno));
+                    status = 1;
+                    continue;
+                }
+            }
+        }
+        if (verbose) {
+            printf("install: %s -> %s\n", src, target);
+        }
+        if (smallclueCopyFile("install", src, target) != 0) {
+            status = 1;
+            continue;
+        }
+        if (chmod(target, mode) != 0) {
+            fprintf(stderr, "install: %s: %s\n", target, strerror(errno));
+            status = 1;
+        }
+    }
+    return status;
+}
+
+typedef struct {
+    bool recursive;
+    bool verbose;
+    bool compress;
+    bool preserve_mode;
+    bool preserve_times;
+    bool dry_run;
+    bool delete_extra;
+    bool update_only;
+    bool checksum;
+    char **include_patterns;
+    size_t include_count;
+    size_t include_capacity;
+    char **exclude_patterns;
+    size_t exclude_count;
+    size_t exclude_capacity;
+    const char *filter_root;
+    const char *filter_dest_root;
+} SmallclueRsyncOptions;
+
+static bool smallclueRsyncLegacyFallbackEnabled(void) {
+    int parsed = pagerParseEnvBool(getenv("PSCALI_RSYNC_LEGACY"));
+    return parsed == 1;
+}
+
+static int smallclueRunNativeRsyncCommand(int argc, char **argv) {
+    if (argc <= 0 || !argv || !argv[0]) {
+        return 1;
+    }
+
+    char exec_path[PATH_MAX];
+    if (!smallclueResolveCommandPathForExec("rsync", exec_path, sizeof(exec_path))) {
+        fprintf(stderr,
+                "rsync: no native rsync backend found in PATH; "
+                "install/provide a real rsync binary or set PSCALI_RSYNC_LEGACY=1\n");
+        return 127;
+    }
+
+    setenv("PSCALI_RSYNC_EXTERNAL_DELEGATE_ACTIVE", "1", 1);
+    execv(exec_path, argv);
+    int err = errno;
+    fprintf(stderr, "rsync: %s: %s\n", exec_path, strerror(err));
+    return (err == ENOENT) ? 127 : 126;
+}
+
+static void smallclueRsyncUsage(FILE *out) {
+    if (!out) {
+        out = stderr;
+    }
+    fprintf(out,
+            "usage: rsync [options] <source>... <destination>\n"
+            "  -a, --archive          archive mode (implies -rpt)\n"
+            "  -r, --recursive        recurse into directories\n"
+            "  -p, --perms            preserve permissions\n"
+            "  -t, --times            preserve modification times\n"
+            "  -u, --update           skip files newer on receiver\n"
+            "  -c, --checksum         use checksum to detect changes\n"
+            "  -v, --verbose          verbose output\n"
+            "  -z, --compress         enable compression for remote transfer (scp -C)\n"
+            "  -n, --dry-run          show what would change without writing\n"
+            "      --delete           delete destination entries not present in source\n"
+            "      --include=PATTERN  include files matching pattern\n"
+            "      --exclude=PATTERN  exclude files matching pattern\n");
+}
+
+static int smallclueRsyncAddPattern(char ***patterns,
+                                    size_t *count,
+                                    size_t *capacity,
+                                    const char *value) {
+    if (!patterns || !count || !capacity || !value || value[0] == '\0') {
+        return -1;
+    }
+    if (*count == *capacity) {
+        size_t next_capacity = *capacity ? (*capacity * 2) : 8;
+        char **resized = (char **)realloc(*patterns, next_capacity * sizeof(char *));
+        if (!resized) {
+            return -1;
+        }
+        *patterns = resized;
+        *capacity = next_capacity;
+    }
+    (*patterns)[*count] = strdup(value);
+    if (!(*patterns)[*count]) {
+        return -1;
+    }
+    (*count)++;
+    return 0;
+}
+
+static void smallclueRsyncFreePatterns(char **patterns, size_t count) {
+    if (!patterns) {
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        free(patterns[i]);
+    }
+    free(patterns);
+}
+
+static bool smallclueRsyncHasTrailingSlash(const char *path) {
+    if (!path) {
+        return false;
+    }
+    size_t len = strlen(path);
+    return len > 1 && path[len - 1] == '/';
+}
+
+static bool smallclueRsyncLooksRemote(const char *path) {
+    if (!path || !*path) {
+        return false;
+    }
+    if (strncmp(path, "rsync://", 8) == 0) {
+        return true;
+    }
+    if (strstr(path, "://") != NULL) {
+        return false;
+    }
+    const char *colon = strchr(path, ':');
+    if (!colon || colon == path) {
+        return false;
+    }
+    const char *slash = strchr(path, '/');
+    if (slash && slash < colon) {
+        return false;
+    }
+    if (path[0] == '/' || path[0] == '.') {
+        return false;
+    }
+    return true;
+}
+
+static void smallclueRsyncStatTimes(const struct stat *st, struct timeval tv[2]) {
+    if (!st || !tv) {
+        return;
+    }
+#if defined(__APPLE__)
+    tv[0].tv_sec = st->st_atimespec.tv_sec;
+    tv[0].tv_usec = (suseconds_t)(st->st_atimespec.tv_nsec / 1000);
+    tv[1].tv_sec = st->st_mtimespec.tv_sec;
+    tv[1].tv_usec = (suseconds_t)(st->st_mtimespec.tv_nsec / 1000);
+#else
+    tv[0].tv_sec = st->st_atim.tv_sec;
+    tv[0].tv_usec = (suseconds_t)(st->st_atim.tv_nsec / 1000);
+    tv[1].tv_sec = st->st_mtim.tv_sec;
+    tv[1].tv_usec = (suseconds_t)(st->st_mtim.tv_nsec / 1000);
+#endif
+}
+
+static int smallclueRsyncCompareMtime(const struct stat *lhs, const struct stat *rhs) {
+#if defined(__APPLE__)
+    if (lhs->st_mtimespec.tv_sec != rhs->st_mtimespec.tv_sec) {
+        return (lhs->st_mtimespec.tv_sec < rhs->st_mtimespec.tv_sec) ? -1 : 1;
+    }
+    if (lhs->st_mtimespec.tv_nsec != rhs->st_mtimespec.tv_nsec) {
+        return (lhs->st_mtimespec.tv_nsec < rhs->st_mtimespec.tv_nsec) ? -1 : 1;
+    }
+#else
+    if (lhs->st_mtim.tv_sec != rhs->st_mtim.tv_sec) {
+        return (lhs->st_mtim.tv_sec < rhs->st_mtim.tv_sec) ? -1 : 1;
+    }
+    if (lhs->st_mtim.tv_nsec != rhs->st_mtim.tv_nsec) {
+        return (lhs->st_mtim.tv_nsec < rhs->st_mtim.tv_nsec) ? -1 : 1;
+    }
+#endif
+    return 0;
+}
+
+static bool smallclueRsyncSameMtime(const struct stat *a, const struct stat *b) {
+    return smallclueRsyncCompareMtime(a, b) == 0;
+}
+
+static int smallclueRsyncFileChecksum(const char *path, uint64_t *out_hash) {
+    if (!path || !out_hash) {
+        errno = EINVAL;
+        return -1;
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+    uint64_t hash = 1469598103934665603ULL;
+    unsigned char buffer[16384];
+    for (;;) {
+        ssize_t nread = read(fd, buffer, sizeof(buffer));
+        if (nread == 0) {
+            break;
+        }
+        if (nread < 0) {
+            int saved = errno;
+            close(fd);
+            errno = saved;
+            return -1;
+        }
+        for (ssize_t i = 0; i < nread; ++i) {
+            hash ^= (uint64_t)buffer[i];
+            hash *= 1099511628211ULL;
+        }
+    }
+    close(fd);
+    *out_hash = hash;
+    return 0;
+}
+
+static bool smallclueRsyncParentPath(const char *path, char *out, size_t out_size) {
+    if (!path || !out || out_size == 0) {
+        return false;
+    }
+    if (!smallclueCopyPath(out, out_size, path)) {
+        return false;
+    }
+    smallclueTrimTrailingSlashes(out);
+    char *slash = strrchr(out, '/');
+    if (!slash) {
+        if (out_size < 2) {
+            return false;
+        }
+        out[0] = '.';
+        out[1] = '\0';
+        return true;
+    }
+    if (slash == out) {
+        out[1] = '\0';
+        return true;
+    }
+    *slash = '\0';
+    return true;
+}
+
+static const char *smallclueRsyncLeafName(const char *path, char *scratch, size_t scratch_size) {
+    if (!path || !scratch || scratch_size == 0 || !smallclueCopyPath(scratch, scratch_size, path)) {
+        return path;
+    }
+    smallclueTrimTrailingSlashes(scratch);
+    return smallclueLeafName(scratch);
+}
+
+static const char *smallclueRsyncRelativePath(const char *root,
+                                              const char *path,
+                                              char *out,
+                                              size_t out_size) {
+    if (!path || !out || out_size == 0) {
+        return "";
+    }
+    out[0] = '\0';
+    if (!root || root[0] == '\0') {
+        const char *leaf = smallclueLeafName(path);
+        smallclueCopyPath(out, out_size, leaf ? leaf : path);
+        return out;
+    }
+    char root_buf[PATH_MAX];
+    if (!smallclueCopyPath(root_buf, sizeof(root_buf), root)) {
+        const char *leaf = smallclueLeafName(path);
+        smallclueCopyPath(out, out_size, leaf ? leaf : path);
+        return out;
+    }
+    smallclueTrimTrailingSlashes(root_buf);
+    size_t root_len = strlen(root_buf);
+    if (strncmp(path, root_buf, root_len) == 0 &&
+        (path[root_len] == '\0' || path[root_len] == '/')) {
+        const char *suffix = path + root_len;
+        if (*suffix == '/') {
+            suffix++;
+        }
+        if (*suffix == '\0') {
+            smallclueCopyPath(out, out_size, ".");
+        } else {
+            smallclueCopyPath(out, out_size, suffix);
+        }
+        return out;
+    }
+    const char *leaf = smallclueLeafName(path);
+    smallclueCopyPath(out, out_size, leaf ? leaf : path);
+    return out;
+}
+
+static bool smallclueRsyncPatternMatch(const char *pattern,
+                                       const char *relative_path,
+                                       const char *leaf_name,
+                                       bool is_dir) {
+    if (!pattern || !*pattern) {
+        return false;
+    }
+    if (relative_path && fnmatch(pattern, relative_path, FNM_PATHNAME) == 0) {
+        return true;
+    }
+    if (leaf_name && fnmatch(pattern, leaf_name, 0) == 0) {
+        return true;
+    }
+    if (is_dir && relative_path) {
+        char rel_dir[PATH_MAX];
+        int written = snprintf(rel_dir, sizeof(rel_dir), "%s/", relative_path);
+        if (written > 0 && (size_t)written < sizeof(rel_dir) &&
+            fnmatch(pattern, rel_dir, FNM_PATHNAME) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool smallclueRsyncMatchesAny(const char *relative_path,
+                                     const char *leaf_name,
+                                     bool is_dir,
+                                     char **patterns,
+                                     size_t pattern_count) {
+    for (size_t i = 0; i < pattern_count; ++i) {
+        if (smallclueRsyncPatternMatch(patterns[i], relative_path, leaf_name, is_dir)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool smallclueRsyncPathSelected(const SmallclueRsyncOptions *opts,
+                                       const char *path,
+                                       bool is_dir,
+                                       bool use_dest_root) {
+    if (!opts) {
+        return true;
+    }
+    if (opts->include_count == 0 && opts->exclude_count == 0) {
+        return true;
+    }
+    char relbuf[PATH_MAX];
+    char leafbuf[PATH_MAX];
+    const char *relative = smallclueRsyncRelativePath(use_dest_root ? opts->filter_dest_root : opts->filter_root,
+                                                      path,
+                                                      relbuf,
+                                                      sizeof(relbuf));
+    const char *leaf = smallclueRsyncLeafName(path, leafbuf, sizeof(leafbuf));
+    bool excluded = smallclueRsyncMatchesAny(relative, leaf, is_dir, opts->exclude_patterns, opts->exclude_count);
+    if (excluded) {
+        return false;
+    }
+    if (opts->include_count == 0) {
+        return true;
+    }
+    if (is_dir) {
+        return true;
+    }
+    return smallclueRsyncMatchesAny(relative, leaf, false, opts->include_patterns, opts->include_count);
+}
+
+static int smallclueRsyncApplyMetadata(const char *dst,
+                                       const struct stat *src_stat,
+                                       const SmallclueRsyncOptions *opts,
+                                       bool allow_chmod) {
+    if (!dst || !src_stat || !opts || opts->dry_run) {
+        return 0;
+    }
+    int status = 0;
+    if (opts->preserve_mode && allow_chmod) {
+        mode_t mode = src_stat->st_mode & 07777;
+        if (chmod(dst, mode) != 0) {
+            fprintf(stderr, "rsync: chmod %s: %s\n", dst, strerror(errno));
+            status = -1;
+        }
+    }
+    if (opts->preserve_times) {
+        struct timeval tv[2];
+        smallclueRsyncStatTimes(src_stat, tv);
+        if (utimes(dst, tv) != 0) {
+            fprintf(stderr, "rsync: utimes %s: %s\n", dst, strerror(errno));
+            status = -1;
+        }
+    }
+    return status;
+}
+
+static int smallclueRsyncEnsureDir(const char *path, mode_t mode, const SmallclueRsyncOptions *opts) {
+    struct stat st;
+    if (lstat(path, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            return 0;
+        }
+        if (opts->dry_run) {
+            if (opts->verbose) {
+                printf("delete %s\n", path);
+                printf("mkdir %s\n", path);
+            }
+            return 0;
+        }
+        if (smallclueRemovePathWithLabel("rsync", path, true, true, false) != 0) {
+            return -1;
+        }
+    } else if (errno != ENOENT) {
+        fprintf(stderr, "rsync: %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (opts->dry_run) {
+        if (opts->verbose) {
+            printf("mkdir %s\n", path);
+        }
+        return 0;
+    }
+    if (smallclueMkdirParents(path, mode, false) != 0) {
+        fprintf(stderr, "rsync: mkdir %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int smallclueRsyncEnsureParentDir(const char *path, const SmallclueRsyncOptions *opts) {
+    char parent[PATH_MAX];
+    if (!smallclueCopyPath(parent, sizeof(parent), path)) {
+        errno = ENAMETOOLONG;
+        fprintf(stderr, "rsync: %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (!smallclueChopParentDirectory(parent)) {
+        return 0;
+    }
+    return smallclueRsyncEnsureDir(parent, 0777, opts);
+}
+
+static int smallclueRsyncRemovePath(const char *path, const SmallclueRsyncOptions *opts) {
+    if (opts->dry_run) {
+        if (opts->verbose) {
+            printf("delete %s\n", path);
+        }
+        return 0;
+    }
+    return smallclueRemovePathWithLabel("rsync", path, true, true, false);
+}
+
+static int smallclueRsyncSyncEntry(const char *src, const char *dst, const SmallclueRsyncOptions *opts);
+
+static int smallclueRsyncDeleteExtraneous(const char *src_dir,
+                                          const char *dst_dir,
+                                          const SmallclueRsyncOptions *opts) {
+    DIR *dir = opendir(dst_dir);
+    if (!dir) {
+        fprintf(stderr, "rsync: %s: %s\n", dst_dir, strerror(errno));
+        return -1;
+    }
+    int status = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        char src_child[PATH_MAX];
+        char dst_child[PATH_MAX];
+        if (smallclueBuildPath(src_child, sizeof(src_child), src_dir, entry->d_name) != 0 ||
+            smallclueBuildPath(dst_child, sizeof(dst_child), dst_dir, entry->d_name) != 0) {
+            fprintf(stderr, "rsync: path too long while deleting '%s'\n", entry->d_name);
+            status = -1;
+            continue;
+        }
+        struct stat dst_st;
+        if (lstat(dst_child, &dst_st) != 0) {
+            continue;
+        }
+        if (!smallclueRsyncPathSelected(opts, dst_child, S_ISDIR(dst_st.st_mode), true)) {
+            continue;
+        }
+        struct stat src_st;
+        if (lstat(src_child, &src_st) == 0) {
+            continue;
+        }
+        if (errno != ENOENT) {
+            fprintf(stderr, "rsync: %s: %s\n", src_child, strerror(errno));
+            status = -1;
+            continue;
+        }
+        if (smallclueRsyncRemovePath(dst_child, opts) != 0) {
+            status = -1;
+        }
+    }
+    closedir(dir);
+    return status;
+}
+
+static int smallclueRsyncSyncDirectoryContents(const char *src_dir,
+                                               const char *dst_dir,
+                                               const SmallclueRsyncOptions *opts,
+                                               bool delete_extra) {
+    struct stat src_st;
+    if (lstat(src_dir, &src_st) != 0) {
+        fprintf(stderr, "rsync: %s: %s\n", src_dir, strerror(errno));
+        return -1;
+    }
+    if (smallclueRsyncEnsureDir(dst_dir, src_st.st_mode & 0777, opts) != 0) {
+        return -1;
+    }
+
+    DIR *dir = opendir(src_dir);
+    if (!dir) {
+        fprintf(stderr, "rsync: %s: %s\n", src_dir, strerror(errno));
+        return -1;
+    }
+
+    int status = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        char src_child[PATH_MAX];
+        char dst_child[PATH_MAX];
+        if (smallclueBuildPath(src_child, sizeof(src_child), src_dir, entry->d_name) != 0 ||
+            smallclueBuildPath(dst_child, sizeof(dst_child), dst_dir, entry->d_name) != 0) {
+            fprintf(stderr, "rsync: path too long while syncing '%s'\n", entry->d_name);
+            status = -1;
+            continue;
+        }
+        if (smallclueRsyncSyncEntry(src_child, dst_child, opts) != 0) {
+            status = -1;
+        }
+    }
+    closedir(dir);
+
+    if (delete_extra && opts->delete_extra) {
+        if (smallclueRsyncDeleteExtraneous(src_dir, dst_dir, opts) != 0) {
+            status = -1;
+        }
+    }
+    return status;
+}
+
+static int smallclueRsyncSyncEntry(const char *src, const char *dst, const SmallclueRsyncOptions *opts) {
+    struct stat src_st;
+    if (lstat(src, &src_st) != 0) {
+        fprintf(stderr, "rsync: %s: %s\n", src, strerror(errno));
+        return -1;
+    }
+    bool src_is_dir = S_ISDIR(src_st.st_mode);
+    if (!smallclueRsyncPathSelected(opts, src, src_is_dir, false)) {
+        if (opts->verbose) {
+            printf("exclude %s\n", src);
+        }
+        return 0;
+    }
+
+    if (src_is_dir) {
+        if (!opts->recursive) {
+            fprintf(stderr, "rsync: skipping directory '%s' (use -r)\n", src);
+            return -1;
+        }
+        int status = smallclueRsyncSyncDirectoryContents(src, dst, opts, true);
+        if (status == 0 && smallclueRsyncApplyMetadata(dst, &src_st, opts, true) != 0) {
+            status = -1;
+        }
+        return status;
+    }
+
+    if (S_ISLNK(src_st.st_mode)) {
+        char link_target[PATH_MAX];
+        ssize_t link_len = readlink(src, link_target, sizeof(link_target) - 1);
+        if (link_len < 0) {
+            fprintf(stderr, "rsync: readlink %s: %s\n", src, strerror(errno));
+            return -1;
+        }
+        link_target[link_len] = '\0';
+
+        bool needs_update = true;
+        struct stat dst_st;
+        if (lstat(dst, &dst_st) == 0 && S_ISLNK(dst_st.st_mode)) {
+            char existing_target[PATH_MAX];
+            ssize_t existing_len = readlink(dst, existing_target, sizeof(existing_target) - 1);
+            if (existing_len >= 0) {
+                existing_target[existing_len] = '\0';
+                if (strcmp(existing_target, link_target) == 0) {
+                    needs_update = false;
+                }
+            }
+        }
+
+        if (!needs_update) {
+            if (opts->verbose) {
+                printf("skip %s\n", dst);
+            }
+            return 0;
+        }
+
+        if (smallclueRsyncEnsureParentDir(dst, opts) != 0) {
+            return -1;
+        }
+
+        if (opts->verbose) {
+            printf("link %s -> %s\n", src, dst);
+        }
+        if (opts->dry_run) {
+            return 0;
+        }
+
+        if (lstat(dst, &dst_st) == 0) {
+            if (smallclueRemovePathWithLabel("rsync", dst, true, true, false) != 0) {
+                return -1;
+            }
+        } else if (errno != ENOENT) {
+            fprintf(stderr, "rsync: %s: %s\n", dst, strerror(errno));
+            return -1;
+        }
+
+        if (symlink(link_target, dst) != 0) {
+            fprintf(stderr, "rsync: symlink %s -> %s: %s\n", dst, link_target, strerror(errno));
+            return -1;
+        }
+        return 0;
+    }
+
+    if (!S_ISREG(src_st.st_mode)) {
+        if (opts->verbose) {
+            printf("skip %s (unsupported file type)\n", src);
+        }
+        return 0;
+    }
+
+    struct stat dst_st;
+    bool dst_exists = (lstat(dst, &dst_st) == 0);
+    bool needs_copy = true;
+    if (dst_exists && S_ISREG(dst_st.st_mode)) {
+        if (opts->update_only && smallclueRsyncCompareMtime(&dst_st, &src_st) > 0) {
+            needs_copy = false;
+        } else if (opts->checksum) {
+            if (src_st.st_size == dst_st.st_size) {
+                uint64_t src_hash = 0;
+                uint64_t dst_hash = 0;
+                if (smallclueRsyncFileChecksum(src, &src_hash) != 0 ||
+                    smallclueRsyncFileChecksum(dst, &dst_hash) != 0) {
+                    fprintf(stderr, "rsync: checksum failed for '%s' or '%s': %s\n", src, dst, strerror(errno));
+                    return -1;
+                }
+                if (src_hash == dst_hash) {
+                    needs_copy = false;
+                }
+            }
+        } else {
+            bool same_size = src_st.st_size == dst_st.st_size;
+            bool same_mtime = smallclueRsyncSameMtime(&src_st, &dst_st);
+            bool same_mode = ((src_st.st_mode & 07777) == (dst_st.st_mode & 07777));
+            if (same_size && same_mtime && (!opts->preserve_mode || same_mode)) {
+                needs_copy = false;
+            }
+        }
+    }
+
+    if (!needs_copy) {
+        if (opts->verbose) {
+            printf("skip %s\n", dst);
+        }
+        if (smallclueRsyncApplyMetadata(dst, &src_st, opts, true) != 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    if (smallclueRsyncEnsureParentDir(dst, opts) != 0) {
+        return -1;
+    }
+    if (opts->verbose) {
+        printf("copy %s -> %s\n", src, dst);
+    }
+    if (opts->dry_run) {
+        return 0;
+    }
+
+    if (dst_exists && !S_ISREG(dst_st.st_mode)) {
+        if (smallclueRemovePathWithLabel("rsync", dst, true, true, false) != 0) {
+            return -1;
+        }
+    }
+    if (smallclueCopyFile("rsync", src, dst) != 0) {
+        return -1;
+    }
+    return smallclueRsyncApplyMetadata(dst, &src_st, opts, true);
+}
+
+static char *smallclueRsyncBuildRemoteSourceArg(const char *arg, bool recursive) {
+    if (!arg) {
+        return NULL;
+    }
+    if (!recursive || !smallclueRsyncHasTrailingSlash(arg)) {
+        return strdup(arg);
+    }
+
+    size_t len = strlen(arg);
+    while (len > 1 && arg[len - 1] == '/') {
+        len--;
+    }
+
+    bool already_dot = false;
+    if (len >= 2 && arg[len - 2] == '/' && arg[len - 1] == '.') {
+        already_dot = true;
+    }
+    if (already_dot) {
+        return strdup(arg);
+    }
+
+    size_t out_len = len + 2; /* "/." */
+    char *out = (char *)malloc(out_len + 1);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, arg, len);
+    out[len] = '/';
+    out[len + 1] = '.';
+    out[len + 2] = '\0';
+    return out;
+}
+
+static int smallclueRsyncRemoteDryRun(int argc, char **argv, int operand_index) {
+    if (!argv || operand_index >= argc) {
+        return 1;
+    }
+    const char *dest = argv[argc - 1];
+    for (int i = operand_index; i < argc - 1; ++i) {
+        if (!argv[i]) {
+            continue;
+        }
+        printf("copy %s -> %s\n", argv[i], dest ? dest : "");
+    }
+    return 0;
+}
+
+static int smallclueRsyncRunRemoteScp(int argc,
+                                      char **argv,
+                                      int operand_index,
+                                      int remote_count,
+                                      const SmallclueRsyncOptions *opts) {
+    if (remote_count > 1) {
+        fprintf(stderr, "rsync: remote-to-remote copy is not supported\n");
+        return 1;
+    }
+    if (opts->delete_extra) {
+        fprintf(stderr, "rsync: --delete is only supported for local paths\n");
+        return 1;
+    }
+    if (opts->update_only || opts->checksum || opts->include_count > 0 || opts->exclude_count > 0) {
+        fprintf(stderr, "rsync: -u/-c/--include/--exclude are not supported for remote transfers yet\n");
+        return 1;
+    }
+    if (opts->dry_run) {
+        return smallclueRsyncRemoteDryRun(argc, argv, operand_index);
+    }
+
+    size_t max_args = (size_t)(argc - operand_index) + 8;
+    char **scp_argv = (char **)calloc(max_args + 1, sizeof(char *));
+    if (!scp_argv) {
+        fprintf(stderr, "rsync: out of memory\n");
+        return 1;
+    }
+
+    int scp_argc = 0;
+    scp_argv[scp_argc++] = strdup("scp");
+    if (opts->recursive) {
+        scp_argv[scp_argc++] = strdup("-r");
+    }
+    if (opts->preserve_mode || opts->preserve_times) {
+        scp_argv[scp_argc++] = strdup("-p");
+    }
+    if (opts->compress) {
+        scp_argv[scp_argc++] = strdup("-C");
+    }
+    for (int i = operand_index; i < argc; ++i) {
+        if (i < argc - 1) {
+            scp_argv[scp_argc++] = smallclueRsyncBuildRemoteSourceArg(argv[i], opts->recursive);
+        } else {
+            scp_argv[scp_argc++] = strdup(argv[i]);
+        }
+    }
+
+    int rc = 0;
+    for (int i = 0; i < scp_argc; ++i) {
+        if (!scp_argv[i]) {
+            fprintf(stderr, "rsync: out of memory\n");
+            rc = 1;
+            goto rsync_remote_cleanup;
+        }
+    }
+
+    if (opts->verbose) {
+        const char *dest = argv[argc - 1];
+        for (int i = operand_index; i < argc - 1; ++i) {
+            if (!argv[i]) {
+                continue;
+            }
+            printf("copy %s -> %s\n", argv[i], dest ? dest : "");
+        }
+    }
+
+    setenv("PSCALI_SCP_NO_FOLLOW_SYMLINK_DIRS", "1", 1);
+    rc = smallclueRunScp(scp_argc, scp_argv);
+    unsetenv("PSCALI_SCP_NO_FOLLOW_SYMLINK_DIRS");
+
+rsync_remote_cleanup:
+    for (int i = 0; i < scp_argc; ++i) {
+        free(scp_argv[i]);
+    }
+    free(scp_argv);
+    return rc;
+}
+
+static int smallclueRsyncCommand(int argc, char **argv) {
+    if (!smallclueRsyncLegacyFallbackEnabled()) {
+        return smallclueRunRsync(argc, argv);
+    }
+
+    SmallclueRsyncOptions opts;
+    memset(&opts, 0, sizeof(opts));
+
+    int argi = 1;
+    while (argi < argc) {
+        const char *arg = argv[argi];
+        if (!arg || arg[0] != '-' || strcmp(arg, "-") == 0) {
+            break;
+        }
+        if (strcmp(arg, "--") == 0) {
+            argi++;
+            break;
+        }
+        if (strcmp(arg, "--help") == 0) {
+            smallclueRsyncUsage(stdout);
+            smallclueRsyncFreePatterns(opts.include_patterns, opts.include_count);
+            smallclueRsyncFreePatterns(opts.exclude_patterns, opts.exclude_count);
+            return 0;
+        }
+        if (strcmp(arg, "--delete") == 0) {
+            opts.delete_extra = true;
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--dry-run") == 0) {
+            opts.dry_run = true;
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--archive") == 0) {
+            opts.recursive = true;
+            opts.preserve_mode = true;
+            opts.preserve_times = true;
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--recursive") == 0) {
+            opts.recursive = true;
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--verbose") == 0) {
+            opts.verbose = true;
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--compress") == 0) {
+            opts.compress = true;
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--perms") == 0) {
+            opts.preserve_mode = true;
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--times") == 0) {
+            opts.preserve_times = true;
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--update") == 0) {
+            opts.update_only = true;
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--checksum") == 0) {
+            opts.checksum = true;
+            argi++;
+            continue;
+        }
+        if (strncmp(arg, "--include=", 10) == 0) {
+            if (smallclueRsyncAddPattern(&opts.include_patterns,
+                                         &opts.include_count,
+                                         &opts.include_capacity,
+                                         arg + 10) != 0) {
+                fprintf(stderr, "rsync: unable to add include pattern\n");
+                goto rsync_parse_fail;
+            }
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--include") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "rsync: --include requires a pattern\n");
+                goto rsync_parse_fail;
+            }
+            if (smallclueRsyncAddPattern(&opts.include_patterns,
+                                         &opts.include_count,
+                                         &opts.include_capacity,
+                                         argv[argi + 1]) != 0) {
+                fprintf(stderr, "rsync: unable to add include pattern\n");
+                goto rsync_parse_fail;
+            }
+            argi += 2;
+            continue;
+        }
+        if (strncmp(arg, "--exclude=", 10) == 0) {
+            if (smallclueRsyncAddPattern(&opts.exclude_patterns,
+                                         &opts.exclude_count,
+                                         &opts.exclude_capacity,
+                                         arg + 10) != 0) {
+                fprintf(stderr, "rsync: unable to add exclude pattern\n");
+                goto rsync_parse_fail;
+            }
+            argi++;
+            continue;
+        }
+        if (strcmp(arg, "--exclude") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "rsync: --exclude requires a pattern\n");
+                goto rsync_parse_fail;
+            }
+            if (smallclueRsyncAddPattern(&opts.exclude_patterns,
+                                         &opts.exclude_count,
+                                         &opts.exclude_capacity,
+                                         argv[argi + 1]) != 0) {
+                fprintf(stderr, "rsync: unable to add exclude pattern\n");
+                goto rsync_parse_fail;
+            }
+            argi += 2;
+            continue;
+        }
+        if (arg[1] == '-') {
+            fprintf(stderr, "rsync: unknown option '%s'\n", arg);
+            goto rsync_parse_fail;
+        }
+        for (const char *cursor = arg + 1; *cursor; ++cursor) {
+            switch (*cursor) {
+                case 'a':
+                    opts.recursive = true;
+                    opts.preserve_mode = true;
+                    opts.preserve_times = true;
+                    break;
+                case 'r':
+                    opts.recursive = true;
+                    break;
+                case 'v':
+                    opts.verbose = true;
+                    break;
+                case 'z':
+                    opts.compress = true;
+                    break;
+                case 'p':
+                    opts.preserve_mode = true;
+                    break;
+                case 't':
+                    opts.preserve_times = true;
+                    break;
+                case 'n':
+                    opts.dry_run = true;
+                    break;
+                case 'u':
+                    opts.update_only = true;
+                    break;
+                case 'c':
+                    opts.checksum = true;
+                    break;
+                default:
+                    fprintf(stderr, "rsync: invalid option -- %c\n", *cursor);
+                    goto rsync_parse_fail;
+            }
+        }
+        argi++;
+    }
+
+    {
+        int operand_count = argc - argi;
+        if (operand_count < 2) {
+            smallclueRsyncUsage(stderr);
+            goto rsync_parse_fail;
+        }
+
+        int source_count = operand_count - 1;
+        bool has_remote = false;
+        int remote_count = 0;
+        for (int i = argi; i < argc; ++i) {
+            if (strncmp(argv[i], "rsync://", 8) == 0) {
+                fprintf(stderr, "rsync: rsync:// URLs are not supported; use host:path syntax\n");
+                goto rsync_parse_fail;
+            }
+            if (smallclueRsyncLooksRemote(argv[i])) {
+                has_remote = true;
+                remote_count++;
+            }
+        }
+        if (has_remote) {
+            int rc = smallclueRsyncRunRemoteScp(argc, argv, argi, remote_count, &opts);
+            smallclueRsyncFreePatterns(opts.include_patterns, opts.include_count);
+            smallclueRsyncFreePatterns(opts.exclude_patterns, opts.exclude_count);
+            return rc;
+        }
+
+        if (opts.delete_extra && source_count != 1) {
+            fprintf(stderr, "rsync: --delete currently requires exactly one source\n");
+            goto rsync_parse_fail;
+        }
+
+        const char *dest_arg = argv[argc - 1];
+        char resolved_dest[PATH_MAX];
+        const char *dest = smallclueResolvePath(dest_arg, resolved_dest, sizeof(resolved_dest));
+        struct stat dest_st;
+        bool dest_exists = lstat(dest, &dest_st) == 0;
+        bool dest_is_dir = dest_exists && S_ISDIR(dest_st.st_mode);
+
+        if (source_count > 1) {
+            if (dest_exists && !dest_is_dir) {
+                fprintf(stderr, "rsync: destination '%s' is not a directory\n", dest_arg);
+                goto rsync_parse_fail;
+            }
+            if (!dest_exists) {
+                if (smallclueRsyncEnsureDir(dest, 0777, &opts) != 0) {
+                    goto rsync_parse_fail;
+                }
+                dest_exists = true;
+                dest_is_dir = true;
+            }
+        }
+
+        int status = 0;
+        for (int i = 0; i < source_count; ++i) {
+            const char *src_arg = argv[argi + i];
+            bool src_trailing_slash = smallclueRsyncHasTrailingSlash(src_arg);
+
+            char resolved_src[PATH_MAX];
+            const char *src = smallclueResolvePath(src_arg, resolved_src, sizeof(resolved_src));
+
+            struct stat src_st;
+            if (lstat(src, &src_st) != 0) {
+                fprintf(stderr, "rsync: %s: %s\n", src_arg, strerror(errno));
+                status = 1;
+                continue;
+            }
+
+            const char *target = dest;
+            char target_path[PATH_MAX];
+            bool copy_dir_contents = false;
+
+            if (source_count > 1 || dest_is_dir) {
+                if (S_ISDIR(src_st.st_mode) && src_trailing_slash) {
+                    copy_dir_contents = true;
+                    target = dest;
+                } else {
+                    char leaf_scratch[PATH_MAX];
+                    const char *leaf = smallclueRsyncLeafName(src_arg, leaf_scratch, sizeof(leaf_scratch));
+                    if (smallclueBuildPath(target_path, sizeof(target_path), dest, leaf) != 0) {
+                        fprintf(stderr, "rsync: %s/%s: %s\n", dest, leaf, strerror(errno));
+                        status = 1;
+                        continue;
+                    }
+                    target = target_path;
+                }
+            } else if (S_ISDIR(src_st.st_mode) && src_trailing_slash) {
+                copy_dir_contents = true;
+                target = dest;
+            }
+
+            char src_root_buf[PATH_MAX];
+            char dst_root_buf[PATH_MAX];
+            if (copy_dir_contents) {
+                opts.filter_root = src;
+                opts.filter_dest_root = target;
+            } else {
+                if (!smallclueRsyncParentPath(src, src_root_buf, sizeof(src_root_buf)) ||
+                    !smallclueRsyncParentPath(target, dst_root_buf, sizeof(dst_root_buf))) {
+                    fprintf(stderr, "rsync: unable to derive filter roots for '%s'\n", src_arg);
+                    status = 1;
+                    continue;
+                }
+                opts.filter_root = src_root_buf;
+                opts.filter_dest_root = dst_root_buf;
+            }
+
+            int rc;
+            if (copy_dir_contents) {
+                rc = smallclueRsyncSyncDirectoryContents(src, target, &opts, opts.delete_extra);
+            } else {
+                rc = smallclueRsyncSyncEntry(src, target, &opts);
+            }
+            if (rc != 0) {
+                status = 1;
+            }
+        }
+
+        smallclueRsyncFreePatterns(opts.include_patterns, opts.include_count);
+        smallclueRsyncFreePatterns(opts.exclude_patterns, opts.exclude_count);
+        return status;
+    }
+
+rsync_parse_fail:
+    smallclueRsyncFreePatterns(opts.include_patterns, opts.include_count);
+    smallclueRsyncFreePatterns(opts.exclude_patterns, opts.exclude_count);
+    return 1;
 }
 
 const SmallclueApplet *smallclueGetApplets(size_t *count) {
@@ -15858,6 +24771,9 @@ static bool smallclueIsInteger(const char *s, long long *out) {
     return true;
 }
 
+/* Evaluates a single atomic expression: no -a/-o splitting (that's handled
+ * one level up, by smallclueTestEvaluateOr/And below), just !expr, a bare
+ * string, a unary op + operand, or a binary op between two operands. */
 static bool smallclueTestEvaluate(int argc, char **argv) {
     if (argc <= 0) {
         return false;
@@ -15894,6 +24810,17 @@ static bool smallclueTestEvaluate(int argc, char **argv) {
         if (strcmp(op, "-w") == 0) {
             return access(arg, W_OK) == 0;
         }
+        if (strcmp(op, "-x") == 0) {
+            return access(arg, X_OK) == 0;
+        }
+        if (strcmp(op, "-s") == 0) {
+            struct stat st;
+            return stat(arg, &st) == 0 && st.st_size > 0;
+        }
+        if (strcmp(op, "-L") == 0 || strcmp(op, "-h") == 0) {
+            struct stat st;
+            return lstat(arg, &st) == 0 && S_ISLNK(st.st_mode);
+        }
     }
     if (argc == 3) {
         const char *left = argv[0];
@@ -15904,6 +24831,22 @@ static bool smallclueTestEvaluate(int argc, char **argv) {
         }
         if (strcmp(op, "!=") == 0) {
             return strcmp(left, right) != 0;
+        }
+        if (strcmp(op, "-nt") == 0 || strcmp(op, "-ot") == 0) {
+            struct stat lst, rst;
+            bool haveLeft = stat(left, &lst) == 0;
+            bool haveRight = stat(right, &rst) == 0;
+            if (!haveLeft || !haveRight) {
+                /* POSIX: -nt is true if left exists and right doesn't. */
+                return strcmp(op, "-nt") == 0 && haveLeft && !haveRight;
+            }
+            if (strcmp(op, "-nt") == 0) return lst.st_mtime > rst.st_mtime;
+            return lst.st_mtime < rst.st_mtime;
+        }
+        if (strcmp(op, "-ef") == 0) {
+            struct stat lst, rst;
+            return stat(left, &lst) == 0 && stat(right, &rst) == 0 &&
+                   lst.st_dev == rst.st_dev && lst.st_ino == rst.st_ino;
         }
         long long lhs, rhs;
         if (smallclueIsInteger(left, &lhs) && smallclueIsInteger(right, &rhs)) {
@@ -15919,11 +24862,38 @@ static bool smallclueTestEvaluate(int argc, char **argv) {
     return false;
 }
 
+/* -a/-o support: scans for the first top-level "-a"/"-o" token and splits
+ * there, recursing on each side. -o has lower precedence than -a (matches
+ * POSIX: "expr1 -a expr2 -o expr3" groups as "(expr1 -a expr2) -o expr3"),
+ * so the OR-split happens first/outermost and the AND-split is tried only
+ * within an OR-free segment. Neither operator is looked for as the very
+ * first or very last token (that position can only be a genuine operand,
+ * e.g. `test -a foo` bare-unary-checks "foo" being non-empty via the
+ * single-arg fallback in smallclueTestEvaluate, not an empty left-hand AND
+ * side) -- this matches how real test(1) resolves the ambiguity. */
+static bool smallclueTestEvaluateAnd(int argc, char **argv) {
+    for (int i = 1; i < argc - 1; ++i) {
+        if (strcmp(argv[i], "-a") == 0) {
+            return smallclueTestEvaluateAnd(i, argv) && smallclueTestEvaluateAnd(argc - i - 1, argv + i + 1);
+        }
+    }
+    return smallclueTestEvaluate(argc, argv);
+}
+
+static bool smallclueTestEvaluateOr(int argc, char **argv) {
+    for (int i = 1; i < argc - 1; ++i) {
+        if (strcmp(argv[i], "-o") == 0) {
+            return smallclueTestEvaluateOr(i, argv) || smallclueTestEvaluateOr(argc - i - 1, argv + i + 1);
+        }
+    }
+    return smallclueTestEvaluateAnd(argc, argv);
+}
+
 static int smallclueTestWithArgs(int argc, char **argv) {
     if (argc <= 0) {
         return 1;
     }
-    bool result = smallclueTestEvaluate(argc, argv);
+    bool result = smallclueTestEvaluateOr(argc, argv);
     return result ? 0 : 1;
 }
 
@@ -16052,10 +25022,41 @@ static int smallclueInitCommand(int argc, char **argv) {
             fprintf(stderr, "init: failed to exec '%s': %s\n", rcPath, strerror(execErr));
             _exit(127);
         } else if (pid > 0) {
+            /* A single waitpid(pid, ...) here only ever reaps rc itself --
+             * for the entire time rc is running (which for an interactive
+             * session can be the whole guest lifetime), any orphaned or
+             * double-forked background process reparented to us as PID 1
+             * would accumulate as an unreaped zombie, since nothing else
+             * in this init calls wait() until final shutdown.
+             *
+             * waitpid(-1, ...) blocks until ANY child changes state and
+             * reaps it, whichever child that is -- looping on that instead
+             * of targeting `pid` directly means every orphan that exits
+             * while rc runs gets reaped as it happens, with no signal
+             * handler needed. We keep looping past any non-rc child until
+             * we see rc's own pid, at which point we've both reaped rc and
+             * captured its exit status for the log message below. */
             int rcStatus = 0;
-            if (waitpid(pid, &rcStatus, 0) < 0) {
-                fprintf(stderr, "init: waitpid(%s) failed: %s\n", rcPath, strerror(errno));
-            } else if (!WIFEXITED(rcStatus) || WEXITSTATUS(rcStatus) != 0) {
+            bool haveRcStatus = false;
+            for (;;) {
+                int status = 0;
+                pid_t reaped = waitpid(-1, &status, 0);
+                if (reaped < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    fprintf(stderr, "init: waitpid(%s) failed: %s\n", rcPath, strerror(errno));
+                    break;
+                }
+                if (reaped == pid) {
+                    rcStatus = status;
+                    haveRcStatus = true;
+                    break;
+                }
+                /* Some other reparented child exited -- reaped and
+                 * discarded; keep waiting for rc specifically. */
+            }
+            if (haveRcStatus && (!WIFEXITED(rcStatus) || WEXITSTATUS(rcStatus) != 0)) {
                 if (WIFEXITED(rcStatus)) {
                     fprintf(stderr, "init: %s exited with status %d\n",
                             rcPath, WEXITSTATUS(rcStatus));

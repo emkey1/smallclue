@@ -1,0 +1,12 @@
+--- src/core.c
++++ src/core.c
+@@ -7789,10 +7789,11 @@
+     } else {
+         printf("%s", header);
+     }
++    printf("\x1b[0m\n");
+     size_t end = top + window;
+     if (end > count) {
+         end = count;
+     }
+     for (size_t idx = top; idx < end; ++idx) {
