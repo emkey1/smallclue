@@ -150,6 +150,26 @@ bool pathTruncateStrip(const char *path, char *buffer, size_t buflen) {
 }
 
 /* exsh stubs removed: standalone builds use smallclue's built-in sh */
+
+/* core.c's applet table references these unconditionally (git/rsync entries
+ * aren't ifdef-guarded), but their real implementations (src/git_app.c,
+ * src/openrsync_app.c) need libgit2/the vendored openrsync tree, which this
+ * script only builds when SMALLCLUE_WITH_LIBGIT2=1 / openrsync is fetched.
+ * Weak so the real, strong definition (when those sources are compiled in
+ * below) silently wins the link over this fallback. */
+__attribute__((weak)) int smallclueGitCommand(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "git: not built in this configuration (libgit2 unavailable)\n");
+    return 127;
+}
+
+__attribute__((weak)) int smallclueRunRsync(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "rsync: real-protocol client not built in this configuration (openrsync unavailable)\n");
+    return 127;
+}
 EOF
 
 # 3. Compile smallclue
@@ -168,8 +188,15 @@ if [ "$(uname -s)" = "Darwin" ]; then
         fi
     done
 fi
+EXTRA_TAIL_LIBS=""
 if [ "$(uname -s)" = "Linux" ]; then
     EXTRA_LD_FLAGS="-static"
+    # awk_interp.c's math builtins (sin/cos/exp/log/sqrt/atan2/fmod/pow/...)
+    # and crypt() (su, OpenSSH) are in libm/libcrypt on glibc, unlike Darwin
+    # where both are folded into libSystem. With -static, library order
+    # matters -- these must come after every object that references them,
+    # so they're appended at the very end of the link line, not here.
+    EXTRA_TAIL_LIBS="-lm -lcrypt"
 fi
 
 NEXTVI_SRC="src/nextvi_stubs.c"
@@ -546,12 +573,40 @@ gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -DSMALL
     src/shell/sh_builtins.c \
     src/shell/sh_lineedit.c \
     src/shell/sh_main.c \
-    src/micro_app.c \
     ${OPENSSH_SHIM} \
     src/runtime_stubs_extra.c \
+    src/awk_lexer.c \
+    src/awk_parser.c \
+    src/awk_value.c \
+    src/awk_interp.c \
+    src/awk_app.c \
+    src/base64_app.c \
+    src/checksum_app.c \
+    src/chown_app.c \
+    src/cmp_app.c \
+    src/comm_app.c \
+    src/dd_app.c \
+    src/diff_app.c \
+    src/expr_app.c \
+    src/fmt_app.c \
+    src/fold_app.c \
+    src/gzip_app.c \
+    src/nl_app.c \
+    src/nohup_app.c \
+    src/od_app.c \
+    src/paste_app.c \
+    src/patch_app.c \
+    src/printf_app.c \
+    src/readlink_app.c \
+    src/rev_app.c \
+    src/seq_app.c \
+    src/split_app.c \
+    src/tac_app.c \
+    src/tar_app.c \
     ${OPENSSH_LIBS} \
     ${DVTM_LIBS} \
     ${LIBGIT2_LIBS} \
+    ${EXTRA_TAIL_LIBS} \
     -o smallclue
 
 if [ ! -f smallclue ]; then

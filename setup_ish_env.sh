@@ -412,6 +412,25 @@ bool pathTruncateStrip(const char *path, char *buffer, size_t buflen) {
     buffer[buflen - 1] = '\0';
     return false; /* Did not modify */
 }
+
+/* core.c's applet table references these unconditionally (git/rsync entries
+ * aren't ifdef-guarded), but their real implementations (src/git_app.c,
+ * src/openrsync_app.c) need libgit2/the vendored openrsync tree, neither of
+ * which this script builds. Weak so a real, strong definition would win the
+ * link over this fallback if one were ever compiled in. */
+__attribute__((weak)) int smallclueGitCommand(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "git: not built in this configuration (libgit2 unavailable)\n");
+    return 127;
+}
+
+__attribute__((weak)) int smallclueRunRsync(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "rsync: real-protocol client not built in this configuration (openrsync unavailable)\n");
+    return 127;
+}
 EOF
 
 # 3. Configure and Build Dependencies
@@ -803,9 +822,38 @@ echo "Compiling smallclue (iSH/32-bit static)..."
     src/shell/sh_main.c \
     ${OPENSSH_SHIM} \
     src/runtime_stubs_extra.c \
+    src/awk_lexer.c \
+    src/awk_parser.c \
+    src/awk_value.c \
+    src/awk_interp.c \
+    src/awk_app.c \
+    src/base64_app.c \
+    src/checksum_app.c \
+    src/chown_app.c \
+    src/cmp_app.c \
+    src/comm_app.c \
+    src/dd_app.c \
+    src/diff_app.c \
+    src/expr_app.c \
+    src/fmt_app.c \
+    src/fold_app.c \
+    src/gzip_app.c \
+    src/nl_app.c \
+    src/nohup_app.c \
+    src/od_app.c \
+    src/paste_app.c \
+    src/patch_app.c \
+    src/printf_app.c \
+    src/readlink_app.c \
+    src/rev_app.c \
+    src/seq_app.c \
+    src/split_app.c \
+    src/tac_app.c \
+    src/tar_app.c \
     ${OPENSSH_LIBS} \
     ${DVTM_LIBS} \
     ${LIBGIT2_LIBS} \
+    -lm -lcrypt \
     -o smallclue
 
 if [ ! -f smallclue ]; then
