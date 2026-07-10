@@ -320,17 +320,24 @@ path = sys.argv[1]
 with open(path) as f:
     text = f.read()
 old_head = "#ifndef _GETOPT_H_\n#define _GETOPT_H_\n\n#ifndef __THROW"
-new_head = """#ifdef HAVE_GETOPT_H
+new_head = """#if defined(HAVE_GETOPT_H) && defined(HAVE_GETOPT_OPTRESET)
 /* This directory is on the include search path ahead of the system's own
  * getopt.h, so a bare #include <getopt.h> anywhere in the tree would
  * otherwise resolve to this compat shim instead of the real header even
  * when the platform provides one (its struct option/getopt_long/
  * getopt_long_only declarations below are `#if 0`'d out precisely because
  * they assume the system header will be the one actually seen). Forward to
- * the next getopt.h on the search path (the system one). Deliberately no
- * _GETOPT_H_ guard around this branch: the system header has its own
- * guard, and defining the same macro name here would make its content get
- * skipped as "already included" without ever having been seen. */
+ * the next getopt.h on the search path (the system one) -- but ONLY when
+ * the system also has BSD's optreset (HAVE_GETOPT_OPTRESET): openbsd-
+ * compat/getopt_long.c's own struct option/getopt_long stay compiled in
+ * (its guard is `!HAVE_GETOPT || !HAVE_GETOPT_OPTRESET`) on any libc that
+ * has getopt_long but lacks optreset -- glibc among them. Forwarding
+ * unconditionally on HAVE_GETOPT_H alone pulls the system's conflicting
+ * struct option into the same translation unit as getopt_long.c's own,
+ * which is a redefinition error, not a redundant-but-harmless one.
+ * Deliberately no _GETOPT_H_ guard around this branch: the system header
+ * has its own guard, and defining the same macro name here would make its
+ * content get skipped as "already included" without ever having been seen. */
 #include_next <getopt.h>
 #elif !defined(_GETOPT_H_)
 #define _GETOPT_H_
