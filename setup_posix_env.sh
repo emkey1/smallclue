@@ -196,7 +196,17 @@ if [ "$(uname -s)" = "Linux" ]; then
     # where both are folded into libSystem. With -static, library order
     # matters -- these must come after every object that references them,
     # so they're appended at the very end of the link line, not here.
-    EXTRA_TAIL_LIBS="-lm -lcrypt"
+    #
+    # -lssl -lcrypto here too: libgit2.a's openssl.c.o (built with
+    # USE_HTTPS=ON) needs SSL_*/SSL_CTX_* symbols. OPENSSH_LIBS already
+    # carries its own -lcrypto earlier in the link line (for OpenSSH's own
+    # crypto use), but that's BEFORE ${LIBGIT2_LIBS} -- static linking is a
+    # single left-to-right pass, so by the time ld reaches libgit2.a's
+    # unresolved SSL_* refs it's already past that -lcrypto and never looks
+    # back ("undefined reference to SSL_connect" etc). Re-listing both here,
+    # after LIBGIT2_LIBS, resolves it the same way CMakeLists.txt's own
+    # libgit2 target_link_libraries ordering already does.
+    EXTRA_TAIL_LIBS="-lm -lcrypt -lssl -lcrypto"
 fi
 
 NEXTVI_SRC="src/nextvi_stubs.c"
