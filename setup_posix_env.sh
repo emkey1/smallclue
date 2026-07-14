@@ -491,7 +491,10 @@ EOF
     fi
 
     echo "Building dvtm applet support (${DVTM_LIBS})..."
-    DVTM_COMMON_DEFS="-D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_XOPEN_SOURCE_EXTENDED -D_GNU_SOURCE ${EXTRA_C_DEFS} -DVERSION=\\\"0.16-pscal\\\" -Dexit=pscalDvtmRequestExit"
+    # DVTM_COMMON_DEFS is expanded unquoted below (plain word-splitting, no
+    # eval/second shell parse) so it must hold the RAW argv text gcc expects
+    # -- one literal backslash-quote per side, not a double-escaped pair.
+    DVTM_COMMON_DEFS="-D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_XOPEN_SOURCE_EXTENDED -D_GNU_SOURCE ${EXTRA_C_DEFS} -DVERSION=\"0.16-pscal\" -Dexit=pscalDvtmRequestExit"
     gcc -std=c99 ${DVTM_COMMON_DEFS} -include "$DVTM_RUNTIME_HOOKS_HEADER" -I"$DVTM_BUILD_DIR" -I"$DVTM_DIR" -Isrc \
         -Dmain=dvtm_main_entry -c "$DVTM_DIR/dvtm.c" -o "$DVTM_BUILD_DIR/dvtm.o"
     gcc -std=c99 ${DVTM_COMMON_DEFS} -include "$DVTM_RUNTIME_HOOKS_HEADER" -I"$DVTM_BUILD_DIR" -I"$DVTM_DIR" -Isrc \
