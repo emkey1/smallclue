@@ -2227,8 +2227,11 @@ static int smallclueHostCommand(int argc, char **argv) {
 
 static int smallclueHostnameCommand(int argc, char **argv) {
     if (argc > 1) {
-        fprintf(stderr, "hostname: setting hostname not supported\n");
-        return 1;
+        if (sethostname(argv[1], strlen(argv[1])) != 0) {
+            fprintf(stderr, "hostname: %s: %s\n", argv[1], strerror(errno));
+            return 1;
+        }
+        return 0;
     }
 
     char path[PATH_MAX];
@@ -2755,7 +2758,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
 #endif
     {"halt", smallclueHaltCommand, "Halt the system"},
     {"host", smallclueHostCommand, "DNS lookup utility"},
-    {"hostname", smallclueHostnameCommand, "Show system hostname"},
+    {"hostname", smallclueHostnameCommand, "Show or set system hostname"},
     {"init", smallclueInitCommand, "System initialization"},
     {"kill", smallclueKillCommand, "Send signals to processes"},
     {"less", smallcluePagerCommand, "Paginate file contents"},
@@ -3194,8 +3197,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -v verbose (hosts debug)\n"
              "  IP-shaped queries auto-detect as PTR/reverse lookups\n"
              "Server override is ignored."},
-    {"hostname", "hostname\n"
-                 "  Show system hostname"},
+    {"hostname", "hostname [NAME]\n"
+                 "  Show system hostname, or set it to NAME (requires CAP_SYS_ADMIN)"},
     {"pbcopy", "pbcopy\n"
                "  Copy stdin to system clipboard"},
     {"pbpaste", "pbpaste\n"
