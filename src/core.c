@@ -4965,6 +4965,9 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         double load[3] = {0, 0, 0};
         bool haveLoad = smallclueTopReadLoadAvg(load);
+        bool inv_video = !batch && isatty(STDOUT_FILENO);
+
+        if (inv_video) fputs("\033[7m", stdout);
         if (haveLoad) {
             printf("Tasks: %zu total   load average: %.2f, %.2f, %.2f\n", count, load[0], load[1], load[2]);
         } else {
@@ -4975,7 +4978,11 @@ static int smallclueTopCommand(int argc, char **argv) {
             printf("Mem: %zuK total, %zuK used, %zuK free\n", mem_total_kb,
                    mem_used_kb, mem_total_kb > mem_used_kb ? mem_total_kb - mem_used_kb : 0);
         }
-        printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        if (inv_video) fputs("\033[0m", stdout);
+        printf("\n");
+        if (inv_video) fputs("\033[7m", stdout);
+        printf("  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        if (inv_video) fputs("\033[0m", stdout);
 
         int rows = -1, cols = -1;
         if (!batch && isatty(STDOUT_FILENO)) {
