@@ -19663,6 +19663,80 @@ static int smallclueTrCommand(int argc, char **argv) {
     ssize_t n;
     int read_err = 0;
 
+    /* Bolt optimization: Fast path for simple translation */
+    if (!deleteMode && !squeezeMode && haveSet2) {
+        while ((n = smallclueReadStream(stdin, buf, sizeof(buf), &read_err)) > 0) {
+            ssize_t i = 0;
+            /* Bolt optimization: Loop unrolling */
+            for (; i <= n - 16; i += 16) {
+                buf[i]    = map[(unsigned char)buf[i]];
+                buf[i+1]  = map[(unsigned char)buf[i+1]];
+                buf[i+2]  = map[(unsigned char)buf[i+2]];
+                buf[i+3]  = map[(unsigned char)buf[i+3]];
+                buf[i+4]  = map[(unsigned char)buf[i+4]];
+                buf[i+5]  = map[(unsigned char)buf[i+5]];
+                buf[i+6]  = map[(unsigned char)buf[i+6]];
+                buf[i+7]  = map[(unsigned char)buf[i+7]];
+                buf[i+8]  = map[(unsigned char)buf[i+8]];
+                buf[i+9]  = map[(unsigned char)buf[i+9]];
+                buf[i+10] = map[(unsigned char)buf[i+10]];
+                buf[i+11] = map[(unsigned char)buf[i+11]];
+                buf[i+12] = map[(unsigned char)buf[i+12]];
+                buf[i+13] = map[(unsigned char)buf[i+13]];
+                buf[i+14] = map[(unsigned char)buf[i+14]];
+                buf[i+15] = map[(unsigned char)buf[i+15]];
+            }
+            for (; i < n; ++i) {
+                buf[i] = map[(unsigned char)buf[i]];
+            }
+            fwrite(buf, 1, n, stdout);
+        }
+        if (read_err) {
+            fprintf(stderr, "tr: read error: %s\n", strerror(read_err));
+            return 1;
+        }
+        return 0;
+    }
+
+    /* Bolt optimization: Fast path for simple deletion */
+    if (deleteMode && !squeezeMode) {
+        while ((n = smallclueReadStream(stdin, buf, sizeof(buf), &read_err)) > 0) {
+            size_t outIdx = 0;
+            ssize_t i = 0;
+            /* Bolt optimization: Loop unrolling with branchless conditional assignments */
+            for (; i <= n - 16; i += 16) {
+                outBuf[outIdx] = buf[i];    outIdx += !set1Member[(unsigned char)buf[i]];
+                outBuf[outIdx] = buf[i+1];  outIdx += !set1Member[(unsigned char)buf[i+1]];
+                outBuf[outIdx] = buf[i+2];  outIdx += !set1Member[(unsigned char)buf[i+2]];
+                outBuf[outIdx] = buf[i+3];  outIdx += !set1Member[(unsigned char)buf[i+3]];
+                outBuf[outIdx] = buf[i+4];  outIdx += !set1Member[(unsigned char)buf[i+4]];
+                outBuf[outIdx] = buf[i+5];  outIdx += !set1Member[(unsigned char)buf[i+5]];
+                outBuf[outIdx] = buf[i+6];  outIdx += !set1Member[(unsigned char)buf[i+6]];
+                outBuf[outIdx] = buf[i+7];  outIdx += !set1Member[(unsigned char)buf[i+7]];
+                outBuf[outIdx] = buf[i+8];  outIdx += !set1Member[(unsigned char)buf[i+8]];
+                outBuf[outIdx] = buf[i+9];  outIdx += !set1Member[(unsigned char)buf[i+9]];
+                outBuf[outIdx] = buf[i+10]; outIdx += !set1Member[(unsigned char)buf[i+10]];
+                outBuf[outIdx] = buf[i+11]; outIdx += !set1Member[(unsigned char)buf[i+11]];
+                outBuf[outIdx] = buf[i+12]; outIdx += !set1Member[(unsigned char)buf[i+12]];
+                outBuf[outIdx] = buf[i+13]; outIdx += !set1Member[(unsigned char)buf[i+13]];
+                outBuf[outIdx] = buf[i+14]; outIdx += !set1Member[(unsigned char)buf[i+14]];
+                outBuf[outIdx] = buf[i+15]; outIdx += !set1Member[(unsigned char)buf[i+15]];
+            }
+            for (; i < n; ++i) {
+                outBuf[outIdx] = buf[i];
+                outIdx += !set1Member[(unsigned char)buf[i]];
+            }
+            if (outIdx > 0) {
+                fwrite(outBuf, 1, outIdx, stdout);
+            }
+        }
+        if (read_err) {
+            fprintf(stderr, "tr: read error: %s\n", strerror(read_err));
+            return 1;
+        }
+        return 0;
+    }
+
     while ((n = smallclueReadStream(stdin, buf, sizeof(buf), &read_err)) > 0) {
         size_t outIdx = 0;
         for (ssize_t i = 0; i < n; ++i) {
