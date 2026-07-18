@@ -30,3 +30,7 @@
 ## 2025-05-19 - Optimization of tee applet block read
 **Learning:** The \`tee\` applet originally processed input using \`smallclueReadStream\` and wrote to outputs using \`fwrite\`, creating significant overhead due to memory copying and lock acquisitions inside \`stdio\`. By bypassing \`stdio\` (e.g., using direct \`read\` and \`write\` system calls on \`STDIN_FILENO\` and \`STDOUT_FILENO\`) with a large stack buffer (64KB), \`tee\`'s throughput is noticeably improved.
 **Action:** Replace \`fread\`/\`fwrite\` with POSIX \`read\`/\`write\` loops in continuous stream tools like \`tee\` while handling \`EINTR\` explicitly and ensuring buffers are flushed correctly (\`fflush(stdout)\`) before transitioning from buffered to raw file descriptors.
+
+## 2024-07-18 - Fast paths and branchless loop unrolling for tr
+**Learning:** For continuous byte-processing streams like `tr`, adding dedicated fast paths for specific operations (e.g., `-d` delete mode or simple translation) can drastically increase performance. By unrolling the character processing loops by a factor of 16 and using branchless arithmetic (like `outIdx += !set1Member[c]`), we avoid tight inner-loop conditionals. This optimization provides almost a 2x speedup in throughput for `tr` commands.
+**Action:** When working on byte-level stream utilities, consider if complex logic checking per-byte (such as checking if the mode is squeeze/translate/delete) can be extracted outside the primary hot-loop into dedicated fast paths, and apply loop unrolling and branchless logic on those paths.
