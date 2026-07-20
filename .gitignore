@@ -1,5 +1,7 @@
 build/
-third-party/
+third-party/*
+!third-party/libgit2
+!third-party/openrsync
 rootfs/
 smallclue
 src/core/build_info.h

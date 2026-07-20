@@ -17,7 +17,7 @@ reset_incomplete_repo() {
         return 0
     fi
 
-    if [ "$require_git" = "1" ] && [ ! -d "$dir/.git" ]; then
+    if [ "$require_git" = "1" ] && [ ! -e "$dir/.git" ]; then
         echo "Removing incomplete dependency at $dir (missing .git)..."
         rm -rf "$dir"
         return 0
@@ -127,6 +127,14 @@ if [ ! -d "$THIRD_PARTY_DIR/dvtm" ]; then
 fi
 
 # --- libgit2 ---
+# Tracked as a git submodule (see .gitmodules) pinned to emkey1/libgit2, the
+# same fork PSCAL's third-party tree uses. `git submodule update --init` is
+# the normal way to populate it; fall back to a plain clone for tarball
+# checkouts (no .git) or PSCAL's own nested tree.
+if [ -f .gitmodules ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "Initializing libgit2 submodule..."
+    git submodule update --init --recursive -- "$THIRD_PARTY_DIR/libgit2"
+fi
 reset_incomplete_repo "$THIRD_PARTY_DIR/libgit2" "1" "CMakeLists.txt" "include/git2.h"
 if [ ! -d "$THIRD_PARTY_DIR/libgit2" ]; then
     if [ -d "../../third-party/libgit2/.git" ]; then
@@ -136,9 +144,23 @@ if [ ! -d "$THIRD_PARTY_DIR/libgit2" ]; then
         echo "Copying libgit2 from ../third-party/libgit2..."
         cp -a "../third-party/libgit2" "$THIRD_PARTY_DIR/libgit2"
     else
-        echo "Cloning libgit2..."
-        git clone https://github.com/libgit2/libgit2 "$THIRD_PARTY_DIR/libgit2"
+        echo "Cloning libgit2 (submodule unavailable)..."
+        git clone https://github.com/emkey1/libgit2 "$THIRD_PARTY_DIR/libgit2"
     fi
+fi
+
+# --- openrsync ---
+# Tracked as a git submodule pinned to emkey1/openrsync (the same fork PSCAL
+# uses, with config_pscal.h already vendored in). Standalone checkouts that
+# aren't nested in PSCAL's third-party/openrsync tree need this.
+if [ -f .gitmodules ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "Initializing openrsync submodule..."
+    git submodule update --init --recursive -- "$THIRD_PARTY_DIR/openrsync"
+fi
+reset_incomplete_repo "$THIRD_PARTY_DIR/openrsync" "1" "config_pscal.h"
+if [ ! -d "$THIRD_PARTY_DIR/openrsync" ]; then
+    echo "Cloning openrsync (submodule unavailable)..."
+    git clone https://github.com/emkey1/openrsync "$THIRD_PARTY_DIR/openrsync"
 fi
 
 # --- OpenSSH ---
