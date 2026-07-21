@@ -19,9 +19,34 @@
       if `third-party/openssh/config.h` is missing, instead of a bare compiler
       "file not found". The openrsync `config_pscal.h` gap is separately fixed
       by the submodule conversion above.
-- [ ] **Split `setup_posix_env.sh` into non-root and root halves.** It demands
-      sudo up front, but stub-file generation and the openssh configure/build
-      steps don't need root — only the rootfs/chroot assembly does.
+- [x] **Split `setup_posix_env.sh` into non-root and root halves.** Steps 0-3
+      (fetch deps, generate stubs, configure/build OpenSSH+dvtm+libgit2,
+      compile+link `smallclue`) moved to a new standalone `build_smallclue.sh`
+      (no sudo needed); `setup_posix_env.sh` now just root-checks, calls it,
+      then does the actual root-only work (rootfs assembly, `/dev`, install,
+      symlinks, `/etc` files). Also fixed two real bugs the root gate had been
+      hiding on macOS, uncovered by finally being able to run steps 0-3
+      standalone here: (1) two `[ -d ".../.git" ]` dependency checks that
+      always failed now that nextvi/dvtm are submodules (`.git` is a file,
+      not a dir, for a submodule) — changed to `-e`; (2) the final `gcc`
+      invocation forced `_POSIX_C_SOURCE`/`_XOPEN_SOURCE`/`_GNU_SOURCE`
+      unconditionally, which on Darwin (even combined with
+      `_DARWIN_C_SOURCE`) hides `chroot(2)`'s prototype and has no OpenSSL
+      `-I` path for `checksum_app.c`'s `<openssl/evp.h>` — both fixed to
+      match CMakeLists.txt's own Apple-vs-not branching.
+  - [ ] **Newly discovered, NOT fixed:** this raw-`gcc` build path (used by
+        `build_smallclue.sh`/`setup_posix_env.sh`, distinct from the CMake
+        path) never actually compiles `src/git_app.c` or
+        `src/openrsync_app.c` into the final binary, despite building
+        libgit2 and fetching openrsync — `git`/`rsync` silently fall back to
+        the "not built in this configuration" stub in binaries built this
+        way. Replicating openrsync's CMake integration (a dozen+ source
+        files needing the same symbol-rename macros CMakeLists.txt applies)
+        in bash is a real chunk of work, deliberately not attempted here.
+        Confirmed present before this session's changes too (not a
+        regression from the split). If this build path is actually used to
+        ship binaries (vs. CMake), this is a real functional gap worth
+        prioritizing.
 - [x] **Add CI.** `.github/workflows/build.yml` runs `fetch_dependencies.sh`
       + openssh `./configure` + cmake configure/build/smoke-test on macOS and
       Linux, on every push/PR to main. Both jobs green on the first real run
