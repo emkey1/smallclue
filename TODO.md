@@ -54,9 +54,24 @@
 
 ## Known bugs / behavior gaps
 
-- [ ] **rsync `-c`/`--checksum` can hang against a non-openrsync/smallclue
-      peer** (both ends block in poll(); README documents `--timeout=N` as the
-      workaround). Fix would be detecting/failing loudly like `-z` does.
+- [x] **rsync `-c`/`--checksum` could hang indefinitely** (both ends block in
+      poll()). Mitigated in `third-party/openrsync/main.c`: `-c` without an
+      explicit `--timeout` now gets a bounded 60s default poll timeout
+      (`PSCAL_CHECKSUM_DEFAULT_TIMEOUT`), converting the hang into a clean
+      "poll: timeout" failure. `--timeout=N`/`--timeout=0` still override it.
+      This is a safety net, not a root-cause fix.
+  - [ ] **Bigger finding while testing the above:** the underlying bug isn't
+        foreign-peer-specific as previously documented/commented. Re-tested
+        the exact same-size/same-mtime/differing-content `-c` case
+        smallclue-to-smallclue (local socketpair, both ends this fork's
+        binary): single-file sync hangs (now bounded by the fix above);
+        directory sync (`-c -r`) fails immediately with "unexpected end of
+        file" instead of hanging at all. Corrected the stale
+        "confirmed working... fast, no hang" claim in fargs.c and README.
+        Root-causing the actual whole-file-checksum wire exchange (why it
+        breaks locally, not just against foreign/newer-protocol peers) is
+        unscoped here — needs a dedicated session with real protocol-level
+        debugging (packet tracing between the forked sender/receiver).
 - [ ] Legacy rsync engine (`PSCALI_RSYNC_LEGACY=1`): remote
       `-u/-c/--include/--exclude/--delete` are not implemented in the scp
       bridge path.
