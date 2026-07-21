@@ -69,6 +69,163 @@ file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated/openrsync)
 configure_file(${OPENRSYNC_ROOT}/config_pscal.h
     ${CMAKE_CURRENT_BINARY_DIR}/generated/openrsync/config.h COPYONLY)
 
+# --- Standalone-build stub generation -------------------------------------
+# setup_posix_env.sh/setup_ish_env.sh (rootfs-oriented, require sudo) also
+# write these files as a side effect, with identical static content. For a
+# plain standalone `cmake .. && cmake --build .` (no rootfs needed), generate
+# them here instead so the build doesn't require root just to get source
+# files that have no system-specific content. Never overwrites an existing
+# file, so PSCAL/rootfs builds that already generated these are untouched.
+if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/core/build_info.h)
+    file(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/src/core/build_info.h
+"#ifndef BUILD_INFO_H
+#define BUILD_INFO_H
+#define BUILD_VERSION \"1.0.0-test\"
+#include <stdbool.h>
+#include <stddef.h>
+bool pscalRuntimeStderrIsInteractive(void);
+const char *pscal_program_version_string(void);
+bool pathTruncateEnabled(void);
+bool pathTruncateStrip(const char *path, char *buffer, size_t buflen);
+#endif
+")
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third-party/openssh AND
+   NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third-party/openssh/pscal_runtime_hooks.h)
+    file(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/third-party/openssh/pscal_runtime_hooks.h
+"#ifndef PSCAL_RUNTIME_HOOKS_H
+#define PSCAL_RUNTIME_HOOKS_H
+#include <setjmp.h>
+#include <signal.h>
+typedef struct {
+    int exit_code;
+    jmp_buf env;
+} pscal_openssh_exit_context;
+
+void pscal_openssh_reset_progress_state(void);
+void pscal_openssh_push_exit_context(pscal_openssh_exit_context *ctx);
+void pscal_openssh_pop_exit_context(pscal_openssh_exit_context *ctx);
+void pscal_openssh_set_global_exit_handler(sigjmp_buf *env, volatile sig_atomic_t *code_out);
+void pscal_openssh_request_exit(int code);
+#endif
+")
+endif()
+
+if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third-party/ios_system/ssh_keygen/sshkey.h)
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/third-party/ios_system/ssh_keygen)
+    file(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/third-party/ios_system/ssh_keygen/sshkey.h
+"#ifndef SSHKEY_H
+#define SSHKEY_H
+struct sshkey {
+    int dummy;
+};
+#endif
+")
+endif()
+
+if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/openssh_globals.c)
+    file(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/src/openssh_globals.c
+"#include <signal.h>
+#include <stdint.h>
+volatile sig_atomic_t pscal_openssh_interrupted = 0;
+int pscal_openssh_showprogress = 1;
+
+/*
+ * Some OpenSSH object files (e.g. ML-KEM code paths) may reference htole64/le64toh
+ * as external symbols depending on libc feature exposure. Provide weak fallbacks so
+ * static smallclue links remain portable across Linux build environments.
+ */
+#if defined(__linux__)
+# ifdef htole64
+#  undef htole64
+# endif
+# ifdef le64toh
+#  undef le64toh
+# endif
+__attribute__((weak)) uint64_t htole64(uint64_t v) {
+# if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return v;
+# else
+    return __builtin_bswap64(v);
+# endif
+}
+__attribute__((weak)) uint64_t le64toh(uint64_t v) {
+# if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return v;
+# else
+    return __builtin_bswap64(v);
+# endif
+}
+#endif
+")
+endif()
+
+if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime_stubs_extra.c)
+    file(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime_stubs_extra.c
+"#include \"smallclue.h\"
+#include <stdbool.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+#include <errno.h>
+
+bool pscalRuntimeStderrIsInteractive(void) {
+    return isatty(STDERR_FILENO);
+}
+
+const char *pscal_program_version_string(void) {
+    return \"1.0.0-test\";
+}
+
+bool pathTruncateEnabled(void) {
+    return false;
+}
+
+bool pathTruncateStrip(const char *path, char *buffer, size_t buflen) {
+    if (!path || !buffer || buflen == 0) return false;
+    strncpy(buffer, path, buflen - 1);
+    buffer[buflen - 1] = '\\0';
+    return false; /* Did not modify */
+}
+
+/* exsh stubs removed: standalone builds use smallclue's built-in sh */
+
+/* core.c's applet table references these unconditionally (git/rsync entries
+ * aren't ifdef-guarded), but their real implementations (src/git_app.c,
+ * src/openrsync_app.c) need libgit2/the vendored openrsync tree, which this
+ * script only builds when SMALLCLUE_WITH_LIBGIT2=1 / openrsync is fetched.
+ * Weak so the real, strong definition (when those sources are compiled in
+ * below) silently wins the link over this fallback. */
+__attribute__((weak)) int smallclueGitCommand(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, \"git: not built in this configuration (libgit2 unavailable)\\n\");
+    return 127;
+}
+
+__attribute__((weak)) int smallclueRunRsync(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, \"rsync: real-protocol client not built in this configuration (openrsync unavailable)\\n\");
+    return 127;
+}
+")
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third-party/openssh AND
+   NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third-party/openssh/config.h)
+    message(FATAL_ERROR
+        "third-party/openssh/config.h is missing -- OpenSSH hasn't been "
+        "configured yet. From third-party/openssh, run:\n"
+        "    ./configure --sysconfdir=/etc/ssh\n"
+        "(on macOS, point CPPFLAGS/LDFLAGS/PKG_CONFIG_PATH at your OpenSSL "
+        "install first, e.g. via `brew --prefix openssl@3`). "
+        "See setup_posix_env.sh's OpenSSH configure step for the exact flags "
+        "used on Linux/macOS if `./configure` fails outright.")
+endif()
+
 # Source files
 set(NEXTVI_SOURCES third-party/nextvi/vi.c)
 
