@@ -11472,8 +11472,18 @@ static int smallclueCatFileFormatted(const char *path, const SmallclueCatOptions
     return status;
 }
 
+static char smallclueFileTypeChar(mode_t mode) {
+    if (S_ISDIR(mode)) return 'd';
+    if (S_ISLNK(mode)) return 'l';
+    if (S_ISCHR(mode)) return 'c';
+    if (S_ISBLK(mode)) return 'b';
+    if (S_ISFIFO(mode)) return 'p';
+    if (S_ISSOCK(mode)) return 's';
+    return '-';
+}
+
 static void print_permissions(mode_t mode) {
-    putchar(S_ISDIR(mode) ? 'd' : S_ISLNK(mode) ? 'l' : '-');
+    putchar(smallclueFileTypeChar(mode));
     putchar(mode & S_IRUSR ? 'r' : '-');
     putchar(mode & S_IWUSR ? 'w' : '-');
     putchar(mode & S_IXUSR ? 'x' : '-');
@@ -22330,6 +22340,46 @@ static bool smallclueMountRemoveFstabEntry(const char *target) {
 }
 #endif
 
+#if defined(__linux__) || defined(linux) || defined(__linux)
+/*
+ * The kernel mount(2) syscall has no "auto" filesystem type -- that's a
+ * mount(8) userspace convention. Real util-linux mount resolves it via
+ * libblkid, falling back (per mount(8)) to trying every non-"nodev" type
+ * listed in /proc/filesystems. Mirror that fallback here so unqualified
+ * `mount device dir` doesn't fail with ENODEV.
+ */
+static bool smallclueMountAutoProbe(const char *source, const char *target,
+                                     unsigned long flags, const void *data,
+                                     int *out_errno) {
+    FILE *fp = fopen("/proc/filesystems", "r");
+    if (!fp) {
+        if (out_errno) *out_errno = errno;
+        return false;
+    }
+    char line[128];
+    int last_errno = ENODEV;
+    bool mounted = false;
+    while (fgets(line, sizeof(line), fp)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = '\0';
+        const char *nodev_marker = line;
+        const char *fstype = tab + 1;
+        if (nodev_marker[0] != '\0' || fstype[0] == '\0') continue;
+        if (mount(source, target, fstype, flags, data) == 0) {
+            mounted = true;
+            break;
+        }
+        last_errno = errno;
+    }
+    fclose(fp);
+    if (out_errno) *out_errno = last_errno;
+    return mounted;
+}
+#endif
+
 static int smallclueMountCommand(int argc, char **argv) {
 #if defined(__linux__) || defined(linux) || defined(__linux)
     const char *usage = "usage: mount [-t type] [-o options] device dir\n";
@@ -22432,10 +22482,19 @@ static int smallclueMountCommand(int argc, char **argv) {
         free(options);
     }
 
-    int rc = mount(source, target, type ? type : "auto", flags, data);
+    bool need_probe = !type || strcmp(type, "auto") == 0;
+    int rc;
+    int mount_errno = 0;
+    if (need_probe) {
+        rc = smallclueMountAutoProbe(source, target, flags, data, &mount_errno) ? 0 : -1;
+    } else {
+        rc = mount(source, target, type, flags, data);
+        mount_errno = errno;
+    }
     if (data) free(data);
 
     if (rc != 0) {
+        errno = mount_errno;
         perror("mount");
         return 1;
     }
@@ -22864,7 +22923,7 @@ static void smallclueStatFormatPerms(char *buf, size_t buflen, mode_t mode) {
     if (!buf || buflen < 11) {
         return;
     }
-    buf[0] = S_ISDIR(mode) ? 'd' : S_ISLNK(mode) ? 'l' : '-';
+    buf[0] = smallclueFileTypeChar(mode);
     buf[1] = (mode & S_IRUSR) ? 'r' : '-';
     buf[2] = (mode & S_IWUSR) ? 'w' : '-';
     buf[3] = (mode & S_IXUSR) ? 'x' : '-';
