@@ -24,9 +24,12 @@
 **Learning:** The `head` applet (`smallclueHeadStream` in `src/core.c`) is optimized by replacing line-by-line dynamic allocations (`smallclueGetlineStream`) with 16KB block processing (`smallclueReadStream`) and a manually unrolled loop to scan for newlines, significantly reducing system call and heap allocation overhead.
 **Action:** For sequential parsing, use 16KB block reads with `smallclueReadStream` rather than byte-by-byte or line-by-line dynamic allocations (`smallclueGetlineStream`), and unroll inner loops to eliminate branching overhead.
 
-## $(date +%Y-%m-%d) - Optimize Cat throughput via syscall bypass
+## 2025-05-19 - Optimize Cat throughput via syscall bypass
 **Learning:** For file stream utilities like `cat`, wrapping the stream through stdio `fwrite()` imposes unneeded overhead due to buffering memory copies and lock acquisition compared to raw direct POSIX `write()` loops. By upgrading `cat_file`/`print_file` to use direct `write(STDOUT_FILENO)` with a large stack buffer (64K), we avoid stdio bottlenecking.
 **Action:** When implementing tools meant to shovel bytes quickly (cat, yes, dd), use unbuffered direct system calls like `read` and `write` wrapped in retry loops for `EINTR`, and manually ensure `fflush()` is called on stdio streams beforehand if intermixing could occur.
 ## 2025-05-19 - Optimization of tee applet block read
 **Learning:** The \`tee\` applet originally processed input using \`smallclueReadStream\` and wrote to outputs using \`fwrite\`, creating significant overhead due to memory copying and lock acquisitions inside \`stdio\`. By bypassing \`stdio\` (e.g., using direct \`read\` and \`write\` system calls on \`STDIN_FILENO\` and \`STDOUT_FILENO\`) with a large stack buffer (64KB), \`tee\`'s throughput is noticeably improved.
 **Action:** Replace \`fread\`/\`fwrite\` with POSIX \`read\`/\`write\` loops in continuous stream tools like \`tee\` while handling \`EINTR\` explicitly and ensuring buffers are flushed correctly (\`fflush(stdout)\`) before transitioning from buffered to raw file descriptors.
+## 2025-05-19 - Optimization of tail stream ring buffer
+**Learning:** The `tail` applet (`smallclueTailStream` in `src/core.c`) originally used an array of dynamically allocated strings (`char **ring`) and called `malloc` and `free` on every new line, adding significant overhead for continuous streams.
+**Action:** Replace dynamically allocated string arrays with a struct-based ring buffer (`{ char *data; size_t cap; }`) that reuses capacities via `realloc`, significantly reducing `malloc` and `free` overhead for continuous streams.
