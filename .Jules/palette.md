@@ -21,3 +21,7 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+
+## 2025-07-04 - Continuous Output Applet UI Check
+**Learning:** In continuous output applets like `watch` and `top`, when the output is redirected and is not a TTY, screen-clearing ANSI escape sequences (like `[2J`) garble the output stream. Replacing these sequences with a simple newline separator maintains readable, visually separated iteration logs.
+**Action:** Always check `isatty` before emitting screen-clearing sequences in continuous running terminal applications, and provide an alternate visual separator (like a newline) for redirected streams.
