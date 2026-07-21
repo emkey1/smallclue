@@ -21,3 +21,7 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+
+## 2024-05-24 - Continuous Output Redirection
+**Learning:** Terminal utilities that redraw the screen periodically (like `top` and `watch`) break log readability when redirected to a file if they continue to emit ANSI clear-screen sequences.
+**Action:** Always guard screen-clearing sequences (`\x1b[2J\x1b[H`) with `isatty(STDOUT_FILENO)`. When redirected, replace the clear sequence with a simple newline to provide visual separation between iteration snapshots.
