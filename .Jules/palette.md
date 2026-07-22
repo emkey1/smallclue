@@ -21,3 +21,6 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+## 2026-07-22 - Tabular data headers in interactive terminal
+**Learning:** Tabular data like `top` output benefits significantly from visual separation (like inverse video `[7m`) for the header row when running interactively. This improves readability and establishes visual hierarchy without cluttering non-interactive redirected output.
+**Action:** Always wrap tabular terminal output headers in inverse video or bold formatting (guarded by `isatty`) to improve UX and visual parsing.

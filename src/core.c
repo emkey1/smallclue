@@ -4975,7 +4975,11 @@ static int smallclueTopCommand(int argc, char **argv) {
             printf("Mem: %zuK total, %zuK used, %zuK free\n", mem_total_kb,
                    mem_used_kb, mem_total_kb > mem_used_kb ? mem_total_kb - mem_used_kb : 0);
         }
-        printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        if (!batch && isatty(STDOUT_FILENO)) {
+            printf("\n\033[7m  %5s %5s %-8s %s %7s %6s %-12s\033[0m\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        } else {
+            printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        }
 
         int rows = -1, cols = -1;
         if (!batch && isatty(STDOUT_FILENO)) {
