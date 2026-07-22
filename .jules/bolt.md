@@ -30,3 +30,6 @@
 ## 2025-05-19 - Optimization of tee applet block read
 **Learning:** The \`tee\` applet originally processed input using \`smallclueReadStream\` and wrote to outputs using \`fwrite\`, creating significant overhead due to memory copying and lock acquisitions inside \`stdio\`. By bypassing \`stdio\` (e.g., using direct \`read\` and \`write\` system calls on \`STDIN_FILENO\` and \`STDOUT_FILENO\`) with a large stack buffer (64KB), \`tee\`'s throughput is noticeably improved.
 **Action:** Replace \`fread\`/\`fwrite\` with POSIX \`read\`/\`write\` loops in continuous stream tools like \`tee\` while handling \`EINTR\` explicitly and ensuring buffers are flushed correctly (\`fflush(stdout)\`) before transitioning from buffered to raw file descriptors.
+## 2026-07-22 - Optimization of tail applet memory allocations
+**Learning:** The `tail` applet originally stored lines in a ring buffer as an array of strings (`char **ring`), calling `malloc` and `free` for each newly read line. When tailing large files, this high volume of heap allocations creates significant overhead.
+**Action:** Replaced the array of string pointers with an array of structs (`TailRingBuffer`) that pairs the buffer pointer with its capacity. Use `realloc` to reuse previously allocated memory across iterations, falling back to `realloc` only when the incoming line exceeds the buffer's capacity.
