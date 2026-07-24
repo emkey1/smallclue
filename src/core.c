@@ -4965,17 +4965,22 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         double load[3] = {0, 0, 0};
         bool haveLoad = smallclueTopReadLoadAvg(load);
+
+        bool interactive = !batch && isatty(STDOUT_FILENO);
+        const char *inv = interactive ? "\033[7m" : "";
+        const char *rst = interactive ? "\033[0m" : "";
+
         if (haveLoad) {
-            printf("Tasks: %zu total   load average: %.2f, %.2f, %.2f\n", count, load[0], load[1], load[2]);
+            printf("%sTasks: %zu total   load average: %.2f, %.2f, %.2f%s\n", inv, count, load[0], load[1], load[2], rst);
         } else {
-            printf("Tasks: %zu total\n", count);
+            printf("%sTasks: %zu total%s\n", inv, count, rst);
         }
-        printf("Cpu(s): %.1f%% used, %.1f%% idle\n", aggregate_cpu_pct, 100.0 - aggregate_cpu_pct);
+        printf("%sCpu(s): %.1f%% used, %.1f%% idle%s\n", inv, aggregate_cpu_pct, 100.0 - aggregate_cpu_pct, rst);
         if (haveMem) {
-            printf("Mem: %zuK total, %zuK used, %zuK free\n", mem_total_kb,
-                   mem_used_kb, mem_total_kb > mem_used_kb ? mem_total_kb - mem_used_kb : 0);
+            printf("%sMem: %zuK total, %zuK used, %zuK free%s\n", inv, mem_total_kb,
+                   mem_used_kb, mem_total_kb > mem_used_kb ? mem_total_kb - mem_used_kb : 0, rst);
         }
-        printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        printf("\n%s  %5s %5s %-8s %s %7s %6s %s%s\n", inv, "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND", rst);
 
         int rows = -1, cols = -1;
         if (!batch && isatty(STDOUT_FILENO)) {

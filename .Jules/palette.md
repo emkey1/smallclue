@@ -21,3 +21,7 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+
+## $(date +%Y-%m-%d) - Top Status Visual Separation
+**Learning:** Utilities that display continuously updating lists (like `top`) lack visual separation between their summary/header lines and the data rows, making them harder to parse at a glance.
+**Action:** Always wrap the header/status lines of such utilities in inverse video (`\033[7m`) when outputting to an interactive terminal to establish a clear visual hierarchy.
