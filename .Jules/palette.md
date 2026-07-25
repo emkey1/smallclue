@@ -21,3 +21,6 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+## 2026-07-25 - Fullscreen Applet Visual Hierarchy: top (Linux branch)
+**Learning:** The Linux implementation of the `top` applet summary lines and table headers lacked visual separation, violating the principle established for fullscreen utilities.
+**Action:** Always ensure that all branches (e.g., iOS vs. Linux) of fullscreen TUI utilities consistently apply inverse video formatting (`\033[7m`) to their headers and status lines.
