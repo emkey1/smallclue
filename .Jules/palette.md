@@ -21,3 +21,6 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+## 2023-10-26 - Top Iteration Logs UX
+**Learning:** Continuous terminal programs like `top` that render fullscreen typically clear the screen between frames using ANSI escape codes. When users pipe or redirect output (batch mode), these raw codes pollute the log stream, and removing them entirely results in continuous walls of text with no visual separation between iterations.
+**Action:** When a continuous-output terminal utility detects a redirected/non-TTY environment (where it cannot clear the screen), always replace the screen-clearing logic with a simple newline (`\n`) to ensure iteration logs remain readable and cleanly separated.
