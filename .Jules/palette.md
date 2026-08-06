@@ -21,3 +21,7 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+
+## 2024-05-24 - Tabular Headers and Fullscreen Top Output
+**Learning:** Fullscreen applets like top have a tabular structure that becomes hard to parse without a clear header division. Wrapping the header string natively in ANSI codes works beautifully, but requires respecting `isatty` to avoid log pollution.
+**Action:** Use inverse video for fixed-width tabular column headers in fullscreen applets to differentiate them from variables output.
