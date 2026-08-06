@@ -20281,7 +20281,6 @@ static int smallclueWcProcessFileFast(const char *path, FILE *fp, SmallclueWcCou
                 lines++;
             }
 
-            /* Bolt optimization: inline space check instead of isspace() to avoid function call overhead */
             int is_sp = (c == ' ') || (c >= '\t' && c <= '\r');
             if (is_sp) {
                 in_word = 0;
@@ -20322,14 +20321,48 @@ static int smallclueWcProcessFileWide(const char *path, FILE *fp, SmallclueWcCou
     unsigned char carry[16];
     size_t carryLen = 0;
 
+    unsigned char scratch[sizeof(buf) + sizeof(carry)];
     while ((n = smallclueReadStream(fp, buf, sizeof(buf), &read_err)) > 0) {
         bytes += (uint64_t)n;
 
-        for (int i = 0; i < n; ++i) {
+        ssize_t i = 0;
+        /* Bolt optimization: loop unrolling for wc */
+        #define PROCESS_CHAR(idx) do { \
+            unsigned char c = (unsigned char)buf[idx]; \
+            lines += (c == '\n'); \
+            if ((c == ' ') || (c >= '\t' && c <= '\r')) { \
+                in_word = 0; \
+            } else if (!in_word) { \
+                words++; \
+                in_word = 1; \
+            } \
+        } while (0)
+
+        for (; i + 15 < n; i += 16) {
+            PROCESS_CHAR(i);
+            PROCESS_CHAR(i+1);
+            PROCESS_CHAR(i+2);
+            PROCESS_CHAR(i+3);
+            PROCESS_CHAR(i+4);
+            PROCESS_CHAR(i+5);
+            PROCESS_CHAR(i+6);
+            PROCESS_CHAR(i+7);
+            PROCESS_CHAR(i+8);
+            PROCESS_CHAR(i+9);
+            PROCESS_CHAR(i+10);
+            PROCESS_CHAR(i+11);
+            PROCESS_CHAR(i+12);
+            PROCESS_CHAR(i+13);
+            PROCESS_CHAR(i+14);
+            PROCESS_CHAR(i+15);
+        }
+        #undef PROCESS_CHAR
+        for (; i < n; ++i) {
             unsigned char c = (unsigned char)buf[i];
             if (c == '\n') {
                 lines++;
             }
+
             int is_sp = (c == ' ') || (c >= '\t' && c <= '\r');
             if (is_sp) {
                 in_word = 0;
@@ -20342,11 +20375,6 @@ static int smallclueWcProcessFileWide(const char *path, FILE *fp, SmallclueWcCou
         /* Character decode: work off a carry buffer so a multibyte
          * sequence split across two reads still decodes correctly. */
         size_t avail = carryLen + (size_t)n;
-        unsigned char *scratch = (unsigned char *)malloc(avail > 0 ? avail : 1);
-        if (!scratch) {
-            fprintf(stderr, "wc: out of memory\n");
-            return 1;
-        }
         if (carryLen) memcpy(scratch, carry, carryLen);
         memcpy(scratch + carryLen, buf, (size_t)n);
 
@@ -20387,7 +20415,6 @@ static int smallclueWcProcessFileWide(const char *path, FILE *fp, SmallclueWcCou
             pos += rc;
             carryLen = 0;
         }
-        free(scratch);
     }
 
     if (cur_line_length > max_line_length) max_line_length = cur_line_length;
