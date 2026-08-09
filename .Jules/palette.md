@@ -21,3 +21,6 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+## 2026-08-09 - Fullscreen Applet Visual Hierarchy (Top)
+**Learning:** The `top` applet lacked visual separation between its header line and the continuous process output when running in interactive mode. Without inverse video styling, the UI blends into the output payload.
+**Action:** Modified `smallclueTopCommand` in `src/core.c` to check `isatty(STDOUT_FILENO)` and render the column header using inverse video (`[7m`) for better readability.
