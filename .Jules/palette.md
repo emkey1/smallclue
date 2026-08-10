@@ -21,3 +21,6 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+## 2025-05-23 - Top Column Header Visual Hierarchy
+**Learning:** For tabular fullscreen displays like `top`, printing unstyled column headers makes them blend in with the dense data rows, reducing scannability and breaking the visual hierarchy of the TUI.
+**Action:** Always wrap fixed-width table headers in inverse video (`\033[7m`) when rendering interactively in the terminal to visually separate the header from the data rows.
