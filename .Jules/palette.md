@@ -21,3 +21,6 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+## 2024-05-14 - Add inverse video styling to `top` header
+**Learning:** `top` (and other full screen terminal processes like `watch`) uses `\033[7m` and `\033[0m` (inverse video ANSI styling) for their header rows during interactive execution to visually separate the UI tools from process data.
+**Action:** Always guard terminal-interactive styling with `isatty` output checks (and `batch` flags where available) and use standard ANSI `\033[7m` sequences to implement it.
