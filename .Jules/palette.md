@@ -21,3 +21,7 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+
+## 2026-08-13 - Top Column Header Formatting
+**Learning:** In top-like tools, adding inverse video strictly around the fixed column headers rather than the variable-width summary lines avoids jagged, broken highlighting.
+**Action:** Apply inverse video to fixed-width table headers in terminal UIs to provide a clean visual separation.
