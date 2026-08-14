@@ -18,13 +18,11 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 ### File Management
 * **ls**: List directory contents (supports colors, `-l`, `-h`, `-a`, `-t`).
 * **cp**: Copy files and directories (recursive).
-* **rsync**: Synchronize files/directories locally or over SSH (`-a`, `-r`, `-p`, `-t`, `-u`, `-c`, `-v`, `-z`, `-n`, `--delete`, `--include`, `--exclude`). Remote `host:path` transfers are routed through the OpenSSH `scp` backend (supports `-a/-r/-p/-t/-v/-z`, plus `-n` preview; remote `-u/-c/--include/--exclude/--delete` are not yet implemented).
 * **mv**: Move or rename files.
 * **rm**: Remove files and directories.
 * **mkdir** / **rmdir**: Create or remove directories.
 * **touch**: Update file timestamps or create empty files.
 * **ln**: Create links (symbolic and hard).
-* **mount** / **umount**: Add or remove filesystem mounts (iOS supports virtual bind mounts).
 * **pwd**: Print working directory.
 * **chmod**: Change file modes/permissions (supports octal and symbolic `u+x`).
 * **du**: Estimate file space usage.
@@ -68,7 +66,6 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 
 ### Shell & System
 * **sh**: Launches the PSCAL shell frontend (`exsh`).
-* **dvtm**: Launch the dvtm terminal multiplexer applet (enabled in iOS/iPadOS chroot and Docker setup builds).
 * **env**: Run a program in a modified environment.
 * **ps**: Report a snapshot of current processes.
 * **kill**: Send signals to processes.
@@ -86,7 +83,6 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **script**: Record terminal output to a file.
 * **watch**: Execute a program periodically, showing output fullscreen.
 * **time**: Measure command runtime.
-* **git**: Built-in libgit2-backed git applet (currently supports: `init`, `clone`, `remote`, `fetch`, `pull`, `push`, `add`, `commit`, `reset`, `restore`, `checkout`, `switch`, `config` (`--get`, `--get-all`, `--list`, set, `--add`, `--replace-all`, `--unset`, `--unset-all`), `symbolic-ref`, `rev-list`, `show-ref`, `ls-files`, `rev-parse`, `status`, `branch` (list/create/delete/rename), `tag` (list/create/delete), `diff`, `log`, and `show`).
 * **type**: Describe command names.
 * **xargs**: Build and execute command lines from standard input.
 * **pbcopy** / **pbpaste**: Clipboard helpers (on iOS/iPadOS these integrate with the system clipboard).
@@ -105,15 +101,6 @@ These applets are only registered on `PSCAL_TARGET_IOS` builds.
 * **dmesg**: Prints the PSCAL runtime session log.
 * **top**: Show PSCAL virtual processes.
 * **licenses**: View open source licenses included in the distribution.
-
-## Build Notes (iOS/iPadOS chroot + Docker)
-
-* `setup_posix_env.sh` and `setup_ish_env.sh` now build SmallCLUE with `dvtm` enabled by default.
-* Set `SMALLCLUE_WITH_DVTM=0` to explicitly disable `dvtm` during these setup builds.
-* `setup_posix_env.sh` and `setup_ish_env.sh` now build and link bundled `libgit2` by default when `third-party/libgit2` is present.
-* Set `SMALLCLUE_WITH_LIBGIT2=0` to skip libgit2 integration in these setup builds.
-* Docker builds require curses development headers/libraries (`libncurses-dev`); the Dockerfile dependency check/install path now includes this.
-* The `version` applet prints the linked `libgit2` version when libgit2 support is enabled.
 
 ## Usage
 

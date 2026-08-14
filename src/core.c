@@ -10,13 +10,9 @@
 #include "micro_app.h"
 #include "nextvi_app.h"
 #include "openssh_app.h"
-#include "openrsync_app.h"
 #include "common/runtime_clipboard.h"
 #if defined(PSCAL_HAS_LIBCURL)
 #include <curl/curl.h>
-#endif
-#if defined(PSCAL_HAS_LIBGIT2)
-#include <git2.h>
 #endif
 #if defined(PSCAL_TARGET_IOS)
 #include "common/path_virtualization.h"
@@ -73,7 +69,6 @@
 #include <stdatomic.h>
 #include <sys/select.h>
 #include <glob.h>
-#include <pthread.h>
 #include "common/pscal_hosts.h"
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -94,28 +89,12 @@ void PSCALRuntimeEndScriptCapture(void) __attribute__((weak));
 int PSCALRuntimeScriptCaptureActive(void) __attribute__((weak));
 int pscalRuntimeOpenShellTab(void) __attribute__((weak));
 char *pscalRuntimePickMountSourceDirectory(void) __attribute__((weak));
-extern int PSCALRuntimePingHost(const char *host,
-    int count,
-    int timeout_ms,
-    char **out_output) __attribute__((weak_import));
-extern void *PSCALRuntimeGetCurrentRuntimeContext(void) __attribute__((weak_import));
-extern void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) __attribute__((weak_import));
-#if !defined(__APPLE__)
-extern int PSCALRuntimePingHost(const char *host,
-    int count,
-    int timeout_ms,
-    char **out_output) __attribute__((weak));
-extern void *PSCALRuntimeGetCurrentRuntimeContext(void) __attribute__((weak));
-extern void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) __attribute__((weak));
-#endif
 #ifndef PSCAL_RUNTIME_CAPTURE_IMPL
 __attribute__((weak)) void PSCALRuntimeBeginScriptCapture(const char *path, int append) { (void)path; (void)append; }
 __attribute__((weak)) void PSCALRuntimeEndScriptCapture(void) {}
 __attribute__((weak)) int PSCALRuntimeScriptCaptureActive(void) { return 0; }
 __attribute__((weak)) int pscalRuntimeOpenShellTab(void) { errno = ENOSYS; return -1; }
 __attribute__((weak)) char *pscalRuntimePickMountSourceDirectory(void) { errno = ENOSYS; return NULL; }
-__attribute__((weak)) void *PSCALRuntimeGetCurrentRuntimeContext(void) { return NULL; }
-__attribute__((weak)) void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) { (void)ctx; }
 #endif
 __attribute__((weak)) char *pscalRuntimeCopyMarketingVersion(void) { return NULL; }
 #endif
@@ -147,7 +126,6 @@ int PSCALRuntimeScriptCaptureActive(void) { return 0; }
 #endif
 
 int smallclueVprocTestCommand(int argc, char **argv);
-int smallclueGitCommand(int argc, char **argv);
 
 static ssize_t smallclueGetlineStream(char **line, size_t *cap, FILE *stream, int *out_errno);
 static uint64_t gSmallclueProcessStartMonoNs = 0;
@@ -384,6 +362,9 @@ static const char *smallclueDisplayPath(const char *path, char *buffer, size_t b
     return path;
 }
 
+static bool smallclueResolveCommandPathForExec(const char *name, char *resolved, size_t resolved_size);
+
+#if defined(PSCAL_TARGET_IOS)
 static bool smallcluePathHasShebang(const char *path) {
     if (!path || !*path) {
         return false;
@@ -398,9 +379,6 @@ static bool smallcluePathHasShebang(const char *path) {
     return n == 2 && header[0] == '#' && header[1] == '!';
 }
 
-static bool smallclueResolveCommandPathForExec(const char *name, char *resolved, size_t resolved_size);
-
-#if defined(PSCAL_TARGET_IOS)
 static bool smallclueReadShebangInterpreter(const char *path,
                                             char *interpreter,
                                             size_t interpreter_size,
@@ -456,301 +434,6 @@ static bool smallclueReadShebangInterpreter(const char *path,
         }
     }
     return true;
-}
-
-typedef int (*SmallclueToolEntryFn)(int argc, char **argv);
-
-static SmallclueToolEntryFn smallclueLookupToolEntrySymbol(const char *symbol_name) {
-    if (!symbol_name || !*symbol_name) {
-        return NULL;
-    }
-    return (SmallclueToolEntryFn)dlsym(RTLD_DEFAULT, symbol_name);
-}
-
-static const char *smallclueResolveShebangToolName(const char *interpreter) {
-    if (!interpreter || !*interpreter) {
-        return NULL;
-    }
-    const char *base = strrchr(interpreter, '/');
-    base = base ? (base + 1) : interpreter;
-    if (strcasecmp(base, "pascal") == 0) return "pascal";
-    if (strcasecmp(base, "clike") == 0) return "clike";
-    if (strcasecmp(base, "rea") == 0) return "rea";
-    if (strcasecmp(base, "pscalvm") == 0) return "pscalvm";
-    if (strcasecmp(base, "pscaljson2bc") == 0) return "pscaljson2bc";
-#ifdef BUILD_DASCAL
-    if (strcasecmp(base, "dascal") == 0) return "dascal";
-#endif
-#ifdef BUILD_PSCALD
-    if (strcasecmp(base, "pscald") == 0) return "pscald";
-    if (strcasecmp(base, "pscalasm") == 0) return "pscalasm";
-#endif
-#if defined(SMALLCLUE_WITH_EXSH)
-    if (strcasecmp(base, "sh") == 0) return "exsh";
-    if (strcasecmp(base, "exsh") == 0) return "exsh";
-#endif
-    return NULL;
-}
-
-static SmallclueToolEntryFn smallclueResolveShebangToolEntry(const char *tool_name) {
-    if (!tool_name || !*tool_name) {
-        return NULL;
-    }
-    if (strcmp(tool_name, "pascal") == 0) return smallclueLookupToolEntrySymbol("pascal_main");
-    if (strcmp(tool_name, "clike") == 0) return smallclueLookupToolEntrySymbol("clike_main");
-    if (strcmp(tool_name, "rea") == 0) return smallclueLookupToolEntrySymbol("rea_main");
-    if (strcmp(tool_name, "pscalvm") == 0) return smallclueLookupToolEntrySymbol("pscalvm_main");
-    if (strcmp(tool_name, "pscaljson2bc") == 0) return smallclueLookupToolEntrySymbol("pscaljson2bc_main");
-#ifdef BUILD_DASCAL
-    if (strcmp(tool_name, "dascal") == 0) return smallclueLookupToolEntrySymbol("dascal_main");
-#endif
-#ifdef BUILD_PSCALD
-    if (strcmp(tool_name, "pscald") == 0) return smallclueLookupToolEntrySymbol("pscald_main");
-    if (strcmp(tool_name, "pscalasm") == 0) return smallclueLookupToolEntrySymbol("pscalasm_main");
-#endif
-#if defined(SMALLCLUE_WITH_EXSH)
-    if (strcmp(tool_name, "exsh") == 0) return smallclueLookupToolEntrySymbol("exsh_main");
-#endif
-    return NULL;
-}
-
-#if defined(PSCAL_TARGET_IOS)
-#ifndef SMALLCLUE_TOOL_THREAD_STACK_SZ
-#define SMALLCLUE_TOOL_THREAD_STACK_SZ (8 * 1024 * 1024)
-#endif
-
-typedef struct SmallclueToolThreadContext {
-    SmallclueToolEntryFn entry;
-    int argc;
-    char **argv;
-    VProcSessionStdio *session_stdio;
-    VProc *session_vproc;
-    void *runtime_ctx;
-    int status;
-} SmallclueToolThreadContext;
-
-static bool smallclueShebangToolNeedsWorkerThread(const char *tool_name) {
-    if (!tool_name || !*tool_name) {
-        return false;
-    }
-    if (strcmp(tool_name, "exsh") == 0) {
-        return false;
-    }
-    return true;
-}
-
-static void *smallclueToolThreadMain(void *opaque) {
-    SmallclueToolThreadContext *ctx = (SmallclueToolThreadContext *)opaque;
-    if (!ctx || !ctx->entry) {
-        if (ctx) {
-            ctx->status = 127;
-        }
-        return NULL;
-    }
-
-    void *prev_runtime_ctx = NULL;
-    VProcSessionStdio *prev_stdio = vprocSessionStdioCurrent();
-    bool runtime_ctx_swapped = false;
-    bool vproc_active = false;
-    if (PSCALRuntimeGetCurrentRuntimeContext) {
-        prev_runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext();
-    }
-    if (PSCALRuntimeSetCurrentRuntimeContext && ctx->runtime_ctx) {
-        PSCALRuntimeSetCurrentRuntimeContext(ctx->runtime_ctx);
-        runtime_ctx_swapped = true;
-    }
-    if (ctx->session_stdio) {
-        vprocSessionStdioActivate(ctx->session_stdio);
-    }
-    if (ctx->session_vproc) {
-        vprocRegisterThread(ctx->session_vproc, pthread_self());
-        vprocActivate(ctx->session_vproc);
-        vproc_active = true;
-        int worker_pid = vprocPid(ctx->session_vproc);
-        if (worker_pid > 0) {
-            vprocSetStopUnsupported(worker_pid, false);
-            vprocSetCooperativeStopWait(worker_pid, false);
-        }
-    }
-
-    sigset_t unblock_mask;
-    sigemptyset(&unblock_mask);
-    sigaddset(&unblock_mask, SIGINT);
-    sigaddset(&unblock_mask, SIGTSTP);
-    (void)pthread_sigmask(SIG_UNBLOCK, &unblock_mask, NULL);
-
-    ctx->status = ctx->entry(ctx->argc, ctx->argv);
-
-    if (ctx->session_stdio) {
-        vprocSessionStdioActivate(prev_stdio);
-    }
-    if (vproc_active) {
-        vprocDeactivate();
-    }
-    if (runtime_ctx_swapped && PSCALRuntimeSetCurrentRuntimeContext) {
-        PSCALRuntimeSetCurrentRuntimeContext(prev_runtime_ctx);
-    }
-    return NULL;
-}
-
-static int smallclueRunToolEntryInWorkerThread(SmallclueToolEntryFn entry, int argc, char **argv) {
-    if (!entry) {
-        return 127;
-    }
-
-    SmallclueToolThreadContext ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.entry = entry;
-    ctx.argc = argc;
-    ctx.argv = argv;
-    ctx.status = 127;
-    ctx.session_stdio = vprocSessionStdioCurrent();
-    ctx.session_vproc = vprocCurrent();
-    ctx.runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext
-        ? PSCALRuntimeGetCurrentRuntimeContext()
-        : NULL;
-
-    struct termios stdin_termios;
-    bool stdin_termios_valid = (tcgetattr(STDIN_FILENO, &stdin_termios) == 0);
-
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    (void)pthread_attr_setstacksize(&attr, SMALLCLUE_TOOL_THREAD_STACK_SZ);
-    pthread_t worker_thread;
-    int create_rc = pthread_create(&worker_thread, &attr, smallclueToolThreadMain, &ctx);
-    pthread_attr_destroy(&attr);
-    if (create_rc != 0) {
-        return entry(argc, argv);
-    }
-
-    pthread_join(worker_thread, NULL);
-    if (stdin_termios_valid) {
-        (void)tcsetattr(STDIN_FILENO, TCSAFLUSH, &stdin_termios);
-    }
-    return ctx.status;
-}
-#endif
-
-static int smallclueRunShebangTool(const char *path, char *const *argv) {
-    if (!path || !*path) {
-        return -1;
-    }
-
-    char interpreter[PATH_MAX];
-    char interpreter_arg[PATH_MAX];
-    if (!smallclueReadShebangInterpreter(path,
-                                         interpreter,
-                                         sizeof(interpreter),
-                                         interpreter_arg,
-                                         sizeof(interpreter_arg))) {
-        return -1;
-    }
-
-    char arg_words[PATH_MAX];
-    arg_words[0] = '\0';
-    if (interpreter_arg[0]) {
-        snprintf(arg_words, sizeof(arg_words), "%s", interpreter_arg);
-    }
-    char *words[16];
-    size_t word_count = 0;
-    char *cursor = arg_words;
-    while (*cursor && word_count < (sizeof(words) / sizeof(words[0]))) {
-        while (*cursor && isspace((unsigned char)*cursor)) {
-            cursor++;
-        }
-        if (!*cursor) {
-            break;
-        }
-        words[word_count++] = cursor;
-        while (*cursor && !isspace((unsigned char)*cursor)) {
-            cursor++;
-        }
-        if (*cursor) {
-            *cursor++ = '\0';
-        }
-    }
-    const char *tool_name = NULL;
-    size_t shebang_arg_start = 0;
-    const char *base = strrchr(interpreter, '/');
-    base = base ? (base + 1) : interpreter;
-    if (strcmp(base, "env") == 0) {
-        if (word_count == 0) {
-            return -1;
-        }
-        tool_name = smallclueResolveShebangToolName(words[0]);
-        shebang_arg_start = 1;
-    } else {
-        tool_name = smallclueResolveShebangToolName(interpreter);
-        shebang_arg_start = 0;
-    }
-    SmallclueToolEntryFn entry = smallclueResolveShebangToolEntry(tool_name);
-    if (!tool_name || !entry) {
-        return -1;
-    }
-
-    size_t shebang_argc = (word_count > shebang_arg_start)
-                              ? (word_count - shebang_arg_start)
-                              : 0;
-    size_t script_argc = 0;
-    if (argv) {
-        while (argv[1 + script_argc]) {
-            script_argc++;
-        }
-    }
-
-    size_t total_args = 1 + shebang_argc + 1 + script_argc;
-    char **tool_argv = (char **)calloc(total_args + 1, sizeof(char *));
-    if (!tool_argv) {
-        return EXIT_FAILURE;
-    }
-
-    bool ok = true;
-    size_t idx = 0;
-    tool_argv[idx++] = strdup(tool_name);
-    if (!tool_argv[idx - 1]) {
-        ok = false;
-    }
-    for (size_t i = 0; ok && i < shebang_argc; ++i) {
-        tool_argv[idx++] = strdup(words[shebang_arg_start + i]);
-        if (!tool_argv[idx - 1]) {
-            ok = false;
-        }
-    }
-    if (ok) {
-        tool_argv[idx++] = strdup(path);
-        if (!tool_argv[idx - 1]) {
-            ok = false;
-        }
-    }
-    for (size_t i = 0; ok && i < script_argc; ++i) {
-        const char *arg = argv[1 + i];
-        tool_argv[idx++] = strdup(arg ? arg : "");
-        if (!tool_argv[idx - 1]) {
-            ok = false;
-        }
-    }
-    tool_argv[idx] = NULL;
-
-    int status = EXIT_FAILURE;
-    if (ok) {
- #if defined(PSCAL_TARGET_IOS)
-        if (smallclueShebangToolNeedsWorkerThread(tool_name)) {
-            status = smallclueRunToolEntryInWorkerThread(entry, (int)total_args, tool_argv);
-        } else {
-            status = entry((int)total_args, tool_argv);
-        }
- #else
-        status = entry((int)total_args, tool_argv);
- #endif
-    } else {
-        fprintf(stderr, "%s: out of memory launching tool runner\n", tool_name);
-    }
-
-    for (size_t i = 0; i < idx; ++i) {
-        free(tool_argv[i]);
-    }
-    free(tool_argv);
-    return status;
 }
 
 static bool smallclueWatchExecViaShebang(const char *script_path, int argc, char **argv) {
@@ -1126,6 +809,12 @@ static bool smallclueShouldAbort(int *out_status) {
             sigaddset(&watchset, SIGTSTP);
             int signo = 0;
             if (vprocSigwait(cur_pid, &watchset, &signo) == 0) {
+                if (signo == SIGTSTP && !allow_cooperative_sigtstp) {
+                    if (dbg && *dbg) {
+                        fprintf(stderr, "[smallclue] ignore vproc SIGTSTP for non-coop stop\n");
+                    }
+                    return false;
+                }
                 if (out_status) {
                     *out_status = 128 + signo;
                 }
@@ -1161,6 +850,13 @@ static bool smallclueShouldAbort(int *out_status) {
             (sigismember(&pending, SIGINT) || sigismember(&pending, SIGTSTP))) {
             int signo = 0;
             if (sigwait(&watchset, &signo) == 0) {
+                if (signo == SIGTSTP && !allow_cooperative_sigtstp) {
+                    sigprocmask(SIG_SETMASK, &oldset, NULL);
+                    if (dbg && *dbg) {
+                        fprintf(stderr, "[smallclue] ignore host SIGTSTP for non-coop stop\n");
+                    }
+                    return false;
+                }
                 if (out_status) {
                     *out_status = 128 + signo;
                 }
@@ -1265,7 +961,6 @@ static int smallclueClearCommand(int argc, char **argv);
 static int smallclueRmCommand(int argc, char **argv);
 static int smallclueCpCommand(int argc, char **argv);
 static int smallclueMvCommand(int argc, char **argv);
-static int smallclueRsyncCommand(int argc, char **argv);
 static int smallcluePwdCommand(int argc, char **argv);
 static int smallclueEnvCommand(int argc, char **argv);
 static int smallclueChmodCommand(int argc, char **argv);
@@ -1311,7 +1006,6 @@ static int smallclueKillCommand(int argc, char **argv);
 static int smallclueMkdirCommand(int argc, char **argv);
 static int smallclueMknodCommand(int argc, char **argv);
 static int smallclueMountCommand(int argc, char **argv);
-static int smallclueUmountCommand(int argc, char **argv);
 static int smallclueWhoamiCommand(int argc, char **argv);
 static void smallclueEmitTerminalSane(void);
 #if defined(PSCAL_TARGET_IOS)
@@ -1541,13 +1235,6 @@ static int smallclueSuCommand(int argc, char **argv) {
     const char *command = NULL;
     bool login = false;
 
-    /* Sentinel: Sanitize environment to prevent privilege escalation via LD_PRELOAD/PATH injection */
-    unsetenv("LD_PRELOAD");
-    unsetenv("LD_LIBRARY_PATH");
-    unsetenv("LD_DEBUG");
-    unsetenv("IFS");
-    setenv("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", 1);
-
     int arg_idx = 1;
     if (arg_idx < argc && strcmp(argv[arg_idx], "-") == 0) {
         login = true;
@@ -1677,7 +1364,6 @@ static int smallclueSudoCommand(int argc, char **argv) {
             if (!pass) return 1;
             char *encrypted = crypt(pass, sp->sp_pwdp);
             smallclueSecureMemzero(pass, strlen(pass));
-            free(pass);
             if (!encrypted || strcmp(encrypted, sp->sp_pwdp) != 0) {
                 fprintf(stderr, "sudo: authentication failure\n");
                 return 1;
@@ -1734,18 +1420,8 @@ static char *smallclueGetPass(const char *prompt) {
     size_t len = strlen(buf);
     if (len > 0 && buf[len - 1] == '\n') {
         buf[len - 1] = '\0';
-    } else if (len == sizeof(buf) - 1) {
-        /* Sentinel: If the password exceeded the buffer size, flush the remaining
-         * input up to the newline to prevent residual password fragments from
-         * leaking into subsequent stdin reads. */
-        int c;
-        while ((c = fgetc(stdin)) != '\n' && c != EOF) {
-            /* discard */
-        }
     }
-    char *result = strdup(buf);
-    smallclueSecureMemzero(buf, sizeof(buf));
-    return result;
+    return buf;
 }
 #endif
 
@@ -1797,7 +1473,6 @@ static int smallcluePasswdCommand(int argc, char **argv) {
         }
         char *encrypted = crypt(pass, sp->sp_pwdp);
         smallclueSecureMemzero(pass, strlen(pass));
-        free(pass);
         if (!encrypted || strcmp(encrypted, sp->sp_pwdp) != 0) {
             fprintf(stderr, "passwd: authentication failure\n");
             ulckpwdf();
@@ -1807,14 +1482,12 @@ static int smallcluePasswdCommand(int argc, char **argv) {
 
     char *new_pass = smallclueGetPass("New password: ");
     if (!new_pass || !*new_pass) {
-        if (new_pass) free(new_pass);
         fprintf(stderr, "passwd: password unchanged\n");
         ulckpwdf();
         return 1;
     }
     char *new_pass_copy = strdup(new_pass);
-    smallclueSecureMemzero(new_pass, strlen(new_pass));
-    free(new_pass);
+    smallclueSecureMemzero(new_pass, strlen(new_pass)); // Clear static buffer immediately
     if (!new_pass_copy) {
         fprintf(stderr, "passwd: out of memory\n");
         ulckpwdf();
@@ -1824,19 +1497,13 @@ static int smallcluePasswdCommand(int argc, char **argv) {
     char *confirm_pass = smallclueGetPass("Retype new password: ");
     if (!confirm_pass || strcmp(new_pass_copy, confirm_pass) != 0) {
         fprintf(stderr, "passwd: passwords do not match\n");
-        if (confirm_pass) {
-            smallclueSecureMemzero(confirm_pass, strlen(confirm_pass));
-            free(confirm_pass);
-        }
+        if (confirm_pass) smallclueSecureMemzero(confirm_pass, strlen(confirm_pass));
         smallclueSecureMemzero(new_pass_copy, strlen(new_pass_copy));
         free(new_pass_copy);
         ulckpwdf();
         return 1;
     }
-    if (confirm_pass) {
-        smallclueSecureMemzero(confirm_pass, strlen(confirm_pass));
-        free(confirm_pass);
-    }
+    if (confirm_pass) smallclueSecureMemzero(confirm_pass, strlen(confirm_pass));
 
     // Generate salt
     char salt[64];
@@ -1995,7 +1662,6 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"clear", smallclueClearCommand, "Clear the terminal"},
     {"cls", smallclueClearCommand, "Clear the terminal"},
     {"cp", smallclueCpCommand, "Copy files"},
-    {"rsync", smallclueRsyncCommand, "Synchronize files and directories"},
     {"curl", smallclueCurlCommand, "Transfer data from URLs"},
     {"cut", smallclueCutCommand, "Extract fields from lines"},
     {"date", smallclueDateCommand, "Display current date/time"},
@@ -2012,7 +1678,6 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"file", smallclueFileCommand, "Identify file types"},
     {"find", smallclueFindCommand, "Search for files"},
     {"grep", smallclueGrepCommand, "Search for patterns"},
-    {"git", smallclueGitCommand, "Git plumbing and porcelain"},
     {"head", smallclueHeadCommand, "Print the first lines of files"},
     {"history", smallclueHistoryCommand, "Show command history"},
     {"id", smallclueIdCommand, "Print user identity information"},
@@ -2032,7 +1697,6 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"mkdir", smallclueMkdirCommand, "Create directories"},
     {"mknod", smallclueMknodCommand, "Create special files"},
     {"mount", smallclueMountCommand, "Mount filesystems"},
-    {"umount", smallclueUmountCommand, "Unmount filesystems"},
     {"more", smallcluePagerCommand, "Paginate file contents"},
     {"mv", smallclueMvCommand, "Move or rename files"},
     {"nslookup", smallclueNslookupCommand, "DNS lookup utility"},
@@ -2040,7 +1704,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"passwd", smallcluePasswdCommand, "Change user password"},
     {"pbcopy", smallcluePbcopyCommand, "Copy stdin to the system clipboard"},
     {"pbpaste", smallcluePbpasteCommand, "Paste the system clipboard to stdout"},
-    {"ping", smallcluePingCommand, "ICMP echo utility"},
+    {"ping", smallcluePingCommand, "TCP ping utility"},
     {"poweroff", smallclueHaltCommand, "Power off the system"},
     {"ps", smallcluePsCommand, "Show simple process information"},
     {"pwd", smallcluePwdCommand, "Print working directory"},
@@ -2155,48 +1819,6 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -i ignore case\n"
              "  -n line numbers\n"
              "  -v invert match"},
-    {"git", "git [-C PATH] [--no-pager] [-c key=value] <subcommand> [args]\n"
-            "  Supported in this build:\n"
-            "  init,\n"
-            "  clone,\n"
-            "  remote,\n"
-            "  ls-remote,\n"
-            "  fetch,\n"
-            "  pull,\n"
-            "  merge,\n"
-            "  cherry,\n"
-            "  cherry-pick,\n"
-            "  revert,\n"
-            "  rebase,\n"
-            "  push,\n"
-            "  add,\n"
-            "  rm,\n"
-            "  mv,\n"
-            "  clean,\n"
-            "  stash,\n"
-            "  commit,\n"
-            "  reset,\n"
-            "  restore,\n"
-            "  checkout,\n"
-            "  switch,\n"
-            "  config --get,\n"
-            "  symbolic-ref,\n"
-            "  rev-list,\n"
-            "  merge-base,\n"
-            "  show-ref,\n"
-            "  ls-files,\n"
-            "  ls-tree,\n"
-            "  cat-file,\n"
-            "  rev-parse,\n"
-            "  status,\n"
-            "  branch,\n"
-            "  tag,\n"
-            "  diff,\n"
-            "  log,\n"
-            "  show,\n"
-            "  reflog,\n"
-            "  blame,\n"
-            "  describe"},
     {"halt", "halt [-f]\n"
              "  Halt the system"},
     {"head", "head [-n N] [FILE...]\n"
@@ -2239,10 +1861,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  -v verbose"},
     {"mknod", "mknod [-m mode] NAME TYPE [MAJOR MINOR]\n"
               "  Create special files (b=block, c/u=char, p=fifo)"},
-    {"mount", "mount [-p] [-t type] [-o options] [source] dir\n"
-              "  Mount filesystems (iOS: omit source to open folder picker; -p persists to /etc/fstab)"},
-    {"umount", "umount [-p] dir\n"
-               "  Unmount filesystems (iOS: -p also removes matching /etc/fstab entry)"},
+    {"mount", "mount [-t type] [-o options] [source] dir\n"
+              "  Mount filesystems (iOS: omit source to open folder picker)"},
     {"micro", "micro [FILE]\n"
               "  Micro editor"},
     {"more", "more [FILE...]\n"
@@ -2268,8 +1888,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                "  Copy stdin to system clipboard"},
     {"pbpaste", "pbpaste\n"
                 "  Paste system clipboard to stdout"},
-    {"ping", "ping [-c count] [-t timeout_ms] HOST\n"
-             "  ICMP echo ping (IPv4)"},
+    {"ping", "ping HOST [PORT]\n"
+             "  TCP ping (default port 80)"},
     {"poweroff", "poweroff [-f]\n"
              "  Power off the system"},
     {"ps", "ps\n"
@@ -2288,10 +1908,6 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  Remove empty directories\n"
               "  -p remove parents\n"
               "  -v verbose"},
-    {"rsync", "rsync [options] <source>... <destination>\n"
-              "  Synchronize files and directories (OpenRsync-compatible applet)\n"
-              "  Common: -a -v -z -r --delete --exclude PATTERN --include PATTERN\n"
-              "  Remote paths use host:path syntax over SSH"},
     {"runit", "runit\n"
              "  Service supervisor"},
     {"sed", "sed 's/old/new/g' [FILE...]\n"
@@ -2306,8 +1922,6 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"stty", "stty [reset] [sane]\n"
              "  Report terminal settings; apply reset/sane"},
 #if defined(SMALLCLUE_WITH_EXSH)
-    {"exsh", "exsh\n"
-             "  Launch PSCAL shell front end"},
     {"sh", "sh\n"
            "  Launch PSCAL shell front end"},
 #endif
@@ -2417,10 +2031,6 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
 #if defined(PSCAL_TARGET_IOS)
     {"addt", "addt\n"
              "  Open an additional shell tab"},
-    {"tabadd", "tabadd\n"
-               "  Alias for addt"},
-    {"tadd", "tadd\n"
-             "  Alias for addt"},
     {"smallclue-help", "smallclue-help [command]\n"
                        "  Without arguments: list all applets\n"
                        "  With a command: show usage if available"},
@@ -2434,10 +2044,7 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
 
 static size_t kSmallclueAppletCount = sizeof(kSmallclueApplets) / sizeof(kSmallclueApplets[0]);
 
-const char *smallclueLookupAppletUsage(const char *name) {
-    if (!name) {
-        return NULL;
-    }
+static const char * __attribute__((unused)) smallclueLookupHelp(const char *name) {
     for (const SmallclueAppletHelp *h = kSmallclueAppletHelp; h && h->name; ++h) {
         if (strcmp(h->name, name) == 0) {
             return h->usage;
@@ -2449,7 +2056,7 @@ const char *smallclueLookupAppletUsage(const char *name) {
 static const char *pager_command_name(const char *name);
 static int pager_read_key(void);
 static char *pagerReadLogicalLine(const PagerBuffer *buffer, size_t line_index, bool *had_newline);
-static void smallclueMenuStartFrameTo(FILE *out, bool *first_frame);
+static void smallclueMenuStartFrame(bool *first_frame);
 
 static void pagerBell(void) {
     fputc('\a', stdout);
@@ -2578,43 +2185,6 @@ static ssize_t smallclueReadStream(FILE *stream, void *buf, size_t count, int *o
     return (ssize_t)read_bytes;
 }
 
-static bool smallclueWriteFullyStream(FILE *stream, const void *buf, size_t count, int *out_errno) {
-    if (out_errno) {
-        *out_errno = 0;
-    }
-    if (!stream || (!buf && count > 0)) {
-        if (out_errno) {
-            *out_errno = EINVAL;
-        }
-        return false;
-    }
-    size_t off = 0;
-    while (off < count) {
-        errno = 0;
-        size_t nw = fwrite((const char *)buf + off, 1, count - off, stream);
-        if (nw > 0) {
-            off += nw;
-            continue;
-        }
-        if (ferror(stream)) {
-            int err = errno ? errno : EIO;
-            if (err == EINTR || err == EAGAIN) {
-                clearerr(stream);
-                continue;
-            }
-            if (out_errno) {
-                *out_errno = err;
-            }
-            return false;
-        }
-        if (out_errno) {
-            *out_errno = EIO;
-        }
-        return false;
-    }
-    return true;
-}
-
 static int smallclueGetcStream(FILE *stream, int *out_errno) {
     if (out_errno) {
         *out_errno = 0;
@@ -2734,36 +2304,30 @@ static bool smallclueReadTokensFromStdin(SmallclueLineVector *vec) {
     char *token = NULL;
     size_t tokcap = 0;
     size_t toklen = 0;
-    char buf[16384];
+    int ch;
     int read_err = 0;
-    ssize_t n;
-
-    while ((n = smallclueReadStream(stdin, buf, sizeof(buf), &read_err)) > 0) {
-        for (ssize_t i = 0; i < n; ++i) {
-            int ch = (unsigned char)buf[i];
-            /* Bolt optimization: inline isspace equivalent to reduce function call overhead */
-            if ((ch == ' ') || (ch >= '\t' && ch <= '\r')) {
-                if (toklen > 0) {
-                    if (!smallclueLineVectorAppend(vec, token, toklen)) {
-                        free(token);
-                        return false;
-                    }
-                    toklen = 0;
-                }
-                continue;
-            }
-            if (toklen + 1 >= tokcap) {
-                size_t newcap = tokcap ? tokcap * 2 : 64;
-                char *tmp = (char *)realloc(token, newcap);
-                if (!tmp) {
+    while ((ch = smallclueGetcStream(stdin, &read_err)) != EOF) {
+        if (isspace((unsigned char)ch)) {
+            if (toklen > 0) {
+                if (!smallclueLineVectorAppend(vec, token, toklen)) {
                     free(token);
                     return false;
                 }
-                token = tmp;
-                tokcap = newcap;
+                toklen = 0;
             }
-            token[toklen++] = (char)ch;
+            continue;
         }
+        if (toklen + 1 >= tokcap) {
+            size_t newcap = tokcap ? tokcap * 2 : 64;
+            char *tmp = (char *)realloc(token, newcap);
+            if (!tmp) {
+                free(token);
+                return false;
+            }
+            token = tmp;
+            tokcap = newcap;
+        }
+        token[toklen++] = (char)ch;
     }
     if (read_err) {
         free(token);
@@ -3159,16 +2723,9 @@ static int smallclueTopCommand(int argc, char **argv) {
         size_t mem_used_kb = 0, mem_free_kb = 0;
         if (smallclueReadMemStats(&mem_used_kb, &mem_free_kb)) {
             char mem_line[160];
-            int mn;
-            if (isatty(STDOUT_FILENO)) {
-                mn = snprintf(mem_line, sizeof(mem_line),
-                              "\033[7mMem: %zuK used, %zuK free\033[0m\n",
-                              mem_used_kb, mem_free_kb);
-            } else {
-                mn = snprintf(mem_line, sizeof(mem_line),
+            int mn = snprintf(mem_line, sizeof(mem_line),
                               "Mem: %zuK used, %zuK free\n",
                               mem_used_kb, mem_free_kb);
-            }
             if (mn > 0) {
                 (void)smallclueWriteAll(STDOUT_FILENO, mem_line, (size_t)mn);
             }
@@ -3176,16 +2733,9 @@ static int smallclueTopCommand(int argc, char **argv) {
         double cpu_usr = 0, cpu_sys = 0, cpu_nice = 0, cpu_idle = 0;
         if (smallclueReadCpuStats(&cpu_usr, &cpu_sys, &cpu_nice, &cpu_idle)) {
             char cpu_line[160];
-            int cn;
-            if (isatty(STDOUT_FILENO)) {
-                cn = snprintf(cpu_line, sizeof(cpu_line),
-                              "\033[7mCPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\033[0m\n\n",
-                              cpu_usr, cpu_sys, cpu_nice, cpu_idle);
-            } else {
-                cn = snprintf(cpu_line, sizeof(cpu_line),
+            int cn = snprintf(cpu_line, sizeof(cpu_line),
                               "CPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\n\n",
                               cpu_usr, cpu_sys, cpu_nice, cpu_idle);
-            }
             if (cn > 0) {
                 (void)smallclueWriteAll(STDOUT_FILENO, cpu_line, (size_t)cn);
             }
@@ -3196,7 +2746,7 @@ static int smallclueTopCommand(int argc, char **argv) {
         int hn;
         if (isatty(STDOUT_FILENO)) {
             hn = snprintf(header, sizeof(header),
-                          "\033[7m%6s %6s %6s %6s %-3s %-8s %-10s %6s %6s %s\033[0m\n",
+                          "\033[1m%6s %6s %6s %6s %-3s %-8s %-10s %6s %6s %s\033[0m\n",
                           "PID", "PPID", "PGID", "SID", "FG", "PTY", "STATE", "UTIME", "STIME", "CMD");
         } else {
             hn = snprintf(header, sizeof(header),
@@ -3591,38 +3141,6 @@ static int smallclueStringCompare(const void *a, const void *b) {
     return strcmp(*lhs, *rhs);
 }
 
-static FILE *smallclueOpenTempFile(const char *tag) {
-#if defined(PSCAL_TARGET_IOS)
-    const char *tmp_root = getenv("TMPDIR");
-    if (!tmp_root || !*tmp_root) {
-        tmp_root = "/tmp";
-    }
-    const char *name = (tag && *tag) ? tag : "tmp";
-    char tmpl[PATH_MAX];
-    snprintf(tmpl, sizeof(tmpl), "%s/smallclue-%s-XXXXXX", tmp_root, name);
-    int fd = mkstemp(tmpl);
-    if (fd < 0) {
-        return NULL;
-    }
-    int tracked_fd = vprocHostDup(fd);
-    if (tracked_fd >= 0) {
-        close(fd);
-        fd = tracked_fd;
-    }
-    FILE *fp = fdopen(fd, "w+b");
-    if (!fp) {
-        close(fd);
-        unlink(tmpl);
-        return NULL;
-    }
-    unlink(tmpl);
-    return fp;
-#else
-    (void)tag;
-    return tmpfile();
-#endif
-}
-
 static int pagerCollectLines(const char *cmd_name, const char *path, FILE *stream, PagerBuffer *buffer) {
     if (!stream || !buffer) {
         return 1;
@@ -3641,18 +3159,6 @@ static int pagerCollectLines(const char *cmd_name, const char *path, FILE *strea
                 pager_command_name(cmd_name), strerror(errno));
         return 1;
     }
-#if defined(PSCAL_TARGET_IOS)
-    /*
-     * mkstemp() may bypass vproc's open tracking on iOS. Move the descriptor
-     * to a vproc-tracked duplicate so stdio writes are permitted by shim
-     * fallback hardening.
-     */
-    int tracked_fd = vprocHostDup(fd);
-    if (tracked_fd >= 0) {
-        close(fd);
-        fd = tracked_fd;
-    }
-#endif
     FILE *fp = fdopen(fd, "w+b");
     if (!fp) {
         close(fd);
@@ -3688,11 +3194,10 @@ static int pagerCollectLines(const char *cmd_name, const char *path, FILE *strea
             return 1;
         }
         if (read_bytes > 0) {
-            int write_err = 0;
-            if (!smallclueWriteFullyStream(fp, buf, (size_t)read_bytes, &write_err)) {
-                fprintf(stderr, "%s: failed to buffer pager input: %s\n",
-                        pager_command_name(cmd_name),
-                        strerror(write_err ? write_err : EIO));
+            size_t written = fwrite(buf, 1, (size_t)read_bytes, fp);
+            if (written != (size_t)read_bytes) {
+                fprintf(stderr, "%s: failed to buffer pager input\n",
+                        pager_command_name(cmd_name));
                 free(offsets);
                 fclose(fp);
                 return 1;
@@ -3833,24 +3338,16 @@ static size_t pagerMaxTop(const PagerBuffer *buffer, int page_rows) {
     return buffer->line_count - page;
 }
 
-static int pagerPromptAndRead(const char *cmd_name, const char *detail) {
+static int pagerPromptAndRead(const char *cmd_name) {
     const char *label = pager_command_name(cmd_name);
     bool md_mode = (label && strcmp(label, "md") == 0);
     bool color = isatty(STDOUT_FILENO);
     const char *inv = color ? "\033[7m" : "";
     const char *rst = color ? "\033[0m" : "";
-    if (detail && *detail) {
-        if (md_mode) {
-            fprintf(stdout, "\r%s--%s %s-- (Space=advance, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)%s ",
-                    inv, label, detail, rst);
-        } else {
-            fprintf(stdout, "\r%s--%s %s-- (Space=advance, b=prev, arrows=scroll, q=next file, Q=exit)%s ",
-                    inv, label, detail, rst);
-        }
-    } else if (md_mode) {
-        fprintf(stdout, "\r%s--%s-- (Space=advance, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)%s ", inv, label, rst);
+    if (md_mode) {
+        fprintf(stdout, "\r%s--%s-- (Space=next, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)%s ", inv, label, rst);
     } else {
-        fprintf(stdout, "\r%s--%s-- (Space=advance, b=prev, arrows=scroll, q=quit)%s ", inv, label, rst);
+        fprintf(stdout, "\r%s--%s-- (Space=next, b=prev, arrows=scroll, q=quit)%s ", inv, label, rst);
     }
     fflush(stdout);
     int key = pager_read_key();
@@ -4025,12 +3522,8 @@ static void pagerSigwinchHandler(int signo) {
 }
 
 static int pager_terminal_rows(void);
-static int pager_terminal_cols(void);
 
-static int pagerInteractiveSession(const char *cmd_name,
-                                   const char *detail,
-                                   PagerBuffer *buffer,
-                                   int page_rows) {
+static int pagerInteractiveSession(const char *cmd_name, PagerBuffer *buffer, int page_rows) {
     if (!buffer || buffer->line_count == 0) {
         pager_last_exit_key = 'q';
         pager_last_md_link_index = -1;
@@ -4072,7 +3565,7 @@ static int pagerInteractiveSession(const char *cmd_name,
             free(highlight);
             redraw = false;
         }
-        int key = pagerPromptAndRead(cmd_name, detail);
+        int key = pagerPromptAndRead(cmd_name);
         switch (key) {
             case PAGER_KEY_RESIZE:
                 g_pager_sigwinch_received = 0;
@@ -4105,10 +3598,6 @@ static int pagerInteractiveSession(const char *cmd_name,
                     }
                     top = new_top;
                     redraw = true;
-                } else if (key == ' ') {
-                    pager_last_exit_key = ' ';
-                    pager_last_md_link_index = -1;
-                    goto done;
                 } else {
                     pagerBell();
                 }
@@ -4200,10 +3689,8 @@ done:
 }
 
 static int print_file(const char *path, FILE *stream) {
-    char buffer[65536];
+    char buffer[4096];
     bool dbg = getenv("PSCALI_PIPE_DEBUG") != NULL;
-    /* Bolt optimization: Use direct write calls for 'cat' to bypass stdio overhead */
-    fflush(stdout); /* flush any previously buffered stdout data to prevent interleaving */
     while (true) {
         int read_err = 0;
         ssize_t n = smallclueReadStream(stream, buffer, sizeof(buffer), &read_err);
@@ -4216,15 +3703,9 @@ static int print_file(const char *path, FILE *stream) {
         if (n == 0) {
             break;
         }
-        size_t total_written = 0;
-        while (total_written < (size_t)n) {
-            ssize_t nw = write(STDOUT_FILENO, buffer + total_written, (size_t)n - total_written);
-            if (nw < 0) {
-                if (errno == EINTR) continue;
-                perror("cat: write error");
-                return 1;
-            }
-            total_written += (size_t)nw;
+        if (fwrite(buffer, 1, (size_t)n, stdout) != (size_t)n) {
+            perror("cat: write error");
+            return 1;
         }
         if (dbg) {
             fprintf(stderr, "[cat] wrote chunk=%zu bytes\n", (size_t)n);
@@ -4305,8 +3786,6 @@ static _Thread_local int pager_control_fd_value = -2;
 #if defined(PSCAL_TARGET_IOS)
 static _Thread_local bool pager_session_queue_enabled = false;
 #endif
-static _Thread_local int pager_observed_rows = 0;
-static _Thread_local int pager_observed_cols = 0;
 
 // Duplicate an FD for pager control input only if it can be read from.
 static int pagerDupForRead(int fd) {
@@ -4658,29 +4137,10 @@ static int pager_read_key(void) {
     }
     int result = 'q';
     const int seq_timeout_ms = 120;
-    const int resize_poll_ms = 100;
-    if (pager_observed_rows <= 0 || pager_observed_cols <= 0) {
-        int initial_rows = pager_terminal_rows();
-        int initial_cols = pager_terminal_cols();
-        if (initial_rows > 0) {
-            pager_observed_rows = initial_rows;
-        }
-        if (initial_cols > 0) {
-            pager_observed_cols = initial_cols;
-        }
-    }
     for (;;) {
         unsigned char ch = 0;
-        ssize_t n = pagerReadByteWithTimeout(fd, use_session_queue, &ch, false, resize_poll_ms);
+        ssize_t n = pagerReadByteWithTimeout(fd, use_session_queue, &ch, true, seq_timeout_ms);
         if (n == -2) {
-            int rows_now = pager_terminal_rows();
-            int cols_now = pager_terminal_cols();
-            if (rows_now > 0) {
-                pager_observed_rows = rows_now;
-            }
-            if (cols_now > 0) {
-                pager_observed_cols = cols_now;
-            }
             result = PAGER_KEY_RESIZE;
             break;
         }
@@ -4694,22 +4154,6 @@ static int pager_read_key(void) {
             }
         }
         if (n <= 0) {
-            int rows_now = pager_terminal_rows();
-            int cols_now = pager_terminal_cols();
-            if (rows_now > 0 && cols_now > 0) {
-                if (pager_observed_rows <= 0 || pager_observed_cols <= 0) {
-                    pager_observed_rows = rows_now;
-                    pager_observed_cols = cols_now;
-                } else if (rows_now != pager_observed_rows || cols_now != pager_observed_cols) {
-                    pager_observed_rows = rows_now;
-                    pager_observed_cols = cols_now;
-                    result = PAGER_KEY_RESIZE;
-                    break;
-                }
-            }
-            if (n == 0) {
-                continue;
-            }
             break;
         }
         if (ch == '\x1b') {
@@ -4767,6 +4211,11 @@ static int pager_terminal_rows(void) {
     const char *lines = getenv("LINES");
     if (lines && *lines) {
         parsed = atoi(lines);
+#if defined(PSCAL_TARGET_IOS)
+        if (parsed > 0) {
+            return parsed;
+        }
+#endif
     }
     struct winsize ws;
     if (isatty(STDOUT_FILENO) && ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
@@ -4795,6 +4244,11 @@ static int pager_terminal_cols(void) {
     const char *cols = getenv("COLUMNS");
     if (cols && *cols) {
         parsed = atoi(cols);
+#if defined(PSCAL_TARGET_IOS)
+        if (parsed > 0) {
+            return parsed;
+        }
+#endif
     }
     struct winsize ws;
     if (isatty(STDOUT_FILENO) && ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
@@ -4875,11 +4329,7 @@ static bool pagerStreamIsInteractive(FILE *stream) {
     return isatty(fd) != 0;
 }
 
-static int pager_file(const char *cmd_name,
-                      const char *path,
-                      const char *detail,
-                      FILE *stream,
-                      bool raw_mode) {
+static int pager_file(const char *cmd_name, const char *path, FILE *stream, bool raw_mode) {
     pager_control_fd_reset();
     pager_last_exit_key = 'q';
     pager_last_md_link_index = -1;
@@ -4980,10 +4430,10 @@ static int pager_file(const char *cmd_name,
 #if defined(PSCAL_TARGET_IOS)
     bool prev_session_queue = pager_session_queue_enabled;
     pager_session_queue_enabled = true;
-    status = pagerInteractiveSession(cmd_name, detail, &buffer, page_rows);
+    status = pagerInteractiveSession(cmd_name, &buffer, page_rows);
     pager_session_queue_enabled = prev_session_queue;
 #else
-    status = pagerInteractiveSession(cmd_name, detail, &buffer, page_rows);
+    status = pagerInteractiveSession(cmd_name, &buffer, page_rows);
 #endif
     pagerBufferFree(&buffer);
     pager_control_fd_reset();
@@ -6022,20 +5472,6 @@ static int markdownTermWidth(void) {
     return MARKDOWN_WRAP_WIDTH;
 }
 
-static int markdownPreferredWrapWidth(void) {
-    int width = markdownTermWidth();
-    if (width <= 20) {
-        return MARKDOWN_WRAP_WIDTH;
-    }
-    if (width > 2) {
-        width -= 2;
-    }
-    if (width < 20) {
-        return MARKDOWN_WRAP_WIDTH;
-    }
-    return width;
-}
-
 static char *markdownTrimInline(char *str) {
     if (!str) return str;
     while (*str && isspace((unsigned char)*str)) {
@@ -6278,14 +5714,14 @@ static char markdownFenceMarker(const char *text) {
     return '\0';
 }
 
-static void markdownWriteHeading(FILE *out, const char *text, int level, int wrap_width) {
+static void markdownWriteHeading(FILE *out, const char *text, int level) {
     if (!text || !*text) return;
     char *formatted = markdownSimplifyInline(text);
     if (!formatted) return;
     fprintf(out, "%s\n", formatted);
     char underline = (level == 1) ? '=' : '-';
     size_t len = strlen(formatted);
-    size_t underline_len = len > (size_t)wrap_width ? (size_t)wrap_width : len;
+    size_t underline_len = len > MARKDOWN_WRAP_WIDTH ? MARKDOWN_WRAP_WIDTH : len;
     for (size_t i = 0; i < underline_len; ++i) {
         fputc(underline, out);
     }
@@ -6367,7 +5803,7 @@ static bool markdownExtractListItem(char *line, char **content, char *firstPrefi
     return false;
 }
 
-static void markdownFlushParagraph(FILE *out, char **paragraph, size_t *length, int wrap_width) {
+static void markdownFlushParagraph(FILE *out, char **paragraph, size_t *length) {
     if (!paragraph || !*paragraph || !length || *length == 0) {
         return;
     }
@@ -6386,7 +5822,7 @@ static void markdownFlushParagraph(FILE *out, char **paragraph, size_t *length, 
     } else {
         char *formatted = markdownSimplifyInline(text);
         if (formatted) {
-            markdownWrapAndWrite(out, formatted, "", "", wrap_width);
+            markdownWrapAndWrite(out, formatted, "", "", MARKDOWN_WRAP_WIDTH);
             free(formatted);
         }
         fputc('\n', out);
@@ -7327,18 +6763,15 @@ static bool markdownLooksLikeWebNoiseLine(const char *line) {
         return true;
     }
     if (len > 8 && probe[len - 1] == ',' &&
-        !strstr(probe, ". ") &&
         (strchr(probe, '.') || strchr(probe, '[') || strchr(probe, ':'))) {
         return true;
     }
     if (len > 1 && len <= 6 && probe[len - 1] == ',' &&
-        (probe[0] == '.' || probe[0] == '#' || probe[0] == '[' || probe[0] == ':' || probe[0] == '@') &&
-        !strstr(probe, "://")) {
+        isalpha((unsigned char)probe[0]) && !strstr(probe, "://")) {
         bool tiny_selector = true;
         for (size_t i = 0; i + 1 < len; ++i) {
             unsigned char ch = (unsigned char)probe[i];
-            if (!(isalnum(ch) || ch == '-' || ch == '_' ||
-                  ch == '.' || ch == '#' || ch == '[' || ch == ']' || ch == ':')) {
+            if (!(isalnum(ch) || ch == '-' || ch == '_')) {
                 tiny_selector = false;
                 break;
             }
@@ -7354,7 +6787,6 @@ static bool markdownLooksLikeWebNoiseLine(const char *line) {
         }
     }
     if (comma_count >= 2 &&
-        !strstr(probe, ". ") &&
         (strchr(probe, '.') || strchr(probe, '[') || strchr(probe, ':') || strstr(probe, "button") || strstr(probe, "html"))) {
         return true;
     }
@@ -7529,13 +6961,12 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
     bool fragmented_link_label_locked = false;
     char fragmented_link_meta[512] = {0};
     bool paragraph_link_only_chain = false;
-    int render_width = markdownPreferredWrapWidth();
 
     if (label && *label) {
         fprintf(output, "%s\n", label);
         size_t underline_len = strlen(label);
-        if (underline_len > (size_t)render_width) {
-            underline_len = (size_t)render_width;
+        if (underline_len > MARKDOWN_WRAP_WIDTH) {
+            underline_len = MARKDOWN_WRAP_WIDTH;
         }
         for (size_t i = 0; i < underline_len; ++i) {
             fputc('=', output);
@@ -7602,7 +7033,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                             paragraph_link_only_chain = false;
                         }
                         if (paragraph_len > 0) {
-                            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
+                            markdownFlushParagraph(output, &paragraph, &paragraph_len);
                             has_blank_separator = true;
                             paragraph_link_only_chain = false;
                         }
@@ -7734,7 +7165,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             if (paragraph_len > 0) {
-                markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
+                markdownFlushParagraph(output, &paragraph, &paragraph_len);
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
@@ -7752,7 +7183,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             if (paragraph_len > 0) {
-                markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
+                markdownFlushParagraph(output, &paragraph, &paragraph_len);
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
@@ -7769,7 +7200,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             if (paragraph_len > 0) {
-                markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
+                markdownFlushParagraph(output, &paragraph, &paragraph_len);
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
@@ -7790,7 +7221,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             if (paragraph_len > 0) {
-                markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
+                markdownFlushParagraph(output, &paragraph, &paragraph_len);
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
@@ -7801,7 +7232,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
         char fence = markdownFenceMarker(trimmed);
         if (fence != '\0') {
             bool had_paragraph = paragraph_len > 0;
-            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
+            markdownFlushParagraph(output, &paragraph, &paragraph_len);
             if (had_paragraph) {
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
@@ -7833,7 +7264,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             if (paragraph_len > 0) {
-                markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
+                markdownFlushParagraph(output, &paragraph, &paragraph_len);
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             } else if (!has_blank_separator) {
@@ -7856,7 +7287,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             paragraph[paragraph_len] = '\0';
             char *heading_text = markdownTrimInline(paragraph);
             if (heading_text && *heading_text) {
-                markdownWriteHeading(output, heading_text, setext_heading, render_width);
+                markdownWriteHeading(output, heading_text, setext_heading);
                 has_blank_separator = true;
             }
             paragraph_len = 0;
@@ -7867,12 +7298,12 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
 
         if (markdownIsHorizontalRule(trimmed)) {
             bool had_paragraph = paragraph_len > 0;
-            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
+            markdownFlushParagraph(output, &paragraph, &paragraph_len);
             if (had_paragraph) {
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
-            for (int i = 0; i < render_width; ++i) {
+            for (int i = 0; i < MARKDOWN_WRAP_WIDTH; ++i) {
                 fputc('-', output);
             }
             fputc('\n', output);
@@ -7891,14 +7322,14 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             bool had_paragraph = paragraph_len > 0;
-            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
+            markdownFlushParagraph(output, &paragraph, &paragraph_len);
             if (had_paragraph) {
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
             const char *heading_text = trimmed + heading;
             while (*heading_text == ' ' || *heading_text == '\t') heading_text++;
-            markdownWriteHeading(output, heading_text, heading, render_width);
+            markdownWriteHeading(output, heading_text, heading);
             has_blank_separator = true;
             continue;
         }
@@ -7912,7 +7343,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
                 paragraph_link_only_chain = false;
             }
             bool had_paragraph = paragraph_len > 0;
-            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
+            markdownFlushParagraph(output, &paragraph, &paragraph_len);
             if (had_paragraph) {
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
@@ -7921,7 +7352,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             while (*quote == ' ' || *quote == '\t') quote++;
             char *formatted = markdownSimplifyInline(quote);
             if (formatted) {
-                markdownWrapAndWrite(output, formatted, "> ", "> ", render_width);
+                markdownWrapAndWrite(output, formatted, "> ", "> ", MARKDOWN_WRAP_WIDTH);
                 free(formatted);
             }
             has_blank_separator = true;
@@ -7937,7 +7368,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
         if (pipe_count >= 2) {
             if (!in_table) {
                 bool had_paragraph = paragraph_len > 0;
-                markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
+                markdownFlushParagraph(output, &paragraph, &paragraph_len);
                 if (had_paragraph) {
                     has_blank_separator = true;
                     paragraph_link_only_chain = false;
@@ -7967,14 +7398,14 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
         char prefix_sub[32];
         if (markdownExtractListItem(line, &list_text, prefix_first, sizeof(prefix_first), prefix_sub, sizeof(prefix_sub))) {
             bool had_paragraph = paragraph_len > 0;
-            markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
+            markdownFlushParagraph(output, &paragraph, &paragraph_len);
             if (had_paragraph) {
                 has_blank_separator = true;
                 paragraph_link_only_chain = false;
             }
             char *formatted = markdownSimplifyInline(list_text);
             if (formatted) {
-                markdownWrapAndWrite(output, formatted, prefix_first, prefix_sub, render_width);
+                markdownWrapAndWrite(output, formatted, prefix_first, prefix_sub, MARKDOWN_WRAP_WIDTH);
                 free(formatted);
             }
             has_blank_separator = false;
@@ -7992,7 +7423,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
     }
 
     bool had_paragraph = paragraph_len > 0;
-    markdownFlushParagraph(output, &paragraph, &paragraph_len, render_width);
+    markdownFlushParagraph(output, &paragraph, &paragraph_len);
     if (had_paragraph) {
         has_blank_separator = true;
         paragraph_link_only_chain = false;
@@ -8105,7 +7536,7 @@ static int smallclueMarkdownDisplayDataEx(const char *label,
         return 0;
     }
 
-    FILE *source = smallclueOpenTempFile("md-source");
+    FILE *source = tmpfile();
     if (!source) {
         free(converted_html);
         return 1;
@@ -8121,7 +7552,7 @@ static int smallclueMarkdownDisplayDataEx(const char *label,
     fflush(source);
     rewind(source);
 
-    FILE *buffer = smallclueOpenTempFile("md-buffer");
+    FILE *buffer = tmpfile();
     bool direct = false;
     if (!buffer) {
         buffer = stdout;
@@ -8152,7 +7583,7 @@ static int smallclueMarkdownDisplayDataEx(const char *label,
     rewind(buffer);
     const MarkdownLinkList *prev_active_links = pager_active_md_links;
     pagerSetActiveMarkdownLinks(links_out);
-    int status = pager_file("md", label ? label : "(stdin)", NULL, buffer, false);
+    int status = pager_file("md", label ? label : "(stdin)", buffer, false);
     pagerSetActiveMarkdownLinks(prev_active_links);
     if (exit_key_out) {
         *exit_key_out = pagerLastExitKey();
@@ -8367,29 +7798,14 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
             top = (links->count > window) ? (links->count - window) : 0;
         }
 
-        char *frame = NULL;
-        size_t frame_len = 0;
-        FILE *out = open_memstream(&frame, &frame_len);
-        if (!out) {
-            out = stdout;
-        }
-        smallclueMenuStartFrameTo(out, &first_frame);
-        char header[256];
+        smallclueMenuStartFrame(&first_frame);
         if (source_label && *source_label) {
-            snprintf(header, sizeof(header), "Links in %s (%zu/%zu)  [Arrows=move Enter=open q=cancel]",
+            printf("Links in %s (%zu/%zu)  [Arrows=move Enter=open q=cancel]\n",
                    source_label, cursor + 1, links->count);
         } else {
-            snprintf(header, sizeof(header), "Links (%zu/%zu)  [Arrows=move Enter=open q=cancel]",
+            printf("Links (%zu/%zu)  [Arrows=move Enter=open q=cancel]\n",
                    cursor + 1, links->count);
         }
-        fputs("\x1b[7m", out);
-        if (cols > 0 && (int)strlen(header) > cols) {
-            if (cols <= 3) { fwrite(header, 1, (size_t)cols, out); }
-            else { fwrite(header, 1, (size_t)(cols - 3), out); fputs("...", out); }
-        } else {
-            fprintf(out, "%s", header);
-        }
-        fputs("\x1b[0m\n", out);
 
         size_t end = top + window;
         if (end > links->count) end = links->count;
@@ -8399,27 +7815,19 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
             const char *target = links->items[i].target ? links->items[i].target : "";
             char line[PATH_MAX * 3];
             snprintf(line, sizeof(line), "%3zu. %s (%s)", i + 1, text, target);
-            if (active) fputs("\x1b[7m", out);
+            if (active) printf("\x1b[7m");
             if (cols > 0 && (int)strlen(line) > cols) {
                 if (cols > 3) {
-                    fwrite(line, 1, (size_t)(cols - 3), out);
-                    fputs("...", out);
+                    fwrite(line, 1, (size_t)(cols - 3), stdout);
+                    fputs("...", stdout);
                 } else {
-                    fwrite(line, 1, (size_t)cols, out);
+                    fwrite(line, 1, (size_t)cols, stdout);
                 }
-                fputc('\n', out);
+                fputc('\n', stdout);
             } else {
-                fprintf(out, "%s\n", line);
+                printf("%s\n", line);
             }
-            if (active) fputs("\x1b[0m", out);
-        }
-        if (out != stdout) {
-            fflush(out);
-            fclose(out);
-            if (frame && frame_len > 0) {
-                fwrite(frame, 1, frame_len, stdout);
-            }
-            free(frame);
+            if (active) printf("\x1b[0m");
         }
         fflush(stdout);
 
@@ -8726,16 +8134,13 @@ static int smallclueMarkdownListDocuments(void) {
     return 0;
 }
 
-static void smallclueMenuStartFrameTo(FILE *out, bool *first_frame) {
-    if (!out) {
-        out = stdout;
-    }
+static void smallclueMenuStartFrame(bool *first_frame) {
     if (first_frame && *first_frame) {
-        fputs("\x1b[2J\x1b[H", out);
+        printf("\x1b[2J\x1b[H");
         *first_frame = false;
         return;
     }
-    fputs("\x1b[H\x1b[J", out);
+    printf("\x1b[H\x1b[J");
 }
 
 static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
@@ -8747,29 +8152,22 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
                                           int term_cols,
                                           bool show_docs_dir,
                                           bool *first_frame) {
-    char *frame = NULL;
-    size_t frame_len = 0;
-    FILE *out = open_memstream(&frame, &frame_len);
-    if (!out) {
-        out = stdout;
-    }
-    smallclueMenuStartFrameTo(out, first_frame);
+    smallclueMenuStartFrame(first_frame);
     char header[256];
     snprintf(header, sizeof(header),
              "Markdown docs (Arrows=move, Enter=open, q=quit) [%zu/%zu]",
              cursor + 1, count);
-    fputs("\x1b[7m", out);
     if (term_cols > 0 && (int)strlen(header) > term_cols) {
         if (term_cols <= 3) {
-            fwrite(header, 1, (size_t)term_cols, out);
+            fwrite(header, 1, (size_t)term_cols, stdout);
         } else {
-            fwrite(header, 1, (size_t)(term_cols - 3), out);
-            fputs("...", out);
+            fwrite(header, 1, (size_t)(term_cols - 3), stdout);
+            fputs("...", stdout);
         }
+        fputc('\n', stdout);
     } else {
-        fprintf(out, "%s", header);
+        printf("%s\n", header);
     }
-    fputs("\x1b[0m\n", out);
     size_t end = top + window;
     if (end > count) {
         end = count;
@@ -8781,21 +8179,21 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
         const char *title = entries[idx].title ? entries[idx].title : "";
         snprintf(line, sizeof(line), " %-24.24s %s", name, title);
         if (highlight) {
-            fputs("\x1b[7m", out);
+            printf("\x1b[7m");
         }
         if (term_cols > 0 && (int)strlen(line) > term_cols) {
             if (term_cols <= 3) {
-                fwrite(line, 1, (size_t)term_cols, out);
+                fwrite(line, 1, (size_t)term_cols, stdout);
             } else {
-                fwrite(line, 1, (size_t)(term_cols - 3), out);
-                fputs("...", out);
+                fwrite(line, 1, (size_t)(term_cols - 3), stdout);
+                fputs("...", stdout);
             }
-            fputc('\n', out);
+            fputc('\n', stdout);
         } else {
-            fprintf(out, "%s\n", line);
+            printf("%s\n", line);
         }
         if (highlight) {
-            fputs("\x1b[0m", out);
+            printf("\x1b[0m");
         }
     }
     if (show_docs_dir) {
@@ -8805,23 +8203,15 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
         snprintf(footer, sizeof(footer), "Docs: %s", visible_docs_dir);
         if (term_cols > 0 && (int)strlen(footer) > term_cols) {
             if (term_cols <= 3) {
-                fwrite(footer, 1, (size_t)term_cols, out);
+                fwrite(footer, 1, (size_t)term_cols, stdout);
             } else {
-                fwrite(footer, 1, (size_t)(term_cols - 3), out);
-                fputs("...", out);
+                fwrite(footer, 1, (size_t)(term_cols - 3), stdout);
+                fputs("...", stdout);
             }
-            fputc('\n', out);
+            fputc('\n', stdout);
         } else {
-            fprintf(out, "%s\n", footer);
+            printf("%s\n", footer);
         }
-    }
-    if (out != stdout) {
-        fflush(out);
-        fclose(out);
-        if (frame && frame_len > 0) {
-            fwrite(frame, 1, frame_len, stdout);
-        }
-        free(frame);
     }
     fflush(stdout);
 }
@@ -10184,45 +9574,11 @@ typedef enum {
 static uint16_t smallclueBsdSum(FILE *f, unsigned long long *out_blocks) {
     uint16_t sum = 0;
     unsigned long long total = 0;
-    char buf[16384];
-    int read_err = 0;
-    ssize_t n;
-
-    while ((n = smallclueReadStream(f, buf, sizeof(buf), &read_err)) > 0) {
-        ssize_t i = 0;
-        /* Bolt optimization: Loop unrolling for BSD sum to reduce branching overhead */
-        #define PROCESS_BSD_CHAR(idx) do { \
-            unsigned char c = (unsigned char)buf[idx]; \
-            sum = (uint16_t)((sum >> 1) | ((sum & 1) << 15)); \
-            sum = (uint16_t)((sum + (uint16_t)c) & 0xFFFF); \
-        } while (0)
-
-        for (; i + 15 < n; i += 16) {
-            PROCESS_BSD_CHAR(i);
-            PROCESS_BSD_CHAR(i+1);
-            PROCESS_BSD_CHAR(i+2);
-            PROCESS_BSD_CHAR(i+3);
-            PROCESS_BSD_CHAR(i+4);
-            PROCESS_BSD_CHAR(i+5);
-            PROCESS_BSD_CHAR(i+6);
-            PROCESS_BSD_CHAR(i+7);
-            PROCESS_BSD_CHAR(i+8);
-            PROCESS_BSD_CHAR(i+9);
-            PROCESS_BSD_CHAR(i+10);
-            PROCESS_BSD_CHAR(i+11);
-            PROCESS_BSD_CHAR(i+12);
-            PROCESS_BSD_CHAR(i+13);
-            PROCESS_BSD_CHAR(i+14);
-            PROCESS_BSD_CHAR(i+15);
-        }
-        #undef PROCESS_BSD_CHAR
-
-        for (; i < n; ++i) {
-            unsigned char c = (unsigned char)buf[i];
-            sum = (uint16_t)((sum >> 1) | ((sum & 1) << 15));
-            sum = (uint16_t)((sum + (uint16_t)c) & 0xFFFF);
-        }
-        total += (unsigned long long)n;
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        sum = (uint16_t)((sum >> 1) | ((sum & 1) << 15));
+        sum = (uint16_t)((sum + (uint16_t)c) & 0xFFFF);
+        total++;
     }
     if (out_blocks) {
         *out_blocks = (total + 1023ULL) / 1024ULL; /* 1K blocks */
@@ -10233,23 +9589,10 @@ static uint16_t smallclueBsdSum(FILE *f, unsigned long long *out_blocks) {
 static uint16_t smallclueSysvSum(FILE *f, unsigned long long *out_blocks) {
     uint32_t sum = 0;
     unsigned long long total = 0;
-    char buf[16384];
-    int read_err = 0;
-    ssize_t n;
-
-    while ((n = smallclueReadStream(f, buf, sizeof(buf), &read_err)) > 0) {
-        ssize_t i = 0;
-        /* Bolt optimization: Loop unrolling for SysV sum to reduce branching overhead */
-        for (; i + 15 < n; i += 16) {
-            sum += (uint8_t)buf[i] + (uint8_t)buf[i+1] + (uint8_t)buf[i+2] + (uint8_t)buf[i+3] +
-                   (uint8_t)buf[i+4] + (uint8_t)buf[i+5] + (uint8_t)buf[i+6] + (uint8_t)buf[i+7] +
-                   (uint8_t)buf[i+8] + (uint8_t)buf[i+9] + (uint8_t)buf[i+10] + (uint8_t)buf[i+11] +
-                   (uint8_t)buf[i+12] + (uint8_t)buf[i+13] + (uint8_t)buf[i+14] + (uint8_t)buf[i+15];
-        }
-        for (; i < n; ++i) {
-            sum += (uint8_t)buf[i];
-        }
-        total += (unsigned long long)n;
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        sum += (uint8_t)c;
+        total++;
     }
     /* Fold to 16 bits */
     sum = (sum & 0xFFFF) + (sum >> 16);
@@ -10385,13 +9728,6 @@ static int smallclueVersionCommand(int argc, char **argv) {
     } else {
         printf("version: %s\n", version);
     }
-#if defined(PSCAL_HAS_LIBGIT2)
-    int lg2_major = 0;
-    int lg2_minor = 0;
-    int lg2_rev = 0;
-    git_libgit2_version(&lg2_major, &lg2_minor, &lg2_rev);
-    printf("libgit2: %d.%d.%d\n", lg2_major, lg2_minor, lg2_rev);
-#endif
     free(version);
     return 0;
 }
@@ -10405,7 +9741,6 @@ typedef struct {
 
 static const SmallclueLicense kSmallclueLicenses[] = {
     {"PSCAL", "pscal_LICENSE.txt"},
-    {"libgit2", "libgit2_LICENSE.txt"},
     {"OpenSSH", "openssh_LICENSE.txt"},
     {"curl", "curl_LICENSE.txt"},
     {"OpenSSL", "openssl_LICENSE.txt"},
@@ -10452,7 +9787,7 @@ static bool smallclueLicensesResolvePath(const char *filename, char *out, size_t
 }
 
 static void smallclueLicensesRenderMenu(size_t selected, bool *first_frame) {
-    smallclueMenuStartFrameTo(stdout, first_frame);
+    smallclueMenuStartFrame(first_frame);
     printf("PSCAL & Third-Party Licenses\n");
     printf("Use arrows to navigate, Enter to view, q to quit.\n\n");
     size_t total = smallclueLicensesCount();
@@ -10546,7 +9881,7 @@ static int smallclueHelpCommand(int argc, char **argv) {
                 status = 1;
                 continue;
             }
-            const char *usage = smallclueLookupAppletUsage(applet->name);
+            const char *usage = smallclueLookupHelp(applet->name);
             fprintf(mem, "%s - %s\n", applet->name, applet->description ? applet->description : "");
             if (usage) {
                 fprintf(mem, "Usage:\n%s\n", usage);
@@ -10578,7 +9913,7 @@ static int smallclueHelpCommand(int argc, char **argv) {
                 if (*p == '\n') line_count++;
             }
             if (line_count >= rows) {
-                pager_file("smallclue-help", "(internal)", NULL, r, false);
+                pager_file("smallclue-help", "(internal)", r, false);
             } else {
                 // Print directly if it fits on one screen
                 fwrite(buffer, 1, buflen, stdout);
@@ -10868,43 +10203,16 @@ static void smallclueTimePrintMetric(const char *label, double seconds) {
     printf("%s\t%ldm%.3fs\n", label, minutes, remainder);
 }
 
-static int smallclueTimeRunCommand(int argc, char **argv) {
-    if (argc <= 0 || !argv || !argv[0] || argv[0][0] == '\0') {
-        return 127;
-    }
-
-    const SmallclueApplet *applet = smallclueFindApplet(argv[0]);
-    if (applet) {
-        return smallclueDispatchApplet(applet, argc, argv);
-    }
-
-#if defined(PSCAL_TARGET_IOS)
-    char exec_path[PATH_MAX];
-    char shell_cwd[PATH_MAX];
-    const char *resolve_cwd = NULL;
-    if (vprocShellGetcwdShim(shell_cwd, sizeof(shell_cwd)) != NULL && shell_cwd[0] == '/') {
-        resolve_cwd = shell_cwd;
-    }
-    if (smallclueResolveExecutableFromBaseCwd(resolve_cwd,
-                                              argv[0],
-                                              exec_path,
-                                              sizeof(exec_path)) &&
-        smallcluePathHasShebang(exec_path)) {
-        int status = smallclueRunShebangTool(exec_path, argv);
-        if (status >= 0) {
-            return status;
-        }
-    }
-#endif
-
-    fprintf(stderr, "time: %s: command not found\n", argv[0]);
-    return 127;
-}
-
 static int smallclueTimeCommand(int argc, char **argv) {
     if (argc < 2 || !argv[1] || argv[1][0] == '\0') {
         fprintf(stderr, "usage: time command [args...]\n");
         return 1;
+    }
+
+    const SmallclueApplet *applet = smallclueFindApplet(argv[1]);
+    if (!applet) {
+        fprintf(stderr, "time: %s: command not found\n", argv[1]);
+        return 127;
     }
 
     struct timespec start_real = {0};
@@ -10914,7 +10222,7 @@ static int smallclueTimeCommand(int argc, char **argv) {
     bool have_real = (clock_gettime(CLOCK_MONOTONIC, &start_real) == 0);
     bool have_usage = (getrusage(RUSAGE_SELF, &start_usage) == 0);
 
-    int status = smallclueTimeRunCommand(argc - 1, &argv[1]);
+    int status = smallclueDispatchApplet(applet, argc - 1, &argv[1]);
 
     if (have_real) {
         have_real = (clock_gettime(CLOCK_MONOTONIC, &end_real) == 0);
@@ -11133,12 +10441,8 @@ static int smallclueWatchCommand(int argc, char **argv) {
         }
         /* Match the clear behavior of the standalone `clear` applet: clear
          * scrollback, home cursor, then clear the visible viewport. */
-        if (isatty(STDOUT_FILENO)) {
-            fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
-            printf("\033[7mEvery %.2fs: %s\033[0m\n\n", interval, cmdline ? cmdline : argv[idx]);
-        } else {
-            printf("\nEvery %.2fs: %s\n\n", interval, cmdline ? cmdline : argv[idx]);
-        }
+        fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
+        printf("Every %.2fs: %s\n\n", interval, cmdline ? cmdline : argv[idx]);
         fflush(stdout);
 #if defined(PSCAL_TARGET_IOS)
         status = smallclueWatchRunCommand(cmd_argc, &argv[idx]);
@@ -11309,29 +10613,27 @@ static int smallclueTeeCommand(int argc, char **argv) {
         }
     }
     int file_count = argc - optind;
-    int *files = NULL;
+    FILE **files = NULL;
     if (file_count > 0) {
-        files = (int *)calloc((size_t)file_count, sizeof(int));
+        files = (FILE **)calloc((size_t)file_count, sizeof(FILE *));
         if (!files) {
             perror("tee");
             return 1;
         }
         for (int i = 0; i < file_count; ++i) {
-            int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
-            files[i] = open(argv[optind + i], flags, 0666);
-            if (files[i] < 0) {
+            const char *mode = append ? "ab" : "wb";
+            files[i] = fopen(argv[optind + i], mode);
+            if (!files[i]) {
                 fprintf(stderr, "tee: %s: %s\n", argv[optind + i], strerror(errno));
             }
         }
     }
     int status = 0;
-    char buffer[65536];
-    bool stdout_failed = false;
-    fflush(stdout); /* flush before transitioning to direct fd writes */
+    char buffer[4096];
     while (true) {
-        ssize_t nread = read(STDIN_FILENO, buffer, sizeof(buffer));
+        int read_err = 0;
+        ssize_t nread = smallclueReadStream(stdin, buffer, sizeof(buffer), &read_err);
         if (nread < 0) {
-            if (errno == EINTR) continue;
             perror("tee");
             status = 1;
             break;
@@ -11339,41 +10641,32 @@ static int smallclueTeeCommand(int argc, char **argv) {
         if (nread == 0) {
             break;
         }
-        ssize_t total_written = 0;
-        while (!stdout_failed && total_written < nread) {
-            ssize_t nw = write(STDOUT_FILENO, buffer + total_written, (size_t)(nread - total_written));
-            if (nw < 0) {
-                if (errno == EINTR) continue;
-                perror("tee: write error");
-                status = 1;
-                stdout_failed = true;
-                break;
-            }
-            total_written += nw;
+        if (fwrite(buffer, 1, (size_t)nread, stdout) != (size_t)nread) {
+            perror("tee");
+            status = 1;
+            break;
         }
         for (int i = 0; i < file_count; ++i) {
-            if (files[i] < 0) {
+            if (!files[i]) {
                 continue;
             }
-            ssize_t file_written = 0;
-            while (file_written < nread) {
-                ssize_t nw = write(files[i], buffer + file_written, (size_t)(nread - file_written));
-                if (nw < 0) {
-                    if (errno == EINTR) continue;
-                    fprintf(stderr, "tee: %s: %s\n", argv[optind + i], strerror(errno));
-                    close(files[i]);
-                    files[i] = -1;
-                    status = 1;
-                    break;
-                }
-                file_written += nw;
+            if (fwrite(buffer, 1, (size_t)nread, files[i]) != (size_t)nread) {
+                fprintf(stderr, "tee: %s: %s\n", argv[optind + i], strerror(errno));
+                fclose(files[i]);
+                files[i] = NULL;
+                status = 1;
             }
+        }
+        if (read_err) {
+            perror("tee");
+            status = 1;
+            break;
         }
     }
     if (files) {
         for (int i = 0; i < file_count; ++i) {
-            if (files[i] >= 0) {
-                close(files[i]);
+            if (files[i]) {
+                fclose(files[i]);
             }
         }
         free(files);
@@ -11743,177 +11036,99 @@ static int smallclueDfCommand(int argc, char **argv) {
     }
     return status;
 }
-enum {
-    SMALLCLUE_PING_PAYLOAD_SIZE = 56
-};
-
-static uint16_t smallclueInternetChecksum(const void *data, size_t len) {
-    const uint8_t *bytes = (const uint8_t *)data;
-    uint32_t sum = 0;
-    while (len > 1) {
-        sum += (uint32_t)((bytes[0] << 8) | bytes[1]);
-        bytes += 2;
-        len -= 2;
-    }
-    if (len > 0) {
-        sum += (uint32_t)(bytes[0] << 8);
-    }
-    while ((sum >> 16) != 0) {
-        sum = (sum & 0xffffu) + (sum >> 16);
-    }
-    return (uint16_t)~sum;
-}
-
-static bool smallcluePingDecodeReply(const unsigned char *buf, size_t len,
-        uint16_t ident, uint16_t seq, size_t *out_reply_len) {
-    const struct icmp *icmp_hdr = NULL;
-    size_t reply_len = len;
-
-    if (len >= sizeof(struct ip)) {
-        const struct ip *ip_hdr = (const struct ip *)buf;
-        if (ip_hdr->ip_v == 4) {
-            size_t ip_len = (size_t)ip_hdr->ip_hl << 2;
-            if (ip_len >= sizeof(struct ip) && len >= ip_len + ICMP_MINLEN) {
-                icmp_hdr = (const struct icmp *)(buf + ip_len);
-                reply_len = len - ip_len;
-            }
-        }
-    }
-    if (!icmp_hdr && len >= ICMP_MINLEN) {
-        icmp_hdr = (const struct icmp *)buf;
-        reply_len = len;
-    }
-    if (!icmp_hdr) {
-        errno = EPROTO;
-        return false;
-    }
-    if (icmp_hdr->icmp_type != ICMP_ECHOREPLY) {
-        errno = EPROTO;
-        return false;
-    }
-    if (ntohs((uint16_t)icmp_hdr->icmp_seq) != seq) {
-        errno = EPROTO;
-        return false;
-    }
-    if (ntohs((uint16_t)icmp_hdr->icmp_id) != ident) {
-        errno = EPROTO;
-        return false;
-    }
-    if (out_reply_len) {
-        *out_reply_len = reply_len;
-    }
-    return true;
-}
-
-static int smallcluePingAttempt(const struct sockaddr_in *target_addr, int timeout_ms,
-        uint16_t ident, uint16_t seq, double *out_ms, size_t *out_reply_len) {
-    if (!target_addr) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+static int smallcluePingAttempt(const struct sockaddr *addr, socklen_t addrlen, int family, int timeout_ms, double *out_ms, int probe_port) {
+    int sock = socket(family, SOCK_STREAM, IPPROTO_TCP);
     if (sock < 0) {
         return -1;
     }
-
-    struct timeval tv;
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-        close(sock);
-        return -1;
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
     }
-
-    if (connect(sock, (const struct sockaddr *)target_addr, sizeof(*target_addr)) < 0) {
-        close(sock);
-        return -1;
-    }
-
-    unsigned char packet[ICMP_MINLEN + SMALLCLUE_PING_PAYLOAD_SIZE];
-    memset(packet, 0, sizeof(packet));
-    struct icmp *icmp_hdr = (struct icmp *)packet;
-    icmp_hdr->icmp_type = ICMP_ECHO;
-    icmp_hdr->icmp_code = 0;
-    icmp_hdr->icmp_id = htons(ident);
-    icmp_hdr->icmp_seq = htons(seq);
-    for (size_t i = ICMP_MINLEN; i < sizeof(packet); ++i) {
-        packet[i] = (unsigned char)(i & 0xffu);
-    }
-    icmp_hdr->icmp_cksum = 0;
-    icmp_hdr->icmp_cksum = smallclueInternetChecksum(packet, sizeof(packet));
-
-    struct timespec start;
-    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
-        close(sock);
-        return -1;
-    }
-
-    ssize_t sent = send(sock, packet, sizeof(packet), 0);
-    if (sent != (ssize_t)sizeof(packet)) {
-        if (sent >= 0) {
-            errno = EIO;
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    int rc = -1;
+    // If a specific port was provided, override it in the sockaddr.
+    if (probe_port > 0) {
+        if (addr->sa_family == AF_INET && addrlen >= sizeof(struct sockaddr_in)) {
+            struct sockaddr_in tmp;
+            memcpy(&tmp, addr, sizeof(tmp));
+            tmp.sin_port = htons((uint16_t)probe_port);
+            rc = connect(sock, (struct sockaddr *)&tmp, sizeof(tmp));
+        } else if (addr->sa_family == AF_INET6 && addrlen >= sizeof(struct sockaddr_in6)) {
+            struct sockaddr_in6 tmp6;
+            memcpy(&tmp6, addr, sizeof(tmp6));
+            tmp6.sin6_port = htons((uint16_t)probe_port);
+            rc = connect(sock, (struct sockaddr *)&tmp6, sizeof(tmp6));
+        } else {
+            rc = connect(sock, addr, addrlen);
         }
-        close(sock);
-        return -1;
+    } else {
+        rc = connect(sock, addr, addrlen);
     }
-
-    unsigned char reply[1500];
-    for (;;) {
-        ssize_t received = recv(sock, reply, sizeof(reply), 0);
-        if (received < 0) {
+    if (rc < 0 && errno == EINPROGRESS) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(sock, &wfds);
+        struct timeval tv;
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        rc = select(sock + 1, NULL, &wfds, NULL, &tv);
+        if (rc <= 0) {
+            close(sock);
+            errno = (rc == 0) ? ETIMEDOUT : errno;
+            return -1;
+        }
+        int so_error = 0;
+        socklen_t slen = sizeof(so_error);
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &slen) < 0 || so_error != 0) {
+            if (so_error != 0) {
+                errno = so_error;
+            }
             close(sock);
             return -1;
         }
-
-        struct timespec end;
-        if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
-            close(sock);
-            return -1;
-        }
-
-        size_t reply_len = 0;
-        if (!smallcluePingDecodeReply(reply, (size_t)received, ident, seq, &reply_len)) {
-            continue;
-        }
-
-        if (out_ms) {
-            double start_ms = (double)start.tv_sec * 1000.0 + (double)start.tv_nsec / 1e6;
-            double end_ms = (double)end.tv_sec * 1000.0 + (double)end.tv_nsec / 1e6;
-            *out_ms = end_ms - start_ms;
-        }
-        if (out_reply_len) {
-            *out_reply_len = reply_len;
-        }
+    } else if (rc < 0) {
         close(sock);
-        return 0;
+        return -1;
     }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    close(sock);
+    if (out_ms) {
+        double start_ms = (double)start.tv_sec * 1000.0 + (double)start.tv_nsec / 1e6;
+        double end_ms = (double)end.tv_sec * 1000.0 + (double)end.tv_nsec / 1e6;
+        *out_ms = end_ms - start_ms;
+    }
+    return 0;
 }
 
 static int smallcluePingCommand(int argc, char **argv) {
-    const char *usage = "usage: ping [-c count] [-t timeout_ms] host\n";
+    const char *usage = "usage: ping [-c count] [-p port] [-t timeout_ms] host\n";
     if (argc <= 1) {
         fputs(usage, stderr);
         return 1;
     }
-
     smallclueResetGetopt();
     int count = 4;
     int timeout_ms = 3000;
+    int probe_port = 80;
     int opt;
-    while ((opt = getopt(argc, argv, "c:t:")) != -1) {
+    while ((opt = getopt(argc, argv, "c:p:t:")) != -1) {
         switch (opt) {
             case 'c':
                 count = atoi(optarg);
-                if (count <= 0) {
-                    count = 4;
+                if (count <= 0) count = 4;
+                break;
+            case 'p':
+                probe_port = atoi(optarg);
+                if (probe_port <= 0 || probe_port > 65535) {
+                    fprintf(stderr, "ping: invalid port '%s'\n", optarg);
+                    return 1;
                 }
                 break;
             case 't':
                 timeout_ms = atoi(optarg);
-                if (timeout_ms <= 0) {
-                    timeout_ms = 3000;
-                }
+                if (timeout_ms <= 0) timeout_ms = 3000;
                 break;
             default:
                 fputs(usage, stderr);
@@ -11924,95 +11139,63 @@ static int smallcluePingCommand(int argc, char **argv) {
         fputs(usage, stderr);
         return 1;
     }
-
     const char *host = argv[optind];
-#if defined(PSCAL_TARGET_IOS)
-    if (PSCALRuntimePingHost) {
-        char *output = NULL;
-        int status = PSCALRuntimePingHost(host, count, timeout_ms, &output);
-        if (output) {
-            fputs(output, stdout);
-            free(output);
-        }
-        return status;
-    }
-#endif
-
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
     struct addrinfo *res = NULL;
-    int gai = pscalHostsGetAddrInfo(host, NULL, &hints, &res);
+    char portbuf[16];
+    snprintf(portbuf, sizeof(portbuf), "%d", probe_port);
+    int gai = pscalHostsGetAddrInfo(host, portbuf, &hints, &res);
     if (gai != 0) {
         fprintf(stderr, "ping: %s: %s\n", host, gai_strerror(gai));
         return 1;
     }
-
-    struct addrinfo *selected = NULL;
-    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
-        if (ai->ai_family == AF_INET && ai->ai_addrlen >= sizeof(struct sockaddr_in)) {
-            selected = ai;
-            break;
-        }
-    }
+    struct addrinfo *selected = res;
     if (!selected) {
-        fprintf(stderr, "ping: %s: no IPv4 ICMP address resolved\n", host);
-        pscalHostsFreeAddrInfo(res);
+        fprintf(stderr, "ping: no addresses resolved for %s\n", host);
+        freeaddrinfo(res);
         return 1;
     }
-
-    struct sockaddr_in target_addr;
-    memcpy(&target_addr, selected->ai_addr, sizeof(target_addr));
-
+    struct sockaddr_storage target_addr;
+    memcpy(&target_addr, selected->ai_addr, selected->ai_addrlen);
+    socklen_t target_len = (socklen_t)selected->ai_addrlen;
     char addrbuf[NI_MAXHOST];
-    if (getnameinfo((struct sockaddr *)&target_addr, sizeof(target_addr),
+    if (getnameinfo((struct sockaddr *)&target_addr, target_len,
             addrbuf, sizeof(addrbuf), NULL, 0, NI_NUMERICHOST) != 0) {
         strncpy(addrbuf, "unknown", sizeof(addrbuf));
         addrbuf[sizeof(addrbuf) - 1] = '\0';
     }
-
-    printf("PING %s (%s): %d data bytes\n", host, addrbuf, SMALLCLUE_PING_PAYLOAD_SIZE);
-
+    printf("PING %s (%s) TCP port %d, %d probes, timeout %d ms\n",
+        host, addrbuf, probe_port, count, timeout_ms);
     int successes = 0;
-    double min_ms = 0.0;
-    double max_ms = 0.0;
-    double total_ms = 0.0;
-    uint16_t ident = (uint16_t)(getpid() & 0xffff);
-
+    double min_ms = 0.0, max_ms = 0.0, total_ms = 0.0;
     for (int i = 0; i < count; ++i) {
-        double elapsed_ms = 0.0;
-        size_t reply_len = 0;
-        int rc = smallcluePingAttempt(&target_addr, timeout_ms, ident, (uint16_t)(i + 1),
-            &elapsed_ms, &reply_len);
+        double elapsed = 0.0;
+        int rc = smallcluePingAttempt((struct sockaddr *)&target_addr, target_len,
+            selected->ai_family, timeout_ms, &elapsed, probe_port);
         if (rc == 0) {
             successes++;
-            if (successes == 1 || elapsed_ms < min_ms) {
-                min_ms = elapsed_ms;
-            }
-            if (elapsed_ms > max_ms) {
-                max_ms = elapsed_ms;
-            }
-            total_ms += elapsed_ms;
-            printf("%zu bytes from %s: icmp_seq=%d time=%.3f ms\n",
-                reply_len, addrbuf, i + 1, elapsed_ms);
+            if (successes == 1 || elapsed < min_ms) min_ms = elapsed;
+            if (elapsed > max_ms) max_ms = elapsed;
+            total_ms += elapsed;
+            printf("attempt %d: connected in %.2f ms\n", i + 1, elapsed);
         } else {
-            printf("Request timeout for icmp_seq %d (%s)\n", i + 1, strerror(errno));
+            printf("attempt %d: failed (%s)\n", i + 1, strerror(errno));
         }
         fflush(stdout);
         if (i + 1 < count) {
-            usleep(1000000);
+            usleep(500000);
         }
     }
-
     printf("--- %s ping statistics ---\n", host);
-    printf("%d packets transmitted, %d packets received, %.1f%% packet loss\n",
-        count, successes, count > 0 ? ((double)(count - successes) * 100.0 / (double)count) : 0.0);
+    printf("%d probes sent, %d successful, %d failed\n",
+        count, successes, count - successes);
     if (successes > 0) {
-        printf("round-trip min/avg/max = %.3f/%.3f/%.3f ms\n",
-            min_ms, total_ms / (double)successes, max_ms);
+        printf("round-trip min/avg/max = %.2f/%.2f/%.2f ms (TCP port %d)\n",
+            min_ms, total_ms / successes, max_ms, probe_port);
     }
-
     pscalHostsFreeAddrInfo(res);
     return (successes > 0) ? 0 : 1;
 }
@@ -12158,10 +11341,6 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
         return 1;
     }
     const char *host = argv[optind];
-#if defined(PSCAL_TARGET_IOS)
-    pthread_t bypass_tid = pthread_self();
-    vprocRegisterInterposeBypassThread(bypass_tid);
-#endif
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -12173,9 +11352,6 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
     int gai = pscalHostsGetAddrInfo(host, portbuf, &hints, &res);
     if (gai != 0 || !res) {
         fprintf(stderr, "traceroute: %s: %s\n", host, gai_strerror(gai));
-#if defined(PSCAL_TARGET_IOS)
-        vprocUnregisterInterposeBypassThread(bypass_tid);
-#endif
         return 1;
     }
 
@@ -12183,9 +11359,6 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
     if (recv_sock < 0) {
         fprintf(stderr, "traceroute: unable to open ICMP socket: %s\n", strerror(errno));
         pscalHostsFreeAddrInfo(res);
-#if defined(PSCAL_TARGET_IOS)
-        vprocUnregisterInterposeBypassThread(bypass_tid);
-#endif
         return 1;
     }
 
@@ -12194,9 +11367,6 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
         fprintf(stderr, "traceroute: unable to open UDP socket: %s\n", strerror(errno));
         close(recv_sock);
         pscalHostsFreeAddrInfo(res);
-#if defined(PSCAL_TARGET_IOS)
-        vprocUnregisterInterposeBypassThread(bypass_tid);
-#endif
         return 1;
     }
 
@@ -12261,10 +11431,7 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
 
     close(send_sock);
     close(recv_sock);
-    pscalHostsFreeAddrInfo(res);
-#if defined(PSCAL_TARGET_IOS)
-    vprocUnregisterInterposeBypassThread(bypass_tid);
-#endif
+    freeaddrinfo(res);
     return reached ? 0 : 1;
 }
 
@@ -12445,17 +11612,6 @@ static int smallclueCatCommand(int argc, char **argv) {
     return status ? 1 : 0;
 }
 
-static const char *smallcluePagerDisplayName(const char *path) {
-    if (!path || !*path || strcmp(path, "(stdin)") == 0) {
-        return "(stdin)";
-    }
-    const char *slash = strrchr(path, '/');
-    if (slash && slash[1] != '\0') {
-        return slash + 1;
-    }
-    return path;
-}
-
 static int smallcluePagerCommand(int argc, char **argv) {
     const char *cmd_name = pager_command_name(argv && argc > 0 ? argv[0] : NULL);
     smallclueResetGetopt();
@@ -12474,31 +11630,17 @@ static int smallcluePagerCommand(int argc, char **argv) {
     }
 
     int status = 0;
-    int file_count = argc - optind;
     if (optind >= argc) {
         if (pscalRuntimeStdinIsInteractive()) {
             fprintf(stderr, "%s: missing filename\n", cmd_name);
             return 1;
         }
-        return pager_file(cmd_name, "(stdin)", NULL, stdin, raw_mode);
+        return pager_file(cmd_name, "(stdin)", stdin, raw_mode);
     }
     for (int i = optind; i < argc; ++i) {
         const char *path = argv[i];
-        char detail[PATH_MAX + 32];
-        const char *detail_ptr = NULL;
-        if (file_count > 1) {
-            snprintf(detail, sizeof(detail), "%s (%d/%d)",
-                     smallcluePagerDisplayName(path && strcmp(path, "-") != 0 ? path : "(stdin)"),
-                     (i - optind) + 1,
-                     file_count);
-            detail_ptr = detail;
-        }
         if (!path || strcmp(path, "-") == 0) {
-            status |= pager_file(cmd_name, "(stdin)", detail_ptr, stdin, raw_mode);
-            int exit_key = pagerLastExitKey();
-            if (exit_key == 'Q' || exit_key == 3 || exit_key == 4) {
-                break;
-            }
+            status |= pager_file(cmd_name, "(stdin)", stdin, raw_mode);
             continue;
         }
         FILE *fp = fopen(path, "r");
@@ -12507,14 +11649,8 @@ static int smallcluePagerCommand(int argc, char **argv) {
             status = 1;
             continue;
         }
-        status |= pager_file(cmd_name, path, detail_ptr, fp, raw_mode);
+        status |= pager_file(cmd_name, path, fp, raw_mode);
         fclose(fp);
-        {
-            int exit_key = pagerLastExitKey();
-            if (exit_key == 'Q' || exit_key == 3 || exit_key == 4) {
-                break;
-            }
-        }
     }
     return status ? 1 : 0;
 }
@@ -12558,14 +11694,7 @@ static int smallclueMarkdownCommand(int argc, char **argv) {
         return smallclueMarkdownListDocuments();
     }
     int status = 0;
-    int file_count = argc - optind;
     for (int i = optind; i < argc; ++i) {
-        if (file_count > 1) {
-            if (i > optind) {
-                putchar('\n');
-            }
-            printf("==> %s <==\n", argv[i]);
-        }
         status |= smallclueMarkdownBrowseTarget(argv[i], output_raw);
     }
     return status ? 1 : 0;
@@ -13030,59 +12159,26 @@ static int smallclueHeadStream(FILE *fp, const char *label, long lines) {
     if (lines <= 0) {
         return 0;
     }
-    char buf[16384];
+    char *line = NULL;
+    size_t cap = 0;
     long remaining = lines;
-    int read_err = 0;
-    ssize_t n;
     int status = 0;
-
-    while (remaining > 0 && (n = smallclueReadStream(fp, buf, sizeof(buf), &read_err)) > 0) {
-        ssize_t i = 0;
-        ssize_t end_idx = -1;
-
-        /* Bolt optimization: unrolled loop for head line scanning */
-        #define CHECK_NL(idx) do { \
-            if (buf[i + (idx)] == '\n') { \
-                remaining--; \
-                if (remaining == 0) { \
-                    end_idx = i + (idx); \
-                    goto found; \
-                } \
-            } \
-        } while(0)
-
-        for (; i + 15 < n; i += 16) {
-            CHECK_NL(0); CHECK_NL(1); CHECK_NL(2); CHECK_NL(3);
-            CHECK_NL(4); CHECK_NL(5); CHECK_NL(6); CHECK_NL(7);
-            CHECK_NL(8); CHECK_NL(9); CHECK_NL(10); CHECK_NL(11);
-            CHECK_NL(12); CHECK_NL(13); CHECK_NL(14); CHECK_NL(15);
-        }
-        #undef CHECK_NL
-
-        for (; i < n; ++i) {
-            if (buf[i] == '\n') {
-                remaining--;
-                if (remaining == 0) {
-                    end_idx = i;
-                    goto found;
-                }
+    while (remaining > 0) {
+        int read_err = 0;
+        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
+        if (len < 0) {
+            if (read_err) {
+                fprintf(stderr, "head: %s: %s\n",
+                        label ? label : "(stdin)",
+                        strerror(read_err));
+                status = 1;
             }
-        }
-found:
-        if (end_idx >= 0) {
-            fwrite(buf, 1, (size_t)(end_idx + 1), stdout);
             break;
-        } else {
-            fwrite(buf, 1, (size_t)n, stdout);
         }
+        fwrite(line, 1, (size_t)len, stdout);
+        remaining--;
     }
-
-    if (read_err) {
-        fprintf(stderr, "head: %s: %s\n",
-                label ? label : "(stdin)",
-                strerror(read_err));
-        status = 1;
-    }
+    free(line);
     return status;
 }
 
@@ -13123,8 +12219,7 @@ static int smallclueHeadCommand(int argc, char **argv) {
     }
 
     int status = 0;
-    int file_count = argc - index;
-    if (file_count <= 0) {
+    if (index >= argc) {
         status = smallclueHeadStream(stdin, "(stdin)", lines);
     } else {
         for (int i = index; i < argc; ++i) {
@@ -13134,12 +12229,6 @@ static int smallclueHeadCommand(int argc, char **argv) {
                 fprintf(stderr, "head: %s: %s\n", path, strerror(errno));
                 status = 1;
                 continue;
-            }
-            if (file_count > 1) {
-                if (i > index) {
-                    putchar('\n');
-                }
-                printf("==> %s <==\n", path);
             }
             status |= smallclueHeadStream(fp, path, lines);
             fclose(fp);
@@ -13387,8 +12476,7 @@ static int smallclueTailCommand(int argc, char **argv) {
         return 1;
     }
     int status = 0;
-    int file_count = argc - index;
-    if (file_count <= 0) {
+    if (index >= argc) {
         status = follow ? smallclueTailFollow(stdin, "(stdin)", lines)
                         : smallclueTailStream(stdin, "(stdin)", lines);
     } else {
@@ -13400,12 +12488,6 @@ static int smallclueTailCommand(int argc, char **argv) {
                 fprintf(stderr, "tail: %s: %s\n", path, strerror(errno));
                 status = 1;
                 continue;
-            }
-            if (file_count > 1) {
-                if (i > index) {
-                    putchar('\n');
-                }
-                printf("==> %s <==\n", path);
             }
             if (follow) {
                 status |= smallclueTailFollow(fp, path, lines);
@@ -14550,36 +13632,9 @@ static int smallclueTrCommand(int argc, char **argv) {
     int read_err = 0;
 
     while ((n = smallclueReadStream(stdin, buf, sizeof(buf), &read_err)) > 0) {
-        ssize_t i = 0;
         if (delete_only) {
             size_t out_idx = 0;
-            #define PROCESS_DELETE(idx) do { \
-                unsigned char c = (unsigned char)buf[idx]; \
-                if (!delete_map[c]) { \
-                    out_buf[out_idx++] = c; \
-                } \
-            } while (0)
-
-            for (; i + 15 < n; i += 16) {
-                PROCESS_DELETE(i);
-                PROCESS_DELETE(i+1);
-                PROCESS_DELETE(i+2);
-                PROCESS_DELETE(i+3);
-                PROCESS_DELETE(i+4);
-                PROCESS_DELETE(i+5);
-                PROCESS_DELETE(i+6);
-                PROCESS_DELETE(i+7);
-                PROCESS_DELETE(i+8);
-                PROCESS_DELETE(i+9);
-                PROCESS_DELETE(i+10);
-                PROCESS_DELETE(i+11);
-                PROCESS_DELETE(i+12);
-                PROCESS_DELETE(i+13);
-                PROCESS_DELETE(i+14);
-                PROCESS_DELETE(i+15);
-            }
-            #undef PROCESS_DELETE
-            for (; i < n; ++i) {
+            for (ssize_t i = 0; i < n; ++i) {
                 unsigned char c = (unsigned char)buf[i];
                 if (!delete_map[c]) {
                     out_buf[out_idx++] = c;
@@ -14589,31 +13644,7 @@ static int smallclueTrCommand(int argc, char **argv) {
                 fwrite(out_buf, 1, out_idx, stdout);
             }
         } else {
-            #define PROCESS_MAP(idx) do { \
-                unsigned char c = (unsigned char)buf[idx]; \
-                buf[idx] = map[c]; \
-            } while (0)
-
-            for (; i + 15 < n; i += 16) {
-                PROCESS_MAP(i);
-                PROCESS_MAP(i+1);
-                PROCESS_MAP(i+2);
-                PROCESS_MAP(i+3);
-                PROCESS_MAP(i+4);
-                PROCESS_MAP(i+5);
-                PROCESS_MAP(i+6);
-                PROCESS_MAP(i+7);
-                PROCESS_MAP(i+8);
-                PROCESS_MAP(i+9);
-                PROCESS_MAP(i+10);
-                PROCESS_MAP(i+11);
-                PROCESS_MAP(i+12);
-                PROCESS_MAP(i+13);
-                PROCESS_MAP(i+14);
-                PROCESS_MAP(i+15);
-            }
-            #undef PROCESS_MAP
-            for (; i < n; ++i) {
+            for (ssize_t i = 0; i < n; ++i) {
                 unsigned char c = (unsigned char)buf[i];
                 buf[i] = map[c];
             }
@@ -14943,68 +13974,27 @@ static int smallclueWcProcessFile(const char *path, SmallclueWcCounts *counts) {
         fp = stdin;
     }
 
-    uint64_t lines = 0;
-    uint64_t words = 0;
-    uint64_t bytes = 0;
+    counts->lines = counts->words = counts->bytes = 0;
     int in_word = 0;
     int read_err = 0;
     char buf[16384];
     ssize_t n;
 
     while ((n = smallclueReadStream(fp, buf, sizeof(buf), &read_err)) > 0) {
-        bytes += (uint64_t)n;
-        ssize_t i = 0;
-        /* Bolt optimization: loop unrolling for wc */
-        #define PROCESS_CHAR(idx) do { \
-            unsigned char c = (unsigned char)buf[idx]; \
-            lines += (c == '\n'); \
-            if ((c == ' ') || (c >= '\t' && c <= '\r')) { \
-                in_word = 0; \
-            } else if (!in_word) { \
-                words++; \
-                in_word = 1; \
-            } \
-        } while (0)
-
-        for (; i + 15 < n; i += 16) {
-            PROCESS_CHAR(i);
-            PROCESS_CHAR(i+1);
-            PROCESS_CHAR(i+2);
-            PROCESS_CHAR(i+3);
-            PROCESS_CHAR(i+4);
-            PROCESS_CHAR(i+5);
-            PROCESS_CHAR(i+6);
-            PROCESS_CHAR(i+7);
-            PROCESS_CHAR(i+8);
-            PROCESS_CHAR(i+9);
-            PROCESS_CHAR(i+10);
-            PROCESS_CHAR(i+11);
-            PROCESS_CHAR(i+12);
-            PROCESS_CHAR(i+13);
-            PROCESS_CHAR(i+14);
-            PROCESS_CHAR(i+15);
-        }
-        #undef PROCESS_CHAR
-        for (; i < n; ++i) {
+        counts->bytes += (uint64_t)n;
+        for (ssize_t i = 0; i < n; ++i) {
             unsigned char c = (unsigned char)buf[i];
             if (c == '\n') {
-                lines++;
+                counts->lines++;
             }
-
-            /* Bolt optimization: inline space check instead of isspace() to avoid function call overhead */
-            int is_sp = (c == ' ') || (c >= '\t' && c <= '\r');
-            if (is_sp) {
+            if (isspace(c)) {
                 in_word = 0;
             } else if (!in_word) {
-                words++;
+                counts->words++;
                 in_word = 1;
             }
         }
     }
-
-    counts->lines = lines;
-    counts->words = words;
-    counts->bytes = bytes;
 
     if (fp != stdin) {
         fclose(fp);
@@ -15327,11 +14317,7 @@ static bool smallclueConfirmDelete(const char *label, const char *path) {
                 label, path);
         return false;
     }
-    if (isatty(STDERR_FILENO)) {
-        fprintf(stderr, "%s: remove '\033[1;31m%s\033[0m'? [y/N] ", label, path);
-    } else {
-        fprintf(stderr, "%s: remove '%s'? [y/N] ", label, path);
-    }
+    fprintf(stderr, "%s: remove '\033[1;31m%s\033[0m'? [y/N] ", label, path);
     fflush(stderr);
     int c = getchar();
     /* consume the rest of the line */
@@ -15813,173 +14799,6 @@ static bool smallclueFstabEncodeField(const char *input, char *out, size_t out_s
     return true;
 }
 
-static bool smallclueFstabBufferAppend(char **buffer,
-                                       size_t *length,
-                                       size_t *capacity,
-                                       const char *data,
-                                       size_t data_len) {
-    if (!buffer || !length || !capacity) {
-        errno = EINVAL;
-        return false;
-    }
-    if (data_len == 0) {
-        return true;
-    }
-    if (!data) {
-        errno = EINVAL;
-        return false;
-    }
-    if (*length > SIZE_MAX - data_len) {
-        errno = EOVERFLOW;
-        return false;
-    }
-    size_t needed = *length + data_len + 1;
-    if (needed > *capacity) {
-        size_t new_capacity = (*capacity > 0) ? *capacity : 1024;
-        while (new_capacity < needed) {
-            if (new_capacity > SIZE_MAX / 2) {
-                new_capacity = needed;
-                break;
-            }
-            new_capacity *= 2;
-        }
-        char *resized = (char *)realloc(*buffer, new_capacity);
-        if (!resized) {
-            errno = ENOMEM;
-            return false;
-        }
-        *buffer = resized;
-        *capacity = new_capacity;
-    }
-    memcpy(*buffer + *length, data, data_len);
-    *length += data_len;
-    (*buffer)[*length] = '\0';
-    return true;
-}
-
-static bool smallclueFstabReadWholeFile(int fd, char **out_data, size_t *out_len) {
-    if (fd < 0 || !out_data || !out_len) {
-        errno = EINVAL;
-        return false;
-    }
-    if (vprocHostLseek(fd, 0, SEEK_SET) < 0) {
-        return false;
-    }
-
-    char *buffer = NULL;
-    size_t length = 0;
-    size_t capacity = 0;
-    char chunk[2048];
-    while (true) {
-        ssize_t read_bytes = vprocHostRead(fd, chunk, sizeof(chunk));
-        if (read_bytes < 0) {
-            int saved_errno = errno;
-            free(buffer);
-            errno = saved_errno;
-            return false;
-        }
-        if (read_bytes == 0) {
-            break;
-        }
-        if (!smallclueFstabBufferAppend(&buffer,
-                                        &length,
-                                        &capacity,
-                                        chunk,
-                                        (size_t)read_bytes)) {
-            int saved_errno = errno;
-            free(buffer);
-            errno = saved_errno;
-            return false;
-        }
-    }
-
-    if (!buffer) {
-        buffer = (char *)calloc(1, 1);
-        if (!buffer) {
-            errno = ENOMEM;
-            return false;
-        }
-    }
-    buffer[length] = '\0';
-    *out_data = buffer;
-    *out_len = length;
-    return true;
-}
-
-static bool smallclueFstabRewriteWholeFile(int fd, const char *data, size_t data_len) {
-    if (fd < 0 || (!data && data_len > 0)) {
-        errno = EINVAL;
-        return false;
-    }
-    if (vprocHostLseek(fd, 0, SEEK_SET) < 0) {
-        return false;
-    }
-    if (ftruncate(fd, 0) != 0) {
-        return false;
-    }
-    if (vprocHostLseek(fd, 0, SEEK_SET) < 0) {
-        return false;
-    }
-    size_t written = 0;
-    while (written < data_len) {
-        ssize_t rc = vprocHostWrite(fd, data + written, data_len - written);
-        if (rc <= 0) {
-            if (rc == 0) {
-                errno = EIO;
-            }
-            return false;
-        }
-        written += (size_t)rc;
-    }
-    (void)vprocHostFsync(fd);
-    return true;
-}
-
-static bool smallclueFstabLineEquals(const char *line, size_t line_len, const char *value) {
-    if (!line || !value) {
-        return false;
-    }
-    while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) {
-        line_len--;
-    }
-    size_t value_len = strlen(value);
-    return line_len == value_len && memcmp(line, value, value_len) == 0;
-}
-
-static bool smallclueFstabLineMatchesTarget(const char *line,
-                                            size_t line_len,
-                                            const char *target_encoded) {
-    if (!line || !target_encoded) {
-        return false;
-    }
-    while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) {
-        line_len--;
-    }
-    char *scratch = (char *)malloc(line_len + 1);
-    if (!scratch) {
-        return false;
-    }
-    memcpy(scratch, line, line_len);
-    scratch[line_len] = '\0';
-
-    char *cursor = scratch;
-    while (*cursor && isspace((unsigned char)*cursor)) {
-        cursor++;
-    }
-    if (*cursor == '\0' || *cursor == '#') {
-        free(scratch);
-        return false;
-    }
-
-    char *saveptr = NULL;
-    char *source_field = strtok_r(cursor, " \t", &saveptr);
-    char *target_field = strtok_r(NULL, " \t", &saveptr);
-    (void)source_field;
-    bool match = (target_field && strcmp(target_field, target_encoded) == 0);
-    free(scratch);
-    return match;
-}
-
 static bool smallclueMountPersistFstabEntry(const char *source,
                                             const char *target,
                                             const char *type,
@@ -16016,170 +14835,63 @@ static bool smallclueMountPersistFstabEntry(const char *source,
         return false;
     }
 
-    int fd = vprocHostOpen("/etc/fstab", O_RDWR | O_CREAT, 0666);
-    if (fd < 0) {
-        return false;
-    }
-
-    char *existing = NULL;
-    size_t existing_len = 0;
-    if (!smallclueFstabReadWholeFile(fd, &existing, &existing_len)) {
-        int saved_errno = errno;
-        vprocHostClose(fd);
-        errno = saved_errno;
+    FILE *fp = fopen("/etc/fstab", "a+");
+    if (!fp) {
         return false;
     }
 
     bool exists = false;
-    const char *cursor = existing;
-    const char *end = existing + existing_len;
-    while (cursor < end) {
-        const char *newline = memchr(cursor, '\n', (size_t)(end - cursor));
-        size_t raw_len = newline ? (size_t)(newline - cursor + 1) : (size_t)(end - cursor);
-        size_t line_len = newline ? raw_len - 1 : raw_len;
-        if (smallclueFstabLineEquals(cursor, line_len, entry_line)) {
+    rewind(fp);
+    char line[(PATH_MAX * 8) + 128];
+    while (fgets(line, sizeof(line), fp)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (strcmp(line, entry_line) == 0) {
             exists = true;
             break;
         }
-        cursor += raw_len;
     }
-
     if (!exists) {
-        char *updated = NULL;
-        size_t updated_len = 0;
-        size_t updated_capacity = 0;
-        if (!smallclueFstabBufferAppend(&updated,
-                                        &updated_len,
-                                        &updated_capacity,
-                                        existing,
-                                        existing_len)) {
+        if (fseek(fp, 0, SEEK_END) != 0) {
             int saved_errno = errno;
-            free(existing);
-            vprocHostClose(fd);
+            fclose(fp);
             errno = saved_errno;
             return false;
         }
-        if (updated_len > 0 && updated[updated_len - 1] != '\n') {
-            if (!smallclueFstabBufferAppend(&updated,
-                                            &updated_len,
-                                            &updated_capacity,
-                                            "\n",
-                                            1)) {
+        long end = ftell(fp);
+        if (end > 0) {
+            if (fseek(fp, end - 1, SEEK_SET) != 0) {
                 int saved_errno = errno;
-                free(updated);
-                free(existing);
-                vprocHostClose(fd);
+                fclose(fp);
                 errno = saved_errno;
                 return false;
             }
-        }
-        if (!smallclueFstabBufferAppend(&updated,
-                                        &updated_len,
-                                        &updated_capacity,
-                                        entry_line,
-                                        strlen(entry_line)) ||
-            !smallclueFstabBufferAppend(&updated,
-                                        &updated_len,
-                                        &updated_capacity,
-                                        "\n",
-                                        1)) {
-            int saved_errno = errno;
-            free(updated);
-            free(existing);
-            vprocHostClose(fd);
-            errno = saved_errno;
-            return false;
-        }
-        if (!smallclueFstabRewriteWholeFile(fd, updated, updated_len)) {
-            int saved_errno = errno;
-            free(updated);
-            free(existing);
-            vprocHostClose(fd);
-            errno = saved_errno;
-            return false;
-        }
-        free(updated);
-    }
-
-    free(existing);
-    vprocHostClose(fd);
-    return true;
-}
-
-static bool smallclueMountRemoveFstabEntry(const char *target) {
-    if (!target || target[0] != '/') {
-        errno = EINVAL;
-        return false;
-    }
-
-    char target_encoded[PATH_MAX * 4];
-    if (!smallclueFstabEncodeField(target, target_encoded, sizeof(target_encoded))) {
-        return false;
-    }
-
-    int fd = vprocHostOpen("/etc/fstab", O_RDWR | O_CREAT, 0666);
-    if (fd < 0) {
-        return false;
-    }
-
-    char *existing = NULL;
-    size_t existing_len = 0;
-    if (!smallclueFstabReadWholeFile(fd, &existing, &existing_len)) {
-        int saved_errno = errno;
-        vprocHostClose(fd);
-        errno = saved_errno;
-        return false;
-    }
-
-    bool removed = false;
-    char *updated = NULL;
-    size_t updated_len = 0;
-    size_t updated_capacity = 0;
-    const char *cursor = existing;
-    const char *end = existing + existing_len;
-    while (cursor < end) {
-        const char *newline = memchr(cursor, '\n', (size_t)(end - cursor));
-        size_t raw_len = newline ? (size_t)(newline - cursor + 1) : (size_t)(end - cursor);
-        size_t line_len = newline ? raw_len - 1 : raw_len;
-        if (!smallclueFstabLineMatchesTarget(cursor, line_len, target_encoded)) {
-            if (!smallclueFstabBufferAppend(&updated,
-                                            &updated_len,
-                                            &updated_capacity,
-                                            cursor,
-                                            raw_len)) {
+            int last = fgetc(fp);
+            if (last == EOF && ferror(fp)) {
                 int saved_errno = errno;
-                free(updated);
-                free(existing);
-                vprocHostClose(fd);
+                fclose(fp);
                 errno = saved_errno;
                 return false;
             }
-        } else {
-            removed = true;
+            if (last != '\n') {
+                if (fseek(fp, 0, SEEK_END) != 0 || fputc('\n', fp) == EOF) {
+                    int saved_errno = errno;
+                    fclose(fp);
+                    errno = saved_errno;
+                    return false;
+                }
+            }
         }
-        cursor += raw_len;
+        if (fprintf(fp, "%s\n", entry_line) < 0 || fflush(fp) != 0) {
+            int saved_errno = errno;
+            fclose(fp);
+            errno = saved_errno;
+            return false;
+        }
     }
-
-    if (!removed) {
-        free(updated);
-        free(existing);
-        vprocHostClose(fd);
-        errno = ENOENT;
-        return false;
-    }
-
-    if (!smallclueFstabRewriteWholeFile(fd, updated ? updated : "", updated_len)) {
-        int saved_errno = errno;
-        free(updated);
-        free(existing);
-        vprocHostClose(fd);
-        errno = saved_errno;
-        return false;
-    }
-
-    free(updated);
-    free(existing);
-    vprocHostClose(fd);
+    fclose(fp);
     return true;
 }
 #endif
@@ -16531,100 +15243,6 @@ static int smallclueMountCommand(int argc, char **argv) {
     (void)argc;
     (void)argv;
     fprintf(stderr, "mount: not supported on this platform\n");
-    return 1;
-#endif
-}
-
-static int smallclueUmountCommand(int argc, char **argv) {
-#if defined(__linux__) || defined(linux) || defined(__linux)
-    const char *usage = "usage: umount dir\n";
-    smallclueResetGetopt();
-    int opt;
-    while ((opt = getopt(argc, argv, "")) != -1) {
-        (void)opt;
-        fputs(usage, stderr);
-        return 1;
-    }
-    if (optind + 1 != argc) {
-        fputs(usage, stderr);
-        return 1;
-    }
-    const char *target = argv[optind];
-    if (umount(target) != 0) {
-        perror("umount");
-        return 1;
-    }
-    return 0;
-#elif defined(PSCAL_TARGET_IOS)
-    const char *usage = "usage: umount [-p] dir\n";
-    bool persist_to_fstab = false;
-
-    smallclueResetGetopt();
-    int opt;
-    while ((opt = getopt(argc, argv, "p")) != -1) {
-        switch (opt) {
-            case 'p':
-                persist_to_fstab = true;
-                break;
-            default:
-                fputs(usage, stderr);
-                return 1;
-        }
-    }
-    if (optind + 1 != argc) {
-        fputs(usage, stderr);
-        return 1;
-    }
-
-    const char *target = argv[optind];
-    char target_virtual[PATH_MAX];
-    bool have_target_virtual = false;
-    if (realpath(target, target_virtual)) {
-        have_target_virtual = true;
-    } else {
-        if (target[0] == '/') {
-            int n = snprintf(target_virtual, sizeof(target_virtual), "%s", target);
-            if (n > 0 && (size_t)n < sizeof(target_virtual)) {
-                have_target_virtual = true;
-            }
-        } else {
-            char cwd[PATH_MAX];
-            if (getcwd(cwd, sizeof(cwd))) {
-                int n = snprintf(target_virtual, sizeof(target_virtual), "%s/%s", cwd, target);
-                if (n > 0 && (size_t)n < sizeof(target_virtual)) {
-                    have_target_virtual = true;
-                }
-            }
-        }
-    }
-    if (!have_target_virtual) {
-        fprintf(stderr, "umount: %s: %s\n", target, strerror(errno));
-        return 1;
-    }
-
-    if (!pathTruncateMountRemove(target_virtual)) {
-        int saved_errno = errno;
-        fprintf(stderr,
-                "umount: %s: %s\n",
-                target,
-                strerror(saved_errno ? saved_errno : EINVAL));
-        return 1;
-    }
-
-    if (persist_to_fstab) {
-        if (!smallclueMountRemoveFstabEntry(target_virtual)) {
-            int saved_errno = errno;
-            fprintf(stderr,
-                    "umount: unmounted but failed to update /etc/fstab: %s\n",
-                    strerror(saved_errno ? saved_errno : EIO));
-            return 1;
-        }
-    }
-    return 0;
-#else
-    (void)argc;
-    (void)argv;
-    fprintf(stderr, "umount: not supported on this platform\n");
     return 1;
 #endif
 }
@@ -17074,1099 +15692,6 @@ static int smallclueMvCommand(int argc, char **argv) {
         }
     }
     return status;
-}
-
-typedef struct {
-    bool recursive;
-    bool verbose;
-    bool compress;
-    bool preserve_mode;
-    bool preserve_times;
-    bool dry_run;
-    bool delete_extra;
-    bool update_only;
-    bool checksum;
-    char **include_patterns;
-    size_t include_count;
-    size_t include_capacity;
-    char **exclude_patterns;
-    size_t exclude_count;
-    size_t exclude_capacity;
-    const char *filter_root;
-    const char *filter_dest_root;
-} SmallclueRsyncOptions;
-
-static bool smallclueRsyncLegacyFallbackEnabled(void) {
-    int parsed = pagerParseEnvBool(getenv("PSCALI_RSYNC_LEGACY"));
-    return parsed == 1;
-}
-
-static int smallclueRunNativeRsyncCommand(int argc, char **argv) {
-    if (argc <= 0 || !argv || !argv[0]) {
-        return 1;
-    }
-
-    char exec_path[PATH_MAX];
-    if (!smallclueResolveCommandPathForExec("rsync", exec_path, sizeof(exec_path))) {
-        fprintf(stderr,
-                "rsync: no native rsync backend found in PATH; "
-                "install/provide a real rsync binary or set PSCALI_RSYNC_LEGACY=1\n");
-        return 127;
-    }
-
-    setenv("PSCALI_RSYNC_EXTERNAL_DELEGATE_ACTIVE", "1", 1);
-    execv(exec_path, argv);
-    int err = errno;
-    fprintf(stderr, "rsync: %s: %s\n", exec_path, strerror(err));
-    return (err == ENOENT) ? 127 : 126;
-}
-
-static void smallclueRsyncUsage(FILE *out) {
-    if (!out) {
-        out = stderr;
-    }
-    fprintf(out,
-            "usage: rsync [options] <source>... <destination>\n"
-            "  -a, --archive          archive mode (implies -rpt)\n"
-            "  -r, --recursive        recurse into directories\n"
-            "  -p, --perms            preserve permissions\n"
-            "  -t, --times            preserve modification times\n"
-            "  -u, --update           skip files newer on receiver\n"
-            "  -c, --checksum         use checksum to detect changes\n"
-            "  -v, --verbose          verbose output\n"
-            "  -z, --compress         enable compression for remote transfer (scp -C)\n"
-            "  -n, --dry-run          show what would change without writing\n"
-            "      --delete           delete destination entries not present in source\n"
-            "      --include=PATTERN  include files matching pattern\n"
-            "      --exclude=PATTERN  exclude files matching pattern\n");
-}
-
-static int smallclueRsyncAddPattern(char ***patterns,
-                                    size_t *count,
-                                    size_t *capacity,
-                                    const char *value) {
-    if (!patterns || !count || !capacity || !value || value[0] == '\0') {
-        return -1;
-    }
-    if (*count == *capacity) {
-        size_t next_capacity = *capacity ? (*capacity * 2) : 8;
-        char **resized = (char **)realloc(*patterns, next_capacity * sizeof(char *));
-        if (!resized) {
-            return -1;
-        }
-        *patterns = resized;
-        *capacity = next_capacity;
-    }
-    (*patterns)[*count] = strdup(value);
-    if (!(*patterns)[*count]) {
-        return -1;
-    }
-    (*count)++;
-    return 0;
-}
-
-static void smallclueRsyncFreePatterns(char **patterns, size_t count) {
-    if (!patterns) {
-        return;
-    }
-    for (size_t i = 0; i < count; ++i) {
-        free(patterns[i]);
-    }
-    free(patterns);
-}
-
-static bool smallclueRsyncHasTrailingSlash(const char *path) {
-    if (!path) {
-        return false;
-    }
-    size_t len = strlen(path);
-    return len > 1 && path[len - 1] == '/';
-}
-
-static bool smallclueRsyncLooksRemote(const char *path) {
-    if (!path || !*path) {
-        return false;
-    }
-    if (strncmp(path, "rsync://", 8) == 0) {
-        return true;
-    }
-    if (strstr(path, "://") != NULL) {
-        return false;
-    }
-    const char *colon = strchr(path, ':');
-    if (!colon || colon == path) {
-        return false;
-    }
-    const char *slash = strchr(path, '/');
-    if (slash && slash < colon) {
-        return false;
-    }
-    if (path[0] == '/' || path[0] == '.') {
-        return false;
-    }
-    return true;
-}
-
-static void smallclueRsyncStatTimes(const struct stat *st, struct timeval tv[2]) {
-    if (!st || !tv) {
-        return;
-    }
-#if defined(__APPLE__)
-    tv[0].tv_sec = st->st_atimespec.tv_sec;
-    tv[0].tv_usec = (suseconds_t)(st->st_atimespec.tv_nsec / 1000);
-    tv[1].tv_sec = st->st_mtimespec.tv_sec;
-    tv[1].tv_usec = (suseconds_t)(st->st_mtimespec.tv_nsec / 1000);
-#else
-    tv[0].tv_sec = st->st_atim.tv_sec;
-    tv[0].tv_usec = (suseconds_t)(st->st_atim.tv_nsec / 1000);
-    tv[1].tv_sec = st->st_mtim.tv_sec;
-    tv[1].tv_usec = (suseconds_t)(st->st_mtim.tv_nsec / 1000);
-#endif
-}
-
-static int smallclueRsyncCompareMtime(const struct stat *lhs, const struct stat *rhs) {
-#if defined(__APPLE__)
-    if (lhs->st_mtimespec.tv_sec != rhs->st_mtimespec.tv_sec) {
-        return (lhs->st_mtimespec.tv_sec < rhs->st_mtimespec.tv_sec) ? -1 : 1;
-    }
-    if (lhs->st_mtimespec.tv_nsec != rhs->st_mtimespec.tv_nsec) {
-        return (lhs->st_mtimespec.tv_nsec < rhs->st_mtimespec.tv_nsec) ? -1 : 1;
-    }
-#else
-    if (lhs->st_mtim.tv_sec != rhs->st_mtim.tv_sec) {
-        return (lhs->st_mtim.tv_sec < rhs->st_mtim.tv_sec) ? -1 : 1;
-    }
-    if (lhs->st_mtim.tv_nsec != rhs->st_mtim.tv_nsec) {
-        return (lhs->st_mtim.tv_nsec < rhs->st_mtim.tv_nsec) ? -1 : 1;
-    }
-#endif
-    return 0;
-}
-
-static bool smallclueRsyncSameMtime(const struct stat *a, const struct stat *b) {
-    return smallclueRsyncCompareMtime(a, b) == 0;
-}
-
-static int smallclueRsyncFileChecksum(const char *path, uint64_t *out_hash) {
-    if (!path || !out_hash) {
-        errno = EINVAL;
-        return -1;
-    }
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        return -1;
-    }
-    uint64_t hash = 1469598103934665603ULL;
-    unsigned char buffer[16384];
-    for (;;) {
-        ssize_t nread = read(fd, buffer, sizeof(buffer));
-        if (nread == 0) {
-            break;
-        }
-        if (nread < 0) {
-            int saved = errno;
-            close(fd);
-            errno = saved;
-            return -1;
-        }
-        for (ssize_t i = 0; i < nread; ++i) {
-            hash ^= (uint64_t)buffer[i];
-            hash *= 1099511628211ULL;
-        }
-    }
-    close(fd);
-    *out_hash = hash;
-    return 0;
-}
-
-static bool smallclueRsyncParentPath(const char *path, char *out, size_t out_size) {
-    if (!path || !out || out_size == 0) {
-        return false;
-    }
-    if (!smallclueCopyPath(out, out_size, path)) {
-        return false;
-    }
-    smallclueTrimTrailingSlashes(out);
-    char *slash = strrchr(out, '/');
-    if (!slash) {
-        if (out_size < 2) {
-            return false;
-        }
-        out[0] = '.';
-        out[1] = '\0';
-        return true;
-    }
-    if (slash == out) {
-        out[1] = '\0';
-        return true;
-    }
-    *slash = '\0';
-    return true;
-}
-
-static const char *smallclueRsyncLeafName(const char *path, char *scratch, size_t scratch_size) {
-    if (!path || !scratch || scratch_size == 0 || !smallclueCopyPath(scratch, scratch_size, path)) {
-        return path;
-    }
-    smallclueTrimTrailingSlashes(scratch);
-    return smallclueLeafName(scratch);
-}
-
-static const char *smallclueRsyncRelativePath(const char *root,
-                                              const char *path,
-                                              char *out,
-                                              size_t out_size) {
-    if (!path || !out || out_size == 0) {
-        return "";
-    }
-    out[0] = '\0';
-    if (!root || root[0] == '\0') {
-        const char *leaf = smallclueLeafName(path);
-        smallclueCopyPath(out, out_size, leaf ? leaf : path);
-        return out;
-    }
-    char root_buf[PATH_MAX];
-    if (!smallclueCopyPath(root_buf, sizeof(root_buf), root)) {
-        const char *leaf = smallclueLeafName(path);
-        smallclueCopyPath(out, out_size, leaf ? leaf : path);
-        return out;
-    }
-    smallclueTrimTrailingSlashes(root_buf);
-    size_t root_len = strlen(root_buf);
-    if (strncmp(path, root_buf, root_len) == 0 &&
-        (path[root_len] == '\0' || path[root_len] == '/')) {
-        const char *suffix = path + root_len;
-        if (*suffix == '/') {
-            suffix++;
-        }
-        if (*suffix == '\0') {
-            smallclueCopyPath(out, out_size, ".");
-        } else {
-            smallclueCopyPath(out, out_size, suffix);
-        }
-        return out;
-    }
-    const char *leaf = smallclueLeafName(path);
-    smallclueCopyPath(out, out_size, leaf ? leaf : path);
-    return out;
-}
-
-static bool smallclueRsyncPatternMatch(const char *pattern,
-                                       const char *relative_path,
-                                       const char *leaf_name,
-                                       bool is_dir) {
-    if (!pattern || !*pattern) {
-        return false;
-    }
-    if (relative_path && fnmatch(pattern, relative_path, FNM_PATHNAME) == 0) {
-        return true;
-    }
-    if (leaf_name && fnmatch(pattern, leaf_name, 0) == 0) {
-        return true;
-    }
-    if (is_dir && relative_path) {
-        char rel_dir[PATH_MAX];
-        int written = snprintf(rel_dir, sizeof(rel_dir), "%s/", relative_path);
-        if (written > 0 && (size_t)written < sizeof(rel_dir) &&
-            fnmatch(pattern, rel_dir, FNM_PATHNAME) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool smallclueRsyncMatchesAny(const char *relative_path,
-                                     const char *leaf_name,
-                                     bool is_dir,
-                                     char **patterns,
-                                     size_t pattern_count) {
-    for (size_t i = 0; i < pattern_count; ++i) {
-        if (smallclueRsyncPatternMatch(patterns[i], relative_path, leaf_name, is_dir)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool smallclueRsyncPathSelected(const SmallclueRsyncOptions *opts,
-                                       const char *path,
-                                       bool is_dir,
-                                       bool use_dest_root) {
-    if (!opts) {
-        return true;
-    }
-    if (opts->include_count == 0 && opts->exclude_count == 0) {
-        return true;
-    }
-    char relbuf[PATH_MAX];
-    char leafbuf[PATH_MAX];
-    const char *relative = smallclueRsyncRelativePath(use_dest_root ? opts->filter_dest_root : opts->filter_root,
-                                                      path,
-                                                      relbuf,
-                                                      sizeof(relbuf));
-    const char *leaf = smallclueRsyncLeafName(path, leafbuf, sizeof(leafbuf));
-    bool excluded = smallclueRsyncMatchesAny(relative, leaf, is_dir, opts->exclude_patterns, opts->exclude_count);
-    if (excluded) {
-        return false;
-    }
-    if (opts->include_count == 0) {
-        return true;
-    }
-    if (is_dir) {
-        return true;
-    }
-    return smallclueRsyncMatchesAny(relative, leaf, false, opts->include_patterns, opts->include_count);
-}
-
-static int smallclueRsyncApplyMetadata(const char *dst,
-                                       const struct stat *src_stat,
-                                       const SmallclueRsyncOptions *opts,
-                                       bool allow_chmod) {
-    if (!dst || !src_stat || !opts || opts->dry_run) {
-        return 0;
-    }
-    int status = 0;
-    if (opts->preserve_mode && allow_chmod) {
-        mode_t mode = src_stat->st_mode & 07777;
-        if (chmod(dst, mode) != 0) {
-            fprintf(stderr, "rsync: chmod %s: %s\n", dst, strerror(errno));
-            status = -1;
-        }
-    }
-    if (opts->preserve_times) {
-        struct timeval tv[2];
-        smallclueRsyncStatTimes(src_stat, tv);
-        if (utimes(dst, tv) != 0) {
-            fprintf(stderr, "rsync: utimes %s: %s\n", dst, strerror(errno));
-            status = -1;
-        }
-    }
-    return status;
-}
-
-static int smallclueRsyncEnsureDir(const char *path, mode_t mode, const SmallclueRsyncOptions *opts) {
-    struct stat st;
-    if (lstat(path, &st) == 0) {
-        if (S_ISDIR(st.st_mode)) {
-            return 0;
-        }
-        if (opts->dry_run) {
-            if (opts->verbose) {
-                printf("delete %s\n", path);
-                printf("mkdir %s\n", path);
-            }
-            return 0;
-        }
-        if (smallclueRemovePathWithLabel("rsync", path, true, true, false) != 0) {
-            return -1;
-        }
-    } else if (errno != ENOENT) {
-        fprintf(stderr, "rsync: %s: %s\n", path, strerror(errno));
-        return -1;
-    }
-    if (opts->dry_run) {
-        if (opts->verbose) {
-            printf("mkdir %s\n", path);
-        }
-        return 0;
-    }
-    if (smallclueMkdirParents(path, mode, false) != 0) {
-        fprintf(stderr, "rsync: mkdir %s: %s\n", path, strerror(errno));
-        return -1;
-    }
-    return 0;
-}
-
-static int smallclueRsyncEnsureParentDir(const char *path, const SmallclueRsyncOptions *opts) {
-    char parent[PATH_MAX];
-    if (!smallclueCopyPath(parent, sizeof(parent), path)) {
-        errno = ENAMETOOLONG;
-        fprintf(stderr, "rsync: %s: %s\n", path, strerror(errno));
-        return -1;
-    }
-    if (!smallclueChopParentDirectory(parent)) {
-        return 0;
-    }
-    return smallclueRsyncEnsureDir(parent, 0777, opts);
-}
-
-static int smallclueRsyncRemovePath(const char *path, const SmallclueRsyncOptions *opts) {
-    if (opts->dry_run) {
-        if (opts->verbose) {
-            printf("delete %s\n", path);
-        }
-        return 0;
-    }
-    return smallclueRemovePathWithLabel("rsync", path, true, true, false);
-}
-
-static int smallclueRsyncSyncEntry(const char *src, const char *dst, const SmallclueRsyncOptions *opts);
-
-static int smallclueRsyncDeleteExtraneous(const char *src_dir,
-                                          const char *dst_dir,
-                                          const SmallclueRsyncOptions *opts) {
-    DIR *dir = opendir(dst_dir);
-    if (!dir) {
-        fprintf(stderr, "rsync: %s: %s\n", dst_dir, strerror(errno));
-        return -1;
-    }
-    int status = 0;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-        char src_child[PATH_MAX];
-        char dst_child[PATH_MAX];
-        if (smallclueBuildPath(src_child, sizeof(src_child), src_dir, entry->d_name) != 0 ||
-            smallclueBuildPath(dst_child, sizeof(dst_child), dst_dir, entry->d_name) != 0) {
-            fprintf(stderr, "rsync: path too long while deleting '%s'\n", entry->d_name);
-            status = -1;
-            continue;
-        }
-        struct stat dst_st;
-        if (lstat(dst_child, &dst_st) != 0) {
-            continue;
-        }
-        if (!smallclueRsyncPathSelected(opts, dst_child, S_ISDIR(dst_st.st_mode), true)) {
-            continue;
-        }
-        struct stat src_st;
-        if (lstat(src_child, &src_st) == 0) {
-            continue;
-        }
-        if (errno != ENOENT) {
-            fprintf(stderr, "rsync: %s: %s\n", src_child, strerror(errno));
-            status = -1;
-            continue;
-        }
-        if (smallclueRsyncRemovePath(dst_child, opts) != 0) {
-            status = -1;
-        }
-    }
-    closedir(dir);
-    return status;
-}
-
-static int smallclueRsyncSyncDirectoryContents(const char *src_dir,
-                                               const char *dst_dir,
-                                               const SmallclueRsyncOptions *opts,
-                                               bool delete_extra) {
-    struct stat src_st;
-    if (lstat(src_dir, &src_st) != 0) {
-        fprintf(stderr, "rsync: %s: %s\n", src_dir, strerror(errno));
-        return -1;
-    }
-    if (smallclueRsyncEnsureDir(dst_dir, src_st.st_mode & 0777, opts) != 0) {
-        return -1;
-    }
-
-    DIR *dir = opendir(src_dir);
-    if (!dir) {
-        fprintf(stderr, "rsync: %s: %s\n", src_dir, strerror(errno));
-        return -1;
-    }
-
-    int status = 0;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-        char src_child[PATH_MAX];
-        char dst_child[PATH_MAX];
-        if (smallclueBuildPath(src_child, sizeof(src_child), src_dir, entry->d_name) != 0 ||
-            smallclueBuildPath(dst_child, sizeof(dst_child), dst_dir, entry->d_name) != 0) {
-            fprintf(stderr, "rsync: path too long while syncing '%s'\n", entry->d_name);
-            status = -1;
-            continue;
-        }
-        if (smallclueRsyncSyncEntry(src_child, dst_child, opts) != 0) {
-            status = -1;
-        }
-    }
-    closedir(dir);
-
-    if (delete_extra && opts->delete_extra) {
-        if (smallclueRsyncDeleteExtraneous(src_dir, dst_dir, opts) != 0) {
-            status = -1;
-        }
-    }
-    return status;
-}
-
-static int smallclueRsyncSyncEntry(const char *src, const char *dst, const SmallclueRsyncOptions *opts) {
-    struct stat src_st;
-    if (lstat(src, &src_st) != 0) {
-        fprintf(stderr, "rsync: %s: %s\n", src, strerror(errno));
-        return -1;
-    }
-    bool src_is_dir = S_ISDIR(src_st.st_mode);
-    if (!smallclueRsyncPathSelected(opts, src, src_is_dir, false)) {
-        if (opts->verbose) {
-            printf("exclude %s\n", src);
-        }
-        return 0;
-    }
-
-    if (src_is_dir) {
-        if (!opts->recursive) {
-            fprintf(stderr, "rsync: skipping directory '%s' (use -r)\n", src);
-            return -1;
-        }
-        int status = smallclueRsyncSyncDirectoryContents(src, dst, opts, true);
-        if (status == 0 && smallclueRsyncApplyMetadata(dst, &src_st, opts, true) != 0) {
-            status = -1;
-        }
-        return status;
-    }
-
-    if (S_ISLNK(src_st.st_mode)) {
-        char link_target[PATH_MAX];
-        ssize_t link_len = readlink(src, link_target, sizeof(link_target) - 1);
-        if (link_len < 0) {
-            fprintf(stderr, "rsync: readlink %s: %s\n", src, strerror(errno));
-            return -1;
-        }
-        link_target[link_len] = '\0';
-
-        bool needs_update = true;
-        struct stat dst_st;
-        if (lstat(dst, &dst_st) == 0 && S_ISLNK(dst_st.st_mode)) {
-            char existing_target[PATH_MAX];
-            ssize_t existing_len = readlink(dst, existing_target, sizeof(existing_target) - 1);
-            if (existing_len >= 0) {
-                existing_target[existing_len] = '\0';
-                if (strcmp(existing_target, link_target) == 0) {
-                    needs_update = false;
-                }
-            }
-        }
-
-        if (!needs_update) {
-            if (opts->verbose) {
-                printf("skip %s\n", dst);
-            }
-            return 0;
-        }
-
-        if (smallclueRsyncEnsureParentDir(dst, opts) != 0) {
-            return -1;
-        }
-
-        if (opts->verbose) {
-            printf("link %s -> %s\n", src, dst);
-        }
-        if (opts->dry_run) {
-            return 0;
-        }
-
-        if (lstat(dst, &dst_st) == 0) {
-            if (smallclueRemovePathWithLabel("rsync", dst, true, true, false) != 0) {
-                return -1;
-            }
-        } else if (errno != ENOENT) {
-            fprintf(stderr, "rsync: %s: %s\n", dst, strerror(errno));
-            return -1;
-        }
-
-        if (symlink(link_target, dst) != 0) {
-            fprintf(stderr, "rsync: symlink %s -> %s: %s\n", dst, link_target, strerror(errno));
-            return -1;
-        }
-        return 0;
-    }
-
-    if (!S_ISREG(src_st.st_mode)) {
-        if (opts->verbose) {
-            printf("skip %s (unsupported file type)\n", src);
-        }
-        return 0;
-    }
-
-    struct stat dst_st;
-    bool dst_exists = (lstat(dst, &dst_st) == 0);
-    bool needs_copy = true;
-    if (dst_exists && S_ISREG(dst_st.st_mode)) {
-        if (opts->update_only && smallclueRsyncCompareMtime(&dst_st, &src_st) > 0) {
-            needs_copy = false;
-        } else if (opts->checksum) {
-            if (src_st.st_size == dst_st.st_size) {
-                uint64_t src_hash = 0;
-                uint64_t dst_hash = 0;
-                if (smallclueRsyncFileChecksum(src, &src_hash) != 0 ||
-                    smallclueRsyncFileChecksum(dst, &dst_hash) != 0) {
-                    fprintf(stderr, "rsync: checksum failed for '%s' or '%s': %s\n", src, dst, strerror(errno));
-                    return -1;
-                }
-                if (src_hash == dst_hash) {
-                    needs_copy = false;
-                }
-            }
-        } else {
-            bool same_size = src_st.st_size == dst_st.st_size;
-            bool same_mtime = smallclueRsyncSameMtime(&src_st, &dst_st);
-            bool same_mode = ((src_st.st_mode & 07777) == (dst_st.st_mode & 07777));
-            if (same_size && same_mtime && (!opts->preserve_mode || same_mode)) {
-                needs_copy = false;
-            }
-        }
-    }
-
-    if (!needs_copy) {
-        if (opts->verbose) {
-            printf("skip %s\n", dst);
-        }
-        if (smallclueRsyncApplyMetadata(dst, &src_st, opts, true) != 0) {
-            return -1;
-        }
-        return 0;
-    }
-
-    if (smallclueRsyncEnsureParentDir(dst, opts) != 0) {
-        return -1;
-    }
-    if (opts->verbose) {
-        printf("copy %s -> %s\n", src, dst);
-    }
-    if (opts->dry_run) {
-        return 0;
-    }
-
-    if (dst_exists && !S_ISREG(dst_st.st_mode)) {
-        if (smallclueRemovePathWithLabel("rsync", dst, true, true, false) != 0) {
-            return -1;
-        }
-    }
-    if (smallclueCopyFile("rsync", src, dst) != 0) {
-        return -1;
-    }
-    return smallclueRsyncApplyMetadata(dst, &src_st, opts, true);
-}
-
-static char *smallclueRsyncBuildRemoteSourceArg(const char *arg, bool recursive) {
-    if (!arg) {
-        return NULL;
-    }
-    if (!recursive || !smallclueRsyncHasTrailingSlash(arg)) {
-        return strdup(arg);
-    }
-
-    size_t len = strlen(arg);
-    while (len > 1 && arg[len - 1] == '/') {
-        len--;
-    }
-
-    bool already_dot = false;
-    if (len >= 2 && arg[len - 2] == '/' && arg[len - 1] == '.') {
-        already_dot = true;
-    }
-    if (already_dot) {
-        return strdup(arg);
-    }
-
-    size_t out_len = len + 2; /* "/." */
-    char *out = (char *)malloc(out_len + 1);
-    if (!out) {
-        return NULL;
-    }
-    memcpy(out, arg, len);
-    out[len] = '/';
-    out[len + 1] = '.';
-    out[len + 2] = '\0';
-    return out;
-}
-
-static int smallclueRsyncRemoteDryRun(int argc, char **argv, int operand_index) {
-    if (!argv || operand_index >= argc) {
-        return 1;
-    }
-    const char *dest = argv[argc - 1];
-    for (int i = operand_index; i < argc - 1; ++i) {
-        if (!argv[i]) {
-            continue;
-        }
-        printf("copy %s -> %s\n", argv[i], dest ? dest : "");
-    }
-    return 0;
-}
-
-static int smallclueRsyncRunRemoteScp(int argc,
-                                      char **argv,
-                                      int operand_index,
-                                      int remote_count,
-                                      const SmallclueRsyncOptions *opts) {
-    if (remote_count > 1) {
-        fprintf(stderr, "rsync: remote-to-remote copy is not supported\n");
-        return 1;
-    }
-    if (opts->delete_extra) {
-        fprintf(stderr, "rsync: --delete is only supported for local paths\n");
-        return 1;
-    }
-    if (opts->update_only || opts->checksum || opts->include_count > 0 || opts->exclude_count > 0) {
-        fprintf(stderr, "rsync: -u/-c/--include/--exclude are not supported for remote transfers yet\n");
-        return 1;
-    }
-    if (opts->dry_run) {
-        return smallclueRsyncRemoteDryRun(argc, argv, operand_index);
-    }
-
-    size_t max_args = (size_t)(argc - operand_index) + 8;
-    char **scp_argv = (char **)calloc(max_args + 1, sizeof(char *));
-    if (!scp_argv) {
-        fprintf(stderr, "rsync: out of memory\n");
-        return 1;
-    }
-
-    int scp_argc = 0;
-    scp_argv[scp_argc++] = strdup("scp");
-    if (opts->recursive) {
-        scp_argv[scp_argc++] = strdup("-r");
-    }
-    if (opts->preserve_mode || opts->preserve_times) {
-        scp_argv[scp_argc++] = strdup("-p");
-    }
-    if (opts->compress) {
-        scp_argv[scp_argc++] = strdup("-C");
-    }
-    for (int i = operand_index; i < argc; ++i) {
-        if (i < argc - 1) {
-            scp_argv[scp_argc++] = smallclueRsyncBuildRemoteSourceArg(argv[i], opts->recursive);
-        } else {
-            scp_argv[scp_argc++] = strdup(argv[i]);
-        }
-    }
-
-    int rc = 0;
-    for (int i = 0; i < scp_argc; ++i) {
-        if (!scp_argv[i]) {
-            fprintf(stderr, "rsync: out of memory\n");
-            rc = 1;
-            goto rsync_remote_cleanup;
-        }
-    }
-
-    if (opts->verbose) {
-        const char *dest = argv[argc - 1];
-        for (int i = operand_index; i < argc - 1; ++i) {
-            if (!argv[i]) {
-                continue;
-            }
-            printf("copy %s -> %s\n", argv[i], dest ? dest : "");
-        }
-    }
-
-    setenv("PSCALI_SCP_NO_FOLLOW_SYMLINK_DIRS", "1", 1);
-    rc = smallclueRunScp(scp_argc, scp_argv);
-    unsetenv("PSCALI_SCP_NO_FOLLOW_SYMLINK_DIRS");
-
-rsync_remote_cleanup:
-    for (int i = 0; i < scp_argc; ++i) {
-        free(scp_argv[i]);
-    }
-    free(scp_argv);
-    return rc;
-}
-
-static int smallclueRsyncCommand(int argc, char **argv) {
-    if (!smallclueRsyncLegacyFallbackEnabled()) {
-        return smallclueRunRsync(argc, argv);
-    }
-
-    SmallclueRsyncOptions opts;
-    memset(&opts, 0, sizeof(opts));
-
-    int argi = 1;
-    while (argi < argc) {
-        const char *arg = argv[argi];
-        if (!arg || arg[0] != '-' || strcmp(arg, "-") == 0) {
-            break;
-        }
-        if (strcmp(arg, "--") == 0) {
-            argi++;
-            break;
-        }
-        if (strcmp(arg, "--help") == 0) {
-            smallclueRsyncUsage(stdout);
-            smallclueRsyncFreePatterns(opts.include_patterns, opts.include_count);
-            smallclueRsyncFreePatterns(opts.exclude_patterns, opts.exclude_count);
-            return 0;
-        }
-        if (strcmp(arg, "--delete") == 0) {
-            opts.delete_extra = true;
-            argi++;
-            continue;
-        }
-        if (strcmp(arg, "--dry-run") == 0) {
-            opts.dry_run = true;
-            argi++;
-            continue;
-        }
-        if (strcmp(arg, "--archive") == 0) {
-            opts.recursive = true;
-            opts.preserve_mode = true;
-            opts.preserve_times = true;
-            argi++;
-            continue;
-        }
-        if (strcmp(arg, "--recursive") == 0) {
-            opts.recursive = true;
-            argi++;
-            continue;
-        }
-        if (strcmp(arg, "--verbose") == 0) {
-            opts.verbose = true;
-            argi++;
-            continue;
-        }
-        if (strcmp(arg, "--compress") == 0) {
-            opts.compress = true;
-            argi++;
-            continue;
-        }
-        if (strcmp(arg, "--perms") == 0) {
-            opts.preserve_mode = true;
-            argi++;
-            continue;
-        }
-        if (strcmp(arg, "--times") == 0) {
-            opts.preserve_times = true;
-            argi++;
-            continue;
-        }
-        if (strcmp(arg, "--update") == 0) {
-            opts.update_only = true;
-            argi++;
-            continue;
-        }
-        if (strcmp(arg, "--checksum") == 0) {
-            opts.checksum = true;
-            argi++;
-            continue;
-        }
-        if (strncmp(arg, "--include=", 10) == 0) {
-            if (smallclueRsyncAddPattern(&opts.include_patterns,
-                                         &opts.include_count,
-                                         &opts.include_capacity,
-                                         arg + 10) != 0) {
-                fprintf(stderr, "rsync: unable to add include pattern\n");
-                goto rsync_parse_fail;
-            }
-            argi++;
-            continue;
-        }
-        if (strcmp(arg, "--include") == 0) {
-            if (argi + 1 >= argc) {
-                fprintf(stderr, "rsync: --include requires a pattern\n");
-                goto rsync_parse_fail;
-            }
-            if (smallclueRsyncAddPattern(&opts.include_patterns,
-                                         &opts.include_count,
-                                         &opts.include_capacity,
-                                         argv[argi + 1]) != 0) {
-                fprintf(stderr, "rsync: unable to add include pattern\n");
-                goto rsync_parse_fail;
-            }
-            argi += 2;
-            continue;
-        }
-        if (strncmp(arg, "--exclude=", 10) == 0) {
-            if (smallclueRsyncAddPattern(&opts.exclude_patterns,
-                                         &opts.exclude_count,
-                                         &opts.exclude_capacity,
-                                         arg + 10) != 0) {
-                fprintf(stderr, "rsync: unable to add exclude pattern\n");
-                goto rsync_parse_fail;
-            }
-            argi++;
-            continue;
-        }
-        if (strcmp(arg, "--exclude") == 0) {
-            if (argi + 1 >= argc) {
-                fprintf(stderr, "rsync: --exclude requires a pattern\n");
-                goto rsync_parse_fail;
-            }
-            if (smallclueRsyncAddPattern(&opts.exclude_patterns,
-                                         &opts.exclude_count,
-                                         &opts.exclude_capacity,
-                                         argv[argi + 1]) != 0) {
-                fprintf(stderr, "rsync: unable to add exclude pattern\n");
-                goto rsync_parse_fail;
-            }
-            argi += 2;
-            continue;
-        }
-        if (arg[1] == '-') {
-            fprintf(stderr, "rsync: unknown option '%s'\n", arg);
-            goto rsync_parse_fail;
-        }
-        for (const char *cursor = arg + 1; *cursor; ++cursor) {
-            switch (*cursor) {
-                case 'a':
-                    opts.recursive = true;
-                    opts.preserve_mode = true;
-                    opts.preserve_times = true;
-                    break;
-                case 'r':
-                    opts.recursive = true;
-                    break;
-                case 'v':
-                    opts.verbose = true;
-                    break;
-                case 'z':
-                    opts.compress = true;
-                    break;
-                case 'p':
-                    opts.preserve_mode = true;
-                    break;
-                case 't':
-                    opts.preserve_times = true;
-                    break;
-                case 'n':
-                    opts.dry_run = true;
-                    break;
-                case 'u':
-                    opts.update_only = true;
-                    break;
-                case 'c':
-                    opts.checksum = true;
-                    break;
-                default:
-                    fprintf(stderr, "rsync: invalid option -- %c\n", *cursor);
-                    goto rsync_parse_fail;
-            }
-        }
-        argi++;
-    }
-
-    {
-        int operand_count = argc - argi;
-        if (operand_count < 2) {
-            smallclueRsyncUsage(stderr);
-            goto rsync_parse_fail;
-        }
-
-        int source_count = operand_count - 1;
-        bool has_remote = false;
-        int remote_count = 0;
-        for (int i = argi; i < argc; ++i) {
-            if (strncmp(argv[i], "rsync://", 8) == 0) {
-                fprintf(stderr, "rsync: rsync:// URLs are not supported; use host:path syntax\n");
-                goto rsync_parse_fail;
-            }
-            if (smallclueRsyncLooksRemote(argv[i])) {
-                has_remote = true;
-                remote_count++;
-            }
-        }
-        if (has_remote) {
-            int rc = smallclueRsyncRunRemoteScp(argc, argv, argi, remote_count, &opts);
-            smallclueRsyncFreePatterns(opts.include_patterns, opts.include_count);
-            smallclueRsyncFreePatterns(opts.exclude_patterns, opts.exclude_count);
-            return rc;
-        }
-
-        if (opts.delete_extra && source_count != 1) {
-            fprintf(stderr, "rsync: --delete currently requires exactly one source\n");
-            goto rsync_parse_fail;
-        }
-
-        const char *dest_arg = argv[argc - 1];
-        char resolved_dest[PATH_MAX];
-        const char *dest = smallclueResolvePath(dest_arg, resolved_dest, sizeof(resolved_dest));
-        struct stat dest_st;
-        bool dest_exists = lstat(dest, &dest_st) == 0;
-        bool dest_is_dir = dest_exists && S_ISDIR(dest_st.st_mode);
-
-        if (source_count > 1) {
-            if (dest_exists && !dest_is_dir) {
-                fprintf(stderr, "rsync: destination '%s' is not a directory\n", dest_arg);
-                goto rsync_parse_fail;
-            }
-            if (!dest_exists) {
-                if (smallclueRsyncEnsureDir(dest, 0777, &opts) != 0) {
-                    goto rsync_parse_fail;
-                }
-                dest_exists = true;
-                dest_is_dir = true;
-            }
-        }
-
-        int status = 0;
-        for (int i = 0; i < source_count; ++i) {
-            const char *src_arg = argv[argi + i];
-            bool src_trailing_slash = smallclueRsyncHasTrailingSlash(src_arg);
-
-            char resolved_src[PATH_MAX];
-            const char *src = smallclueResolvePath(src_arg, resolved_src, sizeof(resolved_src));
-
-            struct stat src_st;
-            if (lstat(src, &src_st) != 0) {
-                fprintf(stderr, "rsync: %s: %s\n", src_arg, strerror(errno));
-                status = 1;
-                continue;
-            }
-
-            const char *target = dest;
-            char target_path[PATH_MAX];
-            bool copy_dir_contents = false;
-
-            if (source_count > 1 || dest_is_dir) {
-                if (S_ISDIR(src_st.st_mode) && src_trailing_slash) {
-                    copy_dir_contents = true;
-                    target = dest;
-                } else {
-                    char leaf_scratch[PATH_MAX];
-                    const char *leaf = smallclueRsyncLeafName(src_arg, leaf_scratch, sizeof(leaf_scratch));
-                    if (smallclueBuildPath(target_path, sizeof(target_path), dest, leaf) != 0) {
-                        fprintf(stderr, "rsync: %s/%s: %s\n", dest, leaf, strerror(errno));
-                        status = 1;
-                        continue;
-                    }
-                    target = target_path;
-                }
-            } else if (S_ISDIR(src_st.st_mode) && src_trailing_slash) {
-                copy_dir_contents = true;
-                target = dest;
-            }
-
-            char src_root_buf[PATH_MAX];
-            char dst_root_buf[PATH_MAX];
-            if (copy_dir_contents) {
-                opts.filter_root = src;
-                opts.filter_dest_root = target;
-            } else {
-                if (!smallclueRsyncParentPath(src, src_root_buf, sizeof(src_root_buf)) ||
-                    !smallclueRsyncParentPath(target, dst_root_buf, sizeof(dst_root_buf))) {
-                    fprintf(stderr, "rsync: unable to derive filter roots for '%s'\n", src_arg);
-                    status = 1;
-                    continue;
-                }
-                opts.filter_root = src_root_buf;
-                opts.filter_dest_root = dst_root_buf;
-            }
-
-            int rc;
-            if (copy_dir_contents) {
-                rc = smallclueRsyncSyncDirectoryContents(src, target, &opts, opts.delete_extra);
-            } else {
-                rc = smallclueRsyncSyncEntry(src, target, &opts);
-            }
-            if (rc != 0) {
-                status = 1;
-            }
-        }
-
-        smallclueRsyncFreePatterns(opts.include_patterns, opts.include_count);
-        smallclueRsyncFreePatterns(opts.exclude_patterns, opts.exclude_count);
-        return status;
-    }
-
-rsync_parse_fail:
-    smallclueRsyncFreePatterns(opts.include_patterns, opts.include_count);
-    smallclueRsyncFreePatterns(opts.exclude_patterns, opts.exclude_count);
-    return 1;
 }
 
 const SmallclueApplet *smallclueGetApplets(size_t *count) {
