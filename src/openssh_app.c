@@ -243,69 +243,6 @@ static void smallclueRestoreEnv(const char *name, const char *value) {
     }
 }
 
-static bool smallclueEnvHasAbsolutePathValue(const char *name) {
-    if (!name || !*name) {
-        return false;
-    }
-    const char *value = getenv(name);
-    if (!value) {
-        return false;
-    }
-    while (*value == ' ' || *value == '\t') {
-        value++;
-    }
-    return value[0] == '/';
-}
-
-static size_t smallclueTrimmedPathLength(const char *path) {
-    if (!path || path[0] == '\0') {
-        return 0;
-    }
-    size_t len = strlen(path);
-    while (len > 1 && path[len - 1] == '/') {
-        len--;
-    }
-    return len;
-}
-
-static bool smallcluePathsEqualNormalized(const char *lhs, const char *rhs) {
-    size_t lhs_len = smallclueTrimmedPathLength(lhs);
-    size_t rhs_len = smallclueTrimmedPathLength(rhs);
-    if (lhs_len == 0 || rhs_len == 0 || lhs_len != rhs_len) {
-        return false;
-    }
-    return strncmp(lhs, rhs, lhs_len) == 0;
-}
-
-static bool smallcluePathTruncateIsHomeFallback(void) {
-    if (smallclueEnvHasAbsolutePathValue("PSCALI_CONTAINER_ROOT")) {
-        return false;
-    }
-    const char *truncate = getenv("PATH_TRUNCATE");
-    const char *home = getenv("HOME");
-    if (!truncate || truncate[0] != '/' || !home || home[0] != '/') {
-        return false;
-    }
-    return smallcluePathsEqualNormalized(truncate, home);
-}
-
-static bool smallcluePathTruncateContextActive(void) {
-    bool has_container_root = smallclueEnvHasAbsolutePathValue("PSCALI_CONTAINER_ROOT");
-    if (has_container_root) {
-        return true;
-    }
-    bool has_path_truncate = smallclueEnvHasAbsolutePathValue("PATH_TRUNCATE");
-    if (has_path_truncate) {
-        return !smallcluePathTruncateIsHomeFallback();
-    }
-#if defined(PSCAL_TARGET_IOS)
-    if (vprocCurrent() != NULL) {
-        return !smallcluePathTruncateIsHomeFallback();
-    }
-#endif
-    return false;
-}
-
 static bool smallclueOptionKeyLooksPath(const char *key, size_t len) {
     if (!key || len < 4) {
         return false;
@@ -324,9 +261,6 @@ static char *smallclueExpandAbsolutePath(const char *path) {
         return smallclueDupString(path);
     }
     if (path[0] != '/') {
-        return smallclueDupString(path);
-    }
-    if (!smallcluePathTruncateContextActive()) {
         return smallclueDupString(path);
     }
     char expanded[PATH_MAX];
@@ -350,9 +284,6 @@ static char *smallclueExpandOptionAssignment(const char *option) {
     }
     const char *value = eq + 1;
     if (value[0] != '/') {
-        return smallclueDupString(option);
-    }
-    if (!smallcluePathTruncateContextActive()) {
         return smallclueDupString(option);
     }
     char expanded[PATH_MAX];
@@ -627,7 +558,7 @@ static char **smallclueExpandSftpArgs(int argc, char **argv, int *out_count) {
 static void smallclueEnsureWritableHomeSsh(void) {
 #if defined(PSCAL_TARGET_IOS)
     const char *existing_runner = getenv("PSCALI_TOOL_RUNNER_PATH");
-    if (existing_runner && *existing_runner) {
+    if (existing_runner && *existing_runner && access(existing_runner, X_OK) == 0) {
         const char *home_existing = getenv("HOME");
         if (home_existing && *home_existing) {
             setenv("PSCALI_REAL_HOME", home_existing, 1);
@@ -638,28 +569,12 @@ static void smallclueEnsureWritableHomeSsh(void) {
         const char *workdir = getenv("PSCALI_WORKDIR");
         const char *home_for_runner = getenv("HOME");
         char candidate[PATH_MAX];
-        char fallback_runner[PATH_MAX];
-        bool have_fallback = false;
         const char *resolved_runner = NULL;
 
         if (!resolved_runner && workspace && *workspace) {
             if (snprintf(candidate, sizeof(candidate), "%s/pscal_tool_runner", workspace) > 0 &&
                 access(candidate, X_OK) == 0) {
                 resolved_runner = candidate;
-            } else if (!have_fallback &&
-                       snprintf(fallback_runner, sizeof(fallback_runner),
-                                "%s/pscal_tool_runner", workspace) > 0) {
-                have_fallback = true;
-            }
-        }
-        if (!resolved_runner && workspace && *workspace) {
-            if (snprintf(candidate, sizeof(candidate), "%s/bin/pscal_tool_runner", workspace) > 0 &&
-                access(candidate, X_OK) == 0) {
-                resolved_runner = candidate;
-            } else if (!have_fallback &&
-                       snprintf(fallback_runner, sizeof(fallback_runner),
-                                "%s/bin/pscal_tool_runner", workspace) > 0) {
-                have_fallback = true;
             }
         }
         if (!resolved_runner && container_root && *container_root) {
@@ -667,21 +582,6 @@ static void smallclueEnsureWritableHomeSsh(void) {
                          container_root) > 0 &&
                 access(candidate, X_OK) == 0) {
                 resolved_runner = candidate;
-            } else if (!have_fallback &&
-                       snprintf(fallback_runner, sizeof(fallback_runner),
-                                "%s/Documents/pscal_tool_runner", container_root) > 0) {
-                have_fallback = true;
-            }
-        }
-        if (!resolved_runner && container_root && *container_root) {
-            if (snprintf(candidate, sizeof(candidate), "%s/Documents/bin/pscal_tool_runner",
-                         container_root) > 0 &&
-                access(candidate, X_OK) == 0) {
-                resolved_runner = candidate;
-            } else if (!have_fallback &&
-                       snprintf(fallback_runner, sizeof(fallback_runner),
-                                "%s/Documents/bin/pscal_tool_runner", container_root) > 0) {
-                have_fallback = true;
             }
         }
         if (!resolved_runner && workdir && *workdir) {
@@ -689,10 +589,6 @@ static void smallclueEnsureWritableHomeSsh(void) {
                          workdir) > 0 &&
                 access(candidate, X_OK) == 0) {
                 resolved_runner = candidate;
-            } else if (!have_fallback &&
-                       snprintf(fallback_runner, sizeof(fallback_runner),
-                                "%s/../pscal_tool_runner", workdir) > 0) {
-                have_fallback = true;
             }
         }
         if (!resolved_runner && home_for_runner && *home_for_runner) {
@@ -700,10 +596,6 @@ static void smallclueEnsureWritableHomeSsh(void) {
                          home_for_runner) > 0 &&
                 access(candidate, X_OK) == 0) {
                 resolved_runner = candidate;
-            } else if (!have_fallback &&
-                       snprintf(fallback_runner, sizeof(fallback_runner),
-                                "%s/../pscal_tool_runner", home_for_runner) > 0) {
-                have_fallback = true;
             }
         }
         if (!resolved_runner && home_for_runner && *home_for_runner) {
@@ -711,17 +603,7 @@ static void smallclueEnsureWritableHomeSsh(void) {
                          home_for_runner) > 0 &&
                 access(candidate, X_OK) == 0) {
                 resolved_runner = candidate;
-            } else if (!have_fallback &&
-                       snprintf(fallback_runner, sizeof(fallback_runner),
-                                "%s/pscal_tool_runner", home_for_runner) > 0) {
-                have_fallback = true;
             }
-        }
-        if (!resolved_runner && have_fallback &&
-            ((container_root && *container_root) ||
-             (workspace && *workspace) ||
-             (workdir && *workdir))) {
-            resolved_runner = fallback_runner;
         }
 
         if (resolved_runner) {
@@ -1022,17 +904,14 @@ static int smallclueRunOpensshEntryOnce(const char *label, int (*entry)(int, cha
     char connection_attempts_option[48] = {0};
     bool inject_connect_timeout = false;
     bool inject_connection_attempts = false;
-    if (argc > 0 && argv) {
+    if (label && strcmp(label, "ssh") == 0 && argc > 0 && argv) {
         /*
          * OpenSSH's closefrom() is process-wide and unsafe in our multitab
          * runtime (it can close unrelated tab/session descriptors). Force the
-         * iOS guard for all OpenSSH entrypoints (ssh/scp/sftp), including
-         * nested ssh invocations launched by sftp/scp transport setup.
+         * iOS guard on every SSH launch.
          */
         setenv("PSCALI_SSH_SKIP_CLOSEFROM", "1", 1);
-    }
 
-    if (label && strcmp(label, "ssh") == 0 && argc > 0 && argv) {
         if (!smallclueSshArgvHasOptionKey(argc, argv, "ConnectTimeout")) {
             int timeout_seconds = smallclueSshEnvPositiveInt("PSCALI_SSH_CONNECT_TIMEOUT",
                                                              8, 1, 600);
@@ -1674,7 +1553,7 @@ int PSCALRuntimeCreateSshSession(int argc,
     if (PSCALRuntimeGetCurrentRuntimeContext) {
         ctx->runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext();
     }
-    ctx->argv = (char **)calloc((size_t)argc + 1u, sizeof(char *));
+    ctx->argv = (char **)calloc((size_t)argc, sizeof(char *));
     if (!ctx->argv) {
         smallclueCloseSessionFds(ctx);
         free(ctx);
@@ -1685,13 +1564,11 @@ int PSCALRuntimeCreateSshSession(int argc,
         ctx->argv[i] = smallclueDupString(argv[i]);
         if (!ctx->argv[i]) {
             smallclueFreeArgv(ctx->argv, i);
-            smallclueCloseSessionFds(ctx);
             free(ctx);
             errno = ENOMEM;
             return -1;
         }
     }
-    ctx->argv[argc] = NULL;
 
     if (PSCALRuntimeRegisterSessionContext) {
         PSCALRuntimeRegisterSessionContext(session_id);
@@ -2048,10 +1925,10 @@ static char *smallclueResolvePublicKeyPath(const char *identity_arg) {
             candidate = with_pub;
         }
         if (candidate[0] == '/') {
-            char *expanded = smallclueExpandAbsolutePath(candidate);
-            if (expanded) {
+            char expanded[PATH_MAX];
+            if (pathTruncateExpand(candidate, expanded, sizeof(expanded))) {
                 free(candidate);
-                candidate = expanded;
+                candidate = smallclueDupString(expanded);
             }
         }
         if (!candidate || access(candidate, R_OK) != 0) {
