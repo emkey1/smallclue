@@ -21,6 +21,3 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
-## 2024-08-01 - [Terminal UI Highlights]
-**Learning:** In full-screen TTY tools (like `top`), column headers should use inverse video formatting (`\033[7m`) instead of bold text (`\033[1m`), creating clear visual hierarchy between the summary dashboard and the tabular data list.
-**Action:** Always wrap fixed-width column headers with inverse video for interactive shell applets, ensuring they are conditionally wrapped with `isatty(STDOUT_FILENO)` to avoid log pollution when redirected to files.
