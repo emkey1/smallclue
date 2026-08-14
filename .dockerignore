@@ -1,0 +1,10 @@
+build/
+third-party/
+rootfs/
+smallclue
+src/core/build_info.h
+src/runtime_stubs_extra.c
+enter_chroot.sh
+src/openssh_globals.c
+build-codex-check/
+docker-build*

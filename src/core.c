@@ -20,6 +20,7 @@
 #include "printf_app.h"
 #include "expr_app.h"
 #include "chown_app.h"
+#include "chroot_app.h"
 #include "base64_app.h"
 #include "nohup_app.h"
 #include "cmp_app.h"
@@ -518,6 +519,9 @@ static const char *smallclueResolveShebangToolName(const char *interpreter) {
 #if defined(SMALLCLUE_WITH_EXSH)
     if (strcasecmp(base, "sh") == 0) return "exsh";
     if (strcasecmp(base, "exsh") == 0) return "exsh";
+#elif defined(SMALLCLUE_WITH_SH)
+    if (strcasecmp(base, "sh") == 0) return "sh";
+    if (strcasecmp(base, "ash") == 0) return "sh";
 #endif
     return NULL;
 }
@@ -1382,6 +1386,8 @@ static int smallclueHaltCommand(int argc, char **argv);
 #if defined(SMALLCLUE_WITH_EXSH)
 extern int exsh_main(int argc, char **argv);
 static int smallclueShCommand(int argc, char **argv);
+#elif defined(SMALLCLUE_WITH_SH)
+static int smallclueNativeShCommand(int argc, char **argv);
 #endif
 static int smallclueUptimeCommand(int argc, char **argv);
 static int smallclueUnameCommand(int argc, char **argv);
@@ -2221,8 +2227,11 @@ static int smallclueHostCommand(int argc, char **argv) {
 
 static int smallclueHostnameCommand(int argc, char **argv) {
     if (argc > 1) {
-        fprintf(stderr, "hostname: setting hostname not supported\n");
-        return 1;
+        if (sethostname(argv[1], strlen(argv[1])) != 0) {
+            fprintf(stderr, "hostname: %s: %s\n", argv[1], strerror(errno));
+            return 1;
+        }
+        return 0;
     }
 
     char path[PATH_MAX];
@@ -2712,6 +2721,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"chmod", smallclueChmodCommand, "Change file permissions"},
     {"chown", smallclueChownCommand, "Change file owner and group"},
     {"chgrp", smallclueChgrpCommand, "Change file group ownership"},
+    {"chroot", smallclueChrootCommand, "Run a command with a new root directory"},
     {"clear", smallclueClearCommand, "Clear the terminal"},
     {"cls", smallclueClearCommand, "Clear the terminal"},
     {"cp", smallclueCpCommand, "Copy files and directories"},
@@ -2748,7 +2758,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
 #endif
     {"halt", smallclueHaltCommand, "Halt the system"},
     {"host", smallclueHostCommand, "DNS lookup utility"},
-    {"hostname", smallclueHostnameCommand, "Show system hostname"},
+    {"hostname", smallclueHostnameCommand, "Show or set system hostname"},
     {"init", smallclueInitCommand, "System initialization"},
     {"kill", smallclueKillCommand, "Send signals to processes"},
     {"less", smallcluePagerCommand, "Paginate file contents"},
@@ -2805,6 +2815,9 @@ static const SmallclueApplet kSmallclueApplets[] = {
 #if defined(SMALLCLUE_WITH_EXSH)
     {"exsh", smallclueShCommand, "Run the PSCAL shell front end"},
     {"sh", smallclueShCommand, "Run the PSCAL shell front end"},
+#elif defined(SMALLCLUE_WITH_SH)
+    {"ash", smallclueNativeShCommand, "POSIX shell (BusyBox-ash compatible)"},
+    {"sh", smallclueNativeShCommand, "POSIX shell (BusyBox-ash compatible)"},
 #endif
     {"scp", smallclueScpCommand, "Securely copy files over SSH"},
     {"sftp", smallclueSftpCommand, "Interactive SFTP client"},
@@ -2884,6 +2897,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"chgrp", "chgrp [-R] [-h] GROUP FILE ...\n"
               "  Change group ownership of each FILE (numeric ID or name)\n"
               "  -R recursive  -h affect symlinks themselves, not their targets"},
+    {"chroot", "chroot [-u USER] [-g GROUP] NEWROOT [COMMAND [ARG]...]\n"
+               "  Run COMMAND (default: $SHELL or /bin/sh) with NEWROOT as its root\n"
+               "  -u drop to USER (numeric ID or name) after chrooting\n"
+               "  -g drop to GROUP (numeric ID or name) after chrooting"},
     {"clear", "clear\n"
               "  Clear the terminal"},
     {"cls", "cls\n"
@@ -3180,8 +3197,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -v verbose (hosts debug)\n"
              "  IP-shaped queries auto-detect as PTR/reverse lookups\n"
              "Server override is ignored."},
-    {"hostname", "hostname\n"
-                 "  Show system hostname"},
+    {"hostname", "hostname [NAME]\n"
+                 "  Show system hostname, or set it to NAME (requires CAP_SYS_ADMIN)"},
     {"pbcopy", "pbcopy\n"
                "  Copy stdin to system clipboard"},
     {"pbpaste", "pbpaste\n"
@@ -3262,6 +3279,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Launch PSCAL shell front end"},
     {"sh", "sh\n"
            "  Launch PSCAL shell front end"},
+#elif defined(SMALLCLUE_WITH_SH)
+    {"sh", "sh [-eiuxvnfCam] [-c command | script | -s] [args]\n"
+           "  POSIX shell (BusyBox-ash compatible): pipelines, functions,\n"
+           "  expansions, job control, interactive line editing"},
+    {"ash", "ash [-eiuxvnfCam] [-c command | script | -s] [args]\n"
+            "  Alias for sh"},
 #endif
     {"scp", "scp [-P PORT] SRC... DEST\n"
             "  Uses OpenSSH scp"},
@@ -13135,6 +13158,12 @@ static int smallclueHelpCommand(int argc, char **argv) {
 #if defined(SMALLCLUE_WITH_EXSH)
 static int smallclueShCommand(int argc, char **argv) {
     return exsh_main(argc, argv);
+}
+#elif defined(SMALLCLUE_WITH_SH)
+/* smallclue's native POSIX shell (src/shell/). */
+extern int shMain(int argc, char **argv);
+static int smallclueNativeShCommand(int argc, char **argv) {
+    return shMain(argc, argv);
 }
 #endif
 

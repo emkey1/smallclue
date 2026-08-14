@@ -320,17 +320,24 @@ path = sys.argv[1]
 with open(path) as f:
     text = f.read()
 old_head = "#ifndef _GETOPT_H_\n#define _GETOPT_H_\n\n#ifndef __THROW"
-new_head = """#ifdef HAVE_GETOPT_H
+new_head = """#if defined(HAVE_GETOPT_H) && defined(HAVE_GETOPT_OPTRESET)
 /* This directory is on the include search path ahead of the system's own
  * getopt.h, so a bare #include <getopt.h> anywhere in the tree would
  * otherwise resolve to this compat shim instead of the real header even
  * when the platform provides one (its struct option/getopt_long/
  * getopt_long_only declarations below are `#if 0`'d out precisely because
  * they assume the system header will be the one actually seen). Forward to
- * the next getopt.h on the search path (the system one). Deliberately no
- * _GETOPT_H_ guard around this branch: the system header has its own
- * guard, and defining the same macro name here would make its content get
- * skipped as "already included" without ever having been seen. */
+ * the next getopt.h on the search path (the system one) -- but ONLY when
+ * the system also has BSD's optreset (HAVE_GETOPT_OPTRESET): openbsd-
+ * compat/getopt_long.c's own struct option/getopt_long stay compiled in
+ * (its guard is `!HAVE_GETOPT || !HAVE_GETOPT_OPTRESET`) on any libc that
+ * has getopt_long but lacks optreset -- glibc among them. Forwarding
+ * unconditionally on HAVE_GETOPT_H alone pulls the system's conflicting
+ * struct option into the same translation unit as getopt_long.c's own,
+ * which is a redefinition error, not a redundant-but-harmless one.
+ * Deliberately no _GETOPT_H_ guard around this branch: the system header
+ * has its own guard, and defining the same macro name here would make its
+ * content get skipped as "already included" without ever having been seen. */
 #include_next <getopt.h>
 #elif !defined(_GETOPT_H_)
 #define _GETOPT_H_
@@ -346,7 +353,14 @@ new_struct = ("/* Not every translation unit that reaches this fallback branch (
               " * has an entirely separate config.h that never mentions getopt at all. The\n"
               " * GNU-style struct option/getopt_long/getopt_long_only ABI below is stable\n"
               " * across every platform this project targets (Linux glibc, macOS, *BSD),\n"
-              " * so it's safe to always provide it here rather than gating it further. */\n"
+              " * so it's safe to always provide it here rather than gating it further --\n"
+              " * EXCEPT for openbsd-compat/getopt_long.c itself, which reaches this same\n"
+              " * fallback branch (via includes.h) on any libc with getopt but no BSD\n"
+              " * optreset (glibc among them) and ALSO defines this exact struct/functions\n"
+              " * a few lines further down in that same file -- a real double-definition,\n"
+              " * not a redundant-but-harmless one. It defines the sentinel below before\n"
+              " * including anything, specifically to skip this copy. */\n"
+              "#ifndef SMALLCLUE_GETOPT_LONG_C_OWN_STRUCT_OPTION\n"
               "struct option {")
 assert old_struct in text, "getopt.h struct option shape changed upstream, patch needs review"
 text = text.replace(old_struct, new_struct, 1)
@@ -362,10 +376,38 @@ new_tail = """int\t getopt_long(int, char * const *, const char *,
 \t    const struct option *, int *);
 int\t getopt_long_only(int, char * const *, const char *,
 \t    const struct option *, int *);
+#endif /* !SMALLCLUE_GETOPT_LONG_C_OWN_STRUCT_OPTION */
 
 #ifndef _GETOPT_DEFINED_"""
 assert old_tail in text, "getopt.h tail shape changed upstream, patch needs review"
 text = text.replace(old_tail, new_tail, 1)
+with open(path, "w") as f:
+    f.write(text)
+PYEOF
+    fi
+
+    GETOPT_LONG_C="$OPENSSH_DIR/openbsd-compat/getopt_long.c"
+    if [ -f "$GETOPT_LONG_C" ] && ! grep -q "SMALLCLUE_GETOPT_LONG_C_OWN_STRUCT_OPTION" "$GETOPT_LONG_C"; then
+        echo "Patching openbsd-compat/getopt_long.c to skip getopt.h's own struct option copy..."
+        python3 - "$GETOPT_LONG_C" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+old = '/* OPENBSD ORIGINAL: lib/libc/stdlib/getopt_long.c */\n#include "includes.h"'
+new = ('/* OPENBSD ORIGINAL: lib/libc/stdlib/getopt_long.c */\n'
+       '/* This file defines its own struct option/getopt_long/getopt_long_only\n'
+       ' * (guarded below by !HAVE_GETOPT || !HAVE_GETOPT_OPTRESET) whenever the\n'
+       ' * platform lacks BSD optreset -- true on glibc. includes.h pulls in this\n'
+       ' * same directory\'s own getopt.h too (via openbsd-compat.h), which in its\n'
+       ' * fallback branch also defines that struct for OTHER consumers (notably\n'
+       ' * openrsync) that never define it themselves. Without this sentinel both\n'
+       ' * copies land in this one translation unit -- a real redefinition, not a\n'
+       ' * redundant-but-harmless one. */\n'
+       '#define SMALLCLUE_GETOPT_LONG_C_OWN_STRUCT_OPTION 1\n'
+       '#include "includes.h"')
+assert old in text, "getopt_long.c shape changed upstream, patch needs review"
+text = text.replace(old, new, 1)
 with open(path, "w") as f:
     f.write(text)
 PYEOF
@@ -444,356 +486,6 @@ text = text.replace(
 with open(path, "w") as f:
     f.write(text)
 PYEOF
-fi
-
-# --- Linenoise ---
-if [ ! -d "$THIRD_PARTY_DIR/linenoise" ]; then
-    echo "Cloning linenoise..."
-    git clone https://github.com/antirez/linenoise "$THIRD_PARTY_DIR/linenoise"
-fi
-
-# --- Dash ---
-if [ ! -d "$THIRD_PARTY_DIR/dash" ]; then
-    echo "Cloning dash..."
-    git clone https://git.kernel.org/pub/scm/utils/dash/dash.git "$THIRD_PARTY_DIR/dash"
-    # Pin to a stable release (v0.5.13.1)
-    (cd "$THIRD_PARTY_DIR/dash" && git checkout v0.5.13.1)
-fi
-
-# --- Dash Integration (Linenoise) ---
-DASH_SRC="$THIRD_PARTY_DIR/dash/src"
-if [ -d "$DASH_SRC" ]; then
-    echo "Integrating linenoise into dash..."
-    cp "$THIRD_PARTY_DIR/linenoise/linenoise.c" "$DASH_SRC/"
-    cp "$THIRD_PARTY_DIR/linenoise/linenoise.h" "$DASH_SRC/"
-
-    # Patch Makefile.am to include linenoise.c
-    if ! grep -q "linenoise.c" "$DASH_SRC/Makefile.am"; then
-        echo "Patching dash Makefile.am..."
-        sed -i.bak 's/input.c/input.c linenoise.c/g' "$DASH_SRC/Makefile.am"
-        rm -f "$DASH_SRC/Makefile.am.bak"
-    fi
-
-    # Patch input.c
-    INPUT_C="$DASH_SRC/input.c"
-    if [ -f "$INPUT_C" ]; then
-        if ! grep -q 'linenoise.h' "$INPUT_C"; then
-            echo "Patching dash input.c includes..."
-            awk '
-                { print }
-                /#include "trap.h"/ {
-                    print "#include \"linenoise.h\""
-                }
-            ' "$INPUT_C" > "$INPUT_C.tmp" && mv "$INPUT_C.tmp" "$INPUT_C"
-        fi
-
-        if ! grep -q '^#include <ctype.h>' "$INPUT_C"; then
-            awk '
-                BEGIN { done = 0 }
-                {
-                    print
-                    if (!done && $0 ~ /^#include <stdio.h>/) {
-                        print "#include <ctype.h>"
-                        print "#include <dirent.h>"
-                        print "#include <limits.h>"
-                        print "#include <sys/stat.h>"
-                        done = 1
-                    }
-                }
-            ' "$INPUT_C" > "$INPUT_C.tmp" && mv "$INPUT_C.tmp" "$INPUT_C"
-        fi
-
-        if ! grep -q 'PSCAL_LINENOISE_COMPLETION_BEGIN' "$INPUT_C"; then
-            echo "Patching dash input.c completion helpers..."
-            cat > "$DASH_SRC/linenoise_completion_helpers.c" <<'EOF'
-/* PSCAL_LINENOISE_COMPLETION_BEGIN */
-#ifndef PATH_MAX
-#define PATH_MAX 4096
-#endif
-
-static void
-smallclueLinenoiseAddMergedCompletion(const char *buf, size_t token_start,
-				      const char *replacement,
-				      linenoiseCompletions *lc)
-{
-	size_t prefix_len = token_start;
-	size_t repl_len = strlen(replacement);
-	char merged[PATH_MAX * 2];
-
-	if (prefix_len + repl_len + 1 >= sizeof(merged))
-		return;
-	memcpy(merged, buf, prefix_len);
-	memcpy(merged + prefix_len, replacement, repl_len);
-	merged[prefix_len + repl_len] = '\0';
-	linenoiseAddCompletion(lc, merged);
-}
-
-static int
-smallcluePrefixMatch(const char *text, const char *prefix)
-{
-	size_t prefix_len = strlen(prefix);
-	return strncmp(text, prefix, prefix_len) == 0;
-}
-
-static void
-smallclueLinenoiseCompletePath(const char *buf, size_t token_start,
-			       const char *token, linenoiseCompletions *lc)
-{
-	const char *slash = strrchr(token, '/');
-	const char *name_prefix = token;
-	char dir_open[PATH_MAX];
-	char dir_emit[PATH_MAX];
-	DIR *dir;
-	struct dirent *entry;
-
-	if (slash) {
-		size_t emit_len = (size_t)(slash - token + 1);
-		if (emit_len >= sizeof(dir_emit))
-			return;
-		memcpy(dir_emit, token, emit_len);
-		dir_emit[emit_len] = '\0';
-		name_prefix = slash + 1;
-		if (strcmp(dir_emit, "/") == 0) {
-			snprintf(dir_open, sizeof(dir_open), "/");
-		} else {
-			size_t open_len = emit_len - 1;
-			if (open_len >= sizeof(dir_open))
-				return;
-			memcpy(dir_open, token, open_len);
-			dir_open[open_len] = '\0';
-			if (open_len == 0)
-				snprintf(dir_open, sizeof(dir_open), ".");
-		}
-	} else {
-		dir_emit[0] = '\0';
-		snprintf(dir_open, sizeof(dir_open), ".");
-	}
-
-	dir = opendir(dir_open);
-	if (!dir)
-		return;
-
-	while ((entry = readdir(dir)) != NULL) {
-		char candidate[PATH_MAX];
-		char fullpath[PATH_MAX];
-		size_t candidate_len;
-		struct stat st;
-
-		if (name_prefix[0] != '.' && entry->d_name[0] == '.')
-			continue;
-		if (!smallcluePrefixMatch(entry->d_name, name_prefix))
-			continue;
-
-		snprintf(candidate, sizeof(candidate), "%s%s", dir_emit, entry->d_name);
-		if (slash) {
-			if (strcmp(dir_open, "/") == 0)
-				snprintf(fullpath, sizeof(fullpath), "/%s", entry->d_name);
-			else
-				snprintf(fullpath, sizeof(fullpath), "%s/%s", dir_open, entry->d_name);
-		} else {
-			snprintf(fullpath, sizeof(fullpath), "%s", entry->d_name);
-		}
-
-		candidate_len = strlen(candidate);
-		if (candidate_len + 1 < sizeof(candidate) &&
-		    stat(fullpath, &st) == 0 &&
-		    S_ISDIR(st.st_mode) &&
-		    (candidate_len == 0 || candidate[candidate_len - 1] != '/')) {
-			candidate[candidate_len++] = '/';
-			candidate[candidate_len] = '\0';
-		}
-
-		smallclueLinenoiseAddMergedCompletion(buf, token_start, candidate, lc);
-	}
-
-	closedir(dir);
-}
-
-static void
-smallclueLinenoiseCompleteCommands(const char *buf, size_t token_start,
-				   const char *token, linenoiseCompletions *lc)
-{
-	char *path_copy;
-	char *saveptr = NULL;
-	char *segment;
-	const char *path_env = getenv("PATH");
-
-	if (!path_env || !*path_env)
-		return;
-
-	path_copy = strdup(path_env);
-	if (!path_copy)
-		return;
-
-	for (segment = strtok_r(path_copy, ":", &saveptr);
-	     segment;
-	     segment = strtok_r(NULL, ":", &saveptr)) {
-		DIR *dir;
-		struct dirent *entry;
-		const char *dir_path = (*segment == '\0') ? "." : segment;
-
-		dir = opendir(dir_path);
-		if (!dir)
-			continue;
-
-		while ((entry = readdir(dir)) != NULL) {
-			char fullpath[PATH_MAX];
-			struct stat st;
-
-			if (entry->d_name[0] == '.')
-				continue;
-			if (!smallcluePrefixMatch(entry->d_name, token))
-				continue;
-
-			snprintf(fullpath, sizeof(fullpath), "%s/%s", dir_path, entry->d_name);
-			if (stat(fullpath, &st) != 0 || !S_ISREG(st.st_mode))
-				continue;
-			if (access(fullpath, X_OK) != 0)
-				continue;
-
-			smallclueLinenoiseAddMergedCompletion(buf, token_start, entry->d_name, lc);
-		}
-		closedir(dir);
-	}
-
-	free(path_copy);
-}
-
-static void
-smallclueLinenoiseCompletion(const char *buf, linenoiseCompletions *lc)
-{
-	size_t len;
-	size_t token_start;
-	const char *token;
-
-	if (!buf)
-		return;
-
-	len = strlen(buf);
-	if (len == 0)
-		return;
-
-	token_start = len;
-	while (token_start > 0 &&
-	       !isspace((unsigned char)buf[token_start - 1]))
-		token_start--;
-
-	token = buf + token_start;
-	if (*token == '\0')
-		return;
-
-	if (token_start == 0 && strchr(token, '/') == NULL)
-		smallclueLinenoiseCompleteCommands(buf, token_start, token, lc);
-	smallclueLinenoiseCompletePath(buf, token_start, token, lc);
-}
-/* PSCAL_LINENOISE_COMPLETION_END */
-EOF
-            HELPER_LINE=$(grep -n '^#define IBUFSIZ' "$INPUT_C" | head -n 1 | cut -d: -f1)
-            if [ -n "$HELPER_LINE" ]; then
-                head -n $((HELPER_LINE - 1)) "$INPUT_C" > "$INPUT_C.tmp"
-                cat "$DASH_SRC/linenoise_completion_helpers.c" >> "$INPUT_C.tmp"
-                tail -n +"$HELPER_LINE" "$INPUT_C" >> "$INPUT_C.tmp"
-                mv "$INPUT_C.tmp" "$INPUT_C"
-            fi
-            rm -f "$DASH_SRC/linenoise_completion_helpers.c"
-        fi
-
-        # Replace the linenoise read block with completion-aware version.
-        if ! grep -q 'linenoiseSetCompletionCallback' "$INPUT_C"; then
-            echo "Patching dash input.c linenoise read loop..."
-            cat > "$DASH_SRC/linenoise_patch.c" <<'EOF'
-	if (fd == 0 && isatty(0)) {
-		static char *ln_buf = NULL;
-		static int ln_len = 0;
-		static int ln_pos = 0;
-		static int history_loaded = 0;
-		static int completion_loaded = 0;
-
-		if (!history_loaded) {
-			const char *home = getenv("HOME");
-			if (home) {
-				char path[1024];
-				snprintf(path, sizeof(path), "%s/.sh_history", home);
-				linenoiseHistoryLoad(path);
-			}
-			history_loaded = 1;
-		}
-		if (!completion_loaded) {
-			linenoiseSetCompletionCallback(smallclueLinenoiseCompletion);
-			completion_loaded = 1;
-		}
-
-		if (ln_buf == NULL) {
-			char *line = linenoise(getprompt(NULL));
-			if (line) {
-				if (*line) {
-					linenoiseHistoryAdd(line);
-					const char *home = getenv("HOME");
-					if (home) {
-						char path[1024];
-						snprintf(path, sizeof(path), "%s/.sh_history", home);
-						linenoiseHistorySave(path);
-					}
-				}
-				int len = strlen(line);
-				ln_buf = malloc(len + 2);
-				if (ln_buf) {
-					strcpy(ln_buf, line);
-					ln_buf[len] = '\n';
-					ln_buf[len + 1] = '\0';
-					ln_len = len + 1;
-					ln_pos = 0;
-				}
-				free(line);
-			} else {
-				return 0;
-			}
-		}
-
-		if (ln_buf) {
-			int to_copy = ln_len - ln_pos;
-			if (to_copy > nr)
-				to_copy = nr;
-			memcpy(buf, ln_buf + ln_pos, to_copy);
-			ln_pos += to_copy;
-			if (ln_pos >= ln_len) {
-				free(ln_buf);
-				ln_buf = NULL;
-				ln_len = 0;
-				ln_pos = 0;
-			}
-			return to_copy;
-		}
-	}
-EOF
-            START_LINE=$(grep -n 'if (fd == 0 && isatty(0)) {' "$INPUT_C" | head -n 1 | cut -d: -f1)
-            END_LINE=$(awk -v start="$START_LINE" 'NR > start && /#ifndef SMALL/ { print NR; exit }' "$INPUT_C")
-            if [ -n "$START_LINE" ] && [ -n "$END_LINE" ]; then
-                head -n $((START_LINE - 1)) "$INPUT_C" > "$INPUT_C.tmp"
-                cat "$DASH_SRC/linenoise_patch.c" >> "$INPUT_C.tmp"
-                tail -n +"$END_LINE" "$INPUT_C" >> "$INPUT_C.tmp"
-                mv "$INPUT_C.tmp" "$INPUT_C"
-            fi
-            rm -f "$DASH_SRC/linenoise_patch.c"
-        fi
-
-        # Keep the old libedit branch compiled out when linenoise is active.
-        if ! grep -q "if (0) { /\* replaced by linenoise \*/" "$INPUT_C"; then
-            sed -i.bak 's/if (fd == 0 && el) {/if (0) { \/* replaced by linenoise *\//' "$INPUT_C"
-            rm -f "$INPUT_C.bak"
-        fi
-    fi
-
-    # Patch parser.c to suppress prompt when using linenoise (which handles prompt itself)
-    PARSER_C="$DASH_SRC/parser.c"
-    if [ -f "$PARSER_C" ]; then
-        if grep -q "show = 1;" "$PARSER_C"; then
-            echo "Patching dash parser.c..."
-            sed -i.bak 's/show = 1;/show = !stdin_istty;/g' "$PARSER_C"
-            sed -i.bak 's/show = !el;/show = !el \&\& !stdin_istty;/g' "$PARSER_C"
-            rm -f "$PARSER_C.bak"
-        fi
-    fi
 fi
 
 echo "Dependencies fetched and patched."

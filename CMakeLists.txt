@@ -57,7 +57,14 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/third-party/openssh/openbsd-compat
 )
 
+# openrsync lives in PSCAL's third-party tree when smallclue is the
+# src/smallclue submodule; standalone checkouts can put it in their own
+# third-party/ instead.
 set(OPENRSYNC_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../third-party/openrsync)
+if(NOT EXISTS ${OPENRSYNC_ROOT}/config_pscal.h AND
+   EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third-party/openrsync/config_pscal.h)
+    set(OPENRSYNC_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third-party/openrsync)
+endif()
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated/openrsync)
 configure_file(${OPENRSYNC_ROOT}/config_pscal.h
     ${CMAKE_CURRENT_BINARY_DIR}/generated/openrsync/config.h COPYONLY)
@@ -182,6 +189,7 @@ set(SOURCES
     src/printf_app.c
     src/expr_app.c
     src/chown_app.c
+    src/chroot_app.c
     src/base64_app.c
     src/nohup_app.c
     src/cmp_app.c
@@ -295,6 +303,25 @@ if(WITH_EXSH)
     list(APPEND SOURCES src/integration.c)
     # You might need to add include paths for vm/ and backend_ast/ here
     # include_directories(${CMAKE_CURRENT_SOURCE_DIR}/vm)
+else()
+    # Standalone builds ship smallclue's own POSIX shell (BusyBox-ash-class):
+    # the exsh lexer/parser vendored in src/shell/ plus a native AST-walking
+    # interpreter with no PSCAL VM dependency.
+    add_definitions(-DSMALLCLUE_WITH_SH)
+    list(APPEND SOURCES
+        src/shell/lexer.c
+        src/shell/parser.c
+        src/shell/ast.c
+        src/shell/sh_utils.c
+        src/shell/sh_var.c
+        src/shell/sh_astcopy.c
+        src/shell/sh_expand.c
+        src/shell/sh_arith.c
+        src/shell/sh_exec.c
+        src/shell/sh_builtins.c
+        src/shell/sh_lineedit.c
+        src/shell/sh_main.c
+    )
 endif()
 
 # The built-in `git` applet (src/git_app.c) is libgit2-backed. This mirrors
@@ -397,6 +424,13 @@ if(APPLE)
     target_link_libraries(smallclue PRIVATE resolv)
 endif()
 
+if(UNIX AND NOT APPLE)
+    # awk_interp.c's builtins (sin/cos/exp/log/sqrt/atan2/fmod/pow) and
+    # OpenSSH/su's crypt() calls are in libm/libcrypt on glibc; both are
+    # part of libSystem on Darwin, hence the UNIX-and-not-APPLE guard.
+    target_link_libraries(smallclue PRIVATE m crypt)
+endif()
+
 # musl libc (Alpine, aarch64-linux-musl) has no <fts.h>/libfts -- glibc and
 # Darwin both ship it in libc itself, so this is a no-op there. On musl,
 # install musl-fts-dev (ships both the header at the normal system include
@@ -410,6 +444,23 @@ find_library(FTS_LIBRARY fts)
 set(CMAKE_FIND_LIBRARY_SUFFIXES ${_smallclue_saved_lib_suffixes})
 if(FTS_LIBRARY)
     target_link_libraries(smallclue PRIVATE ${FTS_LIBRARY})
+endif()
+
+# openrsync (vendored OpenBSD source) calls strlcpy/strlcat/recallocarray/
+# strtonum/major/minor -- present in BSD libc and in Darwin's, but glibc only
+# gained strlcpy/strlcat in 2.38 and never shipped the rest. Same story as
+# FTS_LIBRARY above: link the distro's libbsd (apt/dnf package libbsd-dev)
+# when present.
+if(UNIX AND NOT APPLE)
+    set(_smallclue_saved_lib_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
+    set(CMAKE_FIND_LIBRARY_SUFFIXES .a ${CMAKE_FIND_LIBRARY_SUFFIXES})
+    find_library(BSD_LIBRARY bsd)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ${_smallclue_saved_lib_suffixes})
+    if(BSD_LIBRARY)
+        target_link_libraries(smallclue PRIVATE ${BSD_LIBRARY})
+    else()
+        message(WARNING "libbsd not found; openrsync needs strlcpy/strlcat/recallocarray/strtonum/major/minor. Install libbsd-dev (Debian/Ubuntu) or equivalent.")
+    endif()
 endif()
 
 # Link OpenSSH dependencies

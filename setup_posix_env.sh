@@ -21,10 +21,6 @@ if [ ! -d "third-party/openssh" ] || [ ! -f "third-party/openssh/ssh.c" ] || [ !
     echo "OpenSSH repository missing or incomplete."
     MISSING_DEPS=1
 fi
-if [ ! -d "third-party/dash" ]; then
-    echo "Dash missing."
-    MISSING_DEPS=1
-fi
 if [ ! -d "third-party/dvtm/.git" ] || [ ! -f "third-party/dvtm/dvtm.c" ] || [ ! -f "third-party/dvtm/vt.c" ] || [ ! -f "third-party/dvtm/config.def.h" ]; then
     echo "dvtm repository missing or incomplete."
     MISSING_DEPS=1
@@ -153,7 +149,27 @@ bool pathTruncateStrip(const char *path, char *buffer, size_t buflen) {
     return false; /* Did not modify */
 }
 
-/* exsh stubs removed as dash is used for sh */
+/* exsh stubs removed: standalone builds use smallclue's built-in sh */
+
+/* core.c's applet table references these unconditionally (git/rsync entries
+ * aren't ifdef-guarded), but their real implementations (src/git_app.c,
+ * src/openrsync_app.c) need libgit2/the vendored openrsync tree, which this
+ * script only builds when SMALLCLUE_WITH_LIBGIT2=1 / openrsync is fetched.
+ * Weak so the real, strong definition (when those sources are compiled in
+ * below) silently wins the link over this fallback. */
+__attribute__((weak)) int smallclueGitCommand(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "git: not built in this configuration (libgit2 unavailable)\n");
+    return 127;
+}
+
+__attribute__((weak)) int smallclueRunRsync(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "rsync: real-protocol client not built in this configuration (openrsync unavailable)\n");
+    return 127;
+}
 EOF
 
 # 3. Compile smallclue
@@ -163,9 +179,34 @@ EXTRA_LD_FLAGS=""
 if [ "$(uname -s)" = "Darwin" ]; then
     # Keep BSD typedefs (u_int/u_char/u_short) visible in macOS SDK networking headers.
     EXTRA_C_DEFS="-D_DARWIN_C_SOURCE"
+    # macOS ships no libcrypto in the SDK; point the final link at the same
+    # OpenSSL the OpenSSH configure step found (homebrew, typically).
+    for ssl_prefix in "$(brew --prefix openssl@3 2>/dev/null)" /opt/homebrew/opt/openssl@3 /usr/local/opt/openssl@3; do
+        if [ -n "$ssl_prefix" ] && [ -d "$ssl_prefix/lib" ]; then
+            EXTRA_LD_FLAGS="-L$ssl_prefix/lib"
+            break
+        fi
+    done
 fi
+EXTRA_TAIL_LIBS=""
 if [ "$(uname -s)" = "Linux" ]; then
     EXTRA_LD_FLAGS="-static"
+    # awk_interp.c's math builtins (sin/cos/exp/log/sqrt/atan2/fmod/pow/...)
+    # and crypt() (su, OpenSSH) are in libm/libcrypt on glibc, unlike Darwin
+    # where both are folded into libSystem. With -static, library order
+    # matters -- these must come after every object that references them,
+    # so they're appended at the very end of the link line, not here.
+    #
+    # -lssl -lcrypto here too: libgit2.a's openssl.c.o (built with
+    # USE_HTTPS=ON) needs SSL_*/SSL_CTX_* symbols. OPENSSH_LIBS already
+    # carries its own -lcrypto earlier in the link line (for OpenSSH's own
+    # crypto use), but that's BEFORE ${LIBGIT2_LIBS} -- static linking is a
+    # single left-to-right pass, so by the time ld reaches libgit2.a's
+    # unresolved SSL_* refs it's already past that -lcrypto and never looks
+    # back ("undefined reference to SSL_connect" etc). Re-listing both here,
+    # after LIBGIT2_LIBS, resolves it the same way CMakeLists.txt's own
+    # libgit2 target_link_libraries ordering already does.
+    EXTRA_TAIL_LIBS="-lm -lcrypt -lssl -lcrypto"
 fi
 
 NEXTVI_SRC="src/nextvi_stubs.c"
@@ -297,11 +338,18 @@ if [ -d "$OPENSSH_DIR" ]; then
             fi
 
             if ! (cd "$OPENSSH_DIR" && env "${OPENSSH_CONFIG_ENV[@]}" ./configure "${OPENSSH_CONFIG_ARGS[@]}"); then
-                echo "Error: OpenSSH configure failed."
-                if [ -f "$OPENSSH_DIR/config.log" ]; then
-                    echo "See: $OPENSSH_DIR/config.log"
+                # Retry relaxing the OpenSSL header/library version cross-check:
+                # some systems (e.g. a locally-built OpenSSL alongside an older
+                # system libcrypto) have headers and library reporting different
+                # versions even though they're ABI-compatible for our purposes.
+                echo "OpenSSH configure failed; retrying with --without-openssl-header-check..."
+                if ! (cd "$OPENSSH_DIR" && env "${OPENSSH_CONFIG_ENV[@]}" ./configure "${OPENSSH_CONFIG_ARGS[@]}" --without-openssl-header-check); then
+                    echo "Error: OpenSSH configure failed."
+                    if [ -f "$OPENSSH_DIR/config.log" ]; then
+                        echo "See: $OPENSSH_DIR/config.log"
+                    fi
+                    exit 1
                 fi
-                exit 1
             fi
         else
             echo "Error: configure script not found and could not be generated."
@@ -348,12 +396,16 @@ if [ -d "$OPENSSH_DIR" ]; then
         rm -f "$OPENSSH_DIR/sftp.c.bak"
     fi
 
-    # sftp-client.c
-    if grep -q "interrupted" "$OPENSSH_DIR/sftp-client.c"; then
+    # sftp-client.c. The pscal_openssh_ checks make these idempotent: the
+    # plain substring guards used to match their own output, stacking the
+    # prefix on every rebuild (pscal_openssh_pscal_openssh_...).
+    if grep -q "interrupted" "$OPENSSH_DIR/sftp-client.c" && \
+       ! grep -q "pscal_openssh_interrupted" "$OPENSSH_DIR/sftp-client.c"; then
         sed -i.bak 's/interrupted/pscal_openssh_interrupted/g' "$OPENSSH_DIR/sftp-client.c"
         rm -f "$OPENSSH_DIR/sftp-client.c.bak"
     fi
-    if grep -q "showprogress" "$OPENSSH_DIR/sftp-client.c"; then
+    if grep -q "showprogress" "$OPENSSH_DIR/sftp-client.c" && \
+       ! grep -q "pscal_openssh_showprogress" "$OPENSSH_DIR/sftp-client.c"; then
         sed -i.bak 's/showprogress/pscal_openssh_showprogress/g' "$OPENSSH_DIR/sftp-client.c"
         if ! grep -q "extern int pscal_openssh_showprogress;" "$OPENSSH_DIR/sftp-client.c"; then
             awk '
@@ -391,24 +443,16 @@ $OPENSSH_DIR/ssh-keygen.o $OPENSSH_DIR/sshsig.o $OPENSSH_DIR/ssh-pkcs11.o"
     if [ "$(uname -s)" = "Linux" ]; then
         OPENSSH_LIBS="$OPENSSH_LIBS -lcrypt"
     fi
+    if [ "$(uname -s)" = "Darwin" ]; then
+        # openbsd-compat's getrrsetbyname uses the BIND resolver state.
+        OPENSSH_LIBS="$OPENSSH_LIBS -lresolv"
+    fi
 
     # Include globals and stubs
     OPENSSH_SRC="src/openssh_stubs.c src/openssh_globals.c"
 
     # Do not link shim if using real openssh (avoid dns symbol conflict)
     OPENSSH_SHIM=""
-fi
-
-# Build dash if present
-DASH_DIR="third-party/dash"
-if [ -d "$DASH_DIR" ] && [ ! -f "$DASH_DIR/src/dash" ]; then
-    echo "Building dash..."
-    # Git checkout needs autogen
-    if [ ! -f "$DASH_DIR/configure" ]; then
-        echo "Generating dash configure script..."
-        (cd "$DASH_DIR" && ./autogen.sh)
-    fi
-    (cd "$DASH_DIR" && ./configure --enable-static && make -j4)
 fi
 
 if [ "$SMALLCLUE_WITH_DVTM" = "1" ]; then
@@ -430,7 +474,19 @@ if [ "$SMALLCLUE_WITH_DVTM" = "1" ]; then
 int main(void) { initscr(); endwin(); return 0; }
 EOF
 
-    for try_libs in "-lncursesw -lutil" "-lncursesw" "-lncurses -lutil" "-lncurses" "-lcurses -lutil" "-lcurses"; do
+    # Debian/glibc splits terminfo out of libncurses*.a for STATIC linking
+    # (dynamic linking doesn't need this -- libncurses.so already pulls
+    # tinfo symbols in via its own NEEDED entry). A static-only build (our
+    # EXTRA_LD_FLAGS=-static path) sees undefined references to `SP`/
+    # `_nc_screen_of`/etc without an explicit -ltinfo, even though
+    # libncursesw.a/libncurses.a themselves link fine dynamically. Every
+    # existing combo gets a -ltinfo-augmented counterpart so this doesn't
+    # regress platforms where tinfo is already folded into libncurses*.a.
+    for try_libs in "-lncursesw -lutil" "-lncursesw" \
+                     "-lncursesw -lutil -ltinfo" "-lncursesw -ltinfo" \
+                     "-lncurses -lutil" "-lncurses" \
+                     "-lncurses -lutil -ltinfo" "-lncurses -ltinfo" \
+                     "-lcurses -lutil" "-lcurses"; do
         if gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${EXTRA_C_DEFS} ${EXTRA_LD_FLAGS} \
             "$DVTM_PROBE_SRC" ${try_libs} -o "$DVTM_BUILD_DIR/curses_probe.bin" >/dev/null 2>&1; then
             DVTM_LIBS="$try_libs"
@@ -440,12 +496,15 @@ EOF
 
     if [ -z "$DVTM_LIBS" ]; then
         echo "Error: failed to locate a curses+util link combination for dvtm."
-        echo "Tried: -lncursesw/-lncurses/-lcurses with and without -lutil."
+        echo "Tried: -lncursesw/-lncurses/-lcurses with and without -lutil/-ltinfo."
         exit 1
     fi
 
     echo "Building dvtm applet support (${DVTM_LIBS})..."
-    DVTM_COMMON_DEFS="-D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_XOPEN_SOURCE_EXTENDED -D_GNU_SOURCE ${EXTRA_C_DEFS} -DVERSION=\\\"0.16-pscal\\\" -Dexit=pscalDvtmRequestExit"
+    # DVTM_COMMON_DEFS is expanded unquoted below (plain word-splitting, no
+    # eval/second shell parse) so it must hold the RAW argv text gcc expects
+    # -- one literal backslash-quote per side, not a double-escaped pair.
+    DVTM_COMMON_DEFS="-D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_XOPEN_SOURCE_EXTENDED -D_GNU_SOURCE ${EXTRA_C_DEFS} -DVERSION=\"0.16-pscal\" -Dexit=pscalDvtmRequestExit"
     gcc -std=c99 ${DVTM_COMMON_DEFS} -include "$DVTM_RUNTIME_HOOKS_HEADER" -I"$DVTM_BUILD_DIR" -I"$DVTM_DIR" -Isrc \
         -Dmain=dvtm_main_entry -c "$DVTM_DIR/dvtm.c" -o "$DVTM_BUILD_DIR/dvtm.o"
     gcc -std=c99 ${DVTM_COMMON_DEFS} -include "$DVTM_RUNTIME_HOOKS_HEADER" -I"$DVTM_BUILD_DIR" -I"$DVTM_DIR" -Isrc \
@@ -483,8 +542,8 @@ if [ "$SMALLCLUE_WITH_LIBGIT2" = "1" ]; then
         -DBUILD_FUZZERS=OFF \
         -DUSE_SSH=OFF \
         -DUSE_HTTPS=ON \
-        -DUSE_SHA1=builtin \
-        -DUSE_SHA256=builtin \
+        -DUSE_SHA1=OpenSSL \
+        -DUSE_SHA256=OpenSSL \
         -DUSE_HTTP_PARSER=builtin \
         -DUSE_AUTH_NTLM=OFF \
         -DUSE_AUTH_NEGOTIATE=OFF \
@@ -505,15 +564,20 @@ if [ "$SMALLCLUE_WITH_LIBGIT2" = "1" ]; then
     LIBGIT2_EXTRA_DEFS="-DPSCAL_HAS_LIBGIT2"
     LIBGIT2_EXTRA_CFLAGS="-I${LIBGIT2_DIR}/include"
     LIBGIT2_LIBS="$LIBGIT2_ARCHIVE"
+    if [ "$(uname -s)" = "Darwin" ]; then
+        # libgit2's HTTPS/keychain backends use SecureTransport on macOS.
+        LIBGIT2_LIBS="$LIBGIT2_LIBS -framework Security -framework CoreFoundation -liconv"
+    fi
 fi
 
-gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${EXTRA_C_DEFS} ${DVTM_EXTRA_DEFS} ${LIBGIT2_EXTRA_DEFS} \
+gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -DSMALLCLUE_WITH_SH ${EXTRA_C_DEFS} ${DVTM_EXTRA_DEFS} ${LIBGIT2_EXTRA_DEFS} \
     ${LIBGIT2_EXTRA_CFLAGS} \
     -I. -Isrc ${EXTRA_LD_FLAGS} -lpthread \
     src/main.c \
     src/core.c \
     src/runtime_support.c \
     src/micro_app.c \
+    src/micro_main_stub.c \
     src/dvtm_app.c \
     src/nextvi_app.c \
     ${NEXTVI_SRC} \
@@ -522,12 +586,53 @@ gcc -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE ${EXTRA
     ${DVTM_OBJS} \
     src/openssh_app.c \
     src/vproc_test_app.c \
-    src/micro_app.c \
+    src/shell/lexer.c \
+    src/shell/parser.c \
+    src/shell/ast.c \
+    src/shell/sh_utils.c \
+    src/shell/sh_var.c \
+    src/shell/sh_astcopy.c \
+    src/shell/sh_expand.c \
+    src/shell/sh_arith.c \
+    src/shell/sh_exec.c \
+    src/shell/sh_builtins.c \
+    src/shell/sh_lineedit.c \
+    src/shell/sh_main.c \
     ${OPENSSH_SHIM} \
     src/runtime_stubs_extra.c \
+    src/awk_lexer.c \
+    src/awk_parser.c \
+    src/awk_value.c \
+    src/awk_interp.c \
+    src/awk_app.c \
+    src/base64_app.c \
+    src/checksum_app.c \
+    src/chown_app.c \
+    src/chroot_app.c \
+    src/cmp_app.c \
+    src/comm_app.c \
+    src/dd_app.c \
+    src/diff_app.c \
+    src/expr_app.c \
+    src/fmt_app.c \
+    src/fold_app.c \
+    src/gzip_app.c \
+    src/nl_app.c \
+    src/nohup_app.c \
+    src/od_app.c \
+    src/paste_app.c \
+    src/patch_app.c \
+    src/printf_app.c \
+    src/readlink_app.c \
+    src/rev_app.c \
+    src/seq_app.c \
+    src/split_app.c \
+    src/tac_app.c \
+    src/tar_app.c \
     ${OPENSSH_LIBS} \
     ${DVTM_LIBS} \
     ${LIBGIT2_LIBS} \
+    ${EXTRA_TAIL_LIBS} \
     -o smallclue
 
 if [ ! -f smallclue ]; then
@@ -619,7 +724,7 @@ elif [ "$(uname -s)" = "Darwin" ]; then
     mknod -m 666 "$ROOTFS/dev/urandom" c 14 1 || echo "Failed to create /dev/urandom"
 fi
 
-# 5. Install smallclue and dash
+# 5. Install smallclue
 cp smallclue "$ROOTFS/bin/"
 if [ -x "third-party/micro-bin/micro" ]; then
     echo "Installing micro..."
@@ -634,15 +739,6 @@ if [ "$(uname -s)" = "Darwin" ] && [ -n "${SMALLCLUE_CODESIGN_IDENTITY:-}" ]; th
     codesign --force --timestamp=none --sign "${SMALLCLUE_CODESIGN_IDENTITY}" "$ROOTFS/bin/smallclue"
 fi
 
-if [ -f "third-party/dash/src/dash" ]; then
-    echo "Installing dash..."
-    cp "third-party/dash/src/dash" "$ROOTFS/bin/dash"
-    mkdir -p "$ROOTFS/usr/share/doc/dash"
-    cp "third-party/dash/COPYING" "$ROOTFS/usr/share/doc/dash/"
-    # Symlink /bin/sh to dash
-    ln -sf dash "$ROOTFS/bin/sh"
-fi
-
 # 6. Create symlinks
 echo "Creating symlinks..."
 # Extract applet names from ./smallclue output
@@ -652,10 +748,6 @@ APPLETS=$(./smallclue 2>&1 | grep "^  " | awk '{print $1}' | grep -v "smallclue"
 for applet in $APPLETS; do
     # Skip if it is smallclue itself (already handled)
     if [ "$applet" == "smallclue" ]; then
-        continue
-    fi
-    # If dash is present, do not overwrite sh
-    if [ "$applet" == "sh" ] && [ -f "$ROOTFS/bin/dash" ]; then
         continue
     fi
     ln -sf smallclue "$ROOTFS/bin/$applet"
@@ -741,14 +833,14 @@ chown 1000:1000 "$ROOTFS/home/username/.exshrc"
 
 echo "Creating .profile..."
 cat > "$ROOTFS/home/username/.profile" <<EOF
-export ENV=\$HOME/.dashrc
+export ENV=\$HOME/.shrc
 export PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
 EOF
 chown 1000:1000 "$ROOTFS/home/username/.profile"
 
-echo "Creating .dashrc..."
-cat > "$ROOTFS/home/username/.dashrc" <<EOF
-# Basic dash configuration
+echo "Creating .shrc..."
+cat > "$ROOTFS/home/username/.shrc" <<EOF
+# Basic sh configuration
 
 # Get username if not set
 if [ -z "\$USER" ]; then
@@ -776,17 +868,17 @@ alias la='ls -A'
 alias l='ls -CF'
 alias ls='ls --color=auto'
 EOF
-chown 1000:1000 "$ROOTFS/home/username/.dashrc"
+chown 1000:1000 "$ROOTFS/home/username/.shrc"
 
 echo "Creating root .profile..."
 cat > "$ROOTFS/root/.profile" <<EOF
-export ENV=\$HOME/.dashrc
+export ENV=\$HOME/.shrc
 export PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
 EOF
 
-echo "Creating root .dashrc..."
-cat > "$ROOTFS/root/.dashrc" <<EOF
-# Basic dash configuration
+echo "Creating root .shrc..."
+cat > "$ROOTFS/root/.shrc" <<EOF
+# Basic sh configuration
 
 # Get username if not set
 if [ -z "\$USER" ]; then

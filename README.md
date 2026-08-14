@@ -30,6 +30,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **du**: Estimate file space usage (GNU-default directory-subtotal behavior, `--max-depth`, `-c` grand total, `-x` one-filesystem, `-h`).
 * **df**: Report file system disk space usage (enumerates all mounts from `/proc/mounts` when no path is given).
 * **chown** / **chgrp**: Change file ownership/group.
+* **chroot**: Run a command (or shell) with a new root directory, optionally dropping to another user/group.
 * **file**: Determine file type.
 * **stat**: Display file status.
 * **basename** / **dirname**: Parse path components (multi-operand support; `basename` supports a `SUFFIX` operand).
@@ -93,7 +94,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **ipaddr**: Display network interface addresses; on Linux (real netlink, IPv4 only, needs `CAP_NET_ADMIN`): `ipaddr add|del ADDR/PREFIXLEN dev IFACE`, `ipaddr flush dev IFACE`, `ipaddr link set IFACE up|down`, `ipaddr route add|del DEST/PREFIXLEN|default [via GW] [dev IFACE]`.
 
 ### Shell & System
-* **sh**: Launches the PSCAL shell frontend (`exsh`).
+* **sh** / **ash**: In standalone builds, smallclue's own POSIX shell (BusyBox-ash-class): pipelines, functions, full word expansion (`${var...}`, `$(...)`, `$((...))`, globbing, IFS splitting), heredocs, traps, job control (`jobs`/`fg`/`bg`/`wait`), `set -e/-u/-x/-o pipefail`, and interactive line editing with history and tab completion. Implemented in `src/shell/`: the lexer/parser are vendored from exsh, executed by a native AST-walking interpreter with no PSCAL VM dependency. In embedded PSCAL builds (`WITH_EXSH`), `sh` launches the PSCAL shell frontend (`exsh`) instead.
 * **dvtm**: Launch the dvtm terminal multiplexer applet (enabled in iOS/iPadOS chroot and Docker setup builds).
 * **env**: Run a program in a modified environment.
 * **ps**: Report a snapshot of current processes (real `/proc` parsing on Linux, with `STAT` column; supports `-e`/`-f`/`aux`-style argument forms and `-p PID`).
