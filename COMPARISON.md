@@ -22,7 +22,7 @@ Both **BusyBox** and **SmallClue** are multicall binaries that bundle multiple U
 
 ### Shell
 *   **BusyBox**: Includes full shell implementations like `ash` (Almquist Shell) or `hush`.
-*   **SmallClue**: The `sh` applet launches `exsh`, the PSCAL shell frontend, rather than implementing its own shell logic.
+*   **SmallClue**: Standalone builds use smallclue's own native POSIX shell (BusyBox-ash-class, in `src/shell/`). Embedded PSCAL builds (`WITH_EXSH`) instead launch `exsh`, the PSCAL shell frontend.
 
 ### Editors
 *   **BusyBox**: Includes a lightweight `vi` clone.

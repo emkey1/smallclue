@@ -30,7 +30,3 @@
 ## 2025-05-19 - Optimization of tee applet block read
 **Learning:** The \`tee\` applet originally processed input using \`smallclueReadStream\` and wrote to outputs using \`fwrite\`, creating significant overhead due to memory copying and lock acquisitions inside \`stdio\`. By bypassing \`stdio\` (e.g., using direct \`read\` and \`write\` system calls on \`STDIN_FILENO\` and \`STDOUT_FILENO\`) with a large stack buffer (64KB), \`tee\`'s throughput is noticeably improved.
 **Action:** Replace \`fread\`/\`fwrite\` with POSIX \`read\`/\`write\` loops in continuous stream tools like \`tee\` while handling \`EINTR\` explicitly and ensuring buffers are flushed correctly (\`fflush(stdout)\`) before transitioning from buffered to raw file descriptors.
-## 2026-08-06 - Optimize wc wide mode with stack allocation and loop unrolling
-**Learning:** In `src/core.c`, the wide character mode of the `wc` applet (`smallclueWcProcessFileWide`) suffered from significant performance bottlenecks due to a `malloc`/`free` call per read chunk and a per-character branchy `for` loop to evaluate lines and words.
-**Action:** Replaced dynamic allocations with a bounded, fixed-size stack buffer `unsigned char scratch[sizeof(buf) + sizeof(carry)];` to eliminate memory overhead, and unrolled the line/word counting loop by a factor of 16 using a branchless `lines += (c == '
-');` approach similar to `smallclueWcProcessFileFast`. This guarantees safe memory bounds while drastically improving wide-character throughput.
