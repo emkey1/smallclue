@@ -1,0 +1,13 @@
+[submodule "third-party/libgit2"]
+	path = third-party/libgit2
+	url = https://github.com/emkey1/libgit2.git
+[submodule "third-party/openrsync"]
+	path = third-party/openrsync
+	url = https://github.com/emkey1/openrsync.git
+[submodule "third-party/nextvi"]
+	path = third-party/nextvi
+	url = https://github.com/emkey1/nextvi.git
+	branch = smallclue
+[submodule "third-party/dvtm"]
+	path = third-party/dvtm
+	url = https://github.com/emkey1/dvtm.git
