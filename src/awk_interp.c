@@ -971,8 +971,23 @@ static AwkValue awkCallBuiltin(AwkNode *call) {
         char *cmd = awkToStrFmt(&v, "%.6g");
         awkValFree(&v);
         fflush(stdout);
+#if defined(PSCAL_TARGET_IOS)
+        /* system() is unavailable on iOS, but popen() is (see the pipe redirections
+           above) and pclose() yields the same wait status. Run the command that way
+           and forward its output to stdout, which is where system() would send it. */
+        FILE *sysfp = popen(cmd, "r");
+        free(cmd);
+        if (!sysfp) return awkValNum(-1);
+        char sysbuf[4096];
+        size_t sysn;
+        while ((sysn = fread(sysbuf, 1, sizeof(sysbuf), sysfp)) > 0)
+            fwrite(sysbuf, 1, sysn, stdout);
+        fflush(stdout);
+        int rc = pclose(sysfp);
+#else
         int rc = system(cmd);
         free(cmd);
+#endif
         int code = WIFEXITED(rc) ? WEXITSTATUS(rc) : (WIFSIGNALED(rc) ? 128 + WTERMSIG(rc) : -1);
         return awkValNum(code);
     }

@@ -20,6 +20,7 @@
 #include "printf_app.h"
 #include "expr_app.h"
 #include "chown_app.h"
+#include "chroot_app.h"
 #include "base64_app.h"
 #include "nohup_app.h"
 #include "cmp_app.h"
@@ -518,6 +519,9 @@ static const char *smallclueResolveShebangToolName(const char *interpreter) {
 #if defined(SMALLCLUE_WITH_EXSH)
     if (strcasecmp(base, "sh") == 0) return "exsh";
     if (strcasecmp(base, "exsh") == 0) return "exsh";
+#elif defined(SMALLCLUE_WITH_SH)
+    if (strcasecmp(base, "sh") == 0) return "sh";
+    if (strcasecmp(base, "ash") == 0) return "sh";
 #endif
     return NULL;
 }
@@ -1382,6 +1386,8 @@ static int smallclueHaltCommand(int argc, char **argv);
 #if defined(SMALLCLUE_WITH_EXSH)
 extern int exsh_main(int argc, char **argv);
 static int smallclueShCommand(int argc, char **argv);
+#elif defined(SMALLCLUE_WITH_SH)
+static int smallclueNativeShCommand(int argc, char **argv);
 #endif
 static int smallclueUptimeCommand(int argc, char **argv);
 static int smallclueUnameCommand(int argc, char **argv);
@@ -2221,8 +2227,11 @@ static int smallclueHostCommand(int argc, char **argv) {
 
 static int smallclueHostnameCommand(int argc, char **argv) {
     if (argc > 1) {
-        fprintf(stderr, "hostname: setting hostname not supported\n");
-        return 1;
+        if (sethostname(argv[1], strlen(argv[1])) != 0) {
+            fprintf(stderr, "hostname: %s: %s\n", argv[1], strerror(errno));
+            return 1;
+        }
+        return 0;
     }
 
     char path[PATH_MAX];
@@ -2712,6 +2721,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"chmod", smallclueChmodCommand, "Change file permissions"},
     {"chown", smallclueChownCommand, "Change file owner and group"},
     {"chgrp", smallclueChgrpCommand, "Change file group ownership"},
+    {"chroot", smallclueChrootCommand, "Run a command with a new root directory"},
     {"clear", smallclueClearCommand, "Clear the terminal"},
     {"cls", smallclueClearCommand, "Clear the terminal"},
     {"cp", smallclueCpCommand, "Copy files and directories"},
@@ -2748,7 +2758,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
 #endif
     {"halt", smallclueHaltCommand, "Halt the system"},
     {"host", smallclueHostCommand, "DNS lookup utility"},
-    {"hostname", smallclueHostnameCommand, "Show system hostname"},
+    {"hostname", smallclueHostnameCommand, "Show or set system hostname"},
     {"init", smallclueInitCommand, "System initialization"},
     {"kill", smallclueKillCommand, "Send signals to processes"},
     {"less", smallcluePagerCommand, "Paginate file contents"},
@@ -2805,6 +2815,9 @@ static const SmallclueApplet kSmallclueApplets[] = {
 #if defined(SMALLCLUE_WITH_EXSH)
     {"exsh", smallclueShCommand, "Run the PSCAL shell front end"},
     {"sh", smallclueShCommand, "Run the PSCAL shell front end"},
+#elif defined(SMALLCLUE_WITH_SH)
+    {"ash", smallclueNativeShCommand, "POSIX shell (BusyBox-ash compatible)"},
+    {"sh", smallclueNativeShCommand, "POSIX shell (BusyBox-ash compatible)"},
 #endif
     {"scp", smallclueScpCommand, "Securely copy files over SSH"},
     {"sftp", smallclueSftpCommand, "Interactive SFTP client"},
@@ -2884,6 +2897,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"chgrp", "chgrp [-R] [-h] GROUP FILE ...\n"
               "  Change group ownership of each FILE (numeric ID or name)\n"
               "  -R recursive  -h affect symlinks themselves, not their targets"},
+    {"chroot", "chroot [-u USER] [-g GROUP] NEWROOT [COMMAND [ARG]...]\n"
+               "  Run COMMAND (default: $SHELL or /bin/sh) with NEWROOT as its root\n"
+               "  -u drop to USER (numeric ID or name) after chrooting\n"
+               "  -g drop to GROUP (numeric ID or name) after chrooting"},
     {"clear", "clear\n"
               "  Clear the terminal"},
     {"cls", "cls\n"
@@ -3180,8 +3197,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -v verbose (hosts debug)\n"
              "  IP-shaped queries auto-detect as PTR/reverse lookups\n"
              "Server override is ignored."},
-    {"hostname", "hostname\n"
-                 "  Show system hostname"},
+    {"hostname", "hostname [NAME]\n"
+                 "  Show system hostname, or set it to NAME (requires CAP_SYS_ADMIN)"},
     {"pbcopy", "pbcopy\n"
                "  Copy stdin to system clipboard"},
     {"pbpaste", "pbpaste\n"
@@ -3262,6 +3279,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Launch PSCAL shell front end"},
     {"sh", "sh\n"
            "  Launch PSCAL shell front end"},
+#elif defined(SMALLCLUE_WITH_SH)
+    {"sh", "sh [-eiuxvnfCam] [-c command | script | -s] [args]\n"
+           "  POSIX shell (BusyBox-ash compatible): pipelines, functions,\n"
+           "  expansions, job control, interactive line editing"},
+    {"ash", "ash [-eiuxvnfCam] [-c command | script | -s] [args]\n"
+            "  Alias for sh"},
 #endif
     {"scp", "scp [-P PORT] SRC... DEST\n"
             "  Uses OpenSSH scp"},
@@ -4501,7 +4524,11 @@ static int smallclueTopCommand(int argc, char **argv) {
         size_t snapshot_count = snapshots ? vprocSnapshot(snapshots, snapshot_cap) : 0;
 
         /* Clear and render. */
-        fputs("\x1b[2J\x1b[H", stdout);
+        if (isatty(STDOUT_FILENO)) {
+            fputs("\x1b[2J\x1b[H", stdout);
+        } else {
+            fputc('\n', stdout);
+        }
 
 #if defined(__APPLE__)
         size_t mem_used_kb = 0, mem_free_kb = 0;
@@ -5909,7 +5936,11 @@ static void pagerRenderPage(const PagerBuffer *buffer, size_t start, int page_ro
     if (page_rows < 1) {
         page_rows = 1;
     }
-    fputs("\x1b[2J\x1b[H", stdout);
+    if (isatty(STDOUT_FILENO)) {
+        fputs("\x1b[2J\x1b[H", stdout);
+    } else {
+        fputc('\n', stdout);
+    }
     size_t end = start + (size_t)page_rows;
     if (end > buffer->line_count) {
         end = buffer->line_count;
@@ -10587,8 +10618,10 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
                 break;
             case '\n':
             case '\r':
-                printf("\x1b[2J\x1b[H");
-                fflush(stdout);
+                if (isatty(STDOUT_FILENO)) {
+                    printf("\x1b[2J\x1b[H");
+                    fflush(stdout);
+                }
 #if defined(PSCAL_TARGET_IOS)
                 pager_session_queue_enabled = prev_session_queue;
 #endif
@@ -10596,8 +10629,10 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
             case 'q':
             case 'Q':
             case 3:
-                printf("\x1b[2J\x1b[H");
-                fflush(stdout);
+                if (isatty(STDOUT_FILENO)) {
+                    printf("\x1b[2J\x1b[H");
+                    fflush(stdout);
+                }
 #if defined(PSCAL_TARGET_IOS)
                 pager_session_queue_enabled = prev_session_queue;
 #endif
@@ -10870,11 +10905,15 @@ static void smallclueMenuStartFrameTo(FILE *out, bool *first_frame) {
         out = stdout;
     }
     if (first_frame && *first_frame) {
-        fputs("\x1b[2J\x1b[H", out);
+        if (isatty(fileno(out))) {
+            fputs("\x1b[2J\x1b[H", out);
+        }
         *first_frame = false;
         return;
     }
-    fputs("\x1b[H\x1b[J", out);
+    if (isatty(fileno(out))) {
+        fputs("\x1b[H\x1b[J", out);
+    }
 }
 
 static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
@@ -11086,8 +11125,10 @@ static int markdownInteractiveSelectDocument(void) {
         }
     }
 
-    printf("\x1b[2J\x1b[H");
-    fflush(stdout);
+    if (isatty(STDOUT_FILENO)) {
+        printf("\x1b[2J\x1b[H");
+        fflush(stdout);
+    }
     pager_control_fd_reset();
 #if defined(PSCAL_TARGET_IOS)
     pager_session_queue_enabled = prev_session_queue;
@@ -11453,8 +11494,18 @@ static int smallclueCatFileFormatted(const char *path, const SmallclueCatOptions
     return status;
 }
 
+static char smallclueFileTypeChar(mode_t mode) {
+    if (S_ISDIR(mode)) return 'd';
+    if (S_ISLNK(mode)) return 'l';
+    if (S_ISCHR(mode)) return 'c';
+    if (S_ISBLK(mode)) return 'b';
+    if (S_ISFIFO(mode)) return 'p';
+    if (S_ISSOCK(mode)) return 's';
+    return '-';
+}
+
 static void print_permissions(mode_t mode) {
-    putchar(S_ISDIR(mode) ? 'd' : S_ISLNK(mode) ? 'l' : '-');
+    putchar(smallclueFileTypeChar(mode));
     putchar(mode & S_IRUSR ? 'r' : '-');
     putchar(mode & S_IWUSR ? 'w' : '-');
     putchar(mode & S_IXUSR ? 'x' : '-');
@@ -13056,8 +13107,10 @@ static int smallclueLicensesCommand(int argc, char **argv) {
                 break;
         }
     }
-    printf("\033[2J\033[H");
-    fflush(stdout);
+    if (isatty(STDOUT_FILENO)) {
+        printf("\033[2J\033[H");
+        fflush(stdout);
+    }
     pager_control_fd_reset();
 #if defined(PSCAL_TARGET_IOS)
     pager_session_queue_enabled = prev_session_queue;
@@ -13139,6 +13192,12 @@ static int smallclueHelpCommand(int argc, char **argv) {
 #if defined(SMALLCLUE_WITH_EXSH)
 static int smallclueShCommand(int argc, char **argv) {
     return exsh_main(argc, argv);
+}
+#elif defined(SMALLCLUE_WITH_SH)
+/* smallclue's native POSIX shell (src/shell/). */
+extern int shMain(int argc, char **argv);
+static int smallclueNativeShCommand(int argc, char **argv) {
+    return shMain(argc, argv);
 }
 #endif
 
@@ -16300,11 +16359,19 @@ static int smallclueDateCommand(int argc, char **argv) {
             return 1;
         }
         if (set_spec) {
+#if defined(PSCAL_TARGET_IOS)
+            /* clock_settime() is unavailable on iOS, and a sandboxed app could not
+               set the system clock even if it were. Fail rather than silently
+               pretending the date was changed. */
+            fprintf(stderr, "date: cannot set date: not supported on iOS\n");
+            return 1;
+#else
             struct timespec ts = {.tv_sec = now, .tv_nsec = 0};
             if (clock_settime(CLOCK_REALTIME, &ts) != 0) {
                 fprintf(stderr, "date: cannot set date: %s\n", strerror(errno));
                 return 1;
             }
+#endif
         }
     } else {
         now = time(NULL);
@@ -22305,6 +22372,46 @@ static bool smallclueMountRemoveFstabEntry(const char *target) {
 }
 #endif
 
+#if defined(__linux__) || defined(linux) || defined(__linux)
+/*
+ * The kernel mount(2) syscall has no "auto" filesystem type -- that's a
+ * mount(8) userspace convention. Real util-linux mount resolves it via
+ * libblkid, falling back (per mount(8)) to trying every non-"nodev" type
+ * listed in /proc/filesystems. Mirror that fallback here so unqualified
+ * `mount device dir` doesn't fail with ENODEV.
+ */
+static bool smallclueMountAutoProbe(const char *source, const char *target,
+                                     unsigned long flags, const void *data,
+                                     int *out_errno) {
+    FILE *fp = fopen("/proc/filesystems", "r");
+    if (!fp) {
+        if (out_errno) *out_errno = errno;
+        return false;
+    }
+    char line[128];
+    int last_errno = ENODEV;
+    bool mounted = false;
+    while (fgets(line, sizeof(line), fp)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = '\0';
+        const char *nodev_marker = line;
+        const char *fstype = tab + 1;
+        if (nodev_marker[0] != '\0' || fstype[0] == '\0') continue;
+        if (mount(source, target, fstype, flags, data) == 0) {
+            mounted = true;
+            break;
+        }
+        last_errno = errno;
+    }
+    fclose(fp);
+    if (out_errno) *out_errno = last_errno;
+    return mounted;
+}
+#endif
+
 static int smallclueMountCommand(int argc, char **argv) {
 #if defined(__linux__) || defined(linux) || defined(__linux)
     const char *usage = "usage: mount [-t type] [-o options] device dir\n";
@@ -22407,10 +22514,19 @@ static int smallclueMountCommand(int argc, char **argv) {
         free(options);
     }
 
-    int rc = mount(source, target, type ? type : "auto", flags, data);
+    bool need_probe = !type || strcmp(type, "auto") == 0;
+    int rc;
+    int mount_errno = 0;
+    if (need_probe) {
+        rc = smallclueMountAutoProbe(source, target, flags, data, &mount_errno) ? 0 : -1;
+    } else {
+        rc = mount(source, target, type, flags, data);
+        mount_errno = errno;
+    }
     if (data) free(data);
 
     if (rc != 0) {
+        errno = mount_errno;
         perror("mount");
         return 1;
     }
@@ -22839,7 +22955,7 @@ static void smallclueStatFormatPerms(char *buf, size_t buflen, mode_t mode) {
     if (!buf || buflen < 11) {
         return;
     }
-    buf[0] = S_ISDIR(mode) ? 'd' : S_ISLNK(mode) ? 'l' : '-';
+    buf[0] = smallclueFileTypeChar(mode);
     buf[1] = (mode & S_IRUSR) ? 'r' : '-';
     buf[2] = (mode & S_IWUSR) ? 'w' : '-';
     buf[3] = (mode & S_IXUSR) ? 'x' : '-';
