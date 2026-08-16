@@ -2264,6 +2264,8 @@ static int smallclueSuCommand(int argc, char **argv) {
     unsetenv("LD_LIBRARY_PATH");
     unsetenv("LD_DEBUG");
     unsetenv("IFS");
+    unsetenv("ENV");
+    unsetenv("BASH_ENV");
     setenv("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", 1);
 
     int arg_idx = 1;
@@ -2381,6 +2383,8 @@ static int smallclueSudoCommand(int argc, char **argv) {
     unsetenv("LD_LIBRARY_PATH");
     unsetenv("LD_DEBUG");
     unsetenv("IFS");
+    unsetenv("ENV");
+    unsetenv("BASH_ENV");
     setenv("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", 1);
 
     if (getuid() != 0) {
