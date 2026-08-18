@@ -30,3 +30,6 @@
 ## 2025-05-19 - Optimization of tee applet block read
 **Learning:** The \`tee\` applet originally processed input using \`smallclueReadStream\` and wrote to outputs using \`fwrite\`, creating significant overhead due to memory copying and lock acquisitions inside \`stdio\`. By bypassing \`stdio\` (e.g., using direct \`read\` and \`write\` system calls on \`STDIN_FILENO\` and \`STDOUT_FILENO\`) with a large stack buffer (64KB), \`tee\`'s throughput is noticeably improved.
 **Action:** Replace \`fread\`/\`fwrite\` with POSIX \`read\`/\`write\` loops in continuous stream tools like \`tee\` while handling \`EINTR\` explicitly and ensuring buffers are flushed correctly (\`fflush(stdout)\`) before transitioning from buffered to raw file descriptors.
+## 2026-08-18 - Optimization of yes applet
+**Learning:** By default, writing output for `yes` using `fwrite` causes significant stdio overhead. Using POSIX `write` with `fflush(stdout)` massively increases throughput.
+**Action:** For utilities generating continuous streams of text like `yes`, flush stdio and use direct POSIX `write` loops.
