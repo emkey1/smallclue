@@ -4508,15 +4508,9 @@ static int smallclueTopCommand(int argc, char **argv) {
         if (smallclueReadMemStats(&mem_used_kb, &mem_free_kb)) {
             char mem_line[160];
             int mn;
-            if (isatty(STDOUT_FILENO)) {
-                mn = snprintf(mem_line, sizeof(mem_line),
-                              "\033[7mMem: %zuK used, %zuK free\033[0m\n",
-                              mem_used_kb, mem_free_kb);
-            } else {
-                mn = snprintf(mem_line, sizeof(mem_line),
-                              "Mem: %zuK used, %zuK free\n",
-                              mem_used_kb, mem_free_kb);
-            }
+            mn = snprintf(mem_line, sizeof(mem_line),
+                          "Mem: %zuK used, %zuK free\n",
+                          mem_used_kb, mem_free_kb);
             if (mn > 0) {
                 (void)smallclueWriteAll(STDOUT_FILENO, mem_line, (size_t)mn);
             }
@@ -4525,15 +4519,9 @@ static int smallclueTopCommand(int argc, char **argv) {
         if (smallclueReadCpuStats(&cpu_usr, &cpu_sys, &cpu_nice, &cpu_idle)) {
             char cpu_line[160];
             int cn;
-            if (isatty(STDOUT_FILENO)) {
-                cn = snprintf(cpu_line, sizeof(cpu_line),
-                              "\033[7mCPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\033[0m\n\n",
-                              cpu_usr, cpu_sys, cpu_nice, cpu_idle);
-            } else {
-                cn = snprintf(cpu_line, sizeof(cpu_line),
-                              "CPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\n\n",
-                              cpu_usr, cpu_sys, cpu_nice, cpu_idle);
-            }
+            cn = snprintf(cpu_line, sizeof(cpu_line),
+                          "CPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\n\n",
+                          cpu_usr, cpu_sys, cpu_nice, cpu_idle);
             if (cn > 0) {
                 (void)smallclueWriteAll(STDOUT_FILENO, cpu_line, (size_t)cn);
             }
