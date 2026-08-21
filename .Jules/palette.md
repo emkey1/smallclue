@@ -21,3 +21,6 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+## 2025-05-12 - Top Command Visual Hierarchy
+**Learning:** Utilities that display tabular data in fullscreen or continuous modes, like `top`, lack visual separation between the tool's UI (the column headers) and the continuously updated data payload (the process list). Without styling, the header blends into the data.
+**Action:** Always wrap the fixed-width column header strings of fullscreen utilities in inverse video (`\033[7m` and `\033[0m`) to establish a clear visual hierarchy and separate the tool's UI from the data it displays, taking care to wrap the entire string to avoid breaking `printf` alignment calculations.
