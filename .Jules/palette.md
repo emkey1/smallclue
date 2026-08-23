@@ -21,3 +21,6 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+## 2026-08-23 - Fullscreen Menu Visual Hierarchy
+**Learning:** Fullscreen interactive menus (like the `licenses` applet) that clear the screen to display a navigable list suffer from poor visual hierarchy if their header/instruction lines are rendered as plain text. They blend in with the list items below them.
+**Action:** Always wrap the header/status/instruction lines of fullscreen interactive menus in inverse video (`[7m`) to establish a clear visual hierarchy and separate the tool's control UI from the navigable content it displays.
