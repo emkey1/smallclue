@@ -30,3 +30,6 @@
 ## 2025-05-19 - Optimization of tee applet block read
 **Learning:** The \`tee\` applet originally processed input using \`smallclueReadStream\` and wrote to outputs using \`fwrite\`, creating significant overhead due to memory copying and lock acquisitions inside \`stdio\`. By bypassing \`stdio\` (e.g., using direct \`read\` and \`write\` system calls on \`STDIN_FILENO\` and \`STDOUT_FILENO\`) with a large stack buffer (64KB), \`tee\`'s throughput is noticeably improved.
 **Action:** Replace \`fread\`/\`fwrite\` with POSIX \`read\`/\`write\` loops in continuous stream tools like \`tee\` while handling \`EINTR\` explicitly and ensuring buffers are flushed correctly (\`fflush(stdout)\`) before transitioning from buffered to raw file descriptors.
+## 2024-05-19 - Removed dynamic memory allocation in loop
+**Learning:** Found an unnecessary `malloc` and `free` inside a hot file parsing loop in `wc`, which allocated per buffer read.
+**Action:** Replaced it with a fixed-size stack array utilizing `sizeof(buf)` and `sizeof(carry)` to entirely eliminate the heap allocation overhead in `smallclueWcProcessFileWide`.
