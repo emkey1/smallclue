@@ -4507,16 +4507,9 @@ static int smallclueTopCommand(int argc, char **argv) {
         size_t mem_used_kb = 0, mem_free_kb = 0;
         if (smallclueReadMemStats(&mem_used_kb, &mem_free_kb)) {
             char mem_line[160];
-            int mn;
-            if (isatty(STDOUT_FILENO)) {
-                mn = snprintf(mem_line, sizeof(mem_line),
-                              "\033[7mMem: %zuK used, %zuK free\033[0m\n",
-                              mem_used_kb, mem_free_kb);
-            } else {
-                mn = snprintf(mem_line, sizeof(mem_line),
-                              "Mem: %zuK used, %zuK free\n",
-                              mem_used_kb, mem_free_kb);
-            }
+            int mn = snprintf(mem_line, sizeof(mem_line),
+                          "Mem: %zuK used, %zuK free\n",
+                          mem_used_kb, mem_free_kb);
             if (mn > 0) {
                 (void)smallclueWriteAll(STDOUT_FILENO, mem_line, (size_t)mn);
             }
@@ -4524,16 +4517,9 @@ static int smallclueTopCommand(int argc, char **argv) {
         double cpu_usr = 0, cpu_sys = 0, cpu_nice = 0, cpu_idle = 0;
         if (smallclueReadCpuStats(&cpu_usr, &cpu_sys, &cpu_nice, &cpu_idle)) {
             char cpu_line[160];
-            int cn;
-            if (isatty(STDOUT_FILENO)) {
-                cn = snprintf(cpu_line, sizeof(cpu_line),
-                              "\033[7mCPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\033[0m\n\n",
-                              cpu_usr, cpu_sys, cpu_nice, cpu_idle);
-            } else {
-                cn = snprintf(cpu_line, sizeof(cpu_line),
-                              "CPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\n\n",
-                              cpu_usr, cpu_sys, cpu_nice, cpu_idle);
-            }
+            int cn = snprintf(cpu_line, sizeof(cpu_line),
+                          "CPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\n\n",
+                          cpu_usr, cpu_sys, cpu_nice, cpu_idle);
             if (cn > 0) {
                 (void)smallclueWriteAll(STDOUT_FILENO, cpu_line, (size_t)cn);
             }
@@ -4542,7 +4528,7 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         char header[160];
         int hn;
-        if (isatty(STDOUT_FILENO)) {
+        if (pscalRuntimeStdoutIsInteractive()) {
             hn = snprintf(header, sizeof(header),
                           "\033[7m%6s %6s %6s %6s %-3s %-8s %-10s %6s %6s %s\033[0m\n",
                           "PID", "PPID", "PGID", "SID", "FG", "PTY", "STATE", "UTIME", "STIME", "CMD");
@@ -4842,7 +4828,7 @@ static int smallclueTopCommand(int argc, char **argv) {
     smallclueClearPendingSignals();
     double delay = 3.0;
     int max_iterations = -1;
-    bool batch = !isatty(STDOUT_FILENO);
+    bool batch = !pscalRuntimeStdoutIsInteractive();
 
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
@@ -4959,7 +4945,7 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         qsort(entries, count, sizeof(SmallclueTopEntry), smallclueTopCompareEntries);
 
-        if (!batch && isatty(STDOUT_FILENO)) {
+        if (!batch && pscalRuntimeStdoutIsInteractive()) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
         }
 
@@ -4975,10 +4961,14 @@ static int smallclueTopCommand(int argc, char **argv) {
             printf("Mem: %zuK total, %zuK used, %zuK free\n", mem_total_kb,
                    mem_used_kb, mem_total_kb > mem_used_kb ? mem_total_kb - mem_used_kb : 0);
         }
-        printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        if (!batch && pscalRuntimeStdoutIsInteractive()) {
+            printf("\n\033[7m  %5s %5s %-8s %s %7s %6s %s\033[0m\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        } else {
+            printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        }
 
         int rows = -1, cols = -1;
-        if (!batch && isatty(STDOUT_FILENO)) {
+        if (!batch && pscalRuntimeStdoutIsInteractive()) {
             smallclueGetTerminalSize(&rows, &cols);
         }
         size_t visible = count;
@@ -11991,7 +11981,7 @@ static void print_usage(void) {
     fprintf(stderr, "This is smallclue. Usage:\n");
     fprintf(stderr, "  smallclue <applet> [arguments...]\n\n");
     fprintf(stderr, "Available applets:\n");
-    smallcluePrintAppletList(stderr, NULL, isatty(STDERR_FILENO));
+    smallcluePrintAppletList(stderr, NULL, pscalRuntimeStderrIsInteractive());
     fprintf(stderr, "\nYou can symlink applets to 'smallclue' or invoke them directly.\n");
 }
 
@@ -12992,8 +12982,13 @@ static bool smallclueLicensesResolvePath(const char *filename, char *out, size_t
 
 static void smallclueLicensesRenderMenu(size_t selected, bool *first_frame) {
     smallclueMenuStartFrameTo(stdout, first_frame);
-    printf("PSCAL & Third-Party Licenses\n");
-    printf("Use arrows to navigate, Enter to view, q to quit.\n\n");
+    if (pscalRuntimeStdoutIsInteractive()) {
+        printf("\033[7mPSCAL & Third-Party Licenses\n");
+        printf("Use arrows to navigate, Enter to view, q to quit.\033[0m\n\n");
+    } else {
+        printf("PSCAL & Third-Party Licenses\n");
+        printf("Use arrows to navigate, Enter to view, q to quit.\n\n");
+    }
     size_t total = smallclueLicensesCount();
     for (size_t i = 0; i < total; ++i) {
         const char *marker = (i == selected) ? ">" : " ";
@@ -13704,7 +13699,7 @@ static int smallclueWatchCommand(int argc, char **argv) {
         }
         /* Match the clear behavior of the standalone `clear` applet: clear
          * scrollback, home cursor, then clear the visible viewport. */
-        if (isatty(STDOUT_FILENO)) {
+        if (pscalRuntimeStdoutIsInteractive()) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
             printf("\033[7mEvery %.2fs: %s\033[0m\n\n", interval, cmdline ? cmdline : argv[idx]);
         } else {
@@ -21307,7 +21302,7 @@ static bool smallclueConfirmDelete(const char *label, const char *path) {
                 label, path);
         return false;
     }
-    if (isatty(STDERR_FILENO)) {
+    if (pscalRuntimeStderrIsInteractive()) {
         fprintf(stderr, "%s: remove '\033[1;31m%s\033[0m'? [y/N] ", label, path);
     } else {
         fprintf(stderr, "%s: remove '%s'? [y/N] ", label, path);
