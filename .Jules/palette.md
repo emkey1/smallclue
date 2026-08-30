@@ -21,3 +21,6 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+## 2026-08-30 - Inverse Video Headers for Fullscreen Applets
+**Learning:** Fullscreen applets and interactive menus lack visual hierarchy without styling, making headers blend into content.
+**Action:** Apply inverse video ([7m) to fixed-width headers in interactive environments (using pscalRuntimeStdoutIsInteractive()) to visually separate the UI from content.
