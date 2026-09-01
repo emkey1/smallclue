@@ -4959,7 +4959,7 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         qsort(entries, count, sizeof(SmallclueTopEntry), smallclueTopCompareEntries);
 
-        if (!batch && isatty(STDOUT_FILENO)) {
+        if (!batch && pscalRuntimeStdoutIsInteractive()) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
         }
 
@@ -4975,10 +4975,14 @@ static int smallclueTopCommand(int argc, char **argv) {
             printf("Mem: %zuK total, %zuK used, %zuK free\n", mem_total_kb,
                    mem_used_kb, mem_total_kb > mem_used_kb ? mem_total_kb - mem_used_kb : 0);
         }
-        printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        if (!batch && pscalRuntimeStdoutIsInteractive()) {
+            printf("\n\033[7m  %5s %5s %-8s %s %7s %6s %s\033[0m\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        } else {
+            printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        }
 
         int rows = -1, cols = -1;
-        if (!batch && isatty(STDOUT_FILENO)) {
+        if (!batch && pscalRuntimeStdoutIsInteractive()) {
             smallclueGetTerminalSize(&rows, &cols);
         }
         size_t visible = count;
