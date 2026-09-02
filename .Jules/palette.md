@@ -21,3 +21,6 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+## 2024-11-21 - Variable Width TUI Highlighting
+**Learning:** Applying inverse video (\033[7m) to variable-width terminal strings (like dynamically sized summary lines in top) causes jagged, broken visual highlighting that disrupts the UI.
+**Action:** Only apply inverse video to fixed-width elements like column headers or full-width status bars to maintain a clean visual hierarchy.
