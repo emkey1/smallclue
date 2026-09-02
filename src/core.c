@@ -4500,23 +4500,23 @@ static int smallclueTopCommand(int argc, char **argv) {
         }
         size_t snapshot_count = snapshots ? vprocSnapshot(snapshots, snapshot_cap) : 0;
 
+        bool is_interactive = pscalRuntimeStdoutIsInteractive();
+
         /* Clear and render. */
-        fputs("\x1b[2J\x1b[H", stdout);
+        if (is_interactive) {
+            fputs("\x1b[2J\x1b[H", stdout);
+        } else {
+            fputs("\n", stdout);
+        }
 
 #if defined(__APPLE__)
         size_t mem_used_kb = 0, mem_free_kb = 0;
         if (smallclueReadMemStats(&mem_used_kb, &mem_free_kb)) {
             char mem_line[160];
             int mn;
-            if (isatty(STDOUT_FILENO)) {
-                mn = snprintf(mem_line, sizeof(mem_line),
-                              "\033[7mMem: %zuK used, %zuK free\033[0m\n",
-                              mem_used_kb, mem_free_kb);
-            } else {
-                mn = snprintf(mem_line, sizeof(mem_line),
-                              "Mem: %zuK used, %zuK free\n",
-                              mem_used_kb, mem_free_kb);
-            }
+            mn = snprintf(mem_line, sizeof(mem_line),
+                          "Mem: %zuK used, %zuK free\n",
+                          mem_used_kb, mem_free_kb);
             if (mn > 0) {
                 (void)smallclueWriteAll(STDOUT_FILENO, mem_line, (size_t)mn);
             }
@@ -4525,15 +4525,9 @@ static int smallclueTopCommand(int argc, char **argv) {
         if (smallclueReadCpuStats(&cpu_usr, &cpu_sys, &cpu_nice, &cpu_idle)) {
             char cpu_line[160];
             int cn;
-            if (isatty(STDOUT_FILENO)) {
-                cn = snprintf(cpu_line, sizeof(cpu_line),
-                              "\033[7mCPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\033[0m\n\n",
-                              cpu_usr, cpu_sys, cpu_nice, cpu_idle);
-            } else {
-                cn = snprintf(cpu_line, sizeof(cpu_line),
-                              "CPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\n\n",
-                              cpu_usr, cpu_sys, cpu_nice, cpu_idle);
-            }
+            cn = snprintf(cpu_line, sizeof(cpu_line),
+                          "CPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\n\n",
+                          cpu_usr, cpu_sys, cpu_nice, cpu_idle);
             if (cn > 0) {
                 (void)smallclueWriteAll(STDOUT_FILENO, cpu_line, (size_t)cn);
             }
@@ -4542,7 +4536,7 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         char header[160];
         int hn;
-        if (isatty(STDOUT_FILENO)) {
+        if (is_interactive) {
             hn = snprintf(header, sizeof(header),
                           "\033[7m%6s %6s %6s %6s %-3s %-8s %-10s %6s %6s %s\033[0m\n",
                           "PID", "PPID", "PGID", "SID", "FG", "PTY", "STATE", "UTIME", "STIME", "CMD");
@@ -4959,8 +4953,12 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         qsort(entries, count, sizeof(SmallclueTopEntry), smallclueTopCompareEntries);
 
-        if (!batch && isatty(STDOUT_FILENO)) {
+        bool is_batch_interactive = (!batch && pscalRuntimeStdoutIsInteractive());
+
+        if (is_batch_interactive) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
+        } else if (!batch) {
+            fputs("\n", stdout);
         }
 
         double load[3] = {0, 0, 0};
@@ -4975,10 +4973,15 @@ static int smallclueTopCommand(int argc, char **argv) {
             printf("Mem: %zuK total, %zuK used, %zuK free\n", mem_total_kb,
                    mem_used_kb, mem_total_kb > mem_used_kb ? mem_total_kb - mem_used_kb : 0);
         }
-        printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+
+        if (is_batch_interactive) {
+            printf("\n\033[7m  %5s %5s %-8s %s %7s %6s %s\033[0m\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        } else {
+            printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        }
 
         int rows = -1, cols = -1;
-        if (!batch && isatty(STDOUT_FILENO)) {
+        if (is_batch_interactive) {
             smallclueGetTerminalSize(&rows, &cols);
         }
         size_t visible = count;
@@ -13704,7 +13707,7 @@ static int smallclueWatchCommand(int argc, char **argv) {
         }
         /* Match the clear behavior of the standalone `clear` applet: clear
          * scrollback, home cursor, then clear the visible viewport. */
-        if (isatty(STDOUT_FILENO)) {
+        if (pscalRuntimeStdoutIsInteractive()) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
             printf("\033[7mEvery %.2fs: %s\033[0m\n\n", interval, cmdline ? cmdline : argv[idx]);
         } else {
