@@ -21,3 +21,7 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+
+## YYYY-MM-DD - TUI Tool Menus and Variable Line Highlighting
+**Learning:** Applying inverse video highlighting to variable-width output lines (like Memory/CPU status) causes jagged, broken visual edges that look terrible in the terminal. Additionally, interactive menus (like `licenses`) and tabular headers for continuous tools (like `top`) should apply fixed inverse video styling when running interactively to clearly separate the UI from the content, but must fall back correctly (without ANSI codes or screen-clearing sequences) when output is redirected, using the project's explicit `pscalRuntimeStdoutIsInteractive()` check instead of raw `isatty()`.
+**Action:** Always ensure full-line inverse video styling is applied ONLY to fixed-width UI elements (like tabular column headers or static menu prompts) and NEVER to variable-width dynamic output lines. Furthermore, ensure these styles and clearing sequences are guarded strictly by the project's abstraction (`pscalRuntimeStdoutIsInteractive()`) rather than raw `isatty()` to support proper redirection.
