@@ -21,3 +21,7 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+
+## YYYY-MM-DD - Continuous Output Batch Mode Separators
+**Learning:** Fullscreen streaming utilities like `top` or `watch` can generate walls of text when redirected to files or pipes where screen clearing isn't possible. Users need clear visual boundaries to understand where one iteration ends and the next begins.
+**Action:** Always insert a simple newline separator (`\n`) between iteration blocks when continuous visual tools run in non-interactive batch mode.
