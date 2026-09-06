@@ -4510,7 +4510,7 @@ static int smallclueTopCommand(int argc, char **argv) {
             int mn;
             if (isatty(STDOUT_FILENO)) {
                 mn = snprintf(mem_line, sizeof(mem_line),
-                              "\033[7mMem: %zuK used, %zuK free\033[0m\n",
+                              "Mem: %zuK used, %zuK free\n",
                               mem_used_kb, mem_free_kb);
             } else {
                 mn = snprintf(mem_line, sizeof(mem_line),
@@ -4527,7 +4527,7 @@ static int smallclueTopCommand(int argc, char **argv) {
             int cn;
             if (isatty(STDOUT_FILENO)) {
                 cn = snprintf(cpu_line, sizeof(cpu_line),
-                              "\033[7mCPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\033[0m\n\n",
+                              "CPU: %3.0f%% usr %3.0f%% sys %3.0f%% nic %3.0f%% idle\n\n",
                               cpu_usr, cpu_sys, cpu_nice, cpu_idle);
             } else {
                 cn = snprintf(cpu_line, sizeof(cpu_line),
@@ -12992,7 +12992,7 @@ static bool smallclueLicensesResolvePath(const char *filename, char *out, size_t
 
 static void smallclueLicensesRenderMenu(size_t selected, bool *first_frame) {
     smallclueMenuStartFrameTo(stdout, first_frame);
-    printf("PSCAL & Third-Party Licenses\n");
+    printf("\033[7mPSCAL & Third-Party Licenses\033[0m\n");
     printf("Use arrows to navigate, Enter to view, q to quit.\n\n");
     size_t total = smallclueLicensesCount();
     for (size_t i = 0; i < total; ++i) {

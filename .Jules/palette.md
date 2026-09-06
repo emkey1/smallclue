@@ -21,3 +21,7 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+
+## YYYY-MM-DD - Variable Width Summary Line Styling
+**Learning:** Applying inverse video formatting (like `\033[7m`) to variable-width summary lines (such as `Mem:` or `CPU:` in `top`) causes jagged, broken highlighting when rendered in the terminal.
+**Action:** Avoid using inverse video for variable-width summary lines; restrict its use strictly to fixed-width column header strings to maintain a clean, unbroken UI aesthetic.
