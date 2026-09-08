@@ -30,3 +30,6 @@
 ## 2025-05-19 - Optimization of tee applet block read
 **Learning:** The \`tee\` applet originally processed input using \`smallclueReadStream\` and wrote to outputs using \`fwrite\`, creating significant overhead due to memory copying and lock acquisitions inside \`stdio\`. By bypassing \`stdio\` (e.g., using direct \`read\` and \`write\` system calls on \`STDIN_FILENO\` and \`STDOUT_FILENO\`) with a large stack buffer (64KB), \`tee\`'s throughput is noticeably improved.
 **Action:** Replace \`fread\`/\`fwrite\` with POSIX \`read\`/\`write\` loops in continuous stream tools like \`tee\` while handling \`EINTR\` explicitly and ensuring buffers are flushed correctly (\`fflush(stdout)\`) before transitioning from buffered to raw file descriptors.
+## YYYY-MM-DD - Optimize tail applet with struct-based ring buffer
+**Learning:** For streaming utilities like tail that keep a ring buffer of lines, allocating a single buffer and then repeatedly `malloc`/`memcpy`/`free`-ing copies into the ring slot incurs heavy allocator overhead.
+**Action:** Replace the dynamic string array with a struct-based ring buffer array (`struct { char *data; size_t cap; }`). Pass these fields directly to `smallclueGetlineStream` so `getline` can natively reuse their capacities via `realloc`, vastly reducing overhead.
