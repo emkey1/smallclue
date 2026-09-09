@@ -85,6 +85,7 @@ int smallclueTacCommand(int argc, char **argv) {
     if (argc <= 1) {
         status = smallclueTacPrintReversed(stdin, "(stdin)");
     } else {
+        int file_count = argc - 1;
         for (int i = 1; i < argc; ++i) {
             FILE *in = stdin;
             bool needClose = false;
@@ -96,6 +97,12 @@ int smallclueTacCommand(int argc, char **argv) {
                     continue;
                 }
                 needClose = true;
+            }
+            if (file_count > 1) {
+                if (i > 1) {
+                    putchar('\n');
+                }
+                printf("==> %s <==\n", argv[i]);
             }
             if (smallclueTacPrintReversed(in, argv[i]) != 0) {
                 status = 1;
