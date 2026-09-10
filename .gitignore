@@ -8,3 +8,5 @@ enter_chroot.sh
 src/openssh_globals.c
 build-codex-check/
 docker-build*
+third-party/
+third-party/

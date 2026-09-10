@@ -16876,18 +16876,21 @@ static int smallclueTailStream(FILE *fp, const char *label, long lines) {
     if (lines <= 0) {
         return 0;
     }
-    char **ring = (char **)calloc((size_t)lines, sizeof(char *));
+    typedef struct {
+        char *data;
+        size_t cap;
+    } LineBuf;
+    LineBuf *ring = (LineBuf *)calloc((size_t)lines, sizeof(LineBuf));
     if (!ring) {
         fprintf(stderr, "tail: %s: out of memory\n", label ? label : "(stdin)");
         return 1;
     }
-    char *line = NULL;
-    size_t cap = 0;
     long count = 0;
     int status = 0;
     while (1) {
+        long slot = count % lines;
         int read_err = 0;
-        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
+        ssize_t len = smallclueGetlineStream(&ring[slot].data, &ring[slot].cap, fp, &read_err);
         if (len < 0) {
             if (read_err) {
                 fprintf(stderr, "tail: %s: %s\n",
@@ -16897,31 +16900,19 @@ static int smallclueTailStream(FILE *fp, const char *label, long lines) {
             }
             break;
         }
-        char *copy = (char *)malloc((size_t)len + 1);
-        if (!copy) {
-            fprintf(stderr, "tail: %s: out of memory\n", label ? label : "(stdin)");
-            status = 1;
-            break;
-        }
-        memcpy(copy, line, (size_t)len);
-        copy[len] = '\0';
-        long slot = count % lines;
-        free(ring[slot]);
-        ring[slot] = copy;
         count++;
     }
     if (status == 0) {
         long start = count > lines ? count - lines : 0;
         for (long i = start; i < count; ++i) {
-            char *entry = ring[i % lines];
+            char *entry = ring[i % lines].data;
             if (entry) {
                 fputs(entry, stdout);
             }
         }
     }
-    free(line);
     for (long i = 0; i < lines; ++i) {
-        free(ring[i]);
+        free(ring[i].data);
     }
     free(ring);
     return status;
