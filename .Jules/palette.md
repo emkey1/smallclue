@@ -21,3 +21,7 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+
+## 2024-05-30 - Variable-Width Fullscreen Summaries
+**Learning:** When using inverse video for status/header lines in fullscreen terminal interfaces like `top`, applying it to variable-width summary lines (like Tasks, Cpu, Mem) results in broken, jagged highlighting that changes width dynamically, making the UI look unpolished.
+**Action:** Always restrict inverse video highlighting to the fixed-width column headers of tabular data rather than the variable-width summary lines to maintain a clean, consistent UI box.
