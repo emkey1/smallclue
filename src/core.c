@@ -4959,7 +4959,7 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         qsort(entries, count, sizeof(SmallclueTopEntry), smallclueTopCompareEntries);
 
-        if (!batch && isatty(STDOUT_FILENO)) {
+        if (!batch && pscalRuntimeStdoutIsInteractive()) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
         }
 
@@ -4975,10 +4975,14 @@ static int smallclueTopCommand(int argc, char **argv) {
             printf("Mem: %zuK total, %zuK used, %zuK free\n", mem_total_kb,
                    mem_used_kb, mem_total_kb > mem_used_kb ? mem_total_kb - mem_used_kb : 0);
         }
-        printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        if (!batch && pscalRuntimeStdoutIsInteractive()) {
+            printf("\n\033[7m  %5s %5s %-8s %s %7s %6s %s\033[0m\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        } else {
+            printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        }
 
         int rows = -1, cols = -1;
-        if (!batch && isatty(STDOUT_FILENO)) {
+        if (!batch && pscalRuntimeStdoutIsInteractive()) {
             smallclueGetTerminalSize(&rows, &cols);
         }
         size_t visible = count;
@@ -12992,8 +12996,13 @@ static bool smallclueLicensesResolvePath(const char *filename, char *out, size_t
 
 static void smallclueLicensesRenderMenu(size_t selected, bool *first_frame) {
     smallclueMenuStartFrameTo(stdout, first_frame);
-    printf("PSCAL & Third-Party Licenses\n");
-    printf("Use arrows to navigate, Enter to view, q to quit.\n\n");
+    if (pscalRuntimeStdoutIsInteractive()) {
+        printf("\033[7mPSCAL & Third-Party Licenses\n");
+        printf("Use arrows to navigate, Enter to view, q to quit.\033[0m\n\n");
+    } else {
+        printf("PSCAL & Third-Party Licenses\n");
+        printf("Use arrows to navigate, Enter to view, q to quit.\n\n");
+    }
     size_t total = smallclueLicensesCount();
     for (size_t i = 0; i < total; ++i) {
         const char *marker = (i == selected) ? ">" : " ";
@@ -13704,7 +13713,7 @@ static int smallclueWatchCommand(int argc, char **argv) {
         }
         /* Match the clear behavior of the standalone `clear` applet: clear
          * scrollback, home cursor, then clear the visible viewport. */
-        if (isatty(STDOUT_FILENO)) {
+        if (pscalRuntimeStdoutIsInteractive()) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
             printf("\033[7mEvery %.2fs: %s\033[0m\n\n", interval, cmdline ? cmdline : argv[idx]);
         } else {

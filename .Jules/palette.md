@@ -21,3 +21,6 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+## 2025-05-13 - Top and Watch Headers with ANSI Escapes
+**Learning:** Fullscreen applets like `top`, `watch`, and `licenses` suffer from poor visual hierarchy when their status headers blend in with the raw text below them. Using `\033[7m` (inverse video) on header text makes them easily scannable and separates UI from data.
+**Action:** When working on CLI tools that output continuous or tabular data, always use standard ANSI highlighting (like inverse video) to visually separate headers and control instructions from dynamic content.
