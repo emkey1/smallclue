@@ -35,3 +35,8 @@
 **Vulnerability:** The `su` applet in `src/core.c` sanitized `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_DEBUG`, and `IFS` but failed to reset `PATH` to a safe default before calling `execl`. This oversight allowed local privilege escalation if an attacker modified their `PATH` to point to malicious binaries prior to invoking `su` or transitioning privileges.
 **Learning:** Sanitizing environment variables like `LD_PRELOAD` is not enough to secure processes crossing privilege boundaries. `PATH` must also be strictly reset since many child processes rely on it to locate binaries. Missing this opens a direct vector for command injection.
 **Prevention:** Consistently reset `PATH` to a known safe default (e.g., `setenv("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", 1)`) when cleaning up the environment for privilege-transitioning utilities, just as is done for `sudo`.
+
+## 2024-11-20 - [HIGH] Shell injection via ENV/BASH_ENV in `su` and `sudo`
+**Vulnerability:** The `su` and `sudo` applets sanitized several environment variables (`LD_PRELOAD`, `IFS`, etc.) but missed `ENV` and `BASH_ENV`.
+**Learning:** Certain shells (like bash, sh) evaluate scripts specified by `ENV` or `BASH_ENV` when starting up, even non-interactively. If an attacker controls these variables and invokes a privilege-escalating wrapper like `su` or `sudo`, they can execute arbitrary shell scripts as the target user.
+**Prevention:** Always unset `ENV` and `BASH_ENV` alongside other dangerous variables (`LD_*`, `IFS`) during the environment sanitization phase of privilege-transitioning utilities.
