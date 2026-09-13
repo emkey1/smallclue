@@ -21,3 +21,7 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+
+## 2025-10-23 - Applet Output Formatting Checks
+**Learning:** Interactive commands such as `watch`, `top`, and `licenses` in the CLI applets may attempt to output terminal control characters for interactive styling (like colors or inverse video) or screen clearing. Directly testing for `STDOUT_FILENO` with `isatty()` works locally but can bypass project-specific abstractions designed to control or mock interaction across platforms, leading to inconsistent behaviors.
+**Action:** Use project-provided interactivity wrappers, such as `pscalRuntimeStdoutIsInteractive()`, rather than standard libc `isatty()` tests. In the same vein, `STDERR_FILENO` must be guarded by an equivalent wrapper (e.g. `pscalRuntimeStderrIsInteractive()`) rather than assuming it follows `stdout` interactivity.
