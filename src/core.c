@@ -12992,8 +12992,12 @@ static bool smallclueLicensesResolvePath(const char *filename, char *out, size_t
 
 static void smallclueLicensesRenderMenu(size_t selected, bool *first_frame) {
     smallclueMenuStartFrameTo(stdout, first_frame);
-    printf("PSCAL & Third-Party Licenses\n");
-    printf("Use arrows to navigate, Enter to view, q to quit.\n\n");
+    if (pscalRuntimeStdoutIsInteractive()) {
+        printf("\033[7m PSCAL & Third-Party Licenses - Use arrows to navigate, Enter to view, q to quit. \033[0m\n\n");
+    } else {
+        printf("PSCAL & Third-Party Licenses\n");
+        printf("Use arrows to navigate, Enter to view, q to quit.\n\n");
+    }
     size_t total = smallclueLicensesCount();
     for (size_t i = 0; i < total; ++i) {
         const char *marker = (i == selected) ? ">" : " ";
