@@ -21,3 +21,6 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+## 2023-11-20 - Batch Mode Interactive Guarding
+**Learning:** Fullscreen utilities like `watch` and `top` shouldn't just skip screen clears in batch mode; they need to explicitly add visual separators (newlines) between iterations to keep the log readable. Loop counters used for this must increment unconditionally. Also, all ANSI escapes must use `pscalRuntimeStdoutIsInteractive()`.
+**Action:** Ensure loop iteration counters increment unconditionally even if a cap isn't set, and use them to insert batch separators in non-interactive mode. Always guard ANSI with `pscalRuntimeStdoutIsInteractive()`.
