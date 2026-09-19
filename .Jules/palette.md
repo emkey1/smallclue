@@ -21,3 +21,7 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+
+## 2025-05-13 - Full-Width Interactive Menu Headers
+**Learning:** For interactive full-screen menus like `licenses`, simply printing an inverse video string (`\033[7m`) only highlights the text itself, creating a ragged edge if strings vary in length. Users expect terminal UI headers to span the entire screen width.
+**Action:** When rendering floating terminal UI headers in C, combine the inverse video tag with a left-aligned, width-padded format specifier (e.g., `%-*s`) that dynamically consumes the terminal width (e.g., via `pscalRuntimeDetectWindowCols()`) to guarantee a clean, full-width header block.
