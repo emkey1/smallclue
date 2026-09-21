@@ -21,3 +21,7 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+
+## 2024-05-23 - Batch mode separators
+**Learning:** Continuous output applets (like watch or top) must not blindly clear the terminal screen when redirected to a file, because it pollutes logs with raw ANSI escape sequences.
+**Action:** Always replace screen-clearing sequences with simple newline separators (`\n`) for clarity when running in batch/non-interactive mode, and ensure the loop counters increment unconditionally to conditionally insert the separators correctly.

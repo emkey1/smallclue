@@ -4501,7 +4501,11 @@ static int smallclueTopCommand(int argc, char **argv) {
         size_t snapshot_count = snapshots ? vprocSnapshot(snapshots, snapshot_cap) : 0;
 
         /* Clear and render. */
-        fputs("\x1b[2J\x1b[H", stdout);
+        if (pscalRuntimeStdoutIsInteractive()) {
+            fputs("\x1b[2J\x1b[H", stdout);
+        } else {
+            putchar('\n');
+        }
 
 #if defined(__APPLE__)
         size_t mem_used_kb = 0, mem_free_kb = 0;
@@ -4959,8 +4963,10 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         qsort(entries, count, sizeof(SmallclueTopEntry), smallclueTopCompareEntries);
 
-        if (!batch && isatty(STDOUT_FILENO)) {
+        if (!batch && pscalRuntimeStdoutIsInteractive()) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
+        } else if (iterations > 0) {
+            putchar('\n');
         }
 
         double load[3] = {0, 0, 0};
@@ -4978,7 +4984,7 @@ static int smallclueTopCommand(int argc, char **argv) {
         printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
 
         int rows = -1, cols = -1;
-        if (!batch && isatty(STDOUT_FILENO)) {
+        if (!batch && pscalRuntimeStdoutIsInteractive()) {
             smallclueGetTerminalSize(&rows, &cols);
         }
         size_t visible = count;
@@ -5020,10 +5026,8 @@ static int smallclueTopCommand(int argc, char **argv) {
         for (size_t i = 0; i < count; ++i) free(entries[i].command);
         free(entries);
 
-        if (max_iterations > 0) {
-            iterations++;
-            if (iterations >= max_iterations) break;
-        }
+        iterations++;
+        if (max_iterations > 0 && iterations >= max_iterations) break;
 
         struct timespec ts;
         ts.tv_sec = (time_t)delay;
@@ -13704,11 +13708,14 @@ static int smallclueWatchCommand(int argc, char **argv) {
         }
         /* Match the clear behavior of the standalone `clear` applet: clear
          * scrollback, home cursor, then clear the visible viewport. */
-        if (isatty(STDOUT_FILENO)) {
+        if (pscalRuntimeStdoutIsInteractive()) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
             printf("\033[7mEvery %.2fs: %s\033[0m\n\n", interval, cmdline ? cmdline : argv[idx]);
         } else {
-            printf("\nEvery %.2fs: %s\n\n", interval, cmdline ? cmdline : argv[idx]);
+            if (iterations > 0) {
+                putchar('\n');
+            }
+            printf("Every %.2fs: %s\n\n", interval, cmdline ? cmdline : argv[idx]);
         }
         fflush(stdout);
 #if defined(PSCAL_TARGET_IOS)
@@ -13737,11 +13744,9 @@ static int smallclueWatchCommand(int argc, char **argv) {
             status = abort_status;
             goto watch_done;
         }
-        if (max_iterations > 0) {
-            iterations++;
-            if (iterations >= max_iterations) {
-                break;
-            }
+        iterations++;
+        if (max_iterations > 0 && iterations >= max_iterations) {
+            break;
         }
         struct timespec ts;
         ts.tv_sec = (time_t)interval;
