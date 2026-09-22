@@ -12992,8 +12992,47 @@ static bool smallclueLicensesResolvePath(const char *filename, char *out, size_t
 
 static void smallclueLicensesRenderMenu(size_t selected, bool *first_frame) {
     smallclueMenuStartFrameTo(stdout, first_frame);
-    printf("PSCAL & Third-Party Licenses\n");
-    printf("Use arrows to navigate, Enter to view, q to quit.\n\n");
+
+    char header1[256];
+    char header2[256];
+    snprintf(header1, sizeof(header1), "PSCAL & Third-Party Licenses");
+    snprintf(header2, sizeof(header2), "Use arrows to navigate, Enter to view, q to quit.");
+    int term_cols = pscalRuntimeDetectWindowCols();
+
+    if (pscalRuntimeStdoutIsInteractive()) {
+        fputs("\x1b[7m", stdout);
+    }
+    if (term_cols > 0 && (int)strlen(header1) > term_cols) {
+        if (term_cols <= 3) {
+            fwrite(header1, 1, (size_t)term_cols, stdout);
+        } else {
+            fwrite(header1, 1, (size_t)(term_cols - 3), stdout);
+            fputs("...", stdout);
+        }
+    } else {
+        fprintf(stdout, "%-*s", term_cols > 0 ? term_cols : 0, header1);
+    }
+    if (pscalRuntimeStdoutIsInteractive()) {
+        fputs("\x1b[0m\n\x1b[7m", stdout);
+    } else {
+        fputs("\n", stdout);
+    }
+    if (term_cols > 0 && (int)strlen(header2) > term_cols) {
+        if (term_cols <= 3) {
+            fwrite(header2, 1, (size_t)term_cols, stdout);
+        } else {
+            fwrite(header2, 1, (size_t)(term_cols - 3), stdout);
+            fputs("...", stdout);
+        }
+    } else {
+        fprintf(stdout, "%-*s", term_cols > 0 ? term_cols : 0, header2);
+    }
+    if (pscalRuntimeStdoutIsInteractive()) {
+        fputs("\x1b[0m\n\n", stdout);
+    } else {
+        fputs("\n\n", stdout);
+    }
+
     size_t total = smallclueLicensesCount();
     for (size_t i = 0; i < total; ++i) {
         const char *marker = (i == selected) ? ">" : " ";
