@@ -840,10 +840,14 @@ if [ "$NEXTVI_DIRECT_MODE" = "1" ]; then
     echo "nextvi direct mode enabled (no pthread editor worker thread)."
 fi
 
+# OPENSSH_CPPFLAGS as well as OPENSSH_LDFLAGS: checksum_app.c includes
+# <openssl/evp.h> and gzip_app.c/tar_app.c <zlib.h>, and when those come from
+# the vendored build, only these -I flags lead to them. They are the flags
+# probeOpenSshTargetLibs found the headers with.
 echo "Compiling smallclue (iSH/32-bit static)..."
 "${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" "${TARGET_LDFLAGS[@]}" -static -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -DSMALLCLUE_WITH_SH ${NEXTVI_DEFS} ${DVTM_DEFS} ${LIBGIT2_DEFS} \
     ${LIBGIT2_INCLUDES} \
-    -I. -Isrc ${OPENSSH_LDFLAGS} -lpthread \
+    -I. -Isrc ${OPENSSH_CPPFLAGS} ${OPENSSH_LDFLAGS} -lpthread \
     src/main.c \
     src/core.c \
     src/spawn.c \
