@@ -12657,14 +12657,10 @@ static int smallclueYesNoLoop(const char *text, int initial_status) {
         memcpy(line, text, len);
         line[len] = '\n';
         line[len + 1] = '\0';
-
-        fflush(stdout); /* flush any previously buffered stdout data to prevent interleaving */
         int status = initial_status;
         while (true) {
             if (smallclueShouldAbort(&status)) break;
-            ssize_t nw = write(STDOUT_FILENO, line, line_len);
-            if (nw < 0) {
-                if (errno == EINTR) continue;
+            if (fwrite(line, 1, line_len, stdout) != line_len) {
                 status = errno ? errno : status;
                 break;
             }
@@ -12673,7 +12669,6 @@ static int smallclueYesNoLoop(const char *text, int initial_status) {
         return status;
     }
 
-    fflush(stdout); /* flush any previously buffered stdout data to prevent interleaving */
     int status = initial_status;
     size_t iteration = 0;
     while (true) {
