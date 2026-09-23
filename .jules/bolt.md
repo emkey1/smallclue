@@ -30,6 +30,6 @@
 ## 2025-05-19 - Optimization of tee applet block read
 **Learning:** The \`tee\` applet originally processed input using \`smallclueReadStream\` and wrote to outputs using \`fwrite\`, creating significant overhead due to memory copying and lock acquisitions inside \`stdio\`. By bypassing \`stdio\` (e.g., using direct \`read\` and \`write\` system calls on \`STDIN_FILENO\` and \`STDOUT_FILENO\`) with a large stack buffer (64KB), \`tee\`'s throughput is noticeably improved.
 **Action:** Replace \`fread\`/\`fwrite\` with POSIX \`read\`/\`write\` loops in continuous stream tools like \`tee\` while handling \`EINTR\` explicitly and ensuring buffers are flushed correctly (\`fflush(stdout)\`) before transitioning from buffered to raw file descriptors.
-## YYYY-MM-DD - Optimize smallclueWcProcessFileWide allocations and unrolling
-**Learning:** In hot file-processing loops, dynamic heap allocations per iteration and individual byte checking add significant overhead.
-**Action:** Unroll loops over bytes. Replace dynamically sized malloc blocks with static stack buffers using bounded size calculations based on buffer arrays.
+## YYYY-MM-DD - wc wide-character optimization rejected
+**Learning:** In wide-character paths like `smallclueWcProcessFileWide`, the per-character cost is dominated by `mbrtowc()`. Unrolling the byte loop is premature optimization that the compiler already schedules. Also, temporary test files (`test.c`) and build logs (`build_log.txt`) were accidentally included in the commit.
+**Action:** Focus on actual bottlenecks (e.g., `mbrtowc()`) rather than micro-optimizing loops the compiler handles. Always measure impact before proposing an optimization, and rigorously clean up untracked temporary files before creating a PR.
