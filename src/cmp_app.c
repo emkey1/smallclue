@@ -16,11 +16,21 @@ static int smallclueCmpCompare(FILE *f1, const char *name1, FILE *f2, const char
     long byteNum = 0;
     long lineNum = 1;
     bool anyDiff = false;
+    unsigned char buf1[16384];
+    unsigned char buf2[16384];
+    size_t len1 = 0, len2 = 0;
+    size_t i1 = 0, i2 = 0;
     for (;;) {
-        int c1 = fgetc(f1);
-        int c2 = fgetc(f2);
-        bool eof1 = (c1 == EOF);
-        bool eof2 = (c2 == EOF);
+        if (i1 >= len1) {
+            len1 = fread(buf1, 1, sizeof(buf1), f1);
+            i1 = 0;
+        }
+        if (i2 >= len2) {
+            len2 = fread(buf2, 1, sizeof(buf2), f2);
+            i2 = 0;
+        }
+        bool eof1 = (len1 == 0);
+        bool eof2 = (len2 == 0);
         if (eof1 || eof2) {
             if (eof1 && eof2) {
                 return anyDiff ? 1 : 0;
@@ -30,22 +40,31 @@ static int smallclueCmpCompare(FILE *f1, const char *name1, FILE *f2, const char
             }
             return 1;
         }
-        byteNum++;
-        if (c1 != c2) {
-            anyDiff = true;
-            if (listAll) {
-                if (!silent) {
-                    printf("%6ld %3o %3o\n", byteNum, c1, c2);
+
+        size_t avail1 = len1 - i1;
+        size_t avail2 = len2 - i2;
+        size_t n = avail1 < avail2 ? avail1 : avail2;
+
+        for (size_t k = 0; k < n; ++k) {
+            byteNum++;
+            unsigned char c1 = buf1[i1++];
+            unsigned char c2 = buf2[i2++];
+            if (c1 != c2) {
+                anyDiff = true;
+                if (listAll) {
+                    if (!silent) {
+                        printf("%6ld %3o %3o\n", byteNum, c1, c2);
+                    }
+                } else {
+                    if (!silent) {
+                        printf("%s %s differ: char %ld, line %ld\n", name1, name2, byteNum, lineNum);
+                    }
+                    return 1;
                 }
-            } else {
-                if (!silent) {
-                    printf("%s %s differ: char %ld, line %ld\n", name1, name2, byteNum, lineNum);
-                }
-                return 1;
             }
-        }
-        if (c1 == '\n') {
-            lineNum++;
+            if (c1 == '\n') {
+                lineNum++;
+            }
         }
     }
 }
