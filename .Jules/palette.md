@@ -21,3 +21,7 @@
 ## 2025-05-12 - Sequential Multi-file Output Headers
 **Learning:** Utilities that sequentially process and print the contents of multiple files (such as `head` and `tail`) lack clear visual separation without explicit headers. Users expect the standard `==> filename <==` delimiter to differentiate outputs from separate files.
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
+
+## YYYY-MM-DD - Full-width Inverse Video Headers
+**Learning:** Wrapping inverse video tags around variable-width strings or simple columns without padding leaves terminal headers jagged or broken when resized.
+**Action:** Always use `pscalRuntimeDetectWindowCols()` to calculate the remaining padding width, and append spaces so the inverse video styling stretches cleanly across the entire terminal row.

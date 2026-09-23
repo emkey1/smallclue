@@ -4959,8 +4959,12 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         qsort(entries, count, sizeof(SmallclueTopEntry), smallclueTopCompareEntries);
 
-        if (!batch && isatty(STDOUT_FILENO)) {
-            fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
+        if (!batch) {
+            if (pscalRuntimeStdoutIsInteractive()) {
+                fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
+            } else if (iterations > 0) {
+                fputs("\n", stdout);
+            }
         }
 
         double load[3] = {0, 0, 0};
@@ -4975,11 +4979,19 @@ static int smallclueTopCommand(int argc, char **argv) {
             printf("Mem: %zuK total, %zuK used, %zuK free\n", mem_total_kb,
                    mem_used_kb, mem_total_kb > mem_used_kb ? mem_total_kb - mem_used_kb : 0);
         }
-        printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
 
         int rows = -1, cols = -1;
-        if (!batch && isatty(STDOUT_FILENO)) {
+        if (!batch && pscalRuntimeStdoutIsInteractive()) {
             smallclueGetTerminalSize(&rows, &cols);
+            int w = pscalRuntimeDetectWindowCols();
+            char head[256];
+            snprintf(head, sizeof(head), "  %5s %5s %-8s %s %7s %6s %s", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+            int head_len = strlen(head);
+            int pad = w - head_len;
+            if (pad < 0) pad = 0;
+            printf("\n\033[7m%s%*s\033[0m\n", head, pad, "");
+        } else {
+            printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
         }
         size_t visible = count;
         if (rows > 6) {
@@ -5020,8 +5032,8 @@ static int smallclueTopCommand(int argc, char **argv) {
         for (size_t i = 0; i < count; ++i) free(entries[i].command);
         free(entries);
 
+        iterations++;
         if (max_iterations > 0) {
-            iterations++;
             if (iterations >= max_iterations) break;
         }
 
@@ -13704,11 +13716,20 @@ static int smallclueWatchCommand(int argc, char **argv) {
         }
         /* Match the clear behavior of the standalone `clear` applet: clear
          * scrollback, home cursor, then clear the visible viewport. */
-        if (isatty(STDOUT_FILENO)) {
+        if (pscalRuntimeStdoutIsInteractive()) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
-            printf("\033[7mEvery %.2fs: %s\033[0m\n\n", interval, cmdline ? cmdline : argv[idx]);
+            int w = pscalRuntimeDetectWindowCols();
+            char head[256];
+            snprintf(head, sizeof(head), "Every %.2fs: %s", interval, cmdline ? cmdline : argv[idx]);
+            int head_len = strlen(head);
+            int pad = w - head_len;
+            if (pad < 0) pad = 0;
+            printf("\033[7m%s%*s\033[0m\n\n", head, pad, "");
         } else {
-            printf("\nEvery %.2fs: %s\n\n", interval, cmdline ? cmdline : argv[idx]);
+            if (iterations > 0) {
+                fputs("\n", stdout);
+            }
+            printf("Every %.2fs: %s\n\n", interval, cmdline ? cmdline : argv[idx]);
         }
         fflush(stdout);
 #if defined(PSCAL_TARGET_IOS)
@@ -13737,8 +13758,8 @@ static int smallclueWatchCommand(int argc, char **argv) {
             status = abort_status;
             goto watch_done;
         }
+        iterations++;
         if (max_iterations > 0) {
-            iterations++;
             if (iterations >= max_iterations) {
                 break;
             }
