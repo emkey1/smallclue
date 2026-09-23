@@ -23,5 +23,5 @@
 **Action:** Always print clear separator headers (and pre-spacing for subsequent files) when sequentially concatenating or summarizing multiple distinct files to standard output.
 
 ## 2025-05-13 - Interactive Menu Visual Hierarchy
-**Learning:** Interactive menus (like `licenses`) lack clear visual separation between their instructional headers and the selectable content, making it harder for users to quickly distinguish what is navigation and what is content.
-**Action:** Always wrap the header/status lines of interactive menus in inverse video (`\033[7m`), guarded by an interactive terminal check, to establish a clear visual hierarchy and separate the tool's UI from the options it displays.
+**Learning:** Interactive menus (like `licenses`) lack clear visual separation between their instructional headers and the selectable content. However, simply gating ANSI styling on `isInteractive` is insufficient; it ignores standard environmental overrides like `NO_COLOR` and `TERM=dumb`. Additionally, padding headers to full terminal width using spaces can cause layout issues if not properly guarded alongside the color logic.
+**Action:** When adding inverse video or other formatting to UI elements, do not rely solely on interactive terminal checks. Always route styling decisions through the project's centralized color/formatting preference function (e.g., `smallclueColourWanted()`) to ensure standard environmental variables are respected. Keep spacing and padding logic tightly coupled with the formatting guards.
