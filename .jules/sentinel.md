@@ -40,3 +40,8 @@
 **Vulnerability:** The `su` and `sudo` applets in `src/core.c` sanitized common environment variables (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_DEBUG`, `IFS`) and reset `PATH`, but failed to unset `ENV` and `BASH_ENV`.
 **Learning:** If these variables are passed to a newly spawned root shell (like `bash` or `sh`), the shell may automatically source and execute scripts defined in these variables, leading to arbitrary code execution or local privilege escalation before the user ever types a command.
 **Prevention:** Always unset `ENV` and `BASH_ENV` along with other dangerous environment variables when sanitizing the environment before executing commands in a privileged context.
+
+## 2024-05-24 - [Incomplete Password Wiping in Heap Buffers]
+**Vulnerability:** The password wiping logic used `smallclueSecureMemzero(pass, strlen(pass))`, which zeros out the password characters but leaves the null terminator byte untouched on the heap before the buffer is freed.
+**Learning:** While zeroing the characters removes the secret, leaving the null terminator untouched can theoretically lead to a 1-byte heap disclosure or hint at string lengths, and it violates the best practice of clearing the entire allocated buffer for sensitive data.
+**Prevention:** Always zero out at least `strlen(pass) + 1` bytes for dynamically allocated strings to ensure no remnants, including terminators, remain on the heap.
