@@ -33,3 +33,6 @@
 ## YYYY-MM-DD - Optimize cmp applet via block reads
 **Learning:** For utilities like `cmp` that compare inputs byte-by-byte, using `fgetc` introduces substantial function-call and buffering overhead. Profiling shows that reading data in 16KB blocks directly into stack arrays dramatically speeds up byte processing.
 **Action:** Replace `fgetc` with standard `fread` and stack buffers in high-throughput byte-comparison loops like `cmp` to minimize stdio execution overhead.
+## 2024-07-28 - wc Wide Path Stack Buffer Optimization
+**Learning:** In C applications that do chunked processing (like reading streams block by block), allocating memory dynamically using `malloc` inside the read loop (e.g., for processing carry-over bytes in `wc`'s wide character mode) introduces unnecessary heap management overhead.
+**Action:** When the maximum potential size of the temporary buffer is bounded and reasonably small (like a 16KB read buffer plus a 16-byte carry buffer), use a fixed-size stack array instead of `malloc`/`free`. This completely eliminates heap overhead in the hot path.
