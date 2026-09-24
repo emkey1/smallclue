@@ -5491,19 +5491,30 @@ static int smallclueTopCommand(int argc, char **argv) {
         }
 #endif
 
-        char header[160];
-        int hn;
         if (smallclueColourWanted()) {
-            hn = snprintf(header, sizeof(header),
-                          "\033[7m%6s %6s %6s %6s %-3s %-8s %-10s %6s %6s %s\033[0m\n",
-                          "PID", "PPID", "PGID", "SID", "FG", "PTY", "STATE", "UTIME", "STIME", "CMD");
+            char raw_header[256];
+            int raw_len = snprintf(raw_header, sizeof(raw_header), "%6s %6s %6s %6s %-3s %-8s %-10s %6s %6s %s", "PID", "PPID", "PGID", "SID", "FG", "PTY", "STATE", "UTIME", "STIME", "CMD");
+            int cols = pscalRuntimeDetectWindowCols();
+            if (cols <= 0) cols = 80;
+            int pad = cols - raw_len;
+            if (pad < 0) pad = 0;
+            /* Use a dynamically allocated buffer to safely fit terminal padding */
+            char *dyn_header = malloc((size_t)cols + 256);
+            if (dyn_header) {
+                int dyn_hn = snprintf(dyn_header, (size_t)cols + 256, "\033[7m%s%*s\033[0m\n", raw_header, pad, "");
+                if (dyn_hn > 0) {
+                    (void)smallclueWriteAll(STDOUT_FILENO, dyn_header, (size_t)dyn_hn);
+                }
+                free(dyn_header);
+            }
         } else {
-            hn = snprintf(header, sizeof(header),
-                          "%6s %6s %6s %6s %-3s %-8s %-10s %6s %6s %s\n",
-                          "PID", "PPID", "PGID", "SID", "FG", "PTY", "STATE", "UTIME", "STIME", "CMD");
-        }
-        if (hn > 0) {
-            (void)smallclueWriteAll(STDOUT_FILENO, header, (size_t)hn);
+            char header[160];
+            int hn = snprintf(header, sizeof(header),
+                              "%6s %6s %6s %6s %-3s %-8s %-10s %6s %6s %s\n",
+                              "PID", "PPID", "PGID", "SID", "FG", "PTY", "STATE", "UTIME", "STIME", "CMD");
+            if (hn > 0) {
+                (void)smallclueWriteAll(STDOUT_FILENO, header, (size_t)hn);
+            }
         }
 
         if (tree) {
@@ -5991,7 +6002,18 @@ static int smallclueTopCommand(int argc, char **argv) {
             printf("Mem: %zuK total, %zuK used, %zuK free\n", mem_total_kb,
                    mem_used_kb, mem_total_kb > mem_used_kb ? mem_total_kb - mem_used_kb : 0);
         }
-        printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        if (smallclueColourWanted()) {
+            fputs("\n\033[7m", stdout);
+            int raw_len = printf("  %5s %5s %-8s %s %7s %6s %s", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+            int cols = pscalRuntimeDetectWindowCols();
+            if (cols <= 0) cols = 80;
+            int pad = cols - raw_len;
+            if (pad < 0) pad = 0;
+            if (pad > 0) printf("%*s", pad, "");
+            fputs("\033[0m\n", stdout);
+        } else {
+            printf("\n  %5s %5s %-8s %s %7s %6s %s\n", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
+        }
 
         int rows = -1, cols = -1;
         if (!batch && isatty(STDOUT_FILENO)) {
@@ -15977,7 +15999,14 @@ static int smallclueWatchCommand(int argc, char **argv) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
         }
         if (smallclueColourWanted()) {
-            printf("\033[7mEvery %.2fs: %s\033[0m\n\n", interval, cmdline ? cmdline : argv[idx]);
+            fputs("\033[7m", stdout);
+            int raw_len = printf("Every %.2fs: %s", interval, cmdline ? cmdline : argv[idx]);
+            int cols = pscalRuntimeDetectWindowCols();
+            if (cols <= 0) cols = 80;
+            int pad = cols - raw_len;
+            if (pad < 0) pad = 0;
+            if (pad > 0) printf("%*s", pad, "");
+            fputs("\033[0m\n\n", stdout);
         } else {
             printf("%sEvery %.2fs: %s\n\n", cleared ? "" : "\n", interval,
                    cmdline ? cmdline : argv[idx]);

@@ -25,3 +25,7 @@
 ## 2024-06-07 - Add guard for ANSI clearing sequences in watch
 **Learning:** ANSI screen-clearing sequences (`\033[2J\033[H`) intended for interactive terminal sessions can cause severe log pollution when standard output is redirected or piped. This is a common issue with interactive applets like `watch` or pagers when their output is captured.
 **Action:** Always wrap visual screen-clearing and other pure interactive ANSI output sequences with an `isatty(STDOUT_FILENO)` guard to ensure they are only emitted when directly connected to a terminal. For continuous output applets like `watch`, replacing the clear sequence with a simple newline when not in a TTY maintains log readability.
+
+## YYYY-MM-DD - Dynamic Full-Width Inverse Video Headers
+**Learning:** Hardcoded inverse video headers in fullscreen applets do not stretch across the terminal, resulting in jagged resizing and poor visual hierarchy.
+**Action:** Always dynamically build header strings using `snprintf`, measure their length, calculate the remaining width via `pscalRuntimeDetectWindowCols()`, and append space padding so the inverse video highlight stretches cleanly across the terminal row.
