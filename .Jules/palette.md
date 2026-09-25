@@ -29,3 +29,7 @@
 ## YYYY-MM-DD - Dynamic Full-Width Inverse Video Headers
 **Learning:** Hardcoded inverse video headers in fullscreen applets do not stretch across the terminal, resulting in jagged resizing and poor visual hierarchy.
 **Action:** Always dynamically build header strings using `snprintf`, measure their length, calculate the remaining width via `pscalRuntimeDetectWindowCols()`, and append space padding so the inverse video highlight stretches cleanly across the terminal row.
+
+## YYYY-MM-DD - Batch Output Formatting for Fullscreen Applets
+**Learning:** Continuous output applets (like `top` and `watch`) use ANSI sequences to clear the screen interactively. When piped or redirected, these sequences pollute logs, but simply removing them without a replacement makes sequential frames indistinguishable.
+**Action:** When printing non-interactive batch frames after the first iteration in fullscreen applets, emit a simple newline as a frame separator instead of ANSI screen-clearing sequences.

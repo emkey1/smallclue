@@ -5986,8 +5986,10 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         qsort(entries, count, sizeof(SmallclueTopEntry), smallclueTopCompareEntries);
 
-        if (!batch && isatty(STDOUT_FILENO)) {
+        if (!batch && pscalRuntimeStdoutIsInteractive()) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
+        } else if (batch && iterations > 0) {
+            fputs("\n", stdout);
         }
 
         double load[3] = {0, 0, 0};
@@ -15994,9 +15996,11 @@ static int smallclueWatchCommand(int argc, char **argv) {
          * -- and the leading newline belongs to that question, standing in for
          * the clear when there was none. The banner's reverse video is the only
          * decoration here, and it is the only thing gated on colour. */
-        const bool cleared = isatty(STDOUT_FILENO) != 0;
+        const bool cleared = pscalRuntimeStdoutIsInteractive() != 0;
         if (cleared) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
+        } else if (iterations > 0) {
+            fputs("\n", stdout);
         }
         if (smallclueColourWanted()) {
             fputs("\033[7m", stdout);
