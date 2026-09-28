@@ -29322,8 +29322,7 @@ int smallclueMain(int argc, char **argv) {
         if (suggestion) {
             fprintf(stderr, "Did you mean '%s'?\n", suggestion);
         }
-        fprintf(stderr, "\n");
-        print_usage();
+        fprintf(stderr, "Run 'smallclue' with no arguments to see available applets.\n");
         return 127;
     }
 
