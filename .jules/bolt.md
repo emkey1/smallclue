@@ -33,3 +33,6 @@
 ## YYYY-MM-DD - Optimize cmp applet via block reads
 **Learning:** For utilities like `cmp` that compare inputs byte-by-byte, using `fgetc` introduces substantial function-call and buffering overhead. Profiling shows that reading data in 16KB blocks directly into stack arrays dramatically speeds up byte processing.
 **Action:** Replace `fgetc` with standard `fread` and stack buffers in high-throughput byte-comparison loops like `cmp` to minimize stdio execution overhead.
+## 2025-05-19 - Optimize tail applet ring buffer
+**Learning:** The `tail` applet was allocating and freeing lines dynamically for each iteration via `malloc`, `memcpy`, and `free`, which is very slow for continuous streams. By using an array of structs (`{ char *data; size_t cap; }`) and passing them directly to `smallclueGetlineStream`, we can reuse capacities natively via `realloc`.
+**Action:** Replace dynamically allocated string arrays with struct-based ring buffers and reuse the capacity field directly in `getline`/`getlinestream` loops to minimize heap fragmentation and overhead.
