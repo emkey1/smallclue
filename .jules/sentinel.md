@@ -45,3 +45,8 @@
 **Vulnerability:** The password wiping logic used `smallclueSecureMemzero(pass, strlen(pass))`, which zeros out the password characters but leaves the null terminator byte untouched on the heap before the buffer is freed.
 **Learning:** While zeroing the characters removes the secret, leaving the null terminator untouched can theoretically lead to a 1-byte heap disclosure or hint at string lengths, and it violates the best practice of clearing the entire allocated buffer for sensitive data.
 **Prevention:** Always zero out at least `strlen(pass) + 1` bytes for dynamically allocated strings to ensure no remnants, including terminators, remain on the heap.
+
+## 2024-11-20 - [Stack Buffer Password Memory Disclosure]
+**Vulnerability:** The `wget` applet in `src/core.c` did not securely zero out the stack-allocated `userpwdBuf` which contained the provided username and password before returning.
+**Learning:** Stack-allocated arrays containing sensitive information such as passwords persist in memory even after the function returns, potentially leading to memory disclosure.
+**Prevention:** Always securely zero out stack buffers that contain sensitive data (`userpwdBuf` using `smallclueSecureMemzero`) before returning from the function or on failure paths.
