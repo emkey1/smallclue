@@ -474,6 +474,7 @@ set(SOURCES
     src/openssh_shim.c
     src/tar_app.c
     src/gzip_app.c
+    src/sed_app.c
     src/readlink_app.c
     src/checksum_app.c
     src/diff_app.c

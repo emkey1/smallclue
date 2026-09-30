@@ -57,7 +57,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **sort**: Sort lines of text files.
 * **uniq**: Report or omit repeated lines.
 * **cut**: Remove sections from each line of files.
-* **sed**: Stream editor with real POSIX regex support (`s///` substitution, `y///` transliteration, `d`/`p` commands, `-i` in-place edit, `-e`/`-f` multiple scripts, line/regex address ranges).
+* **sed**: POSIX stream editor with the GNU extensions Linux scripts use (`src/sed_app.c`): every command (`{}` `=` `a` `b` `c` `d` `D` `F` `g` `G` `h` `H` `i` `l` `n` `N` `p` `P` `q` `Q` `r` `R` `s` `t` `T` `w` `W` `x` `y` `z` `:`), addresses including `first~step`, `addr,+N`, `0,/re/` and `!`, `s` flags `g` `p` N `w` `i` `m` with `\U`/`\L` case conversion, `-n` `-E` `-i[SUFFIX]` (mode and owner kept) `-s` `-z` `-u`. Output matches GNU sed 4.9 on 134 cases; only `e` (run as a shell command) is left out.
 * **tr**: Translate or delete characters.
 * **tee**: Read from standard input and write to standard output and files.
 * **sum**: BSD/SysV checksum utility.
