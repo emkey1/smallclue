@@ -2881,6 +2881,24 @@ static int smallclueSudoCommand(int argc, char **argv) {
             return 1;
         }
     }
+    /* Leading NAME=value arguments are the command's environment, as sudo(8)
+     * takes them: `sudo DEBIAN_FRONTEND=noninteractive apt-get ...` ran
+     * "DEBIAN_FRONTEND=noninteractive" as the command. The variables this
+     * sudo strips above stay refused, with real sudo's message. */
+    int envStart = i;
+    while (i < argc && argv[i][0] != '=' && strchr(argv[i], '=') != NULL) {
+        const char *name = argv[i];
+        size_t len = (size_t)(strchr(name, '=') - name);
+        if (!strncmp(name, "LD_", 3) || !strncmp(name, "BASH_FUNC_", 10) ||
+            (len == 3 && !strncmp(name, "IFS", 3)) || (len == 3 && !strncmp(name, "ENV", 3)) ||
+            (len == 8 && !strncmp(name, "BASH_ENV", 8))) {
+            fprintf(stderr, "sudo: sorry, you are not allowed to set the following environment variables: %.*s\n",
+                    (int) len, name);
+            return 1;
+        }
+        i++;
+    }
+    int envEnd = i;
     if (!list_only && i >= argc) {
         fputs(usage, stderr);
         return 1;
@@ -3014,7 +3032,12 @@ static int smallclueSudoCommand(int argc, char **argv) {
         return 1;
     }
 #if !defined(__APPLE__) || defined(SMALLCLUE_HAVE_SHADOW_AUTH)
-    (void) initgroups(target_name, target_gid);
+    /* The target's groups, not the invoker's: a failure here would run the
+     * command with the caller's supplementary groups, so it is fatal. */
+    if (initgroups(target_name, target_gid) != 0) {
+        fprintf(stderr, "sudo: unable to set supplementary group IDs: %s\n", strerror(errno));
+        return 1;
+    }
 #endif
     if (setuid(target_uid) != 0) {
         fprintf(stderr, "sudo: setuid: %s\n", strerror(errno));
@@ -3028,6 +3051,12 @@ static int smallclueSudoCommand(int argc, char **argv) {
         setenv("SUDO_UID", num, 1);
         snprintf(num, sizeof(num), "%u", (unsigned) rgid);
         setenv("SUDO_GID", num, 1);
+    }
+    for (int k = envStart; k < envEnd; k++) {
+        char *eq = strchr(argv[k], '=');
+        *eq = '\0';
+        setenv(argv[k], eq + 1, 1);
+        *eq = '=';
     }
 
     execv(exec_path, &argv[i]);
