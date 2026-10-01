@@ -15,6 +15,9 @@
 #include "sed_app.h"
 #include "stty_app.h"
 #include "ln_app.h"
+#include "cat_app.h"
+#include "rmdir_app.h"
+#include "sum_app.h"
 #include "env_app.h"
 #include "stat_app.h"
 #include "touch_app.h"
@@ -1462,7 +1465,6 @@ typedef struct MarkdownLinkList {
 } MarkdownLinkList;
 
 static int smallclueEchoCommand(int argc, char **argv);
-static int smallclueCatCommand(int argc, char **argv);
 static int smallcluePagerCommand(int argc, char **argv);
 static int smallclueClearCommand(int argc, char **argv);
 static int smallclueInstallCommand(int argc, char **argv);
@@ -1483,7 +1485,6 @@ static int smallclueFalseCommand(int argc, char **argv);
 static int smallclueYesCommand(int argc, char **argv);
 static int smallclueNoCommand(int argc, char **argv);
 static int smallclueVersionCommand(int argc, char **argv);
-static int smallclueSumCommand(int argc, char **argv);
 static int smallclueSleepCommand(int argc, char **argv);
 static int smallclueTimeCommand(int argc, char **argv);
 static int smallclueWatchCommand(int argc, char **argv);
@@ -1505,7 +1506,6 @@ static void smallclueEmitTerminalSane(void);
 #if defined(PSCAL_TARGET_IOS)
 static bool smallclueSessionPtyName(char *buf, size_t buf_len);
 #endif
-static int smallclueRmdirCommand(int argc, char **argv);
 static int smallclueTypeCommand(int argc, char **argv);
 static int smallclueFileCommand(int argc, char **argv);
 static int __attribute__((unused)) smallclueLicensesCommand(int argc, char **argv);
@@ -3553,12 +3553,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                  "  -z/--zero: NUL-terminate output instead of newline"},
     {"cal", "cal [month] [year]\n"
             "  Show a simple calendar"},
-    {"cat", "cat [-n|-b] [-E] [-T] [-A] [-s] [FILE ...]\n"
-            "  Concatenate files to stdout\n"
-            "  -n number all lines  -b number non-blank lines only\n"
-            "  -E show $ at line end  -T show tabs as ^I  -A = -E -T\n"
-            "  -s squeeze runs of blank lines to one\n"
-            "  (previously any flag was silently treated as a filename)"},
+    {"cat", "cat [OPTION]... [FILE]...\n"
+           "  Concatenate files; GNU coreutils compatible\n"
+           "  -A -b -e -E -n -s -t -T -u -v"},
     {"chmod", "chmod [OPTION]... MODE[,MODE]... FILE...\n"
            "  Change file mode bits; GNU chmod compatible\n"
            "  MODE: [ugoa]*([-+=]([rwxXst]*|[ugo]))+ or octal; -c -f -v -R --reference=FILE"},
@@ -3885,10 +3882,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"rm", "rm [-f] [-i|-I] [-r|-R] [-d] [-v] [--interactive[=WHEN]] [--one-file-system]\n"
            "   [--[no-]preserve-root] FILE...\n"
            "  GNU rm compatible: prompts, refusals, messages and status as GNU"},
-    {"rmdir", "rmdir [-p] [-v] DIR...\n"
-              "  Remove empty directories\n"
-              "  -p remove parents\n"
-              "  -v verbose"},
+    {"rmdir", "rmdir [OPTION]... DIRECTORY...\n"
+           "  Remove empty directories; GNU coreutils compatible\n"
+           "  -p, -v, --ignore-fail-on-non-empty"},
     {"rsync", "rsync [options] <source>... <destination>\n"
               "  Synchronize files and directories (OpenRsync-compatible applet)\n"
               "  Common: -a -v -z -r --delete --exclude PATTERN --include PATTERN\n"
@@ -3987,11 +3983,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                 "  --preserve-status: exit with COMMAND's own status instead of 124\n"
                 "  Exit 124 on timeout (unless --preserve-status), 125 on usage/setup\n"
                 "  error, 126/127 if COMMAND can't be invoked, else COMMAND's status"},
-    {"sum", "sum [-r|-s] [FILE...]\n"
-            "  BSD (-r, default): rotate-right checksum, 1K blocks.\n"
-            "  SysV (-s, --sysv): simple sum, 512-byte blocks.\n"
-            "  With no FILE or FILE '-', read standard input.\n"
-            "  Prints: <checksum> <blocks> [filename]\n"},
+    {"sum", "sum [OPTION]... [FILE]...\n"
+           "  BSD (-r, default) or System V (-s) checksums; GNU coreutils compatible"},
     {"tty", "tty [-s]\n"
             "  Print terminal name"},
     {"tr", "tr [OPTION]... STRING1 [STRING2]\n"
@@ -12848,98 +12841,6 @@ static int cat_file(const char *path) {
     return status;
 }
 
-typedef struct {
-    bool numberAll;      /* -n */
-    bool numberNonBlank;  /* -b (takes priority over -n if both given) */
-    bool showEnds;        /* -E: '$' at end of line */
-    bool showTabs;        /* -T: tabs as ^I */
-    bool squeezeBlank;    /* -s: collapse runs of blank lines to one */
-    bool showNonPrinting; /* -v: control bytes as ^X, high bytes as M-X */
-} SmallclueCatOptions;
-
-/* Line-based formatting path, used only when any of -n/-b/-A/-E/-T/-s is
- * given -- the flag-less case keeps using the existing raw-byte-stream
- * print_file()/cat_file() fast path unchanged. */
-static int smallclueCatFileFormatted(const char *path, const SmallclueCatOptions *opts, long *lineNo, bool *prevBlank) {
-    FILE *fp;
-    const char *label = path ? path : "(stdin)";
-    if (!path || strcmp(path, "-") == 0) {
-        fp = stdin;
-    } else {
-        char resolved[PATH_MAX];
-        const char *open_path = smallclueResolvePath(path, resolved, sizeof(resolved));
-        if (!open_path || *open_path == '\0') open_path = path;
-        fp = fopen(open_path, "rb");
-        if (!fp) {
-            fprintf(stderr, "cat: %s: %s\n", path, strerror(errno));
-            return 1;
-        }
-    }
-    char *line = NULL;
-    size_t cap = 0;
-    int status = 0;
-    for (;;) {
-        int read_err = 0;
-        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
-        if (len < 0) {
-            if (read_err) {
-                fprintf(stderr, "cat: %s: %s\n", label, strerror(read_err));
-                status = 1;
-            }
-            break;
-        }
-        bool hadNewline = (len > 0 && line[len - 1] == '\n');
-        if (hadNewline) {
-            line[len - 1] = '\0';
-            len--;
-        }
-        bool isBlank = (len == 0);
-        if (opts->squeezeBlank && isBlank && *prevBlank) {
-            continue;
-        }
-        *prevBlank = isBlank;
-
-        if (opts->numberAll || opts->numberNonBlank) {
-            if (!opts->numberNonBlank || !isBlank) {
-                printf("%6ld\t", ++(*lineNo));
-            }
-        }
-        if (opts->showTabs || opts->showNonPrinting) {
-            for (ssize_t i = 0; i < len; ++i) {
-                unsigned char c = (unsigned char) line[i];
-                if (c == '\t') {
-                    /* -v leaves tabs alone; only -T rewrites them. */
-                    if (opts->showTabs) fputs("^I", stdout);
-                    else putchar('\t');
-                    continue;
-                }
-                if (!opts->showNonPrinting) {
-                    putchar(c);
-                    continue;
-                }
-                if (c >= 128) {
-                    fputs("M-", stdout);
-                    c = (unsigned char) (c - 128);
-                }
-                if (c == 127) {
-                    fputs("^?", stdout);
-                } else if (c < 32) {
-                    putchar('^');
-                    putchar((int) c + 64);
-                } else {
-                    putchar(c);
-                }
-            }
-        } else {
-            fwrite(line, 1, (size_t)len, stdout);
-        }
-        if (opts->showEnds) putchar('$');
-        if (hadNewline) putchar('\n');
-    }
-    free(line);
-    if (fp != stdin) fclose(fp);
-    return status;
-}
 
 #define LS_FORMAT_AUTO 0
 #define LS_FORMAT_LONG 1
@@ -13237,152 +13138,9 @@ static int smallclueNoCommand(int argc, char **argv) {
     return status;
 }
 
-typedef enum {
-    SMALLCLUE_SUM_BSD,
-    SMALLCLUE_SUM_SYSV
-} SmallclueSumMode;
 
-static uint16_t smallclueBsdSum(FILE *f, unsigned long long *out_blocks) {
-    uint16_t sum = 0;
-    unsigned long long total = 0;
-    char buf[16384];
-    int read_err = 0;
-    ssize_t n;
 
-    while ((n = smallclueReadStream(f, buf, sizeof(buf), &read_err)) > 0) {
-        ssize_t i = 0;
-        /* Bolt optimization: Loop unrolling for BSD sum to reduce branching overhead */
-        #define PROCESS_BSD_CHAR(idx) do { \
-            unsigned char c = (unsigned char)buf[idx]; \
-            sum = (uint16_t)((sum >> 1) | ((sum & 1) << 15)); \
-            sum = (uint16_t)((sum + (uint16_t)c) & 0xFFFF); \
-        } while (0)
 
-        for (; i + 15 < n; i += 16) {
-            PROCESS_BSD_CHAR(i);
-            PROCESS_BSD_CHAR(i+1);
-            PROCESS_BSD_CHAR(i+2);
-            PROCESS_BSD_CHAR(i+3);
-            PROCESS_BSD_CHAR(i+4);
-            PROCESS_BSD_CHAR(i+5);
-            PROCESS_BSD_CHAR(i+6);
-            PROCESS_BSD_CHAR(i+7);
-            PROCESS_BSD_CHAR(i+8);
-            PROCESS_BSD_CHAR(i+9);
-            PROCESS_BSD_CHAR(i+10);
-            PROCESS_BSD_CHAR(i+11);
-            PROCESS_BSD_CHAR(i+12);
-            PROCESS_BSD_CHAR(i+13);
-            PROCESS_BSD_CHAR(i+14);
-            PROCESS_BSD_CHAR(i+15);
-        }
-        #undef PROCESS_BSD_CHAR
-
-        for (; i < n; ++i) {
-            unsigned char c = (unsigned char)buf[i];
-            sum = (uint16_t)((sum >> 1) | ((sum & 1) << 15));
-            sum = (uint16_t)((sum + (uint16_t)c) & 0xFFFF);
-        }
-        total += (unsigned long long)n;
-    }
-    if (out_blocks) {
-        *out_blocks = (total + 1023ULL) / 1024ULL; /* 1K blocks */
-    }
-    return sum;
-}
-
-static uint16_t smallclueSysvSum(FILE *f, unsigned long long *out_blocks) {
-    uint32_t sum = 0;
-    unsigned long long total = 0;
-    char buf[16384];
-    int read_err = 0;
-    ssize_t n;
-
-    while ((n = smallclueReadStream(f, buf, sizeof(buf), &read_err)) > 0) {
-        ssize_t i = 0;
-        /* Bolt optimization: Loop unrolling for SysV sum to reduce branching overhead */
-        for (; i + 15 < n; i += 16) {
-            sum += (uint8_t)buf[i] + (uint8_t)buf[i+1] + (uint8_t)buf[i+2] + (uint8_t)buf[i+3] +
-                   (uint8_t)buf[i+4] + (uint8_t)buf[i+5] + (uint8_t)buf[i+6] + (uint8_t)buf[i+7] +
-                   (uint8_t)buf[i+8] + (uint8_t)buf[i+9] + (uint8_t)buf[i+10] + (uint8_t)buf[i+11] +
-                   (uint8_t)buf[i+12] + (uint8_t)buf[i+13] + (uint8_t)buf[i+14] + (uint8_t)buf[i+15];
-        }
-        for (; i < n; ++i) {
-            sum += (uint8_t)buf[i];
-        }
-        total += (unsigned long long)n;
-    }
-    /* Fold to 16 bits */
-    sum = (sum & 0xFFFF) + (sum >> 16);
-    sum = (sum & 0xFFFF) + (sum >> 16);
-    if (out_blocks) {
-        *out_blocks = (total + 511ULL) / 512ULL; /* 512-byte blocks */
-    }
-    return (uint16_t)(sum & 0xFFFF);
-}
-
-static int smallclueSumCommand(int argc, char **argv) {
-    SmallclueSumMode mode = SMALLCLUE_SUM_BSD; /* -r default */
-    int idx = 1;
-    while (idx < argc && argv[idx][0] == '-') {
-        const char *opt = argv[idx];
-        if (strcmp(opt, "--") == 0) { idx++; break; }
-        if (strcmp(opt, "-r") == 0) { mode = SMALLCLUE_SUM_BSD; idx++; continue; }
-        if (strcmp(opt, "-s") == 0 || strcmp(opt, "--sysv") == 0) { mode = SMALLCLUE_SUM_SYSV; idx++; continue; }
-        if (strcmp(opt, "--help") == 0) {
-            fputs("usage: sum [-r|-s] [FILE...]\n", stdout);
-            fputs("  -r        BSD algorithm, 1K blocks (default)\n", stdout);
-            fputs("  -s, --sysv System V algorithm, 512-byte blocks\n", stdout);
-            return 0;
-        }
-        if (strcmp(opt, "--version") == 0) {
-            fputs("sum (smallclue) 1.0\n", stdout);
-            return 0;
-        }
-        /* Unknown option */
-        fprintf(stderr, "sum: unknown option '%s'\n", opt);
-        return 1;
-    }
-
-    int file_count = argc - idx;
-    if (file_count <= 0) {
-        argv[idx] = "-";
-        file_count = 1;
-    }
-
-    for (int i = 0; i < file_count; ++i) {
-        const char *path = argv[idx + i];
-        FILE *f = NULL;
-        bool from_stdin = (strcmp(path, "-") == 0);
-        if (from_stdin) {
-            f = stdin;
-        } else {
-            f = fopen(path, "rb");
-            if (!f) {
-                fprintf(stderr, "sum: %s: %s\n", path, strerror(errno));
-                continue;
-            }
-        }
-
-        unsigned long long blocks = 0;
-        uint16_t checksum = (mode == SMALLCLUE_SUM_BSD)
-                                ? smallclueBsdSum(f, &blocks)
-                                : smallclueSysvSum(f, &blocks);
-
-        if (!from_stdin) {
-            fclose(f);
-        } else {
-            clearerr(stdin);
-        }
-
-        if (from_stdin && file_count == 1) {
-            printf("%u %llu\n", (unsigned)checksum, blocks);
-        } else {
-            printf("%u %llu %s\n", (unsigned)checksum, blocks, path);
-        }
-    }
-    return 0;
-}
 
 static bool smallclueFormatBuildTimestamp(const char *programVersion, char *out, size_t out_len) {
     if (!out || out_len == 0) {
@@ -17054,77 +16812,6 @@ static int smallclueDmesgCommand(int argc, char **argv) {
 #endif
 }
 
-static int smallclueCatCommand(int argc, char **argv) {
-    SmallclueCatOptions opts;
-    memset(&opts, 0, sizeof(opts));
-    int argi = 1;
-    for (; argi < argc; ++argi) {
-        const char *arg = argv[argi];
-        if (!arg || arg[0] != '-' || strcmp(arg, "-") == 0) break;
-        if (strcmp(arg, "--") == 0) { argi++; break; }
-        if (arg[1] == '-') {
-            const char *lopt = arg + 2;
-            if (strcmp(lopt, "number") == 0) opts.numberAll = true;
-            else if (strcmp(lopt, "number-nonblank") == 0) opts.numberNonBlank = true;
-            else if (strcmp(lopt, "show-ends") == 0) opts.showEnds = true;
-            else if (strcmp(lopt, "show-tabs") == 0) opts.showTabs = true;
-            else if (strcmp(lopt, "squeeze-blank") == 0) opts.squeezeBlank = true;
-            else if (strcmp(lopt, "show-nonprinting") == 0) opts.showNonPrinting = true;
-            else if (strcmp(lopt, "show-all") == 0) {
-                opts.showEnds = opts.showTabs = opts.showNonPrinting = true;
-            } else {
-                fprintf(stderr, "cat: unrecognized option '%s'\n", arg);
-                return 1;
-            }
-            continue;
-        }
-        for (const char *p = arg + 1; *p; ++p) {
-            switch (*p) {
-                case 'n': opts.numberAll = true; break;
-                case 'b': opts.numberNonBlank = true; break;
-                case 'E': opts.showEnds = true; break;
-                case 'T': opts.showTabs = true; break;
-                case 's': opts.squeezeBlank = true; break;
-                case 'v': opts.showNonPrinting = true; break;
-                /* GNU's bundles: -e is -vE, -t is -vT, -A is -vET. */
-                case 'e': opts.showNonPrinting = true; opts.showEnds = true; break;
-                case 't': opts.showNonPrinting = true; opts.showTabs = true; break;
-                case 'A':
-                    opts.showEnds = true;
-                    opts.showTabs = true;
-                    opts.showNonPrinting = true;
-                    break;
-                case 'u': break; /* unbuffered: accepted, as in every cat */
-                default:
-                    fprintf(stderr, "cat: unsupported option -%c\n", *p);
-                    return 1;
-            }
-        }
-    }
-
-    bool anyFlag = opts.numberAll || opts.numberNonBlank || opts.showEnds ||
-                  opts.showTabs || opts.squeezeBlank || opts.showNonPrinting;
-    int status = 0;
-    if (!anyFlag) {
-        if (argi >= argc) {
-            return cat_file(NULL);
-        }
-        for (int i = argi; i < argc; ++i) {
-            status |= cat_file(argv[i]);
-        }
-        return status ? 1 : 0;
-    }
-
-    long lineNo = 0;
-    bool prevBlank = false;
-    if (argi >= argc) {
-        return smallclueCatFileFormatted(NULL, &opts, &lineNo, &prevBlank);
-    }
-    for (int i = argi; i < argc; ++i) {
-        status |= smallclueCatFileFormatted(argv[i], &opts, &lineNo, &prevBlank);
-    }
-    return status ? 1 : 0;
-}
 
 static const char *smallcluePagerDisplayName(const char *path) {
     if (!path || !*path || strcmp(path, "(stdin)") == 0) {
@@ -19724,70 +19411,7 @@ static int smallclueMkdirParents(const char *path, mode_t mode, bool verbose) {
     return 0;
 }
 
-static int smallclueRmdirPath(const char *path, bool parents, bool verbose) {
-    if (rmdir(path) != 0) {
-        fprintf(stderr, "rmdir: %s: %s\n", path, strerror(errno));
-        return -1;
-    }
-    if (verbose) {
-        printf("rmdir: removing directory, '%s'\n", path);
-    }
-    if (!parents) {
-        return 0;
-    }
-    char *mutable_path = strdup(path);
-    if (!mutable_path) {
-        fprintf(stderr, "rmdir: %s\n", strerror(errno));
-        return -1;
-    }
-    while (smallclueChopParentDirectory(mutable_path)) {
-        if (mutable_path[0] == '\0' || strcmp(mutable_path, ".") == 0 ||
-            strcmp(mutable_path, "/") == 0) {
-            break;
-        }
-        if (rmdir(mutable_path) != 0) {
-            fprintf(stderr, "rmdir: %s: %s\n", mutable_path, strerror(errno));
-            free(mutable_path);
-            return -1;
-        }
-        if (verbose) {
-            printf("rmdir: removing directory, '%s'\n", mutable_path);
-        }
-    }
-    free(mutable_path);
-    return 0;
-}
 
-static int smallclueRmdirCommand(int argc, char **argv) {
-    int parents = 0;
-    int verbose = 0;
-    int opt;
-    smallclueResetGetopt();
-    while ((opt = getopt(argc, argv, "pv")) != -1) {
-        switch (opt) {
-            case 'p':
-                parents = 1;
-                break;
-            case 'v':
-                verbose = 1;
-                break;
-            default:
-                fprintf(stderr, "usage: rmdir [-p] [-v] dir...\n");
-                return 1;
-        }
-    }
-    if (optind >= argc) {
-        fprintf(stderr, "rmdir: missing operand\n");
-        return 1;
-    }
-    int status = 0;
-    for (int i = optind; i < argc; ++i) {
-        if (smallclueRmdirPath(argv[i], parents != 0, verbose != 0) != 0) {
-            status = 1;
-        }
-    }
-    return status;
-}
 
 static int smallclueMkdirCommand(int argc, char **argv) {
     static const char *usage = "usage: mkdir [-pv] [-m MODE] DIR...\n";
