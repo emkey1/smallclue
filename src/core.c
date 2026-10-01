@@ -15,6 +15,10 @@
 #include "sed_app.h"
 #include "stty_app.h"
 #include "ln_app.h"
+#include "tail_app.h"
+#include "head_app.h"
+#include "app_hooks.h"
+#include "rm_app.h"
 #include "tar_app.h"
 #include "gzip_app.h"
 #include "readlink_app.h"
@@ -1450,7 +1454,6 @@ static int smallclueLsCommand(int argc, char **argv);
 static int smallclueCatCommand(int argc, char **argv);
 static int smallcluePagerCommand(int argc, char **argv);
 static int smallclueClearCommand(int argc, char **argv);
-static int smallclueRmCommand(int argc, char **argv);
 static int smallclueCpCommand(int argc, char **argv);
 static int smallclueMvCommand(int argc, char **argv);
 static int smallclueInstallCommand(int argc, char **argv);
@@ -1460,13 +1463,11 @@ static int smallclueEnvCommand(int argc, char **argv);
 static int smallclueChmodCommand(int argc, char **argv);
 static int smallclueDateCommand(int argc, char **argv);
 static int smallclueCalCommand(int argc, char **argv);
-static int smallclueHeadCommand(int argc, char **argv);
 static int smallclueHistoryCommand(int argc, char **argv);
 static int smallclueGrepCommand(int argc, char **argv);
 static int smallclueWcCommand(int argc, char **argv);
 static int smallclueDuCommand(int argc, char **argv);
 static int smallclueFindCommand(int argc, char **argv);
-static int smallclueTailCommand(int argc, char **argv);
 static int smallclueTouchCommand(int argc, char **argv);
 static int smallclueTsetCommand(int argc, char **argv);
 static int smallclueTtyCommand(int argc, char **argv);
@@ -3396,7 +3397,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"gzip", smallclueGzipCommand, "Compress files"},
     {"gunzip", smallclueGunzipCommand, "Decompress files"},
     {"zcat", smallclueZcatCommand, "Decompress files to standard output"},
-    {"head", smallclueHeadCommand, "Print the first lines of files"},
+    {"head", smallclueHeadCommand, "Print the first part of files"},
     {"history", smallclueHistoryCommand, "Show command history"},
     {"id", smallclueIdCommand, "Print user identity information"},
 #if SMALLCLUE_HAS_IFADDRS
@@ -3473,7 +3474,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"ssh-copy-id", smallclueSshCopyIdCommand, "Install SSH public keys on a remote host"},
     {"su", smallclueSuCommand, "Change user ID or become superuser"},
     {"sudo", smallclueSudoCommand, "Execute a command as another user"},
-    {"tail", smallclueTailCommand, "Print the last lines of files"},
+    {"tail", smallclueTailCommand, "Print the last part of files"},
     {"tar", smallclueTarCommand, "Create, extract, or list tar archives"},
     {"tee", smallclueTeeCommand, "Copy stdin to files and stdout"},
     {"telnet", smallclueTelnetCommand, "Simple TCP telnet client"},
@@ -3700,9 +3701,11 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  describe"},
     {"halt", "halt [-f]\n"
              "  Halt the system"},
-    {"head", "head [-n N|-n -N] [FILE...]\n"
-             "  Default N=10\n"
-             "  -n -N: print all but the last N lines instead of the first N"},
+    {"head", "head [-c [-]NUM | -n [-]NUM] [-q|-v] [-z] [FILE...]\n"
+           "  Print the first 10 lines (or NUM lines/bytes) of each FILE\n"
+           "  -c NUM bytes; -n NUM lines; a leading '-': all but the last NUM\n"
+           "  -q never / -v always print file-name headers; -z NUL-terminated lines\n"
+           "  NUM suffixes: b 512, kB 1000, K 1024, MB, M, GB, G, ..."},
     {"history", "history\n"
                 "  Show command history"},
     {"id", "id\n"
@@ -3888,12 +3891,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"realpath", "realpath [-e|-m] PATH...\n"
                  "  Print the canonicalized absolute path\n"
                  "  -e require full existence  -m allow a missing final component (default)"},
-    {"rm", "rm [-r|-R] [-f] [-i] [--no-preserve-root] FILE...\n"
-           "  -r/-R recursive\n"
-           "  -f force\n"
-           "  -i interactive\n"
-           "  --preserve-root (default): refuse recursive removal of '/'\n"
-           "  --no-preserve-root: disable that failsafe"},
+    {"rm", "rm [-f] [-i|-I] [-r|-R] [-d] [-v] [--interactive[=WHEN]] [--one-file-system]\n"
+           "   [--[no-]preserve-root] FILE...\n"
+           "  GNU rm compatible: prompts, refusals, messages and status as GNU"},
     {"rmdir", "rmdir [-p] [-v] DIR...\n"
               "  Remove empty directories\n"
               "  -p remove parents\n"
@@ -3964,10 +3964,11 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  Change user ID or become superuser"},
     {"sudo", "sudo command [args...]\n"
              "  Execute a command as another user"},
-    {"tail", "tail [-n N|-n +N] [-f] [FILE...]\n"
-             "  Default N=10\n"
-             "  -n +N: start output at line N (relative to the start) instead\n"
-             "  of printing the last N lines. Not combinable with -f."},
+    {"tail", "tail [-c [+]NUM | -n [+]NUM] [-f|-F] [-q|-v] [-z] [-s SECS] [--pid=PID] [FILE...]\n"
+           "  Print the last 10 lines (or NUM lines/bytes) of each FILE\n"
+           "  +NUM: start at line/byte NUM instead\n"
+           "  -f follow appended data; -F follow by name and retry (log rotation)\n"
+           "  -q never / -v always print file-name headers; -z NUL-terminated lines"},
     {"tar", "tar -c|-x|-t -f archive [-v] [-z] [-C dir] [file...]\n"
             "  -c create  -x extract  -t list\n"
             "  -f archive path (or - for stdin/stdout)\n"
@@ -19649,455 +19650,13 @@ static const char *smallclueStrCaseStr(const char *haystack, const char *needle,
 #endif
 }
 
-static bool smallclueParseDashLineCount(const char *arg, long *value) {
-    if (!arg || !value || arg[0] != '-' || arg[1] == '\0') {
-        return false;
-    }
-    if (arg[1] == '-') {
-        return false;
-    }
-    const char *p = arg + 1;
-    while (*p) {
-        if (*p < '0' || *p > '9') {
-            return false;
-        }
-        p++;
-    }
-    char *endptr = NULL;
-    long parsed = strtol(arg + 1, &endptr, 10);
-    if (!endptr || *endptr != '\0') {
-        return false;
-    }
-    *value = parsed;
-    return true;
-}
 
-/* Parses the value passed to `-n` when it may carry a leading sign with
- * tool-specific meaning: BSD/GNU tail's "-n +NUM" starts output at line
- * NUM (relative to the beginning), and GNU head's "-n -NUM" prints all
- * but the last NUM lines. A bare "+NUM" for head has no special GNU
- * meaning and is treated as an ordinary positive count. */
-static bool smallclueParseSignedLineCount(const char *text, char *signOut, long *valueOut) {
-    if (!text || !*text) return false;
-    char sign = '\0';
-    const char *p = text;
-    if (*p == '+' || *p == '-') {
-        sign = *p;
-        p++;
-    }
-    if (!*p) return false;
-    char *endptr = NULL;
-    long v = strtol(p, &endptr, 10);
-    if (!endptr || *endptr != '\0' || v < 0) return false;
-    if (signOut) *signOut = sign;
-    if (valueOut) *valueOut = v;
-    return true;
-}
 
-static int smallclueHeadStream(FILE *fp, const char *label, long lines) {
-    if (lines <= 0) {
-        return 0;
-    }
-    char buf[16384];
-    long remaining = lines;
-    int read_err = 0;
-    ssize_t n;
-    int status = 0;
 
-    while (remaining > 0 && (n = smallclueReadStream(fp, buf, sizeof(buf), &read_err)) > 0) {
-        ssize_t i = 0;
-        ssize_t end_idx = -1;
 
-        /* Bolt optimization: unrolled loop for head line scanning */
-        #define CHECK_NL(idx) do { \
-            if (buf[i + (idx)] == '\n') { \
-                remaining--; \
-                if (remaining == 0) { \
-                    end_idx = i + (idx); \
-                    goto found; \
-                } \
-            } \
-        } while(0)
 
-        for (; i + 15 < n; i += 16) {
-            CHECK_NL(0); CHECK_NL(1); CHECK_NL(2); CHECK_NL(3);
-            CHECK_NL(4); CHECK_NL(5); CHECK_NL(6); CHECK_NL(7);
-            CHECK_NL(8); CHECK_NL(9); CHECK_NL(10); CHECK_NL(11);
-            CHECK_NL(12); CHECK_NL(13); CHECK_NL(14); CHECK_NL(15);
-        }
-        #undef CHECK_NL
 
-        for (; i < n; ++i) {
-            if (buf[i] == '\n') {
-                remaining--;
-                if (remaining == 0) {
-                    end_idx = i;
-                    goto found;
-                }
-            }
-        }
-found:
-        if (end_idx >= 0) {
-            fwrite(buf, 1, (size_t)(end_idx + 1), stdout);
-            break;
-        } else {
-            fwrite(buf, 1, (size_t)n, stdout);
-        }
-    }
 
-    if (read_err) {
-        fprintf(stderr, "head: %s: %s\n",
-                label ? label : "(stdin)",
-                strerror(read_err));
-        status = 1;
-    }
-    return status;
-}
-
-/* GNU head's "-n -NUM": print all but the last NUM lines. Since head
- * doesn't know where the end is until EOF, this streams via a NUM-sized
- * ring buffer of line contents -- a line is only printed once NUM more
- * lines have arrived after it (proving it isn't among the final NUM),
- * and whatever remains buffered at EOF (exactly the excluded trailing
- * lines) is discarded rather than printed. */
-static int smallclueHeadStreamAllButLast(FILE *fp, const char *label, long excludeCount) {
-    if (excludeCount <= 0) {
-        char *line = NULL;
-        size_t cap = 0;
-        int status = 0;
-        while (1) {
-            int read_err = 0;
-            ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
-            if (len < 0) {
-                if (read_err) {
-                    fprintf(stderr, "head: %s: %s\n", label ? label : "(stdin)", strerror(read_err));
-                    status = 1;
-                }
-                break;
-            }
-            fwrite(line, 1, (size_t)len, stdout);
-        }
-        free(line);
-        return status;
-    }
-
-    char **ring = (char **)calloc((size_t)excludeCount, sizeof(char *));
-    if (!ring) {
-        fprintf(stderr, "head: %s: out of memory\n", label ? label : "(stdin)");
-        return 1;
-    }
-    char *line = NULL;
-    size_t cap = 0;
-    long count = 0;
-    int status = 0;
-    while (1) {
-        int read_err = 0;
-        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
-        if (len < 0) {
-            if (read_err) {
-                fprintf(stderr, "head: %s: %s\n", label ? label : "(stdin)", strerror(read_err));
-                status = 1;
-            }
-            break;
-        }
-        long slot = count % excludeCount;
-        if (count >= excludeCount && ring[slot]) {
-            fputs(ring[slot], stdout);
-            free(ring[slot]);
-            ring[slot] = NULL;
-        }
-        char *copy = (char *)malloc((size_t)len + 1);
-        if (!copy) {
-            fprintf(stderr, "head: %s: out of memory\n", label ? label : "(stdin)");
-            status = 1;
-            break;
-        }
-        memcpy(copy, line, (size_t)len);
-        copy[len] = '\0';
-        ring[slot] = copy;
-        count++;
-    }
-    free(line);
-    for (long i = 0; i < excludeCount; ++i) {
-        free(ring[i]);
-    }
-    free(ring);
-    return status;
-}
-
-static int smallclueHeadCommand(int argc, char **argv) {
-    long lines = 10;
-    bool allButLast = false;
-    long excludeCount = 0;
-    int index = 1;
-    while (index < argc) {
-        const char *arg = argv[index];
-        if (!arg || arg[0] != '-') {
-            break;
-        }
-        if (strcmp(arg, "--") == 0) {
-            index++;
-            break;
-        }
-        if (strcmp(arg, "-n") == 0) {
-            if (index + 1 >= argc) {
-                fprintf(stderr, "head: option requires an argument -- n\n");
-                return 1;
-            }
-            char sign = '\0';
-            long value = 0;
-            if (!smallclueParseSignedLineCount(argv[index + 1], &sign, &value)) {
-                fprintf(stderr, "head: invalid line count '%s'\n", argv[index + 1]);
-                return 1;
-            }
-            if (sign == '-') {
-                allButLast = true;
-                excludeCount = value;
-            } else {
-                allButLast = false;
-                lines = value;
-            }
-            index += 2;
-            continue;
-        }
-        if (strncmp(arg, "-n", 2) == 0 && arg[2] != '\0') {
-            char sign = '\0';
-            long value = 0;
-            if (!smallclueParseSignedLineCount(arg + 2, &sign, &value)) {
-                fprintf(stderr, "head: invalid line count '%s'\n", arg + 2);
-                return 1;
-            }
-            if (sign == '-') {
-                allButLast = true;
-                excludeCount = value;
-            } else {
-                allButLast = false;
-                lines = value;
-            }
-            index += 1;
-            continue;
-        }
-        long dashLines = 0;
-        if (smallclueParseDashLineCount(arg, &dashLines)) {
-            lines = dashLines;
-            allButLast = false;
-            index += 1;
-            continue;
-        }
-        fprintf(stderr, "head: unsupported option '%s'\n", arg);
-        return 1;
-    }
-
-    int status = 0;
-    int file_count = argc - index;
-    if (file_count <= 0) {
-        status = allButLast ? smallclueHeadStreamAllButLast(stdin, "(stdin)", excludeCount)
-                             : smallclueHeadStream(stdin, "(stdin)", lines);
-    } else {
-        for (int i = index; i < argc; ++i) {
-            const char *path = argv[i];
-            FILE *fp = fopen(path, "r");
-            if (!fp) {
-                fprintf(stderr, "head: %s: %s\n", path, strerror(errno));
-                status = 1;
-                continue;
-            }
-            if (file_count > 1) {
-                if (i > index) {
-                    putchar('\n');
-                }
-                printf("==> %s <==\n", path);
-            }
-            status |= allButLast ? smallclueHeadStreamAllButLast(fp, path, excludeCount)
-                                  : smallclueHeadStream(fp, path, lines);
-            fclose(fp);
-        }
-    }
-    return status ? 1 : 0;
-}
-
-static int smallclueTailStream(FILE *fp, const char *label, long lines) {
-    if (lines <= 0) {
-        return 0;
-    }
-    char **ring = (char **)calloc((size_t)lines, sizeof(char *));
-    if (!ring) {
-        fprintf(stderr, "tail: %s: out of memory\n", label ? label : "(stdin)");
-        return 1;
-    }
-    char *line = NULL;
-    size_t cap = 0;
-    long count = 0;
-    int status = 0;
-    while (1) {
-        int read_err = 0;
-        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
-        if (len < 0) {
-            if (read_err) {
-                fprintf(stderr, "tail: %s: %s\n",
-                        label ? label : "(stdin)",
-                        strerror(read_err));
-                status = 1;
-            }
-            break;
-        }
-        char *copy = (char *)malloc((size_t)len + 1);
-        if (!copy) {
-            fprintf(stderr, "tail: %s: out of memory\n", label ? label : "(stdin)");
-            status = 1;
-            break;
-        }
-        memcpy(copy, line, (size_t)len);
-        copy[len] = '\0';
-        long slot = count % lines;
-        free(ring[slot]);
-        ring[slot] = copy;
-        count++;
-    }
-    if (status == 0) {
-        long start = count > lines ? count - lines : 0;
-        for (long i = start; i < count; ++i) {
-            char *entry = ring[i % lines];
-            if (entry) {
-                fputs(entry, stdout);
-            }
-        }
-    }
-    free(line);
-    for (long i = 0; i < lines; ++i) {
-        free(ring[i]);
-    }
-    free(ring);
-    return status;
-}
-
-/* BSD/GNU tail's "-n +NUM": start output at line NUM (1-based, relative
- * to the start of input) rather than counting back from the end. Unlike
- * the last-N-lines mode, this needs no buffering at all -- just count
- * lines as they stream by and start printing once the target is hit. */
-static int smallclueTailStreamFromLine(FILE *fp, const char *label, long startLine) {
-    if (startLine < 1) {
-        startLine = 1;
-    }
-    char *line = NULL;
-    size_t cap = 0;
-    long count = 0;
-    int status = 0;
-    while (1) {
-        int read_err = 0;
-        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
-        if (len < 0) {
-            if (read_err) {
-                fprintf(stderr, "tail: %s: %s\n", label ? label : "(stdin)", strerror(read_err));
-                status = 1;
-            }
-            break;
-        }
-        count++;
-        if (count >= startLine) {
-            fwrite(line, 1, (size_t)len, stdout);
-        }
-    }
-    free(line);
-    return status;
-}
-
-static int smallclueTailFollow(FILE *fp, const char *label, long lines) {
-    int status = smallclueTailStream(fp, label, lines);
-    if (status != 0) {
-        return status;
-    }
-    int fd = fileno(fp);
-    if (fd < 0) {
-        fprintf(stderr, "tail: %s: bad file descriptor\n", label ? label : "(stdin)");
-        return 1;
-    }
-
-    /* Start following from the current end-of-file position. */
-    off_t lastPos;
-#if defined(__APPLE__)
-    lastPos = ftello(fp);
-#else
-    lastPos = ftell(fp);
-#endif
-    if (lastPos < 0) {
-        lastPos = 0;
-    }
-
-    char *line = NULL;
-    size_t cap = 0;
-    while (1) {
-        if (smallclueShouldAbort(&status)) {
-            break;
-        }
-
-        struct stat st;
-        if (fstat(fd, &st) != 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            fprintf(stderr, "tail: %s: %s\n", label ? label : "(stdin)", strerror(errno));
-            status = 1;
-            break;
-        }
-
-        /* Handle truncation/rotation. */
-        if (st.st_size < lastPos) {
-            fseeko(fp, st.st_size, SEEK_SET);
-            lastPos = st.st_size;
-            usleep(200000);
-            continue;
-        }
-
-        if (st.st_size > lastPos) {
-            /* New content available. */
-            if (fseeko(fp, lastPos, SEEK_SET) != 0) {
-                fprintf(stderr, "tail: %s: %s\n", label ? label : "(stdin)", strerror(errno));
-                status = 1;
-                break;
-            }
-            while (lastPos < st.st_size) {
-                int read_err = 0;
-                ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
-                if (len < 0) {
-                    if (read_err == EINTR) {
-                        clearerr(fp);
-                        continue;
-                    }
-                    if (read_err == 0) {
-                        clearerr(fp);
-                        break;
-                    }
-                    fprintf(stderr, "tail: %s: %s\n",
-                            label ? label : "(stdin)",
-                            strerror(read_err));
-                    status = 1;
-                    break;
-                }
-                fwrite(line, 1, (size_t)len, stdout);
-                fflush(stdout);
-#if defined(__APPLE__)
-                lastPos = ftello(fp);
-#else
-                lastPos = ftell(fp);
-#endif
-                if (lastPos < 0) {
-                    lastPos = st.st_size;
-                    break;
-                }
-            }
-            if (status != 0) {
-                break;
-            }
-        } else {
-            /* No new data; sleep before polling again. */
-            usleep(200000); /* 200ms */
-        }
-    }
-
-    free(line);
-    return status;
-}
 
 #if defined(PSCAL_TARGET_IOS)
 static void smallclueLogPathExpansion(const char *label, const char *path) {
@@ -20117,136 +19676,29 @@ static void smallclueLogPathExpansion(const char *label, const char *path) {
     pscalRuntimeDebugLog(logbuf);
 }
 
-static FILE *smallclueTailOpenFile(const char *path, char *resolved, size_t resolved_len) {
-    const char *open_path = smallclueResolvePath(path, resolved, resolved_len);
-    const char *target = (open_path && *open_path) ? open_path : path;
-    smallclueLogPathExpansion("tail-open", path);
-    return pscalPathVirtualized_fopen(target, "r");
-}
-#else
-static FILE *smallclueTailOpenFile(const char *path, char *resolved, size_t resolved_len) {
-    const char *open_path = smallclueResolvePath(path, resolved, resolved_len);
-    const char *target = (open_path && *open_path) ? open_path : path;
-    (void)resolved;
-    (void)resolved_len;
-    return fopen(target, "r");
-}
 #endif
 
-static int smallclueTailCommand(int argc, char **argv) {
-    smallclueClearPendingSignals();
-    long lines = 10;
-    bool follow = false;
-    bool fromLineStart = false;
-    long startLine = 1;
-    int index = 1;
-    while (index < argc) {
-        const char *arg = argv[index];
-        if (!arg || arg[0] != '-') {
-            break;
-        }
-        if (strcmp(arg, "--") == 0) {
-            index++;
-            break;
-        }
-        if (strcmp(arg, "-f") == 0) {
-            follow = true;
-            index += 1;
-            continue;
-        }
-        if (strcmp(arg, "-n") == 0) {
-            if (index + 1 >= argc) {
-                fprintf(stderr, "tail: option requires an argument -- n\n");
-                return 1;
-            }
-            char sign = '\0';
-            long value = 0;
-            if (!smallclueParseSignedLineCount(argv[index + 1], &sign, &value)) {
-                fprintf(stderr, "tail: invalid line count '%s'\n", argv[index + 1]);
-                return 1;
-            }
-            if (sign == '+') {
-                fromLineStart = true;
-                startLine = value;
-            } else {
-                fromLineStart = false;
-                lines = value;
-            }
-            index += 2;
-            continue;
-        }
-        if (strncmp(arg, "-n", 2) == 0 && arg[2] != '\0') {
-            char sign = '\0';
-            long value = 0;
-            if (!smallclueParseSignedLineCount(arg + 2, &sign, &value)) {
-                fprintf(stderr, "tail: invalid line count '%s'\n", arg + 2);
-                return 1;
-            }
-            if (sign == '+') {
-                fromLineStart = true;
-                startLine = value;
-            } else {
-                fromLineStart = false;
-                lines = value;
-            }
-            index += 1;
-            continue;
-        }
-        long dashLines = 0;
-        if (smallclueParseDashLineCount(arg, &dashLines)) {
-            lines = dashLines;
-            fromLineStart = false;
-            index += 1;
-            continue;
-        }
-        fprintf(stderr, "tail: unsupported option '%s'\n", arg);
-        return 1;
-    }
-    if (follow && (argc - index) > 1) {
-        fprintf(stderr, "tail: -f currently supports a single input\n");
-        return 1;
-    }
-    if (follow && fromLineStart) {
-        fprintf(stderr, "tail: -f cannot be combined with -n +NUM\n");
-        return 1;
-    }
-    int status = 0;
-    int file_count = argc - index;
-    if (file_count <= 0) {
-        status = follow ? smallclueTailFollow(stdin, "(stdin)", lines)
-                : fromLineStart ? smallclueTailStreamFromLine(stdin, "(stdin)", startLine)
-                        : smallclueTailStream(stdin, "(stdin)", lines);
-    } else {
-        for (int i = index; i < argc; ++i) {
-            const char *path = argv[i];
-            char resolved[PATH_MAX];
-            FILE *fp = smallclueTailOpenFile(path, resolved, sizeof(resolved));
-            if (!fp) {
-                fprintf(stderr, "tail: %s: %s\n", path, strerror(errno));
-                status = 1;
-                continue;
-            }
-            if (file_count > 1) {
-                if (i > index) {
-                    putchar('\n');
-                }
-                printf("==> %s <==\n", path);
-            }
-            if (follow) {
-                status |= smallclueTailFollow(fp, path, lines);
-                fclose(fp);
-                break;
-            } else if (fromLineStart) {
-                status |= smallclueTailStreamFromLine(fp, path, startLine);
-                fclose(fp);
-            } else {
-                status |= smallclueTailStream(fp, path, lines);
-                fclose(fp);
-            }
-        }
-    }
-    return status ? 1 : 0;
+/* The hooks app_hooks.h declares, for applets kept in their own files. */
+FILE *smallclueAppOpenRead(const char *path) {
+    char resolved[PATH_MAX];
+    const char *open_path = smallclueResolvePath(path, resolved, sizeof(resolved));
+    const char *target = (open_path && *open_path) ? open_path : path;
+#if defined(PSCAL_TARGET_IOS)
+    smallclueLogPathExpansion("open-read", path);
+    return pscalPathVirtualized_fopen(target, "r");
+#else
+    return fopen(target, "r");
+#endif
 }
+
+bool smallclueAppShouldAbort(int *status) {
+    return smallclueShouldAbort(status);
+}
+
+void smallclueAppClearPendingSignals(void) {
+    smallclueClearPendingSignals();
+}
+
 
 /* Parses touch -t's [[CC]YY]MMDDhhmm[.ss] compact timestamp form. The
  * digit count before an optional ".ss" suffix tells us which of the three
@@ -23384,32 +22836,46 @@ static int smallclueWcProcessFile(const char *path, SmallclueWcCounts *counts, b
     int rc = needWide ? smallclueWcProcessFileWide(path, fp, counts)
                        : smallclueWcProcessFileFast(path, fp, counts);
 
+    int read_errno = errno;
     if (fp != stdin) {
         fclose(fp);
     }
     if (rc != 0) {
-        fprintf(stderr, "wc: %s: read error\n", path ? path : "(stdin)");
-        return 1;
+        /* GNU still prints the counts it has (zeros for a directory), then
+         * the reason: "wc: dir: Is a directory". The caller does both. */
+        memset(counts, 0, sizeof(*counts));
+        errno = read_errno ? read_errno : EIO;
+        return 2;
     }
     return 0;
 }
 
+/* GNU's layout: each count right-aligned in `width` columns, one space
+ * between them and before the name. The width is GNU's compute_number_width
+ * (see smallclueWcCommand), not a fixed 12: `wc -l < f` prints "12", and
+ * scripts compare that text. */
 static void smallclueWcPrint(const SmallclueWcCounts *counts, int show_lines, int show_words,
-                              int show_chars, int show_bytes, int show_maxline, const char *label) {
+                              int show_chars, int show_bytes, int show_maxline, const char *label,
+                              int width) {
+    const char *sep = "";
     if (show_lines) {
-        printf("%12" PRIu64, counts->lines);
+        printf("%s%*" PRIu64, sep, width, counts->lines);
+        sep = " ";
     }
     if (show_words) {
-        printf("%12" PRIu64, counts->words);
+        printf("%s%*" PRIu64, sep, width, counts->words);
+        sep = " ";
     }
     if (show_chars) {
-        printf("%12" PRIu64, counts->chars);
+        printf("%s%*" PRIu64, sep, width, counts->chars);
+        sep = " ";
     }
     if (show_bytes) {
-        printf("%12" PRIu64, counts->bytes);
+        printf("%s%*" PRIu64, sep, width, counts->bytes);
+        sep = " ";
     }
     if (show_maxline) {
-        printf("%12" PRIu64, counts->max_line_length);
+        printf("%s%*" PRIu64, sep, width, counts->max_line_length);
     }
     if (label) {
         printf(" %s", label);
@@ -23419,15 +22885,34 @@ static void smallclueWcPrint(const SmallclueWcCounts *counts, int show_lines, in
 
 static int smallclueWcCommand(int argc, char **argv) {
     int show_lines = 0, show_words = 0, show_bytes = 0, show_chars = 0, show_maxline = 0;
+    /* GNU's --total=WHEN: auto (more than one file), always, only, never. */
+    int total_mode = 0; /* 0 auto, 1 always, 2 only, 3 never */
     int index = 1;
     while (index < argc) {
         const char *arg = argv[index];
-        if (!arg || arg[0] != '-') {
+        if (!arg || arg[0] != '-' || arg[1] == '\0') {
             break;
         }
         if (strcmp(arg, "--") == 0) {
             index++;
             break;
+        }
+        if (strncmp(arg, "--", 2) == 0) {
+            if (!strcmp(arg, "--lines")) show_lines = 1;
+            else if (!strcmp(arg, "--words")) show_words = 1;
+            else if (!strcmp(arg, "--bytes")) show_bytes = 1;
+            else if (!strcmp(arg, "--chars")) show_chars = 1;
+            else if (!strcmp(arg, "--max-line-length")) show_maxline = 1;
+            else if (!strcmp(arg, "--total=auto")) total_mode = 0;
+            else if (!strcmp(arg, "--total=always")) total_mode = 1;
+            else if (!strcmp(arg, "--total=only")) total_mode = 2;
+            else if (!strcmp(arg, "--total=never")) total_mode = 3;
+            else {
+                fprintf(stderr, "wc: unrecognized option '%s'\nTry 'wc --help' for more information.\n", arg);
+                return 1;
+            }
+            index++;
+            continue;
         }
         for (const char *opt = arg + 1; *opt; ++opt) {
             if (*opt == 'l') show_lines = 1;
@@ -23436,7 +22921,7 @@ static int smallclueWcCommand(int argc, char **argv) {
             else if (*opt == 'm') show_chars = 1;
             else if (*opt == 'L') show_maxline = 1;
             else {
-                fprintf(stderr, "wc: invalid option -- %c\n", *opt);
+                fprintf(stderr, "wc: invalid option -- '%c'\nTry 'wc --help' for more information.\n", *opt);
                 return 1;
             }
         }
@@ -23453,18 +22938,63 @@ static int smallclueWcCommand(int argc, char **argv) {
     int status = 0;
     SmallclueWcCounts counts;
     SmallclueWcCounts total = {0, 0, 0, 0, 0};
+
+    /* GNU's compute_number_width: one count of one input prints bare; else
+     * the digits of the regular files' total size, at least 7 when any
+     * input is not a regular file (stdin from a pipe, a device). */
+    int nshown = show_lines + show_words + show_chars + show_bytes + show_maxline;
+    int width = 1;
+    if (!(nshown == 1 && paths <= 1) && total_mode != 2) {
+        int minimum = 1;
+        uint64_t regular_total = 0;
+        bool any = false;
+        for (int i = (paths <= 0 ? argc : index); i <= argc; ++i) {
+            struct stat st;
+            const char *name = i < argc ? argv[i] : NULL;
+            if (paths > 0 && i == argc) break;
+            int r = (!name || !strcmp(name, "-")) ? fstat(STDIN_FILENO, &st) : stat(name, &st);
+            if (r != 0) continue;
+            any = true;
+            if (!S_ISREG(st.st_mode)) minimum = 7;
+            else regular_total += (uint64_t)st.st_size;
+        }
+        if (any) {
+            for (; regular_total >= 10; regular_total /= 10) width++;
+            if (width < minimum) width = minimum;
+        }
+    }
+
+    bool print_each = total_mode != 2;
     if (paths <= 0) {
         if (smallclueWcProcessFile(NULL, &counts, needWide) != 0) {
             return 1;
         }
-        smallclueWcPrint(&counts, show_lines, show_words, show_chars, show_bytes, show_maxline, NULL);
+        if (total_mode == 2) {
+            smallclueWcPrint(&counts, show_lines, show_words, show_chars, show_bytes, show_maxline, NULL, width);
+        } else {
+            smallclueWcPrint(&counts, show_lines, show_words, show_chars, show_bytes, show_maxline, NULL, width);
+            if (total_mode == 1)
+                smallclueWcPrint(&counts, show_lines, show_words, show_chars, show_bytes, show_maxline, "total", width);
+        }
     } else {
         for (int i = index; i < argc; ++i) {
-            if (smallclueWcProcessFile(argv[i], &counts, needWide) != 0) {
+            const char *name = argv[i];
+            int prc = smallclueWcProcessFile(strcmp(name, "-") ? name : NULL, &counts, needWide);
+            if (prc == 1) {
                 status = 1;
                 continue;
             }
-            smallclueWcPrint(&counts, show_lines, show_words, show_chars, show_bytes, show_maxline, argv[i]);
+            if (prc == 2) {
+                int err = errno;
+                status = 1;
+                if (print_each)
+                    smallclueWcPrint(&counts, show_lines, show_words, show_chars, show_bytes, show_maxline, name, width);
+                fflush(stdout);
+                fprintf(stderr, "wc: %s: %s\n", name, strerror(err));
+                continue;
+            }
+            if (print_each)
+                smallclueWcPrint(&counts, show_lines, show_words, show_chars, show_bytes, show_maxline, name, width);
             total.lines += counts.lines;
             total.words += counts.words;
             total.bytes += counts.bytes;
@@ -23473,9 +23003,10 @@ static int smallclueWcCommand(int argc, char **argv) {
                 total.max_line_length = counts.max_line_length;
             }
         }
-        if (paths > 1) {
-            smallclueWcPrint(&total, show_lines, show_words, show_chars, show_bytes, show_maxline, "total");
-        }
+        if (total_mode == 2)
+            smallclueWcPrint(&total, show_lines, show_words, show_chars, show_bytes, show_maxline, NULL, width);
+        else if ((paths > 1 && total_mode == 0) || total_mode == 1)
+            smallclueWcPrint(&total, show_lines, show_words, show_chars, show_bytes, show_maxline, "total", width);
     }
     return status;
 }
@@ -24639,143 +24170,7 @@ static int smallclueMkdirParents(const char *path, mode_t mode, bool verbose) {
     return 0;
 }
 
-/* GNU rm's failsafe against `rm -rf /`-class disasters: recursive removal
- * of a path that resolves to exactly "/" is refused unless the caller
- * explicitly opts out via --no-preserve-root. On by default, matching GNU
- * coreutils (not an opt-in flag). */
-static bool smallclueRmIsPreservedRoot(const char *path) {
-    if (!path) return false;
-    char resolved[PATH_MAX];
-    const char *target = realpath(path, resolved) ? resolved : path;
-    return strcmp(target, "/") == 0;
-}
 
-static int smallclueRmCommand(int argc, char **argv) {
-    int recursive = 0;
-    int force = 0;
-    int interactive = 0;
-    bool preserve_root = true;
-
-    /* --preserve-root/--no-preserve-root are GNU long options with no
-     * short-flag equivalent -- getopt() doesn't understand "--"-prefixed
-     * long options and hard-errors on them, so pull them out first,
-     * gathering the survivors into a vector of our own rather than
-     * compacting argv (see smallclueBorrowArgs). */
-    int nargs = 0;
-    char **args = smallclueBorrowArgs("rm", argc, argv, &nargs);
-    if (!args) {
-        return 1;
-    }
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--preserve-root") == 0) {
-            preserve_root = true;
-            continue;
-        }
-        if (strcmp(argv[i], "--no-preserve-root") == 0) {
-            preserve_root = false;
-            continue;
-        }
-        args[nargs++] = argv[i];
-    }
-
-    int opt;
-    smallclueResetGetopt();
-    while ((opt = getopt(nargs, args, "rRfi")) != -1) {
-        switch (opt) {
-            case 'r':
-            case 'R':
-                recursive = 1;
-                break;
-            case 'f':
-                force = 1;
-                interactive = 0;
-                break;
-            case 'i':
-                interactive = 1;
-                force = 0;
-                break;
-            default:
-                fprintf(stderr, "rm: invalid option -- %c\n", optopt);
-                free(args);
-                return 1;
-        }
-    }
-    if (optind >= nargs) {
-        free(args);
-        if (!force) {
-            fprintf(stderr, "rm: missing operand\n");
-            return 1;
-        }
-        return 0;
-    }
-    int status = 0;
-    for (int i = optind; i < nargs; ++i) {
-        const char *input = args[i];
-        const char *expanded = input;
-#if defined(PSCAL_TARGET_IOS)
-        char pathbuf[PATH_MAX];
-        if (pathTruncateExpand(input, pathbuf, sizeof(pathbuf))) {
-            expanded = pathbuf;
-        }
-#endif
-        if (recursive && preserve_root && smallclueRmIsPreservedRoot(expanded)) {
-            fprintf(stderr, "rm: it is dangerous to operate recursively on '%s'\n", expanded);
-            fprintf(stderr, "rm: use --no-preserve-root to override this failsafe\n");
-            status = 1;
-            continue;
-        }
-        /* A name that exists is removed as itself. The caller's shell has
-         * already expanded any pattern it meant, so a `*`, `?` or `[` still
-         * in an argument is part of a file's name: globbing it again removed
-         * the wrong files -- `rm -f 'a*'` took every name starting with a --
-         * or none at all, since `[` alone is a malformed pattern that
-         * matches nothing, so `rm -f '['` removed nothing and succeeded.
-         * Hosted where a POSIX shell always does the expansion
-         * (SMALLCLUE_ARGS_EXPANDED, iSH-AOK), rm never globs. */
-        struct stat literal_st;
-        bool literal_exists = lstat(expanded, &literal_st) == 0;
-#if defined(SMALLCLUE_ARGS_EXPANDED)
-        bool glob_it = false;
-        (void) literal_exists;
-#else
-        bool glob_it = !literal_exists && strpbrk(expanded, "*?[") != NULL;
-#endif
-        if (glob_it) {
-            glob_t matches;
-            memset(&matches, 0, sizeof(matches));
-            int gret = glob(expanded, GLOB_NOCHECK, NULL, &matches);
-            if (gret != 0) {
-                globfree(&matches);
-                if (!force) {
-                    status = 1;
-                }
-                continue;
-            }
-            for (size_t m = 0; m < matches.gl_pathc; ++m) {
-                if (recursive && preserve_root && smallclueRmIsPreservedRoot(matches.gl_pathv[m])) {
-                    fprintf(stderr, "rm: it is dangerous to operate recursively on '%s'\n", matches.gl_pathv[m]);
-                    fprintf(stderr, "rm: use --no-preserve-root to override this failsafe\n");
-                    status = 1;
-                    continue;
-                }
-                if (smallclueRemovePathWithLabel("rm", matches.gl_pathv[m], recursive != 0, force != 0, interactive != 0) != 0) {
-                    if (!force) {
-                        status = 1;
-                    }
-                }
-            }
-            globfree(&matches);
-        } else {
-            if (smallclueRemovePathWithLabel("rm", expanded, recursive != 0, force != 0, interactive != 0) != 0) {
-                if (!force) {
-                    status = 1;
-                }
-            }
-        }
-    }
-    free(args);
-    return status;
-}
 
 static int smallclueRmdirPath(const char *path, bool parents, bool verbose) {
     if (rmdir(path) != 0) {

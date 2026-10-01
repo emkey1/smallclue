@@ -756,6 +756,9 @@ gcc -std=c99 ${PORTABILITY_DEFS} -DSMALLCLUE_WITH_SH ${EXTRA_C_DEFS} ${DVTM_EXTR
     src/sed_app.c \
     src/stty_app.c \
     src/ln_app.c \
+    src/tail_app.c \
+    src/head_app.c \
+    src/rm_app.c \
     src/nl_app.c \
     src/nohup_app.c \
     src/od_app.c \
