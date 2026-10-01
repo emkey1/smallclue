@@ -193,7 +193,7 @@ static size_t diffNormalize(const Diff *d, const char *s, size_t n, char *out) {
             col += spaces;
             continue;
         }
-        out[o++] = (char)(d->ignoreCase ? tolower(c) : c);
+        out[o++] = (char)(d->ignoreCase && c >= 'A' && c <= 'Z' ? c + 32 : c);   /* glibc folds ASCII only here */
         col++;
     }
     return o;
@@ -910,7 +910,8 @@ static void diffFunction(const Diff *d, const DiffFile *a, lin first, lin *lastS
             m[0].rm_eo = (regoff_t)n;
             match = regexec(&d->funcRe, s, 1, m, REG_STARTEND) == 0;
         } else {
-            match = n > 0 && (isalpha((unsigned char)s[0]) || s[0] == '_' || s[0] == '$');
+            unsigned char c0 = n > 0 ? (unsigned char)s[0] : 0;
+            match = n > 0 && ((c0 < 0x80 && isalpha(c0)) || c0 == '_' || c0 == '$');
         }
         if (match) { found = i; break; }
     }

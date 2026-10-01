@@ -64,11 +64,40 @@ static inline bool gnuUtf8Locale(void) {
     if (!v) return false;
     return strstr(v, "UTF-8") || strstr(v, "utf8") || strstr(v, "UTF8") || strstr(v, "utf-8");
 }
+/* gnulib's locale_quoting_style, as quote() gives it: inside the quotes a
+ * backslash is doubled, \a \b \f \n \r \t \v are spelled so, other
+ * unprintable bytes (and, outside UTF-8, every byte above 0x7f) become
+ * \ooo, and the closing quote is backslashed. */
 static inline const char *gnuQuoteLocale(const char *s, char *buf, size_t size) {
-    if (gnuUtf8Locale())
-        snprintf(buf, size, "\xe2\x80\x98%s\xe2\x80\x99", s);
-    else
-        snprintf(buf, size, "'%s'", s);
+    bool utf8 = gnuUtf8Locale();
+    const char *lq = utf8 ? "\xe2\x80\x98" : "'", *rq = utf8 ? "\xe2\x80\x99" : "'";
+    size_t rql = strlen(rq), o = 0;
+#define GNU_QPUT(str, n) do { size_t n_ = (n); if (o + n_ < size) { memcpy(buf + o, (str), n_); o += n_; } } while (0)
+    GNU_QPUT(lq, strlen(lq));
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        static const char named[] = "\a\b\f\n\r\t\v";
+        static const char letters[] = "abfnrtv";
+        const char *hit = *p ? memchr(named, *p, 7) : NULL;
+        if (!strncmp((const char *)p, rq, rql)) {
+            GNU_QPUT("\\", 1);
+            GNU_QPUT(p, rql);
+            p += rql - 1;
+        } else if (*p == '\\') {
+            GNU_QPUT("\\\\", 2);
+        } else if (hit) {
+            char e[2] = {'\\', letters[hit - named]};
+            GNU_QPUT(e, 2);
+        } else if (*p < 0x20 || *p == 0x7f || (*p >= 0x80 && !utf8)) {
+            char e[5];
+            snprintf(e, sizeof(e), "\\%03o", *p);
+            GNU_QPUT(e, 4);
+        } else {
+            GNU_QPUT(p, 1);
+        }
+    }
+    GNU_QPUT(rq, rql);
+#undef GNU_QPUT
+    buf[o < size ? o : size - 1] = '\0';
     return buf;
 }
 

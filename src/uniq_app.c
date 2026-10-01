@@ -79,13 +79,19 @@ static const char *uniqField(const Uniq *u, const UniqLine *l, size_t *len) {
     return l->s + i;
 }
 
+/* glibc's toupper on a byte in the C or UTF-8 locale: ASCII only (Darwin's
+ * UTF-8 ctype would fold Latin-1 bytes too). */
+static int uniqUpper(int c) {
+    return c >= 'a' && c <= 'z' ? c - 32 : c;
+}
+
 static bool uniqDifferent(const Uniq *u, const char *a, size_t alen, const char *b, size_t blen) {
     if (u->checkChars < alen) alen = u->checkChars;
     if (u->checkChars < blen) blen = u->checkChars;
     if (alen != blen) return true;
     if (!u->ignoreCase) return memcmp(a, b, alen) != 0;
     for (size_t i = 0; i < alen; i++)
-        if (toupper((unsigned char)a[i]) != toupper((unsigned char)b[i])) return true;
+        if (uniqUpper((unsigned char)a[i]) != uniqUpper((unsigned char)b[i])) return true;
     return false;
 }
 

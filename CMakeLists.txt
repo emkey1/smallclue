@@ -477,6 +477,7 @@ set(SOURCES
     src/sed_app.c
     src/stty_app.c
     src/ln_app.c
+    src/tr_app.c
     src/uniq_app.c
     src/ls_app.c
     src/chmod_app.c

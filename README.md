@@ -58,11 +58,11 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **uniq**: Report or omit repeated lines; GNU coreutils compatible (`-c` `-d` `-D` `--all-repeated` `--group` `-u` `-i` `-f` `-s` `-w` `-z`, obsolete `-N`/`+N`, INPUT and OUTPUT).
 * **cut**: Remove sections from each line of files.
 * **sed**: POSIX stream editor with the GNU extensions Linux scripts use (`src/sed_app.c`): every command (`{}` `=` `a` `b` `c` `d` `D` `F` `g` `G` `h` `H` `i` `l` `n` `N` `p` `P` `q` `Q` `r` `R` `s` `t` `T` `w` `W` `x` `y` `z` `:`), addresses including `first~step`, `addr,+N`, `0,/re/` and `!`, `e` (run a shell command), `s` flags `g` `p` N `w` `e` `i` `m` with `\U`/`\L` case conversion, `-n` `-E` `-i[SUFFIX]` (mode and owner kept) `-s` `-z` `-u`. Output matches GNU sed 4.9 on 159 cases.
-* **tr**: Translate or delete characters.
+* **tr**: Translate, squeeze or delete characters; GNU coreutils compatible (escapes, ranges, `[:class:]`, `[=c=]`, `[c*n]`, `-c -d -s -t`, GNU's validation messages).
 * **tee**: Read from standard input and write to standard output and files.
 * **sum**: BSD/SysV checksum utility.
 * **seq**: Print a sequence of numbers (`-w` zero-pad, `-s` separator, floating-point).
-* **nl**: Number lines of files (`-b a`/`t`, `-w`, `-s`).
+* **nl**: Number lines; GNU coreutils compatible (`-b/-h/-f a|t|n|pBRE`, `-v -i -l -n -w -s -p -d`, logical page sections).
 * **tac**: Concatenate and print files with lines in reverse order.
 * **rev**: Reverse the characters of each line.
 * **fold**: Wrap each line to a given width (`-w`, `-s` break at whitespace).
