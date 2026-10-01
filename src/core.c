@@ -15,6 +15,7 @@
 #include "sed_app.h"
 #include "stty_app.h"
 #include "ln_app.h"
+#include "find_app.h"
 #include "xargs_app.h"
 #include "sort_app.h"
 #include "tail_app.h"
@@ -1469,7 +1470,6 @@ static int smallclueHistoryCommand(int argc, char **argv);
 static int smallclueGrepCommand(int argc, char **argv);
 static int smallclueWcCommand(int argc, char **argv);
 static int smallclueDuCommand(int argc, char **argv);
-static int smallclueFindCommand(int argc, char **argv);
 static int smallclueTouchCommand(int argc, char **argv);
 static int smallclueTsetCommand(int argc, char **argv);
 static int smallclueTtyCommand(int argc, char **argv);
@@ -3626,15 +3626,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  Exit with status 1"},
     {"file", "file FILE...\n"
              "  Identify file types"},
-    {"find", "find PATH [expression]\n"
-             "  Common: -name PATTERN -type f|d|l\n"
-             "  -mtime [+-]N: modified N days ago (+older, -newer)\n"
-             "  -newer FILE: modified more recently than FILE\n"
-             "  -size [+-]N[c|k|M|G|w]: size comparison (default unit: 512B blocks)\n"
-             "  -print0: NUL-separated output (pairs with xargs -0)\n"
-             "  -maxdepth/-mindepth N (global traversal options)\n"
-             "  Boolean logic: -a/-and (implicit between adjacent terms),\n"
-             "  -o/-or, !/-not, and \\( \\) grouping"},
+    {"find", "find [-H|-L|-P] [PATH...] [EXPRESSION]\n"
+           "  Search for files; GNU findutils compatible\n"
+           "  tests: -name -path -regex -type -size -perm -newer -mtime -user -empty ...\n"
+           "  actions: -print -print0 -printf -ls -exec CMD {} ; -exec CMD {} + -delete -prune"},
     {"gzip", "gzip [-c] [-k] [-f] [-d] FILE...\n"
              "  -c stdout  -k keep original  -f force overwrite  -d decompress"},
     {"gunzip", "gunzip [-c] [-k] [-f] FILE...\n"
@@ -4424,10 +4419,6 @@ static ssize_t smallclueGetlineStream(char **line, size_t *cap, FILE *stream, in
     }
     return len;
 }
-
-
-
-
 
 typedef struct {
     int pid;
@@ -6269,10 +6260,6 @@ static int smallclueTimeoutCommand(int argc, char **argv) {
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
     return 1;
 }
-
-
-
-
 
 static FILE *smallclueOpenTempFile(const char *tag) {
 #if defined(PSCAL_TARGET_IOS)
@@ -19066,14 +19053,6 @@ static const char *smallclueStrCaseStr(const char *haystack, const char *needle,
 #endif
 }
 
-
-
-
-
-
-
-
-
 #if defined(PSCAL_TARGET_IOS)
 static void smallclueLogPathExpansion(const char *label, const char *path) {
     if (!pscalRuntimeDebugLog) {
@@ -19775,11 +19754,6 @@ static void smallclueApplyWindowSize(int rows, int cols) {
 #endif
     }
 }
-
-
-
-
-
 
 static int smallclueResizeCommand(int argc, char **argv) {
     (void)argv;
@@ -22497,564 +22471,6 @@ static int smallclueDuCommand(int argc, char **argv) {
     return status ? 1 : 0;
 }
 
-/* Boolean expression tree for find's predicate language: -a/-and (implicit
- * between adjacent terms too), -o/-or, !/-not, and parenthesized grouping.
- * Precedence (loosest to tightest, matching real find): OR, AND, NOT.
- * Actions (-print/-print0/-delete/-exec) are themselves expression terms
- * that perform a side effect and evaluate true -- this is what makes
- * `find . -name '*.c' -o -name '*.h'` and `find . -name '*.o' -delete`
- * both fall out of the same evaluator instead of needing special cases. */
-typedef enum {
-    FIND_NODE_TEST,
-    FIND_NODE_AND,
-    FIND_NODE_OR,
-    FIND_NODE_NOT,
-    FIND_NODE_PRINT,
-    FIND_NODE_PRINT0,
-    FIND_NODE_DELETE,
-    FIND_NODE_EXEC,
-} SmallclueFindNodeType;
-
-typedef enum {
-    FIND_TEST_NAME,
-    FIND_TEST_INAME,
-    FIND_TEST_TYPE,
-    FIND_TEST_MTIME,
-    FIND_TEST_NEWER,
-    FIND_TEST_SIZE,
-} SmallclueFindTestKind;
-
-typedef struct SmallclueFindNode {
-    SmallclueFindNodeType type;
-    SmallclueFindTestKind testKind;
-    const char *strArg;   /* -name/-iname pattern */
-    char typeFilter;      /* -type: 'f', 'd', 'l' */
-    char sign;            /* -mtime/-size: '+', '-', or '\0' for exact */
-    long long value;      /* -mtime days or -size threshold */
-    bool isBlockUnit;     /* -size: bare/b vs c/k/M/G/w */
-    time_t newerMtime;    /* -newer: reference mtime */
-    char **execArgv;      /* -exec: argv slice up to (not including) ';' */
-    int execArgc;
-    struct SmallclueFindNode *left;
-    struct SmallclueFindNode *right; /* AND/OR right operand, NOT's child */
-} SmallclueFindNode;
-
-typedef struct SmallclueFindOptions {
-    int maxDepth; /* -1 = unlimited */
-    int minDepth; /* 0 = no minimum */
-    SmallclueFindNode *root;
-} SmallclueFindOptions;
-
-/* Parses find's -size [+-]N[ckMGwb] spec. Confirmed against the real
- * system find with /usr/bin/find explicitly (this shell has a `find`
- * function that redirects to an unrelated bfs-based tool -- an earlier
- * pass through that shadowed `find` produced self-contradictory
- * results and had to be discarded and redone): only the bare/`b` form
- * rounds the file's size UP to whole 512-byte blocks and compares that
- * block COUNT to N. `c` compares the exact byte count to N. `k`/`M`/`G`/`w`
- * compare the exact byte count to N scaled by the suffix -- NOT
- * rounded to a block boundary (e.g. -size -1k matches a 1000-byte file
- * directly against the 1024-byte threshold, no rounding involved). */
-static bool smallclueFindParseSize(const char *s, char *signOut, long long *valueOut, bool *isBlockUnit) {
-    if (!s || !*s) return false;
-    char sign = '\0';
-    const char *p = s;
-    if (*p == '+' || *p == '-') {
-        sign = *p;
-        p++;
-    }
-    char *end = NULL;
-    long long v = strtoll(p, &end, 10);
-    if (end == p) return false;
-    long long multiplier = 1; /* bare: block count itself, not bytes */
-    bool blockUnit = true;
-    if (*end != '\0') {
-        switch (*end) {
-            case 'c': multiplier = 1; blockUnit = false; break;
-            case 'k': multiplier = 1024; blockUnit = false; break;
-            case 'M': multiplier = 1024LL * 1024; blockUnit = false; break;
-            case 'G': multiplier = 1024LL * 1024 * 1024; blockUnit = false; break;
-            case 'w': multiplier = 2; blockUnit = false; break;
-            case 'b': multiplier = 1; blockUnit = true; break;
-            default: return false;
-        }
-        if (end[1] != '\0') return false;
-    }
-    *signOut = sign;
-    *valueOut = v * multiplier;
-    *isBlockUnit = blockUnit;
-    return true;
-}
-
-static bool smallclueFindParseSignedInt(const char *s, char *signOut, long long *valueOut) {
-    if (!s || !*s) return false;
-    char sign = '\0';
-    const char *p = s;
-    if (*p == '+' || *p == '-') {
-        sign = *p;
-        p++;
-    }
-    char *end = NULL;
-    long long v = strtoll(p, &end, 10);
-    if (!end || end == p || *end != '\0') return false;
-    *signOut = sign;
-    *valueOut = v;
-    return true;
-}
-
-static bool smallclueFindCompareSigned(char sign, long long actual, long long spec) {
-    if (sign == '+') return actual > spec;
-    if (sign == '-') return actual < spec;
-    return actual == spec;
-}
-
-static bool smallclueFindTestMatches(const SmallclueFindNode *node, const char *path, const struct stat *st) {
-    switch (node->testKind) {
-        case FIND_TEST_NAME:
-        case FIND_TEST_INAME: {
-            const char *leaf = smallclueLeafName(path);
-            int flags = (node->testKind == FIND_TEST_INAME) ? FNM_CASEFOLD : 0;
-            return fnmatch(node->strArg, leaf, flags) == 0;
-        }
-        case FIND_TEST_TYPE:
-            switch (node->typeFilter) {
-                case 'f': return S_ISREG(st->st_mode);
-                case 'd': return S_ISDIR(st->st_mode);
-                case 'l': return S_ISLNK(st->st_mode);
-                default: return true;
-            }
-        case FIND_TEST_MTIME: {
-            long long ageSeconds = (long long)time(NULL) - (long long)st->st_mtime;
-            long long daysAgo = ageSeconds / 86400;
-            return smallclueFindCompareSigned(node->sign, daysAgo, node->value);
-        }
-        case FIND_TEST_NEWER:
-            return st->st_mtime > node->newerMtime;
-        case FIND_TEST_SIZE: {
-            long long measure = node->isBlockUnit
-                ? (((long long)st->st_size + 511) / 512)
-                : (long long)st->st_size;
-            return smallclueFindCompareSigned(node->sign, measure, node->value);
-        }
-    }
-    return false;
-}
-
-static int smallclueFindRunExec(const char *path, char **execArgv, int execArgc);
-
-/* Evaluates the expression tree for one visited path. AND/OR short-circuit
- * via C's &&/|| exactly like real find: a term after a false -a (or after a
- * true -o) is never evaluated, so its side effects (an -exec or -delete
- * later in the expression) don't run -- matching real find's actual
- * behavior for e.g. `find . -name '*.tmp' -delete` only deleting matches,
- * or `find . -name a -o -name b` only ever testing the first name. */
-static bool smallclueFindEval(const SmallclueFindNode *node, const char *path, const struct stat *st, int *status) {
-    switch (node->type) {
-        case FIND_NODE_TEST:
-            return smallclueFindTestMatches(node, path, st);
-        case FIND_NODE_AND:
-            return smallclueFindEval(node->left, path, st, status) &&
-                   smallclueFindEval(node->right, path, st, status);
-        case FIND_NODE_OR:
-            return smallclueFindEval(node->left, path, st, status) ||
-                   smallclueFindEval(node->right, path, st, status);
-        case FIND_NODE_NOT:
-            return !smallclueFindEval(node->right, path, st, status);
-        case FIND_NODE_PRINT:
-            fputs(path, stdout);
-            putchar('\n');
-            return true;
-        case FIND_NODE_PRINT0:
-            fputs(path, stdout);
-            putchar('\0');
-            return true;
-        case FIND_NODE_DELETE: {
-            int rc = S_ISDIR(st->st_mode) ? rmdir(path) : unlink(path);
-            if (rc != 0) {
-                fprintf(stderr, "find: %s: %s\n", path, strerror(errno));
-                if (status) *status = 1;
-                return false;
-            }
-            return true;
-        }
-        case FIND_NODE_EXEC:
-            return smallclueFindRunExec(path, node->execArgv, node->execArgc) == 0;
-    }
-    return false;
-}
-
-/* Recursive-descent parser for find's expression grammar, precedence
- * loosest-to-tightest: OR ("-o"/"-or"), AND ("-a"/"-and", or nothing at all
- * between two adjacent terms -- find's implicit AND), NOT ("!"/"-not"),
- * primary (a test/action, or a parenthesized sub-expression). Returns NULL
- * on a parse error (after printing a message to stderr) -- *hadAction is
- * set true if any -print/-print0/-delete/-exec term is found anywhere in
- * the expression, so the caller knows whether to add an implicit -print. */
-static SmallclueFindNode *smallclueFindParseOr(char **argv, int argc, int *idx, bool *hadAction);
-
-static SmallclueFindNode *smallclueFindParsePrimary(char **argv, int argc, int *idx, bool *hadAction) {
-    if (*idx >= argc) {
-        fprintf(stderr, "find: unexpected end of expression\n");
-        return NULL;
-    }
-    const char *arg = argv[*idx];
-    if (strcmp(arg, "(") == 0) {
-        (*idx)++;
-        SmallclueFindNode *inner = smallclueFindParseOr(argv, argc, idx, hadAction);
-        if (!inner) return NULL;
-        if (*idx >= argc || strcmp(argv[*idx], ")") != 0) {
-            fprintf(stderr, "find: missing closing ')'\n");
-            return NULL;
-        }
-        (*idx)++;
-        return inner;
-    }
-    if (strcmp(arg, "-name") == 0 || strcmp(arg, "-iname") == 0) {
-        bool isIname = (arg[1] == 'i');
-        (*idx)++;
-        if (*idx >= argc) {
-            fprintf(stderr, "find: missing argument to %s\n", arg);
-            return NULL;
-        }
-        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
-        node->type = FIND_NODE_TEST;
-        node->testKind = isIname ? FIND_TEST_INAME : FIND_TEST_NAME;
-        node->strArg = argv[(*idx)++];
-        return node;
-    }
-    if (strcmp(arg, "-type") == 0) {
-        (*idx)++;
-        if (*idx >= argc) {
-            fprintf(stderr, "find: missing argument to -type\n");
-            return NULL;
-        }
-        const char *typeArg = argv[(*idx)++];
-        if (strcmp(typeArg, "f") != 0 && strcmp(typeArg, "d") != 0 && strcmp(typeArg, "l") != 0) {
-            fprintf(stderr, "find: unsupported -type '%s' (only f/d/l)\n", typeArg);
-            return NULL;
-        }
-        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
-        node->type = FIND_NODE_TEST;
-        node->testKind = FIND_TEST_TYPE;
-        node->typeFilter = typeArg[0];
-        return node;
-    }
-    if (strcmp(arg, "-mtime") == 0) {
-        (*idx)++;
-        if (*idx >= argc) {
-            fprintf(stderr, "find: missing argument to -mtime\n");
-            return NULL;
-        }
-        char sign;
-        long long value;
-        if (!smallclueFindParseSignedInt(argv[(*idx)++], &sign, &value)) {
-            fprintf(stderr, "find: invalid -mtime argument\n");
-            return NULL;
-        }
-        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
-        node->type = FIND_NODE_TEST;
-        node->testKind = FIND_TEST_MTIME;
-        node->sign = sign;
-        node->value = value;
-        return node;
-    }
-    if (strcmp(arg, "-newer") == 0) {
-        (*idx)++;
-        if (*idx >= argc) {
-            fprintf(stderr, "find: missing argument to -newer\n");
-            return NULL;
-        }
-        const char *refPath = argv[(*idx)++];
-        struct stat refSt;
-        if (stat(refPath, &refSt) != 0) {
-            fprintf(stderr, "find: %s: %s\n", refPath, strerror(errno));
-            return NULL;
-        }
-        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
-        node->type = FIND_NODE_TEST;
-        node->testKind = FIND_TEST_NEWER;
-        node->newerMtime = refSt.st_mtime;
-        return node;
-    }
-    if (strcmp(arg, "-size") == 0) {
-        (*idx)++;
-        if (*idx >= argc) {
-            fprintf(stderr, "find: missing argument to -size\n");
-            return NULL;
-        }
-        char sign;
-        long long value;
-        bool isBlockUnit;
-        if (!smallclueFindParseSize(argv[(*idx)++], &sign, &value, &isBlockUnit)) {
-            fprintf(stderr, "find: invalid -size argument\n");
-            return NULL;
-        }
-        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
-        node->type = FIND_NODE_TEST;
-        node->testKind = FIND_TEST_SIZE;
-        node->sign = sign;
-        node->value = value;
-        node->isBlockUnit = isBlockUnit;
-        return node;
-    }
-    if (strcmp(arg, "-print") == 0) {
-        (*idx)++;
-        *hadAction = true;
-        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
-        node->type = FIND_NODE_PRINT;
-        return node;
-    }
-    if (strcmp(arg, "-print0") == 0) {
-        (*idx)++;
-        *hadAction = true;
-        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
-        node->type = FIND_NODE_PRINT0;
-        return node;
-    }
-    if (strcmp(arg, "-delete") == 0) {
-        (*idx)++;
-        *hadAction = true;
-        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
-        node->type = FIND_NODE_DELETE;
-        return node;
-    }
-    if (strcmp(arg, "-exec") == 0) {
-        (*idx)++;
-        int execStart = *idx;
-        while (*idx < argc && strcmp(argv[*idx], ";") != 0) {
-            (*idx)++;
-        }
-        if (*idx >= argc) {
-            fprintf(stderr, "find: -exec requires a terminating ';'\n");
-            return NULL;
-        }
-        int execArgc = *idx - execStart;
-        if (execArgc == 0) {
-            fprintf(stderr, "find: -exec requires a command\n");
-            return NULL;
-        }
-        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
-        node->type = FIND_NODE_EXEC;
-        node->execArgv = &argv[execStart];
-        node->execArgc = execArgc;
-        (*idx)++; /* consume the ';' */
-        *hadAction = true;
-        return node;
-    }
-    fprintf(stderr, "find: unsupported predicate '%s'\n", arg);
-    return NULL;
-}
-
-static SmallclueFindNode *smallclueFindParseNot(char **argv, int argc, int *idx, bool *hadAction) {
-    if (*idx < argc && (strcmp(argv[*idx], "!") == 0 || strcmp(argv[*idx], "-not") == 0)) {
-        (*idx)++;
-        SmallclueFindNode *child = smallclueFindParseNot(argv, argc, idx, hadAction);
-        if (!child) return NULL;
-        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
-        node->type = FIND_NODE_NOT;
-        node->right = child;
-        return node;
-    }
-    return smallclueFindParsePrimary(argv, argc, idx, hadAction);
-}
-
-static bool smallclueFindAtExprBoundary(char **argv, int argc, int idx) {
-    if (idx >= argc) return true;
-    const char *tok = argv[idx];
-    return strcmp(tok, "-o") == 0 || strcmp(tok, "-or") == 0 || strcmp(tok, ")") == 0;
-}
-
-static SmallclueFindNode *smallclueFindParseAnd(char **argv, int argc, int *idx, bool *hadAction) {
-    SmallclueFindNode *left = smallclueFindParseNot(argv, argc, idx, hadAction);
-    if (!left) return NULL;
-    while (!smallclueFindAtExprBoundary(argv, argc, *idx)) {
-        if (strcmp(argv[*idx], "-a") == 0 || strcmp(argv[*idx], "-and") == 0) {
-            (*idx)++;
-        }
-        /* else: implicit AND -- another term follows directly, no operator token */
-        SmallclueFindNode *right = smallclueFindParseNot(argv, argc, idx, hadAction);
-        if (!right) return NULL;
-        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
-        node->type = FIND_NODE_AND;
-        node->left = left;
-        node->right = right;
-        left = node;
-    }
-    return left;
-}
-
-static SmallclueFindNode *smallclueFindParseOr(char **argv, int argc, int *idx, bool *hadAction) {
-    SmallclueFindNode *left = smallclueFindParseAnd(argv, argc, idx, hadAction);
-    if (!left) return NULL;
-    while (*idx < argc && (strcmp(argv[*idx], "-o") == 0 || strcmp(argv[*idx], "-or") == 0)) {
-        (*idx)++;
-        SmallclueFindNode *right = smallclueFindParseAnd(argv, argc, idx, hadAction);
-        if (!right) return NULL;
-        SmallclueFindNode *node = (SmallclueFindNode *)calloc(1, sizeof(*node));
-        node->type = FIND_NODE_OR;
-        node->left = left;
-        node->right = right;
-        left = node;
-    }
-    return left;
-}
-
-static int smallclueFindRunExec(const char *path, char **execArgv, int execArgc) {
-    char **argvCopy = calloc((size_t)execArgc + 1, sizeof(char *));
-    if (!argvCopy) {
-        fprintf(stderr, "find: out of memory\n");
-        return 1;
-    }
-    for (int i = 0; i < execArgc; ++i) {
-        if (strcmp(execArgv[i], "{}") == 0) {
-            argvCopy[i] = (char *)path;
-        } else {
-            argvCopy[i] = execArgv[i];
-        }
-    }
-    argvCopy[execArgc] = NULL;
-
-    pid_t pid = smallclueSpawnSimple(argvCopy[0], argvCopy, 1);
-    if (pid < 0) {
-        fprintf(stderr, "find: %s: %s\n", argvCopy[0], strerror(errno));
-        free(argvCopy);
-        return 1;
-    }
-    free(argvCopy);
-    int childStatus = 0;
-    if (waitpid(pid, &childStatus, 0) < 0) {
-        fprintf(stderr, "find: waitpid: %s\n", strerror(errno));
-        return 1;
-    }
-    if (!WIFEXITED(childStatus) || WEXITSTATUS(childStatus) != 0) {
-        return 1;
-    }
-    return 0;
-}
-
-static int smallclueFindVisit(const char *path, const SmallclueFindOptions *opts,
-                              int *status, int depth) {
-    struct stat st;
-    if (lstat(path, &st) != 0) {
-        fprintf(stderr, "find: %s: %s\n", path, strerror(errno));
-        if (status) *status = 1;
-        return 1;
-    }
-
-    bool isDir = S_ISDIR(st.st_mode);
-    bool descendFirst = isDir && (opts->maxDepth < 0 || depth < opts->maxDepth);
-    /* -delete requires an empty directory, so recurse (and delete children)
-     * before acting on this entry -- matches GNU find's depth-first order
-     * for -delete. */
-    if (descendFirst) {
-        DIR *dir = opendir(path);
-        if (!dir) {
-            fprintf(stderr, "find: %s: %s\n", path, strerror(errno));
-            if (status) *status = 1;
-        } else {
-            struct dirent *entry;
-            while ((entry = readdir(dir)) != NULL) {
-                if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-                    continue;
-                }
-                char child[PATH_MAX];
-                if (smallclueBuildPath(child, sizeof(child), path, entry->d_name) != 0) {
-                    fprintf(stderr, "find: %s/%s: %s\n", path, entry->d_name, strerror(errno));
-                    if (status) *status = 1;
-                    continue;
-                }
-                smallclueFindVisit(child, opts, status, depth + 1);
-            }
-            closedir(dir);
-        }
-    }
-
-    if (depth >= opts->minDepth) {
-        smallclueFindEval(opts->root, path, &st, status);
-    }
-    return 0;
-}
-
-static int smallclueFindCommand(int argc, char **argv) {
-    const char *start = ".";
-    SmallclueFindOptions opts;
-    memset(&opts, 0, sizeof(opts));
-    opts.maxDepth = -1;
-
-    int index = 1;
-    if (index < argc && argv[index] && argv[index][0] != '-') {
-        start = argv[index++];
-    }
-
-    /* -maxdepth/-mindepth are global traversal options in real find, not
-     * expression terms -- pull them out wherever they appear before handing
-     * the rest to the boolean-expression parser, gathering the survivors into
-     * a vector of our own rather than compacting argv (see
-     * smallclueBorrowArgs). Unlike the other applets these two options take a
-     * value, so a removal drops a pair; that only makes compacting in place
-     * worse, as it would leave TWO stale pointers in the tail. */
-    int nargs = 0;
-    char **args = smallclueBorrowArgs("find", argc, argv, &nargs);
-    if (!args) {
-        return 1;
-    }
-    for (int i = 1; i < index; ++i) {
-        args[nargs++] = argv[i];
-    }
-    for (int i = index; i < argc; ++i) {
-        if (strcmp(argv[i], "-maxdepth") == 0 || strcmp(argv[i], "-mindepth") == 0) {
-            bool isMax = (argv[i][2] == 'a');
-            if (i + 1 >= argc) {
-                fprintf(stderr, "find: missing argument to %s\n", argv[i]);
-                free(args);
-                return 1;
-            }
-            int value = atoi(argv[i + 1]);
-            if (isMax) opts.maxDepth = value; else opts.minDepth = value;
-            ++i; /* the value goes with it */
-            continue;
-        }
-        args[nargs++] = argv[i];
-    }
-
-    /* An -exec node keeps a slice of this vector (node->execArgv), so args has
-     * to stay alive across the walk below, not just the parse. */
-    bool hadAction = false;
-    int parseIdx = index;
-    SmallclueFindNode *root = NULL;
-    if (parseIdx < nargs) {
-        root = smallclueFindParseOr(args, nargs, &parseIdx, &hadAction);
-        if (!root) {
-            free(args);
-            return 1;
-        }
-        if (parseIdx != nargs) {
-            fprintf(stderr, "find: unexpected token '%s'\n", args[parseIdx]);
-            free(args);
-            return 1;
-        }
-    }
-    if (!hadAction) {
-        SmallclueFindNode *printNode = (SmallclueFindNode *)calloc(1, sizeof(*printNode));
-        printNode->type = FIND_NODE_PRINT;
-        if (root) {
-            SmallclueFindNode *andNode = (SmallclueFindNode *)calloc(1, sizeof(*andNode));
-            andNode->type = FIND_NODE_AND;
-            andNode->left = root;
-            andNode->right = printNode;
-            root = andNode;
-        } else {
-            root = printNode;
-        }
-    }
-    opts.root = root;
-
-    int status = 0;
-    smallclueFindVisit(start, &opts, &status, 0);
-    free(args);
-    return status ? 1 : 0;
-}
-
 static const char *smallclueLeafName(const char *path) {
     if (!path) {
         return "";
@@ -23433,8 +22849,6 @@ static int smallclueMkdirParents(const char *path, mode_t mode, bool verbose) {
     free(mutable_path);
     return 0;
 }
-
-
 
 static int smallclueRmdirPath(const char *path, bool parents, bool verbose) {
     if (rmdir(path) != 0) {
@@ -24886,8 +24300,6 @@ static int smallclueStatCommand(int argc, char **argv) {
     free(args);
     return status;
 }
-
-
 
 static char *smallclueSearchPath(const char *name) {
     if (!name || !*name) {
