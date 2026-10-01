@@ -15,6 +15,7 @@
 #include "sed_app.h"
 #include "stty_app.h"
 #include "ln_app.h"
+#include "sort_app.h"
 #include "tail_app.h"
 #include "head_app.h"
 #include "app_hooks.h"
@@ -1472,7 +1473,6 @@ static int smallclueTouchCommand(int argc, char **argv);
 static int smallclueTsetCommand(int argc, char **argv);
 static int smallclueTtyCommand(int argc, char **argv);
 static int smallclueResizeCommand(int argc, char **argv);
-static int smallclueSortCommand(int argc, char **argv);
 static int smallclueUniqCommand(int argc, char **argv);
 static int smallclueCutCommand(int argc, char **argv);
 static int smallclueTrCommand(int argc, char **argv);
@@ -3912,18 +3912,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  owner kept), -s separate files, -z NUL-separated lines, -u unbuffered"},
     {"sleep", "sleep SECONDS\n"
               "  Pause execution"},
-    {"sort", "sort [-r] [-n] [-u] [-k N] [-t SEP] [-c|-C] [-m] [FILE...]\n"
-             "  -r reverse\n"
-             "  -n numeric\n"
-             "  -u unique (after sorting)\n"
-             "  -k N sort by field N through end of line (1-based)\n"
-             "  -t SEP field separator for -k (default: runs of whitespace)\n"
-             "  -c/--check: verify input is already sorted; no output, exits 1\n"
-             "     and reports the first out-of-order line if not\n"
-             "  -C/--check=quiet: like -c but no diagnostic message\n"
-             "  -m/--merge: accepted for compatibility (sorts fully rather\n"
-             "     than doing a true presorted-runs merge; same output)\n"
-             "  Stable: equal-key lines keep their original relative order"},
+    {"sort", "sort [-bdfghiMnRrV] [-k KEYDEF]... [-t SEP] [-o FILE] [-u] [-s] [-m] [-c|-C] [-z] [FILE...]\n"
+           "  Sort lines; GNU sort compatible (byte order)\n"
+           "  -k F[.C][OPTS][,F[.C][OPTS]] keys; -n numeric, -g general, -h human (2K 1G),\n"
+           "  -M month, -V version, -R random; -o FILE output; -m merge sorted files"},
     {"stat", "stat [-L] [-c FORMAT|--format=FORMAT] FILE...\n"
              "  -L follow symlinks\n"
              "  -c/--format FORMAT: %n name %s size %F type %a/%A perms\n"
@@ -6680,182 +6672,6 @@ static int smallclueXargsCommand(int argc, char **argv) {
     }
     smallclueLineVectorFree(&extra);
     return status;
-}
-
-
-static int smallclueLineVectorLoadStream(FILE *fp, const char *path, const char *cmd_name, SmallclueLineVector *vec) {
-    char *line = NULL;
-    size_t cap = 0;
-    int status = 0;
-    while (true) {
-        int read_err = 0;
-        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
-        if (len < 0) {
-            if (read_err) {
-                fprintf(stderr, "%s: %s: %s\n", cmd_name, path ? path : "(stdin)", strerror(read_err));
-                status = 1;
-            }
-            break;
-        }
-        if (!smallclueLineVectorAppend(vec, line, (size_t)len)) {
-            fprintf(stderr, "%s: %s: out of memory\n", cmd_name, path ? path : "(stdin)");
-            status = 1;
-            break;
-        }
-    }
-    free(line);
-    return status;
-}
-
-static int smallclueStringCompare(const void *a, const void *b) {
-    const char *const *lhs = (const char *const *)a;
-    const char *const *rhs = (const char *const *)b;
-    return strcmp(*lhs, *rhs);
-}
-
-/* qsort's comparator signature has no room for a context pointer, so sort's
- * extra options (numeric/key-field/separator) live in this file-scope
- * struct, set immediately before the one qsort() call that uses it. */
-typedef struct {
-    bool numeric;
-    bool stable;    /* -s: keep equal-key lines in input order, no last resort */
-    bool foldCase;  /* -f: compare as though every letter were upper case */
-    bool haveKey;
-    int keyField; /* 1-based; the key runs from here to end-of-line, matching
-                    * GNU sort's own semantics for a bare "-k N" (no ",M" end
-                    * field) */
-    char keySep;  /* 0 = split on runs of whitespace (GNU sort's default) */
-} SmallclueSortOptions;
-
-/* Per invocation: this is one sort's parsed flags, and two concurrent sorts
-   would otherwise read each other's key and ordering. */
-static __thread SmallclueSortOptions gSmallclueSortOpts;
-
-/* Returns a pointer into `line` (no copy) at the start of the requested
- * sort key -- either the whole line, or from the Nth field onward. */
-static const char *smallclueSortKeyOf(const char *line) {
-    if (!gSmallclueSortOpts.haveKey) {
-        return line;
-    }
-    const char *p = line;
-    int field = 1;
-    while (field < gSmallclueSortOpts.keyField && *p) {
-        if (gSmallclueSortOpts.keySep) {
-            while (*p && *p != gSmallclueSortOpts.keySep) p++;
-            if (*p) p++;
-        } else {
-            while (*p && isspace((unsigned char)*p)) p++;
-            while (*p && !isspace((unsigned char)*p)) p++;
-            while (*p && isspace((unsigned char)*p)) p++;
-        }
-        field++;
-    }
-    return p;
-}
-
-/* Key-only comparison. -u groups by this and nothing else: `sort -nu` over
- * lines whose numeric keys all compare equal emits ONE line, even though the
- * lines differ. */
-static int smallclueSortCompareKeys(const void *a, const void *b) {
-    const char *lhs = *(const char *const *)a;
-    const char *rhs = *(const char *const *)b;
-    const char *lkey = smallclueSortKeyOf(lhs);
-    const char *rkey = smallclueSortKeyOf(rhs);
-    if (gSmallclueSortOpts.numeric) {
-        double lv = strtod(lkey, NULL);
-        double rv = strtod(rkey, NULL);
-        if (lv < rv) return -1;
-        if (lv > rv) return 1;
-        return 0;
-    }
-    if (gSmallclueSortOpts.foldCase) {
-        /* GNU sort's -f folds UP, so the ordering matches the C locale's
-         * upper-case run rather than strcasecmp's locale-dependent one. */
-        const unsigned char *l = (const unsigned char *) lkey;
-        const unsigned char *r = (const unsigned char *) rkey;
-        for (; *l && *r; ++l, ++r) {
-            int lc = toupper(*l), rc = toupper(*r);
-            if (lc != rc) return lc < rc ? -1 : 1;
-        }
-        if (*l) return 1;
-        if (*r) return -1;
-        return 0;
-    }
-    return strcmp(lkey, rkey);
-}
-
-/* Ordering comparison. When the keys tie, sort compares the ENTIRE lines as a
- * last resort -- which is why `sort -n` over non-numeric input still comes out
- * alphabetical rather than in input order. -s turns that off and makes the
- * sort stable instead; both were previously missing, so every tie fell back to
- * input order, i.e. -s behaviour whether or not it was asked for. */
-static int smallclueSortCompare(const void *a, const void *b) {
-    int rc = smallclueSortCompareKeys(a, b);
-    if (rc != 0 || gSmallclueSortOpts.stable) {
-        return rc;
-    }
-    return strcmp(*(const char *const *)a, *(const char *const *)b);
-}
-
-/* qsort() isn't guaranteed stable, but GNU sort documents itself as
- * stable (equal-key lines keep their original relative order). A simple
- * bottom-up-recursive merge sort gives that for free (merge always
- * takes the left/earlier run on a tie) without needing to smuggle an
- * original-index tiebreaker through qsort's context-free comparator. */
-static void smallclueSortStableMerge(char **arr, char **temp, size_t lo, size_t mid, size_t hi) {
-    size_t i = lo, j = mid, k = lo;
-    while (i < mid && j < hi) {
-        if (smallclueSortCompare(&arr[i], &arr[j]) <= 0) {
-            temp[k++] = arr[i++];
-        } else {
-            temp[k++] = arr[j++];
-        }
-    }
-    while (i < mid) temp[k++] = arr[i++];
-    while (j < hi) temp[k++] = arr[j++];
-    for (size_t x = lo; x < hi; ++x) arr[x] = temp[x];
-}
-
-static void smallclueSortStableRec(char **arr, char **temp, size_t lo, size_t hi) {
-    if (hi - lo <= 1) return;
-    size_t mid = lo + (hi - lo) / 2;
-    smallclueSortStableRec(arr, temp, lo, mid);
-    smallclueSortStableRec(arr, temp, mid, hi);
-    smallclueSortStableMerge(arr, temp, lo, mid, hi);
-}
-
-static void smallclueSortStable(char **arr, size_t count) {
-    if (count < 2) return;
-    char **temp = (char **)malloc(count * sizeof(char *));
-    if (!temp) {
-        qsort(arr, count, sizeof(char *), smallclueSortCompare);
-        return;
-    }
-    smallclueSortStableRec(arr, temp, 0, count);
-    free(temp);
-}
-
-/* -c/--check: verifies the input is already ordered per the current
- * comparator/reverse settings, printing GNU sort's "disorder" diagnostic
- * (unless quiet) and returning 1 on the first out-of-order pair. */
-static int smallclueSortCheckOrder(const SmallclueLineVector *vec, bool reverse, bool quiet, const char *label) {
-    for (size_t i = 1; i < vec->count; ++i) {
-        int cmp = smallclueSortCompare(&vec->items[i - 1], &vec->items[i]);
-        bool outOfOrder = reverse ? (cmp < 0) : (cmp > 0);
-        if (outOfOrder) {
-            if (!quiet) {
-                char *lineCopy = strdup(vec->items[i]);
-                if (lineCopy) {
-                    size_t len = strlen(lineCopy);
-                    if (len > 0 && lineCopy[len - 1] == '\n') lineCopy[len - 1] = '\0';
-                    fprintf(stderr, "sort: %s:%zu: disorder: %s\n", label ? label : "-", i + 1, lineCopy);
-                    free(lineCopy);
-                }
-            }
-            return 1;
-        }
-    }
-    return 0;
 }
 
 static FILE *smallclueOpenTempFile(const char *tag) {
@@ -13645,7 +13461,7 @@ static const char *smallclueLsGetColor(mode_t mode) {
  *
  * The flag lives in a __thread global rather than being threaded through the
  * dozen ls printers. That is this file's existing pattern for per-invocation
- * applet state (see gSmallclueSortOpts): an applet is a function call running
+ * applet state: an applet is a function call running
  * on its own task thread, so a plain global would be shared between two
  * concurrent `ls` calls in a pipeline and a __thread one is not. */
 static __thread bool gSmallclueLsQuoteNames = false;
@@ -20366,173 +20182,6 @@ static int smallclueResizeCommand(int argc, char **argv) {
     return 0;
 }
 
-static int smallclueSortCommand(int argc, char **argv) {
-    int reverse = 0;
-    bool uniqueOnly = false;
-    bool checkOnly = false;
-    bool checkQuiet = false;
-    memset(&gSmallclueSortOpts, 0, sizeof(gSmallclueSortOpts));
-    int index = 1;
-    while (index < argc) {
-        const char *arg = argv[index];
-        if (!arg || arg[0] != '-') {
-            break;
-        }
-        if (strcmp(arg, "--") == 0) {
-            index++;
-            break;
-        }
-        /* These were exact-match only, so a bundle like `sort -rn` -- which
-         * is how people actually write it -- was rejected as an unknown
-         * option. Each valueless short flag is now read out of a bundle. */
-        if (arg[0] == '-' && arg[1] != '-' && arg[1] != '\0' &&
-            strspn(arg + 1, "rnufbs") == strlen(arg + 1)) {
-            for (const char *p = arg + 1; *p; ++p) {
-                switch (*p) {
-                    case 'r': reverse = 1; break;
-                    case 'n': gSmallclueSortOpts.numeric = true; break;
-                    case 'u': uniqueOnly = true; break;
-                    case 'f': gSmallclueSortOpts.foldCase = true; break;
-                    case 's': gSmallclueSortOpts.stable = true; break;
-                    case 'b': break; /* leading blanks: the key scan skips them */
-                    default: break;
-                }
-            }
-            index++;
-            continue;
-        }
-        if (strcmp(arg, "--ignore-case") == 0) {
-            gSmallclueSortOpts.foldCase = true;
-            index++;
-            continue;
-        }
-        if (strcmp(arg, "--stable") == 0) {
-            gSmallclueSortOpts.stable = true;
-            index++;
-            continue;
-        }
-        if (strcmp(arg, "--reverse") == 0) {
-            reverse = 1;
-            index++;
-            continue;
-        }
-        if (strcmp(arg, "--numeric-sort") == 0) {
-            gSmallclueSortOpts.numeric = true;
-            index++;
-            continue;
-        }
-        if (strcmp(arg, "--unique") == 0) {
-            uniqueOnly = true;
-            index++;
-            continue;
-        }
-        if (strcmp(arg, "-c") == 0 || strcmp(arg, "--check") == 0 || strcmp(arg, "--check=diagnose-first") == 0) {
-            checkOnly = true;
-            index++;
-            continue;
-        }
-        if (strcmp(arg, "-C") == 0 || strcmp(arg, "--check=quiet") == 0 || strcmp(arg, "--check=silent") == 0) {
-            checkOnly = true;
-            checkQuiet = true;
-            index++;
-            continue;
-        }
-        if (strcmp(arg, "-m") == 0 || strcmp(arg, "--merge") == 0) {
-            /* Accepted for compatibility: treated as a full re-sort of
-             * the (assumed-sorted) inputs rather than a true multiway
-             * merge. Output is identical either way -- this just skips
-             * the presorted-runs optimization, matching this codebase's
-             * established scope trade-offs (e.g. diff's O(n*m) DP
-             * instead of full Myers). Nothing else to do here: the
-             * existing full-sort path below already produces the
-             * correct result. */
-            index++;
-            continue;
-        }
-        if (strncmp(arg, "-t", 2) == 0) {
-            if (arg[2] != '\0') {
-                gSmallclueSortOpts.keySep = arg[2];
-                index++;
-            } else {
-                if (index + 1 >= argc || !argv[index + 1][0]) {
-                    fprintf(stderr, "sort: missing separator for -t\n");
-                    return 1;
-                }
-                gSmallclueSortOpts.keySep = argv[index + 1][0];
-                index += 2;
-            }
-            continue;
-        }
-        if (strncmp(arg, "-k", 2) == 0) {
-            const char *valStr = NULL;
-            if (arg[2] != '\0') {
-                valStr = arg + 2;
-                index++;
-            } else {
-                if (index + 1 >= argc) {
-                    fprintf(stderr, "sort: missing field for -k\n");
-                    return 1;
-                }
-                valStr = argv[index + 1];
-                index += 2;
-            }
-            int field = (int)strtol(valStr, NULL, 10);
-            if (field <= 0) {
-                fprintf(stderr, "sort: invalid -k field '%s'\n", valStr);
-                return 1;
-            }
-            gSmallclueSortOpts.haveKey = true;
-            gSmallclueSortOpts.keyField = field;
-            continue;
-        }
-        fprintf(stderr, "sort: unsupported option '%s'\n", arg);
-        return 1;
-    }
-
-    SmallclueLineVector vec = {0};
-    int status = 0;
-    if (index >= argc) {
-        status = smallclueLineVectorLoadStream(stdin, NULL, "sort", &vec);
-    } else {
-        for (int i = index; i < argc && status == 0; ++i) {
-            FILE *fp = fopen(argv[i], "r");
-            if (!fp) {
-                fprintf(stderr, "sort: %s: %s\n", argv[i], strerror(errno));
-                status = 1;
-                break;
-            }
-            status = smallclueLineVectorLoadStream(fp, argv[i], "sort", &vec);
-            fclose(fp);
-        }
-    }
-    if (status == 0 && checkOnly) {
-        /* GNU sort's -c reports FILE:LINE; with a single input source
-         * that's unambiguous, so use the real name. With stdin or
-         * multiple concatenated files there's no one file the global
-         * line number maps to, so fall back to "-". */
-        const char *label = (index < argc && index == argc - 1) ? argv[index] : "-";
-        int rc = smallclueSortCheckOrder(&vec, reverse != 0, checkQuiet, label);
-        smallclueLineVectorFree(&vec);
-        return rc;
-    }
-    if (status == 0 && vec.count > 1) {
-        smallclueSortStable(vec.items, vec.count);
-    }
-    if (status == 0) {
-        char *lastPrinted = NULL;
-        for (size_t k = 0; k < vec.count; ++k) {
-            size_t i = reverse ? (vec.count - 1 - k) : k;
-            if (uniqueOnly && lastPrinted &&
-                smallclueSortCompareKeys(&lastPrinted, &vec.items[i]) == 0) {
-                continue;
-            }
-            fputs(vec.items[i], stdout);
-            lastPrinted = vec.items[i];
-        }
-    }
-    smallclueLineVectorFree(&vec);
-    return status;
-}
 
 typedef struct {
     bool printCounts;
