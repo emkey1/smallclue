@@ -15,6 +15,7 @@
 #include "sed_app.h"
 #include "stty_app.h"
 #include "ln_app.h"
+#include "date_app.h"
 #include "cp_app.h"
 #include "grep_app.h"
 #include "find_app.h"
@@ -1464,7 +1465,6 @@ static int smallclueRsyncCommand(int argc, char **argv);
 static int smallcluePwdCommand(int argc, char **argv);
 static int smallclueEnvCommand(int argc, char **argv);
 static int smallclueChmodCommand(int argc, char **argv);
-static int smallclueDateCommand(int argc, char **argv);
 static int smallclueCalCommand(int argc, char **argv);
 static int smallclueHistoryCommand(int argc, char **argv);
 static int smallclueWcCommand(int argc, char **argv);
@@ -3373,7 +3373,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"rsync", smallclueRsyncCommand, "Synchronize files and directories"},
     {"curl", smallclueCurlCommand, "Transfer data from URLs"},
     {"cut", smallclueCutCommand, "Extract fields from lines"},
-    {"date", smallclueDateCommand, "Display current date/time"},
+    {"date", smallclueDateCommand, "Print or set the date and time"},
     {"dd", smallclueDdCommand, "Convert and copy a file block by block"},
     {"diff", smallclueDiffCommand, "Compare files line by line"},
     {"cmp", smallclueCmpCommand, "Compare two files byte by byte"},
@@ -3568,13 +3568,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "     comma-separated (e.g. 1,3-5)\n"
             "  -d delimiter (default tab)\n"
             "  -s suppress lines with no delimiter (default: print unchanged)"},
-    {"date", "date [-u] [-d STRING] [-s STRING] [+FORMAT]\n"
-             "  Show (or set) date/time\n"
-             "  -u: use UTC instead of local time\n"
-             "  -d/--date=STRING: display STRING's time instead of now\n"
-             "  -s/--set=STRING: set the system clock to STRING, then display it\n"
-             "  STRING accepts \"YYYY-MM-DD[ HH:MM[:SS]]\" (also T-separated\n"
-             "  and '/'-separated) -- not full natural-language date parsing"},
+    {"date", "date [OPTION]... [+FORMAT]\n"
+           "  Print or set the date; GNU date compatible\n"
+           "  -d STRING (@N, ISO 8601, relative: '2 days ago', 'next monday'), -f FILE\n"
+           "  -I[FMT] -R --rfc-3339=FMT -r FILE -s STRING -u; FORMAT takes %N %:z %-d %^a ..."},
     {"dd", "dd [if=FILE] [of=FILE] [bs=N] [count=N] [skip=N] [seek=N] [conv=notrunc]\n"
            "  Block-copy if= to of= (default stdin to stdout, bs=512)\n"
            "  N accepts k/M/G/b/w size suffixes\n"
@@ -18613,132 +18610,6 @@ static int smallclueClearCommand(int argc, char **argv) {
     /* Clear screen and scrollback, then home cursor. */
     fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
     fflush(stdout);
-    return 0;
-}
-
-/* Forward declaration: the ISO-8601-ish string parser was originally
- * written for `touch -d`, but the same shapes are exactly what `date -d`
- * / `date -s` need too -- defined later in this file (touch's section),
- * reused here rather than duplicated. */
-static bool smallclueTouchParseDashD(const char *spec, struct tm *out);
-
-static int smallclueDateCommand(int argc, char **argv) {
-    int arg_index = 1;
-    int use_utc = 0;
-    const char *format = "%a %b %e %T %Z %Y";
-    const char *date_spec = NULL;
-    const char *set_spec = NULL;
-
-    while (arg_index < argc && argv[arg_index] && argv[arg_index][0] == '-') {
-        const char *opt = argv[arg_index];
-        if (strcmp(opt, "-u") == 0 || strcmp(opt, "--utc") == 0 || strcmp(opt, "--universal") == 0) {
-            use_utc = 1;
-            arg_index++;
-            continue;
-        }
-        if (strcmp(opt, "-d") == 0 || strcmp(opt, "--date") == 0) {
-            if (arg_index + 1 >= argc) {
-                fprintf(stderr, "date: option '%s' requires an argument\n", opt);
-                return 1;
-            }
-            date_spec = argv[arg_index + 1];
-            arg_index += 2;
-            continue;
-        }
-        if (strncmp(opt, "--date=", 7) == 0) {
-            date_spec = opt + 7;
-            arg_index++;
-            continue;
-        }
-        if (strcmp(opt, "-s") == 0 || strcmp(opt, "--set") == 0) {
-            if (arg_index + 1 >= argc) {
-                fprintf(stderr, "date: option '%s' requires an argument\n", opt);
-                return 1;
-            }
-            set_spec = argv[arg_index + 1];
-            arg_index += 2;
-            continue;
-        }
-        if (strncmp(opt, "--set=", 6) == 0) {
-            set_spec = opt + 6;
-            arg_index++;
-            continue;
-        }
-        if (strcmp(opt, "--") == 0) {
-            arg_index++;
-            break;
-        }
-        fprintf(stderr, "date: unsupported option '%s'\n", opt);
-        return 1;
-    }
-
-    if (arg_index < argc) {
-        const char *fmt = argv[arg_index];
-        if (fmt && fmt[0] == '+') {
-            format = fmt + 1;
-            arg_index++;
-        } else {
-            fprintf(stderr, "date: invalid format specifier '%s'\n", fmt ? fmt : "(null)");
-            return 1;
-        }
-    }
-
-    if (arg_index < argc) {
-        fprintf(stderr, "date: too many operands\n");
-        return 1;
-    }
-
-    struct tm tm_buf;
-    memset(&tm_buf, 0, sizeof(tm_buf));
-    time_t now;
-
-    const char *parse_spec = set_spec ? set_spec : date_spec;
-    if (parse_spec) {
-        if (!smallclueTouchParseDashD(parse_spec, &tm_buf)) {
-            fprintf(stderr, "date: invalid date '%s'\n", parse_spec);
-            return 1;
-        }
-        now = use_utc ? timegm(&tm_buf) : mktime(&tm_buf);
-        if (now == (time_t)-1) {
-            fprintf(stderr, "date: invalid date '%s'\n", parse_spec);
-            return 1;
-        }
-        if (set_spec) {
-#if defined(PSCAL_TARGET_IOS)
-            /* clock_settime() is unavailable on iOS, and a sandboxed app could not
-               set the system clock even if it were. Fail rather than silently
-               pretending the date was changed. */
-            fprintf(stderr, "date: cannot set date: not supported on iOS\n");
-            return 1;
-#else
-            struct timespec ts = {.tv_sec = now, .tv_nsec = 0};
-            if (clock_settime(CLOCK_REALTIME, &ts) != 0) {
-                fprintf(stderr, "date: cannot set date: %s\n", strerror(errno));
-                return 1;
-            }
-#endif
-        }
-    } else {
-        now = time(NULL);
-        if (now == (time_t)-1) {
-            perror("date");
-            return 1;
-        }
-    }
-
-    struct tm *tm_val = use_utc ? gmtime(&now) : localtime(&now);
-    if (!tm_val) {
-        perror("date");
-        return 1;
-    }
-    tm_buf = *tm_val;
-    char buffer[256];
-    size_t len = strftime(buffer, sizeof(buffer), format, &tm_buf);
-    if (len == 0) {
-        fprintf(stderr, "date: failed to format date\n");
-        return 1;
-    }
-    printf("%s\n", buffer);
     return 0;
 }
 
