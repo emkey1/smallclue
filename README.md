@@ -40,8 +40,8 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **diff**: Compare files line by line; GNU diffutils compatible (normal, `-c`, `-u`, `-e`, `-n`, `-y`, `-r`, `-N`, `-x`, whitespace and case options).
 * **patch**: Apply a unified diff to files.
 * **cmp**: Compare two files byte by byte; GNU diffutils compatible (`-b` `-l` `-s` `-i SKIP1[:SKIP2]` `-n` and SKIP operands with GNU number suffixes).
-* **dd**: Convert and copy a file block by block (`if=`/`of=`/`bs=`/`count=`/`skip=`/`seek=`/`conv=notrunc`).
-* **od**: Dump files in octal/hex/decimal/character format.
+* **dd**: Convert and copy a file; GNU coreutils compatible (every operand, conv, iflag/oflag and status value; GNU's report).
+* **od**: Dump files; GNU coreutils compatible (`-t a c d o u x f` with sizes and `z`, old options, `-A -j -N -w -v -S --endian`, traditional offsets).
 
 ### Archives & Compression
 * **tar**: Create, extract, or list tar archives (`-c`/`-x`/`-t`, `-z` for `.tar.gz`).
@@ -63,9 +63,9 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **sum**: BSD and System V checksums; GNU coreutils compatible.
 * **seq**: Print number sequences; GNU coreutils compatible (`-f -s -w`, decimal/exponent/hex operands, exact decimal stepping).
 * **nl**: Number lines; GNU coreutils compatible (`-b/-h/-f a|t|n|pBRE`, `-v -i -l -n -w -s -p -d`, logical page sections).
-* **tac**: Concatenate and print files with lines in reverse order.
+* **tac**: Print files last record first; GNU coreutils compatible (`-b -r -s`, GNU's backward search and regex syntax).
 * **rev**: Reverse the characters of each line.
-* **fold**: Wrap each line to a given width (`-w`, `-s` break at whitespace).
+* **fold**: Wrap lines; GNU coreutils compatible (`-b -s -w`, the obsolete `-NUM`).
 * **paste**: Merge corresponding lines of files side by side (`-d`, `-s`).
 * **split**: Split a file into pieces by line count or byte count (`-l`, `-b`).
 * **fmt**: Reflow text into filled paragraphs (`-w` width, default 75).

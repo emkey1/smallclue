@@ -1,107 +1,207 @@
 /*
- * tac: entirely absent before this. Prints lines in reverse order --
- * "cat backwards", useful for reading recent log entries first.
- *
- * Real tac keeps each line's trailing separator attached to the END of
- * that line's own record rather than treating the separator as a
- * standalone token, which produces a specific (verified against real
- * GNU tac) result for input with no final trailing newline: the last
- * "line" (no newline) ends up glued onto the front of the line that
- * becomes first after reversal, with no newline between them. This
- * implementation reproduces that exactly by reading the whole file into
- * memory and reversing record boundaries the same way (newline stays
- * attached to the preceding text).
+ * tac: GNU coreutils 9 compatible. Records end with the separator (or,
+ * with -b, begin with it), found by GNU's backward search -- each match
+ * the one starting latest, within what is left -- so a regex (-r, in GNU
+ * regex's default Emacs syntax: + and ? are operators, | ( ) { } literal,
+ * \| \( \) the operators) splits "22" by [0-9]+ into two separators, as
+ * GNU does. An empty separator is a NUL. Each FILE reversed on its own.
  */
 
 #include "tac_app.h"
 
+#include "app_hooks.h"
+#include "gnu_getopt.h"
+#include "gnu_regex.h"
+#include "gnu_util.h"
+
 #include <errno.h>
+#include <regex.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static int smallclueTacPrintReversed(FILE *in, const char *label) {
-    char *data = NULL;
-    size_t len = 0;
-    size_t cap = 0;
-    char buf[16384];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
-        if (len + n > cap) {
-            size_t newCap = cap ? cap * 2 : 16384;
-            while (newCap < len + n) newCap *= 2;
-            char *resized = (char *)realloc(data, newCap);
-            if (!resized) {
-                fprintf(stderr, "tac: out of memory\n");
-                free(data);
-                return 1;
+typedef struct {
+    const char *sep;
+    size_t sepLen;
+    bool before, isRegex;
+    regex_t re;
+} Tac;
+
+/* GNU regex's Emacs syntax as an ERE. */
+static char *tacEmacsToEre(const char *s) {
+    size_t n = strlen(s);
+    char *out = (char *)malloc(n * 2 + 1), *o = out;
+    if (!out) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (c == '\\' && i + 1 < n) {
+            char d = s[++i];
+            if (d == '(' || d == ')' || d == '|') *o++ = d;
+            else if (d == '{' || d == '}') { *o++ = '\\'; *o++ = d; }
+            else { *o++ = '\\'; *o++ = d; }
+        } else if (c == '(' || c == ')' || c == '|' || c == '{' || c == '}') {
+            *o++ = '\\';
+            *o++ = c;
+        } else if (c == '[') {
+            /* a bracket expression passes through whole */
+            size_t j = i + 1;
+            if (j < n && s[j] == '^') j++;
+            if (j < n && s[j] == ']') j++;
+            while (j < n && s[j] != ']') {
+                if (s[j] == '[' && j + 1 < n && (s[j + 1] == ':' || s[j + 1] == '.' || s[j + 1] == '=')) {
+                    char close = s[j + 1];
+                    j += 2;
+                    while (j + 1 < n && !(s[j] == close && s[j + 1] == ']')) j++;
+                    j += 2;
+                } else {
+                    j++;
+                }
             }
-            data = resized;
-            cap = newCap;
-        }
-        memcpy(data + len, buf, n);
-        len += n;
-    }
-    if (ferror(in)) {
-        fprintf(stderr, "tac: %s: read error\n", label);
-        free(data);
-        return 1;
-    }
-
-    /* Record boundaries: position 0, then every index right after a '\n',
-     * then len itself (covering a final partial record with no trailing
-     * newline). Building this list explicitly avoids an off-by-one when
-     * deciding whether a record's own trailing newline is included. */
-    size_t *bounds = (size_t *)malloc(sizeof(size_t) * (len + 2));
-    if (!bounds) {
-        fprintf(stderr, "tac: out of memory\n");
-        free(data);
-        return 1;
-    }
-    size_t boundCount = 0;
-    bounds[boundCount++] = 0;
-    for (size_t i = 0; i < len; ++i) {
-        if (data[i] == '\n') {
-            bounds[boundCount++] = i + 1;
+            size_t len = (j < n ? j + 1 : n) - i;
+            memcpy(o, s + i, len);
+            o += len;
+            i += len - 1;
+        } else {
+            *o++ = c;
         }
     }
-    if (boundCount == 0 || bounds[boundCount - 1] != len) {
-        bounds[boundCount++] = len;
-    }
-
-    for (size_t b = boundCount - 1; b > 0; --b) {
-        size_t start = bounds[b - 1];
-        size_t recEnd = bounds[b];
-        fwrite(data + start, 1, recEnd - start, stdout);
-    }
-    free(bounds);
-    free(data);
-    return 0;
+    *o = '\0';
+    return out;
 }
 
-int smallclueTacCommand(int argc, char **argv) {
-    int status = 0;
-    if (argc <= 1) {
-        status = smallclueTacPrintReversed(stdin, "(stdin)");
-    } else {
-        for (int i = 1; i < argc; ++i) {
-            FILE *in = stdin;
-            bool needClose = false;
-            if (strcmp(argv[i], "-") != 0) {
-                in = fopen(argv[i], "rb");
-                if (!in) {
-                    fprintf(stderr, "tac: %s: %s\n", argv[i], strerror(errno));
-                    status = 1;
-                    continue;
-                }
-                needClose = true;
+/* The separator latest-starting within [0, limit); false if none. */
+static bool tacFind(Tac *t, const char *buf, size_t limit, size_t *ms, size_t *me) {
+    if (!t->isRegex) {
+        if (limit < t->sepLen) return false;
+        for (size_t p = limit - t->sepLen + 1; p-- > 0;)
+            if (!memcmp(buf + p, t->sep, t->sepLen)) {
+                *ms = p;
+                *me = p + t->sepLen;
+                return true;
             }
-            if (smallclueTacPrintReversed(in, argv[i]) != 0) {
-                status = 1;
-            }
-            if (needClose) fclose(in);
+        return false;
+    }
+    /* each search gives the leftmost match from x; walking x forward lists
+     * every start, and the last one wins */
+    bool found = false;
+    size_t x = 0;
+    while (x < limit) {
+        regmatch_t m[1];
+        m[0].rm_so = (regoff_t)x;
+        m[0].rm_eo = (regoff_t)limit;
+        if (regexec(&t->re, buf, 1, m, REG_STARTEND | (x ? REG_NOTBOL : 0)) != 0) break;
+        if (m[0].rm_eo > m[0].rm_so) {
+            *ms = (size_t)m[0].rm_so;
+            *me = (size_t)m[0].rm_eo;
+            found = true;
         }
+        x = (size_t)m[0].rm_so + 1;
+    }
+    return found;
+}
+
+static void tacOutput(Tac *t, const char *buf, size_t len) {
+    size_t pastEnd = len, limit = len, ms, me;
+    while (tacFind(t, buf, limit, &ms, &me)) {
+        size_t from = t->before ? ms : me;
+        fwrite(buf + from, 1, pastEnd - from, stdout);
+        pastEnd = from;
+        limit = ms;
+    }
+    fwrite(buf, 1, pastEnd, stdout);
+}
+
+static const GnuLongOpt tacLongs[] = {
+    {"before", GNU_NO_ARG, 'b'}, {"regex", GNU_NO_ARG, 'r'}, {"separator", GNU_REQ_ARG, 's'},
+    {"help", GNU_NO_ARG, 1},     {"version", GNU_NO_ARG, 2},
+};
+
+int smallclueTacCommand(int argc, char **argv) {
+    GnuGetopt g;
+    gnuGetoptInit(&g, argc, argv, "tac", "brs:", tacLongs, sizeof(tacLongs) / sizeof(tacLongs[0]));
+    Tac t;
+    memset(&t, 0, sizeof(t));
+    t.sep = "\n";
+    int c, status = 0;
+    bool reOk = false;
+    char q[4096];
+    while ((c = gnuGetopt(&g)) != -1) {
+        switch (c) {
+        case 'b': t.before = true; break;
+        case 'r': t.isRegex = true; break;
+        case 's': t.sep = g.arg; break;
+        case 1:
+            fputs("Usage: tac [OPTION]... [FILE]...\n"
+                  "Write each FILE to standard output, last line first.\n\n"
+                  "With no FILE, or when FILE is -, read standard input.\n\n"
+                  "Mandatory arguments to long options are mandatory for short options too.\n"
+                  "  -b, --before             attach the separator before instead of after\n"
+                  "  -r, --regex              interpret the separator as a regular expression\n"
+                  "  -s, --separator=STRING   use STRING as the separator instead of newline\n"
+                  "      --help        display this help and exit\n"
+                  "      --version     output version information and exit\n",
+                  stdout);
+            goto done;
+        case 2: puts("tac (SmallCLUE) 9.4"); goto done;
+        default:
+            fputs("Try 'tac --help' for more information.\n", stderr);
+            status = 1;
+            goto done;
+        }
+    }
+    t.sepLen = strlen(t.sep);
+    if (t.sepLen == 0) t.sepLen = 1;   /* "": the NUL byte */
+    if (t.isRegex) {
+        char *ere = tacEmacsToEre(t.sep);
+        int rc = ere ? regcomp(&t.re, ere, gnuRegexFlags(REG_EXTENDED)) : REG_ESPACE;
+        free(ere);
+        if (rc != 0) {
+            fprintf(stderr, "tac: %s\n", gnuRegexMessage(rc));
+            status = 1;
+            goto done;
+        }
+        reOk = true;
+    }
+    for (int i = 0; i < (g.nops ? g.nops : 1); i++) {
+        const char *name = g.nops ? g.ops[i] : "-";
+        bool isStdin = !strcmp(name, "-");
+        FILE *f = isStdin ? stdin : smallclueAppOpenRead(name);
+        if (!f) {
+            fprintf(stderr, "tac: failed to open %s for reading: %s\n", gnuQuote(name, q, sizeof(q)), strerror(errno));
+            status = 1;
+            continue;
+        }
+        char *buf = NULL;
+        size_t len = 0, cap = 0, n;
+        for (;;) {
+            if (len + 65536 + 1 > cap) {
+                cap = cap ? cap * 2 : 131072;
+                char *p = (char *)realloc(buf, cap);
+                if (!p) break;
+                buf = p;
+            }
+            n = fread(buf + len, 1, cap - len - 1, f);
+            if (n == 0) break;
+            len += n;
+        }
+        if (ferror(f)) {
+            fprintf(stderr, "tac: %s: read error: %s\n", gnuQuoteMaybe(name, q, sizeof(q)), strerror(errno));
+            status = 1;
+        } else if (buf) {
+            buf[len] = '\0';
+            tacOutput(&t, buf, len);
+        }
+        free(buf);
+        if (isStdin) clearerr(stdin);
+        else fclose(f);
+    }
+done:
+    if (reOk) regfree(&t.re);
+    gnuGetoptFree(&g);
+    if (fflush(stdout) != 0 && status == 0) {
+        gnuWriteError("tac", errno);
+        status = 1;
     }
     return status;
 }

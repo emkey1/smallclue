@@ -1,124 +1,173 @@
 /*
- * fold: entirely absent before this. Wraps long lines to a fixed width --
- * useful for viewing wide output (log lines, generated code) in a
- * narrow terminal or piping into something that assumes bounded width.
- *
- * Scope note: width is a plain character count (no tab-expansion-to-8-
- * column-stops or wide-character/locale awareness); verified against
- * real GNU fold for plain ASCII input, which is the overwhelming common
- * case for this utility.
+ * fold: GNU coreutils 9 compatible -- GNU's fold_file: columns by byte,
+ * with backspace, carriage return and tab stops (8) unless -b counts every
+ * byte as one; -s breaks after the last blank and rescans the rest; the
+ * obsolete -NUM width; GNU's messages.
  */
 
 #include "fold_app.h"
 
-#include <ctype.h>
+#include "app_hooks.h"
+#include "gnu_getopt.h"
+#include "gnu_util.h"
+
 #include <errno.h>
+#include <inttypes.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static void smallclueFoldWrapLine(const char *line, size_t len, int width, bool spaceBreak, bool hadNewline) {
-    size_t pos = 0;
-    while (pos < len) {
-        size_t remaining = len - pos;
-        if (remaining <= (size_t)width) {
-            fwrite(line + pos, 1, remaining, stdout);
-            if (hadNewline) putchar('\n');
-            pos = len;
-            break;
-        }
-        size_t chunkEnd = pos + (size_t)width;
-        size_t breakAt = chunkEnd; /* exclusive end of what we print this line */
-        if (spaceBreak) {
-            size_t lastSpace = (size_t)-1;
-            for (size_t i = pos; i < chunkEnd; ++i) {
-                if (isspace((unsigned char)line[i])) lastSpace = i;
-            }
-            if (lastSpace != (size_t)-1) {
-                breakAt = lastSpace + 1;
-            }
-        }
-        fwrite(line + pos, 1, breakAt - pos, stdout);
-        putchar('\n');
-        pos = breakAt;
-    }
-    if (len == 0 && hadNewline) {
-        putchar('\n');
-    }
+static size_t foldColumn(size_t col, int c, bool bytes) {
+    if (bytes) return col + 1;
+    if (c == '\b') return col > 0 ? col - 1 : 0;
+    if (c == '\r') return 0;
+    if (c == '\t') return col + 8 - col % 8;
+    return col + 1;
 }
 
-static int smallclueFoldStream(FILE *in, const char *label, int width, bool spaceBreak) {
-    char *line = NULL;
-    size_t cap = 0;
-    ssize_t n;
-    while ((n = getline(&line, &cap, in)) != -1) {
-        bool hadNewline = (n > 0 && line[n - 1] == '\n');
-        size_t contentLen = hadNewline ? (size_t)(n - 1) : (size_t)n;
-        smallclueFoldWrapLine(line, contentLen, width, spaceBreak, hadNewline);
+static bool foldFile(FILE *in, size_t width, bool bytes, bool spaces) {
+    size_t cap = 256, off = 0, col = 0;
+    char *line = (char *)malloc(cap);
+    if (!line) return false;
+    int c;
+    while ((c = getc(in)) != EOF) {
+        if (off + 2 >= cap) {
+            cap *= 2;
+            char *p = (char *)realloc(line, cap);
+            if (!p) break;
+            line = p;
+        }
+        if (c == '\n') {
+            line[off++] = (char)c;
+            fwrite(line, 1, off, stdout);
+            col = off = 0;
+            continue;
+        }
+    rescan:
+        col = foldColumn(col, c, bytes);
+        if (col > width) {
+            if (spaces) {
+                size_t end = off;
+                bool blank = false;
+                while (end) {
+                    --end;
+                    if (line[end] == ' ' || line[end] == '\t') {
+                        blank = true;
+                        break;
+                    }
+                }
+                if (blank) {
+                    end++;
+                    fwrite(line, 1, end, stdout);
+                    putchar('\n');
+                    memmove(line, line + end, off - end);
+                    off -= end;
+                    col = 0;
+                    for (size_t i = 0; i < off; i++) col = foldColumn(col, (unsigned char)line[i], bytes);
+                    goto rescan;
+                }
+            }
+            if (off == 0) {
+                line[off++] = (char)c;
+                continue;
+            }
+            line[off++] = '\n';
+            fwrite(line, 1, off, stdout);
+            col = off = 0;
+            goto rescan;
+        }
+        line[off++] = (char)c;
     }
+    if (off) fwrite(line, 1, off, stdout);
     free(line);
-    if (ferror(in)) {
-        fprintf(stderr, "fold: %s: read error\n", label);
-        return 1;
-    }
-    return 0;
+    return true;
 }
+
+static const GnuLongOpt foldLongs[] = {
+    {"bytes", GNU_NO_ARG, 'b'}, {"spaces", GNU_NO_ARG, 's'}, {"width", GNU_REQ_ARG, 'w'},
+    {"help", GNU_NO_ARG, 1},    {"version", GNU_NO_ARG, 2},
+};
 
 int smallclueFoldCommand(int argc, char **argv) {
-    int width = 80;
-    bool spaceBreak = false;
-    int argi = 1;
-    for (; argi < argc; ++argi) {
-        const char *arg = argv[argi];
-        if (strcmp(arg, "-s") == 0) {
-            spaceBreak = true;
-        } else if (strcmp(arg, "-w") == 0) {
-            if (argi + 1 >= argc) {
-                fprintf(stderr, "fold: option requires an argument -- 'w'\n");
-                return 1;
+    GnuGetopt g;
+    gnuGetoptInit(&g, argc, argv, "fold", "bsw:0::1::2::3::4::5::6::7::8::9::", foldLongs,
+                  sizeof(foldLongs) / sizeof(foldLongs[0]));
+    bool bytes = false, spaces = false;
+    size_t width = 80;
+    int c, status = 0;
+    char q[512], digits[64];
+    while ((c = gnuGetopt(&g)) != -1) {
+        const char *w = NULL;
+        switch (c) {
+        case 'b': bytes = true; break;
+        case 's': spaces = true; break;
+        case 'w': w = g.arg; break;
+        case 1:
+            fputs("Usage: fold [OPTION]... [FILE]...\n"
+                  "Wrap input lines in each FILE, writing to standard output.\n\n"
+                  "With no FILE, or when FILE is -, read standard input.\n\n"
+                  "Mandatory arguments to long options are mandatory for short options too.\n"
+                  "  -b, --bytes         count bytes rather than columns\n"
+                  "  -s, --spaces        break at spaces\n"
+                  "  -w, --width=WIDTH   use WIDTH columns instead of 80\n"
+                  "      --help        display this help and exit\n"
+                  "      --version     output version information and exit\n",
+                  stdout);
+            goto done;
+        case 2: puts("fold (SmallCLUE) 9.4"); goto done;
+        default:
+            if (c >= '0' && c <= '9') {
+                snprintf(digits, sizeof(digits), "%c%s", c, g.arg ? g.arg : "");
+                w = digits;
+                break;
             }
-            width = atoi(argv[++argi]);
-        } else if (strncmp(arg, "-w", 2) == 0 && arg[2] != '\0') {
-            width = atoi(arg + 2);
-        } else if (strcmp(arg, "--") == 0) {
-            argi++;
-            break;
-        } else if (arg[0] == '-' && arg[1] != '\0' && !isdigit((unsigned char)arg[1])) {
-            fprintf(stderr, "fold: unsupported option '%s'\n", arg);
-            return 1;
-        } else if (arg[0] == '-' && isdigit((unsigned char)arg[1])) {
-            width = atoi(arg + 1);
-        } else {
-            break;
+            fputs("Try 'fold --help' for more information.\n", stderr);
+            status = 1;
+            goto done;
         }
-    }
-    if (width <= 0) {
-        fprintf(stderr, "fold: invalid width\n");
-        return 1;
-    }
-
-    int status = 0;
-    if (argi >= argc) {
-        status = smallclueFoldStream(stdin, "(stdin)", width, spaceBreak);
-    } else {
-        for (; argi < argc; ++argi) {
-            FILE *in = stdin;
-            bool needClose = false;
-            if (strcmp(argv[argi], "-") != 0) {
-                in = fopen(argv[argi], "r");
-                if (!in) {
-                    fprintf(stderr, "fold: %s: %s\n", argv[argi], strerror(errno));
-                    status = 1;
-                    continue;
-                }
-                needClose = true;
-            }
-            if (smallclueFoldStream(in, argv[argi], width, spaceBreak) != 0) {
+        if (w) {
+            char *end;
+            errno = 0;
+            intmax_t v = strtoimax(w, &end, 10);
+            if (end == w || *end) {
+                fprintf(stderr, "fold: invalid number of columns: %s\n", gnuQuoteLocale(w, q, sizeof(q)));
                 status = 1;
+                goto done;
             }
-            if (needClose) fclose(in);
+            if (errno == ERANGE || v < 1 || (uintmax_t)v > SIZE_MAX - 9) {
+                /* xdectoumax: out of range, overflow included, is ERANGE */
+                fprintf(stderr, "fold: invalid number of columns: %s: Numerical result out of range\n",
+                        gnuQuoteLocale(w, q, sizeof(q)));
+                status = 1;
+                goto done;
+            }
+            width = (size_t)v;
         }
+    }
+    for (int i = 0; i < (g.nops ? g.nops : 1); i++) {
+        const char *name = g.nops ? g.ops[i] : "-";
+        bool isStdin = !strcmp(name, "-");
+        FILE *f = isStdin ? stdin : smallclueAppOpenRead(name);
+        if (!f) {
+            fprintf(stderr, "fold: %s: %s\n", gnuQuoteMaybe(name, q, sizeof(q)), strerror(errno));
+            status = 1;
+            continue;
+        }
+        foldFile(f, width, bytes, spaces);
+        if (ferror(f)) {
+            fprintf(stderr, "fold: %s: %s\n", gnuQuoteMaybe(name, q, sizeof(q)), strerror(errno));
+            status = 1;
+        }
+        if (isStdin) clearerr(stdin);
+        else fclose(f);
+    }
+done:
+    gnuGetoptFree(&g);
+    if (fflush(stdout) != 0 && status == 0) {
+        gnuWriteError("fold", errno);
+        status = 1;
     }
     return status;
 }
