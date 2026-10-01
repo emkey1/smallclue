@@ -15,6 +15,7 @@
 #include "sed_app.h"
 #include "stty_app.h"
 #include "ln_app.h"
+#include "chmod_app.h"
 #include "date_app.h"
 #include "cp_app.h"
 #include "grep_app.h"
@@ -1464,7 +1465,6 @@ static int smallclueInstallCommand(int argc, char **argv);
 static int smallclueRsyncCommand(int argc, char **argv);
 static int smallcluePwdCommand(int argc, char **argv);
 static int smallclueEnvCommand(int argc, char **argv);
-static int smallclueChmodCommand(int argc, char **argv);
 static int smallclueCalCommand(int argc, char **argv);
 static int smallclueHistoryCommand(int argc, char **argv);
 static int smallclueWcCommand(int argc, char **argv);
@@ -3392,7 +3392,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"basename", smallclueBasenameCommand, "Strip directory prefix"},
     {"cal", smallclueCalCommand, "Show a simple calendar"},
     {"cat", smallclueCatCommand, "Concatenate files"},
-    {"chmod", smallclueChmodCommand, "Change file permissions"},
+    {"chmod", smallclueChmodCommand, "Change file mode bits"},
     {"chown", smallclueChownCommand, "Change file owner and group"},
     {"chgrp", smallclueChgrpCommand, "Change file group ownership"},
     {"chroot", smallclueChrootCommand, "Run a command with a new root directory"},
@@ -3560,9 +3560,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  -E show $ at line end  -T show tabs as ^I  -A = -E -T\n"
             "  -s squeeze runs of blank lines to one\n"
             "  (previously any flag was silently treated as a filename)"},
-    {"chmod", "chmod [-R] MODE FILE ...\n"
-              "  MODE forms: u+rwx,g-w,o=r, a-wx, 755, 0644\n"
-              "  -R recursive"},
+    {"chmod", "chmod [OPTION]... MODE[,MODE]... FILE...\n"
+           "  Change file mode bits; GNU chmod compatible\n"
+           "  MODE: [ugoa]*([-+=]([rwxXst]*|[ugo]))+ or octal; -c -f -v -R --reference=FILE"},
     {"chown", "chown [-R] [-h] OWNER[:[GROUP]] FILE ...\n"
               "  Change owner (and optionally group) of each FILE\n"
               "  OWNER[:GROUP]: both numeric IDs and names accepted\n"
@@ -13962,27 +13962,6 @@ static int smallcluePwdCommand(int argc, char **argv) {
     return 0;
 }
 
-#define SMALLCLUE_CHMOD_TARGET_USER 0x1u
-#define SMALLCLUE_CHMOD_TARGET_GROUP 0x2u
-#define SMALLCLUE_CHMOD_TARGET_OTHER 0x4u
-#define SMALLCLUE_CHMOD_TARGET_ALL (SMALLCLUE_CHMOD_TARGET_USER | SMALLCLUE_CHMOD_TARGET_GROUP | SMALLCLUE_CHMOD_TARGET_OTHER)
-
-#define SMALLCLUE_CHMOD_PERM_READ 0x1u
-#define SMALLCLUE_CHMOD_PERM_WRITE 0x2u
-#define SMALLCLUE_CHMOD_PERM_EXEC 0x4u
-#define SMALLCLUE_CHMOD_PERM_ALL (SMALLCLUE_CHMOD_PERM_READ | SMALLCLUE_CHMOD_PERM_WRITE | SMALLCLUE_CHMOD_PERM_EXEC)
-
-typedef struct {
-    unsigned targets;
-    unsigned perms;
-    char op;
-} SmallclueChmodOp;
-
-typedef struct {
-    SmallclueChmodOp ops[16];
-    size_t count;
-} SmallclueChmodSpec;
-
 static bool smallclueChmodParseOctal(const char *spec, mode_t *out_mode) {
     if (!spec || !out_mode) {
         return false;
@@ -13995,204 +13974,6 @@ static bool smallclueChmodParseOctal(const char *spec, mode_t *out_mode) {
     }
     *out_mode = (mode_t)value;
     return true;
-}
-
-static bool smallclueChmodParseSymbolic(const char *spec, SmallclueChmodSpec *out_spec) {
-    if (!spec || !out_spec) {
-        return false;
-    }
-    out_spec->count = 0;
-    const char *cursor = spec;
-    while (*cursor) {
-        if (out_spec->count >= sizeof(out_spec->ops) / sizeof(out_spec->ops[0])) {
-            return false;
-        }
-        unsigned targets = 0;
-        bool saw_target = false;
-        while (*cursor == 'u' || *cursor == 'g' || *cursor == 'o' || *cursor == 'a') {
-            saw_target = true;
-            if (*cursor == 'u') targets |= SMALLCLUE_CHMOD_TARGET_USER;
-            else if (*cursor == 'g') targets |= SMALLCLUE_CHMOD_TARGET_GROUP;
-            else if (*cursor == 'o') targets |= SMALLCLUE_CHMOD_TARGET_OTHER;
-            else if (*cursor == 'a') targets |= SMALLCLUE_CHMOD_TARGET_ALL;
-            cursor++;
-        }
-        if (!saw_target) {
-            targets = SMALLCLUE_CHMOD_TARGET_ALL;
-        }
-        char op = *cursor;
-        if (op != '+' && op != '-' && op != '=') {
-            return false;
-        }
-        cursor++;
-        unsigned perms = 0;
-        while (*cursor == 'r' || *cursor == 'w' || *cursor == 'x') {
-            if (*cursor == 'r') perms |= SMALLCLUE_CHMOD_PERM_READ;
-            else if (*cursor == 'w') perms |= SMALLCLUE_CHMOD_PERM_WRITE;
-            else if (*cursor == 'x') perms |= SMALLCLUE_CHMOD_PERM_EXEC;
-            cursor++;
-        }
-        if (op != '=' && perms == 0) {
-            return false;
-        }
-        SmallclueChmodOp *entry = &out_spec->ops[out_spec->count++];
-        entry->targets = targets;
-        entry->perms = perms;
-        entry->op = op;
-        if (*cursor == ',') {
-            cursor++;
-            continue;
-        } else if (*cursor == '\0') {
-            break;
-        } else {
-            return false;
-        }
-    }
-    return out_spec->count > 0;
-}
-
-static mode_t smallclueChmodMaskForTargets(unsigned targets, unsigned perms) {
-    mode_t mask = 0;
-    if (perms & SMALLCLUE_CHMOD_PERM_READ) {
-        if (targets & SMALLCLUE_CHMOD_TARGET_USER) mask |= S_IRUSR;
-        if (targets & SMALLCLUE_CHMOD_TARGET_GROUP) mask |= S_IRGRP;
-        if (targets & SMALLCLUE_CHMOD_TARGET_OTHER) mask |= S_IROTH;
-    }
-    if (perms & SMALLCLUE_CHMOD_PERM_WRITE) {
-        if (targets & SMALLCLUE_CHMOD_TARGET_USER) mask |= S_IWUSR;
-        if (targets & SMALLCLUE_CHMOD_TARGET_GROUP) mask |= S_IWGRP;
-        if (targets & SMALLCLUE_CHMOD_TARGET_OTHER) mask |= S_IWOTH;
-    }
-    if (perms & SMALLCLUE_CHMOD_PERM_EXEC) {
-        if (targets & SMALLCLUE_CHMOD_TARGET_USER) mask |= S_IXUSR;
-        if (targets & SMALLCLUE_CHMOD_TARGET_GROUP) mask |= S_IXGRP;
-        if (targets & SMALLCLUE_CHMOD_TARGET_OTHER) mask |= S_IXOTH;
-    }
-    return mask;
-}
-
-static mode_t smallclueChmodApplySpec(mode_t current, const SmallclueChmodSpec *spec) {
-    mode_t result = current;
-    if (!spec) {
-        return result;
-    }
-    for (size_t i = 0; i < spec->count; ++i) {
-        const SmallclueChmodOp *op = &spec->ops[i];
-        mode_t mask = smallclueChmodMaskForTargets(op->targets, op->perms);
-        switch (op->op) {
-            case '+':
-                result |= mask;
-                break;
-            case '-':
-                result &= ~mask;
-                break;
-            case '=': {
-                mode_t clearMask = smallclueChmodMaskForTargets(op->targets, SMALLCLUE_CHMOD_PERM_ALL);
-                result &= ~clearMask;
-                result |= mask;
-                break;
-            }
-            default:
-                break;
-        }
-    }
-    return result;
-}
-
-static int smallclueChmodApplySymbolic(const SmallclueChmodSpec *spec, const char *path) {
-    struct stat st;
-    if (stat(path, &st) != 0) {
-        fprintf(stderr, "chmod: %s: %s\n", path, strerror(errno));
-        return -1;
-    }
-    mode_t desired = smallclueChmodApplySpec(st.st_mode, spec);
-    if (chmod(path, desired) != 0) {
-        fprintf(stderr, "chmod: %s: %s\n", path, strerror(errno));
-        return -1;
-    }
-    return 0;
-}
-
-static int smallclueChmodApplyOne(const char *path, bool useOctal, mode_t octalMode,
-                                  const SmallclueChmodSpec *symbolicSpec) {
-    if (useOctal) {
-        if (chmod(path, octalMode) != 0) {
-            fprintf(stderr, "chmod: %s: %s\n", path, strerror(errno));
-            return 1;
-        }
-        return 0;
-    }
-    return smallclueChmodApplySymbolic(symbolicSpec, path);
-}
-
-static int smallclueChmodApplyRecursive(const char *path, bool useOctal, mode_t octalMode,
-                                        const SmallclueChmodSpec *symbolicSpec) {
-    int status = smallclueChmodApplyOne(path, useOctal, octalMode, symbolicSpec);
-    struct stat st;
-    if (lstat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        return status;
-    }
-    DIR *dir = opendir(path);
-    if (!dir) {
-        fprintf(stderr, "chmod: %s: %s\n", path, strerror(errno));
-        return 1;
-    }
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-        char child[PATH_MAX];
-        if (smallclueBuildPath(child, sizeof(child), path, entry->d_name) != 0) {
-            fprintf(stderr, "chmod: %s/%s: %s\n", path, entry->d_name, strerror(errno));
-            status = 1;
-            continue;
-        }
-        if (smallclueChmodApplyRecursive(child, useOctal, octalMode, symbolicSpec) != 0) {
-            status = 1;
-        }
-    }
-    closedir(dir);
-    return status;
-}
-
-static int smallclueChmodCommand(int argc, char **argv) {
-    bool recursive = false;
-    int argi = 1;
-    for (; argi < argc; ++argi) {
-        if (strcmp(argv[argi], "-R") == 0 || strcmp(argv[argi], "-r") == 0 ||
-            strcmp(argv[argi], "--recursive") == 0) {
-            recursive = true;
-        } else {
-            break;
-        }
-    }
-    if (argc - argi < 2) {
-        fprintf(stderr, "usage: chmod [-R] mode file...\n");
-        return 1;
-    }
-    mode_t octalMode = 0;
-    SmallclueChmodSpec symbolicSpec;
-    bool useOctal = smallclueChmodParseOctal(argv[argi], &octalMode);
-    bool useSymbolic = false;
-    if (!useOctal) {
-        useSymbolic = smallclueChmodParseSymbolic(argv[argi], &symbolicSpec);
-    }
-    if (!useOctal && !useSymbolic) {
-        fprintf(stderr, "chmod: invalid mode: %s\n", argv[argi]);
-        return 1;
-    }
-    argi++;
-    int status = 0;
-    for (int i = argi; i < argc; ++i) {
-        int rc = recursive
-                     ? smallclueChmodApplyRecursive(argv[i], useOctal, octalMode, &symbolicSpec)
-                     : smallclueChmodApplyOne(argv[i], useOctal, octalMode, &symbolicSpec);
-        if (rc != 0) {
-            status = 1;
-        }
-    }
-    return status;
 }
 
 static int smallclueTrueCommand(int argc, char **argv) {

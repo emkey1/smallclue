@@ -756,6 +756,7 @@ gcc -std=c99 ${PORTABILITY_DEFS} -DSMALLCLUE_WITH_SH ${EXTRA_C_DEFS} ${DVTM_EXTR
     src/sed_app.c \
     src/stty_app.c \
     src/ln_app.c \
+    src/chmod_app.c \
     src/date_app.c \
     src/cp_app.c \
     src/grep_app.c \
