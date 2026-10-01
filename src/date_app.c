@@ -860,6 +860,12 @@ static bool dateParse(const char *s, struct timespec now, bool utc, struct times
 
 /* --- The command. --- */
 
+/* For touch -d: the parse-datetime grammar, relative to `now`, in local
+ * time. */
+bool smallclueParseDatetime(const char *s, struct timespec now, struct timespec *out) {
+    return dateParse(s, now, false, out);
+}
+
 static int dateTry(void) {
     fputs("Try 'date --help' for more information.\n", stderr);
     return 1;

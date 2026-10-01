@@ -333,7 +333,7 @@ done:
     if (in && in != stdin) fclose(in);
     gnuGetoptFree(&g);
     if ((u.out != stdout ? fclose(u.out) : fflush(stdout)) != 0 && status == 0) {
-        fprintf(stderr, "uniq: write error: %s\n", strerror(errno));
+        gnuWriteError("uniq", errno);
         status = 1;
     }
     return status;

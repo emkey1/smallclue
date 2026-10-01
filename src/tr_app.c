@@ -480,7 +480,7 @@ done:
     trFree(&s2);
     gnuGetoptFree(&g);
     if (fflush(stdout) != 0 && status == 0) {
-        fprintf(stderr, "tr: write error: %s\n", strerror(errno));
+        gnuWriteError("tr", errno);
         status = 1;
     }
     return status;

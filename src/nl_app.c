@@ -332,7 +332,7 @@ done:
     free(nl.delim);
     gnuGetoptFree(&g);
     if (fflush(stdout) != 0 && status == 0) {
-        fprintf(stderr, "nl: write error: %s\n", strerror(errno));
+        gnuWriteError("nl", errno);
         status = 1;
     }
     return status;

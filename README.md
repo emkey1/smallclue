@@ -22,7 +22,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **mv**: Move or rename files.
 * **rm**: Remove files and directories (`-r`/`-R`, `-f`, `-i`, `--preserve-root`).
 * **mkdir** / **rmdir**: Create or remove directories.
-* **touch**: Update file timestamps or create empty files (`-c`, `-d`, `-t`, `-r`).
+* **touch**: Change file timestamps; GNU coreutils compatible (`-a -m --time -c -h -d DATE -r FILE -t STAMP`).
 * **ln**: Make links, compatible with GNU coreutils 9 (`src/ln_app.c`): all four forms (`TARGET LINK`, `TARGET`, `TARGET... DIR`, `-t DIR TARGET...`) and `-s -f -n -T -t -v -i -r -L -P -d/-F -b --backup[=CONTROL] -S`; `-f` replaces atomically. Matches GNU ln 9.4 on 95 cases (resulting tree, output, status).
 * **mount** / **umount**: Add or remove filesystem mounts (real `mount(2)`/`umount(2)` syscall wrappers on Linux; `umount` supports `-l`/`-f` lazy/force unmount).
 * **pwd**: Print working directory.
@@ -32,7 +32,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **chown** / **chgrp**: Change file ownership/group.
 * **chroot**: Run a command (or shell) with a new root directory, optionally dropping to another user/group.
 * **file**: Determine file type.
-* **stat**: Display file status.
+* **stat**: Display file or file-system status; GNU coreutils compatible (every `-c`/`--printf` directive with widths and precision, `-L -f -t`).
 * **basename** / **dirname**: Parse path components (multi-operand support; `basename` supports a `SUFFIX` operand).
 * **find**: Search for files and directories (`-name`, `-type`, `-exec`, `-delete`, `-maxdepth`/`-mindepth`, `-mtime`/`-newer`, `-size`, `-print0`, and full boolean logic: `-a`/`-and` (implicit between adjacent terms), `-o`/`-or`, `!`/`-not`, `\( \)` grouping).
 * **readlink** / **realpath**: Print resolved symbolic links or canonicalized absolute paths.
@@ -61,7 +61,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **tr**: Translate, squeeze or delete characters; GNU coreutils compatible (escapes, ranges, `[:class:]`, `[=c=]`, `[c*n]`, `-c -d -s -t`, GNU's validation messages).
 * **tee**: Read from standard input and write to standard output and files.
 * **sum**: BSD/SysV checksum utility.
-* **seq**: Print a sequence of numbers (`-w` zero-pad, `-s` separator, floating-point).
+* **seq**: Print number sequences; GNU coreutils compatible (`-f -s -w`, decimal/exponent/hex operands, exact decimal stepping).
 * **nl**: Number lines; GNU coreutils compatible (`-b/-h/-f a|t|n|pBRE`, `-v -i -l -n -w -s -p -d`, logical page sections).
 * **tac**: Concatenate and print files with lines in reverse order.
 * **rev**: Reverse the characters of each line.

@@ -15,6 +15,8 @@
 #include "sed_app.h"
 #include "stty_app.h"
 #include "ln_app.h"
+#include "stat_app.h"
+#include "touch_app.h"
 #include "tr_app.h"
 #include "uniq_app.h"
 #include "ls_app.h"
@@ -1470,7 +1472,6 @@ static int smallclueCalCommand(int argc, char **argv);
 static int smallclueHistoryCommand(int argc, char **argv);
 static int smallclueWcCommand(int argc, char **argv);
 static int smallclueDuCommand(int argc, char **argv);
-static int smallclueTouchCommand(int argc, char **argv);
 static int smallclueTsetCommand(int argc, char **argv);
 static int smallclueTtyCommand(int argc, char **argv);
 static int smallclueResizeCommand(int argc, char **argv);
@@ -1507,7 +1508,6 @@ static bool smallclueSessionPtyName(char *buf, size_t buf_len);
 static int smallclueRmdirCommand(int argc, char **argv);
 static int smallclueTypeCommand(int argc, char **argv);
 static int smallclueFileCommand(int argc, char **argv);
-static int smallclueStatCommand(int argc, char **argv);
 static int __attribute__((unused)) smallclueLicensesCommand(int argc, char **argv);
 static const char *smallclueLeafName(const char *path);
 static int smallclueBuildPath(char *buf, size_t buf_size, const char *dir, const char *leaf);
@@ -3800,9 +3800,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "           u1/u2/u4 (unsigned decimal), c (character)\n"
            "  -c: shorthand for -t c\n"
            "  -v: accepted for compatibility (repeated lines are never collapsed)"},
-    {"seq", "seq [-w] [-s SEP] [FIRST [INCREMENT]] LAST\n"
-            "  Print a sequence of numbers; -w zero-pads to equal width,\n"
-            "  -s SEP sets the separator (default newline)"},
+    {"seq", "seq [OPTION]... [FIRST [INCREMENT]] LAST\n"
+           "  Print a sequence of numbers; GNU coreutils compatible\n"
+           "  -f FORMAT, -s STRING, -w; exact decimal stepping"},
     {"nl", "nl [OPTION]... [FILE]...\n"
            "  Number lines; GNU coreutils compatible\n"
            "  -b/-h/-f a|t|n|pBRE, -v N, -i N, -l N, -n ln|rn|rz, -w N, -s STR, -p, -d CC"},
@@ -3906,12 +3906,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  Sort lines; GNU sort compatible (byte order)\n"
            "  -k F[.C][OPTS][,F[.C][OPTS]] keys; -n numeric, -g general, -h human (2K 1G),\n"
            "  -M month, -V version, -R random; -o FILE output; -m merge sorted files"},
-    {"stat", "stat [-L] [-c FORMAT|--format=FORMAT] FILE...\n"
-             "  -L follow symlinks\n"
-             "  -c/--format FORMAT: %n name %s size %F type %a/%A perms\n"
-             "    %u/%g uid/gid %U/%G user/group %i inode %h links\n"
-             "    %d device %b blocks %B block-size %f raw mode(hex)\n"
-             "    %X/%Y/%Z atime/mtime/ctime (epoch seconds), %% literal %"},
+    {"stat", "stat [OPTION]... FILE...\n"
+           "  Display file or file system status; GNU coreutils compatible\n"
+           "  -c FORMAT, --printf=FORMAT, -L, -f, -t"},
     {"stty", "stty [-F DEVICE] [-a|-g] [SETTING]...\n"
              "  Print or change terminal settings, compatible with GNU stty: every\n"
              "  mode, raw/cooked/sane/cbreak and the other combinations, control\n"
@@ -3978,12 +3975,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -r report terminal type\n"
              "  -Q quiet, -I skip init\n"
              "  -e/-i/-k set erase/intr/kill chars"},
-    {"touch", "touch [-c] [-a] [-m] [-r REFFILE|-t STAMP|-d STRING] FILE...\n"
-              "  Update timestamps or create empty file\n"
-              "  -c no-create  -a access-time-only  -m mtime-only\n"
-              "  -r REFFILE: copy REFFILE's timestamps\n"
-              "  -t [[CC]YY]MMDDhhmm[.ss]\n"
-              "  -d STRING: ISO-ish date (\"YYYY-MM-DD[ HH:MM[:SS]]\")"},
+    {"touch", "touch [OPTION]... FILE...\n"
+           "  Change file timestamps; GNU coreutils compatible\n"
+           "  -a -m --time, -c, -h, -d DATE, -r FILE, -t [[CC]YY]MMDDhhmm[.ss]"},
     {"timeout", "timeout [-s SIGNAL] [-k DURATION] [--preserve-status] DURATION COMMAND [ARG...]\n"
                 "  Run COMMAND, terminating it if it's still running after DURATION\n"
                 "  DURATION accepts an optional s/m/h/d suffix (default seconds)\n"
@@ -17907,241 +17901,8 @@ bool smallclueAppRunInProcess(int argc, char **argv, int *status) {
     return false;
 }
 
-/* Parses touch -t's [[CC]YY]MMDDhhmm[.ss] compact timestamp form. The
- * digit count before an optional ".ss" suffix tells us which of the three
- * year-width variants we're looking at. */
-static bool smallclueTouchParseDashT(const char *spec, struct tm *out) {
-    memset(out, 0, sizeof(*out));
-    out->tm_isdst = -1;
-    char digits[13];
-    int seconds = 0;
-    const char *dot = strchr(spec, '.');
-    size_t digitLen = dot ? (size_t)(dot - spec) : strlen(spec);
-    if (dot) {
-        if (strlen(dot + 1) != 2 || !isdigit((unsigned char)dot[1]) || !isdigit((unsigned char)dot[2])) {
-            return false;
-        }
-        seconds = (dot[1] - '0') * 10 + (dot[2] - '0');
-    }
-    if (digitLen != 8 && digitLen != 10 && digitLen != 12) {
-        return false;
-    }
-    if (digitLen >= sizeof(digits)) {
-        return false;
-    }
-    for (size_t i = 0; i < digitLen; ++i) {
-        if (!isdigit((unsigned char)spec[i])) {
-            return false;
-        }
-        digits[i] = spec[i];
-    }
-    digits[digitLen] = '\0';
 
-    int year = -1;
-    const char *rest = digits;
-    if (digitLen == 12) {
-        char century[3] = {digits[0], digits[1], '\0'};
-        char yy[3] = {digits[2], digits[3], '\0'};
-        year = atoi(century) * 100 + atoi(yy);
-        rest = digits + 4;
-    } else if (digitLen == 10) {
-        char yy[3] = {digits[0], digits[1], '\0'};
-        int yyVal = atoi(yy);
-        year = (yyVal < 69) ? 2000 + yyVal : 1900 + yyVal; /* POSIX pivot */
-        rest = digits + 2;
-    } else {
-        time_t now = time(NULL);
-        struct tm nowTm;
-        localtime_r(&now, &nowTm);
-        year = nowTm.tm_year + 1900;
-    }
-    char mm[3] = {rest[0], rest[1], '\0'};
-    char dd[3] = {rest[2], rest[3], '\0'};
-    char hh[3] = {rest[4], rest[5], '\0'};
-    char min[3] = {rest[6], rest[7], '\0'};
-    out->tm_year = year - 1900;
-    out->tm_mon = atoi(mm) - 1;
-    out->tm_mday = atoi(dd);
-    out->tm_hour = atoi(hh);
-    out->tm_min = atoi(min);
-    out->tm_sec = seconds;
-    return true;
-}
 
-/* Supports the common, unambiguous date-string shapes real scripts use.
- * Full natural-language parsing (GNU coreutils' "getdate" grammar --
- * "yesterday", "next monday", "+1 day") is a much larger feature and out
- * of scope here; this covers explicit ISO-8601-ish timestamps. */
-static bool smallclueTouchParseDashD(const char *spec, struct tm *out) {
-    static const char *formats[] = {
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d",
-        "%Y/%m/%d %H:%M:%S",
-        "%Y/%m/%d",
-    };
-    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); ++i) {
-        memset(out, 0, sizeof(*out));
-        out->tm_isdst = -1;
-        char *end = strptime(spec, formats[i], out);
-        if (end && *end == '\0') {
-            return true;
-        }
-    }
-    return false;
-}
-
-static int smallclueTouchCommand(int argc, char **argv) {
-    bool noCreate = false;
-    bool accessOnly = false;
-    bool modifyOnly = false;
-    const char *refFile = NULL;
-    const char *tSpec = NULL;
-    const char *dSpec = NULL;
-
-    int argi = 1;
-    for (; argi < argc; ++argi) {
-        const char *arg = argv[argi];
-        if (strcmp(arg, "--") == 0) {
-            argi++;
-            break;
-        }
-        if (strcmp(arg, "-c") == 0 || strcmp(arg, "--no-create") == 0) {
-            noCreate = true;
-        } else if (strcmp(arg, "-a") == 0) {
-            accessOnly = true;
-        } else if (strcmp(arg, "-m") == 0) {
-            modifyOnly = true;
-        } else if (strcmp(arg, "-r") == 0) {
-            if (argi + 1 >= argc) {
-                fprintf(stderr, "touch: -r requires a reference file\n");
-                return 1;
-            }
-            refFile = argv[++argi];
-        } else if (strncmp(arg, "-r", 2) == 0 && arg[2] != '\0') {
-            refFile = arg + 2;
-        } else if (strcmp(arg, "-t") == 0) {
-            if (argi + 1 >= argc) {
-                fprintf(stderr, "touch: -t requires a timestamp argument\n");
-                return 1;
-            }
-            tSpec = argv[++argi];
-        } else if (strcmp(arg, "-d") == 0) {
-            if (argi + 1 >= argc) {
-                fprintf(stderr, "touch: -d requires a date string\n");
-                return 1;
-            }
-            dSpec = argv[++argi];
-        } else if (arg[0] == '-' && arg[1] != '\0') {
-            fprintf(stderr, "touch: unsupported option '%s'\n", arg);
-            return 1;
-        } else {
-            break;
-        }
-    }
-    if (argi >= argc) {
-        fprintf(stderr, "touch: missing file operand\n");
-        return 1;
-    }
-
-    struct timeval times[2];
-    if (refFile) {
-        struct stat refStat;
-        if (stat(refFile, &refStat) != 0) {
-            fprintf(stderr, "touch: %s: %s\n", refFile, strerror(errno));
-            return 1;
-        }
-        times[0].tv_sec = refStat.st_atime;
-        times[0].tv_usec = 0;
-        times[1].tv_sec = refStat.st_mtime;
-        times[1].tv_usec = 0;
-    } else if (tSpec) {
-        struct tm tmVal;
-        if (!smallclueTouchParseDashT(tSpec, &tmVal)) {
-            fprintf(stderr, "touch: invalid -t timestamp '%s'\n", tSpec);
-            return 1;
-        }
-        time_t t = mktime(&tmVal);
-        if (t == (time_t)-1) {
-            fprintf(stderr, "touch: invalid -t timestamp '%s'\n", tSpec);
-            return 1;
-        }
-        times[0].tv_sec = times[1].tv_sec = t;
-        times[0].tv_usec = times[1].tv_usec = 0;
-    } else if (dSpec) {
-        struct tm tmVal;
-        if (!smallclueTouchParseDashD(dSpec, &tmVal)) {
-            fprintf(stderr, "touch: unrecognized -d date string '%s'\n", dSpec);
-            return 1;
-        }
-        time_t t = mktime(&tmVal);
-        if (t == (time_t)-1) {
-            fprintf(stderr, "touch: invalid -d date string '%s'\n", dSpec);
-            return 1;
-        }
-        times[0].tv_sec = times[1].tv_sec = t;
-        times[0].tv_usec = times[1].tv_usec = 0;
-    } else {
-        if (gettimeofday(&times[0], NULL) != 0) {
-            times[0].tv_sec = time(NULL);
-            times[0].tv_usec = 0;
-        }
-        times[1] = times[0];
-    }
-
-    int status = 0;
-    for (int i = argi; i < argc; ++i) {
-        const char *path = argv[i];
-        if (!path || !*path) {
-            fprintf(stderr, "touch: invalid path\n");
-            status = 1;
-            continue;
-        }
-        const char *target = path;
-#if defined(PSCAL_TARGET_IOS)
-        char expanded[PATH_MAX];
-        if (pathTruncateExpand(path, expanded, sizeof(expanded))) {
-            target = expanded;
-        }
-#endif
-        struct timeval useTimes[2] = {times[0], times[1]};
-        if (accessOnly || modifyOnly) {
-            struct stat existing;
-            if (stat(target, &existing) == 0) {
-                if (accessOnly && !modifyOnly) {
-                    useTimes[1].tv_sec = existing.st_mtime;
-                    useTimes[1].tv_usec = 0;
-                } else if (modifyOnly && !accessOnly) {
-                    useTimes[0].tv_sec = existing.st_atime;
-                    useTimes[0].tv_usec = 0;
-                }
-            }
-        }
-
-        if (noCreate && access(target, F_OK) != 0) {
-            continue;
-        }
-        int fd = openat(AT_FDCWD, target, O_WRONLY | O_CREAT, 0666);
-        if (fd < 0) {
-            fprintf(stderr, "touch: %s: %s\n", target, strerror(errno));
-#if defined(PSCAL_TARGET_IOS)
-            smallclueLogPathExpansion("touch-open-failed", target);
-#endif
-            status = 1;
-            continue;
-        }
-        if (futimes(fd, useTimes) != 0) {
-            fprintf(stderr, "touch: %s: %s\n", target, strerror(errno));
-#if defined(PSCAL_TARGET_IOS)
-            smallclueLogPathExpansion("touch-futimes-failed", target);
-#endif
-            status = 1;
-        }
-        close(fd);
-    }
-    return status ? 1 : 0;
-}
 
 static long smallclueParseLong(const char *text) {
     if (!text) {
@@ -21616,239 +21377,12 @@ static int smallclueFileCommand(int argc, char **argv) {
     return status;
 }
 
-static const char *smallclueStatTypeLabel(const struct stat *st) {
-    if (S_ISREG(st->st_mode)) return "regular file";
-    if (S_ISDIR(st->st_mode)) return "directory";
-    if (S_ISLNK(st->st_mode)) return "symbolic link";
-    if (S_ISCHR(st->st_mode)) return "character special file";
-    if (S_ISBLK(st->st_mode)) return "block special file";
-    if (S_ISFIFO(st->st_mode)) return "fifo";
-    if (S_ISSOCK(st->st_mode)) return "socket";
-    return "unknown";
-}
 
-static char smallclueFileTypeChar(mode_t mode) {
-    if (S_ISDIR(mode)) return 'd';
-    if (S_ISLNK(mode)) return 'l';
-    if (S_ISCHR(mode)) return 'c';
-    if (S_ISBLK(mode)) return 'b';
-    if (S_ISFIFO(mode)) return 'p';
-    if (S_ISSOCK(mode)) return 's';
-    return '-';
-}
 
-static void smallclueStatFormatPerms(char *buf, size_t buflen, mode_t mode) {
-    if (!buf || buflen < 11) {
-        return;
-    }
-    buf[0] = smallclueFileTypeChar(mode);
-    buf[1] = (mode & S_IRUSR) ? 'r' : '-';
-    buf[2] = (mode & S_IWUSR) ? 'w' : '-';
-    buf[3] = (mode & S_IXUSR) ? 'x' : '-';
-    buf[4] = (mode & S_IRGRP) ? 'r' : '-';
-    buf[5] = (mode & S_IWGRP) ? 'w' : '-';
-    buf[6] = (mode & S_IXGRP) ? 'x' : '-';
-    buf[7] = (mode & S_IROTH) ? 'r' : '-';
-    buf[8] = (mode & S_IWOTH) ? 'w' : '-';
-    buf[9] = (mode & S_IXOTH) ? 'x' : '-';
-    buf[10] = '\0';
-}
 
-static void smallclueStatPrintTime(const char *label, time_t value) {
-    char buf[64];
-    struct tm tm_val;
-    if (localtime_r(&value, &tm_val)) {
-        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_val);
-    } else {
-        snprintf(buf, sizeof(buf), "%lld", (long long)value);
-    }
-    printf("%s: %s\n", label, buf);
-}
 
-static int smallclueStatPath(const char *path, bool follow) {
-    char resolved[PATH_MAX];
-    const char *target = smallclueResolvePath(path, resolved, sizeof(resolved));
-    if (!target || *target == '\0') {
-        target = path;
-    }
-    struct stat st;
-    if ((follow ? stat(target, &st) : lstat(target, &st)) != 0) {
-        fprintf(stderr, "stat: %s: %s\n", path, strerror(errno));
-        return 1;
-    }
-    const char *type = smallclueStatTypeLabel(&st);
-    char display_buf[PATH_MAX * 2];
-    const char *display = path;
-    if (!follow && S_ISLNK(st.st_mode)) {
-        char link_target[PATH_MAX];
-        ssize_t len = readlink(target, link_target, sizeof(link_target) - 1);
-        if (len >= 0) {
-            link_target[len] = '\0';
-            snprintf(display_buf, sizeof(display_buf), "%s -> %s", path, link_target);
-            display = display_buf;
-        }
-    }
-    printf("  File: %s\n", display);
-    printf("  Size: %lld\tBlocks: %lld\tIO Block: %ld\t%s\n",
-           (long long)st.st_size,
-           (long long)st.st_blocks,
-           (long)st.st_blksize,
-           type);
-    printf("Device: %llu\tInode: %llu\tLinks: %llu\n",
-           (unsigned long long)st.st_dev,
-           (unsigned long long)st.st_ino,
-           (unsigned long long)st.st_nlink);
-    char perms[11];
-    smallclueStatFormatPerms(perms, sizeof(perms), st.st_mode);
-    struct passwd *pw = getpwuid(st.st_uid);
-    struct group *gr = getgrgid(st.st_gid);
-    printf("Access: (%04o/%s)  Uid: (%u/%s)   Gid: (%u/%s)\n",
-           (unsigned)(st.st_mode & 07777),
-           perms,
-           (unsigned)st.st_uid,
-           pw ? pw->pw_name : "?",
-           (unsigned)st.st_gid,
-           gr ? gr->gr_name : "?");
-    smallclueStatPrintTime("Access", st.st_atime);
-    smallclueStatPrintTime("Modify", st.st_mtime);
-    smallclueStatPrintTime("Change", st.st_ctime);
-    return 0;
-}
 
-/* GNU-stat-style custom format string (-c/--format), e.g. '%s' / '%Y' /
- * '%n (%a)'. Directives: n=name s=size(bytes) b=blocks(512B units)
- * B=block size(bytes) f=raw mode(hex) F=type description a=perms(octal)
- * A=perms(rwx string) u/g=uid/gid U/G=user/group name i=inode h=hardlink
- * count d=device X/Y/Z=atime/mtime/ctime(epoch seconds). %% is a literal
- * '%'; \n and \t are recognized as escapes in the format string itself
- * (matching GNU stat, which supports both since the format is usually
- * passed already-interpreted by the shell, but a smallclue script/rc
- * invocation may pass it raw). */
-static void smallclueStatPrintFormatted(const char *path, const struct stat *st, const char *format) {
-    for (const char *p = format; *p; ++p) {
-        if (*p == '\\' && p[1] == 'n') {
-            putchar('\n');
-            p++;
-        } else if (*p == '\\' && p[1] == 't') {
-            putchar('\t');
-            p++;
-        } else if (*p == '%' && p[1]) {
-            char directive = *++p;
-            switch (directive) {
-                case '%': putchar('%'); break;
-                case 'n': fputs(path, stdout); break;
-                case 's': printf("%lld", (long long)st->st_size); break;
-                case 'b': printf("%lld", (long long)st->st_blocks); break;
-                case 'B': printf("%ld", (long)st->st_blksize); break;
-                case 'f': printf("%x", (unsigned)st->st_mode); break;
-                case 'F': fputs(smallclueStatTypeLabel(st), stdout); break;
-                case 'a': printf("%03o", (unsigned)(st->st_mode & 07777)); break;
-                case 'A': {
-                    char perms[11];
-                    smallclueStatFormatPerms(perms, sizeof(perms), st->st_mode);
-                    fputs(perms, stdout);
-                    break;
-                }
-                case 'u': printf("%u", (unsigned)st->st_uid); break;
-                case 'g': printf("%u", (unsigned)st->st_gid); break;
-                case 'U': {
-                    struct passwd *pw = getpwuid(st->st_uid);
-                    fputs(pw ? pw->pw_name : "?", stdout);
-                    break;
-                }
-                case 'G': {
-                    struct group *gr = getgrgid(st->st_gid);
-                    fputs(gr ? gr->gr_name : "?", stdout);
-                    break;
-                }
-                case 'i': printf("%llu", (unsigned long long)st->st_ino); break;
-                case 'h': printf("%llu", (unsigned long long)st->st_nlink); break;
-                case 'd': printf("%llu", (unsigned long long)st->st_dev); break;
-                case 'X': printf("%lld", (long long)st->st_atime); break;
-                case 'Y': printf("%lld", (long long)st->st_mtime); break;
-                case 'Z': printf("%lld", (long long)st->st_ctime); break;
-                default:
-                    putchar('%');
-                    putchar(directive);
-                    break;
-            }
-        } else {
-            putchar(*p);
-        }
-    }
-    putchar('\n');
-}
 
-static int smallclueStatCommand(int argc, char **argv) {
-    int follow = 0;
-    const char *format = NULL;
-
-    /* Pull out the GNU long form --format=FORMAT before getopt() ever
-     * sees it -- getopt() doesn't understand "--"-prefixed long options
-     * with an "=" value and hard-errors on it ("illegal option"), so this
-     * has to happen first, not as a post-getopt scan. The survivors are
-     * gathered into a vector of our own rather than argv being compacted
-     * in place (see smallclueBorrowArgs). */
-    int nargs = 0;
-    char **args = smallclueBorrowArgs("stat", argc, argv, &nargs);
-    if (!args) {
-        return 1;
-    }
-    for (int i = 1; i < argc; ++i) {
-        if (strncmp(argv[i], "--format=", 9) == 0) {
-            format = argv[i] + 9;
-            continue;
-        }
-        args[nargs++] = argv[i];
-    }
-
-    smallclueResetGetopt();
-    int opt;
-    while ((opt = getopt(nargs, args, "Lc:")) != -1) {
-        switch (opt) {
-            case 'L':
-                follow = 1;
-                break;
-            case 'c':
-                format = optarg;
-                break;
-            default:
-                fprintf(stderr, "stat: usage: stat [-L] [-c FORMAT] FILE...\n");
-                free(args);
-                return 1;
-        }
-    }
-    if (optind >= nargs) {
-        fprintf(stderr, "stat: missing operand\n");
-        free(args);
-        return 1;
-    }
-    int status = 0;
-    for (int i = optind; i < nargs; ++i) {
-        char resolved[PATH_MAX];
-        const char *target = smallclueResolvePath(args[i], resolved, sizeof(resolved));
-        if (!target || *target == '\0') {
-            target = args[i];
-        }
-        if (format) {
-            struct stat st;
-            if ((follow ? stat(target, &st) : lstat(target, &st)) != 0) {
-                fprintf(stderr, "stat: %s: %s\n", args[i], strerror(errno));
-                status = 1;
-                continue;
-            }
-            smallclueStatPrintFormatted(args[i], &st, format);
-            continue;
-        }
-        if (smallclueStatPath(args[i], follow) != 0) {
-            status = 1;
-        } else if (i + 1 < nargs) {
-            putchar('\n');
-        }
-    }
-    free(args);
-    return status;
-}
 
 static char *smallclueSearchPath(const char *name) {
     if (!name || !*name) {

@@ -101,6 +101,20 @@ static inline const char *gnuQuoteLocale(const char *s, char *buf, size_t size) 
     return buf;
 }
 
+/* GNU's "PROG: write error: ..." -- except for EPIPE while SIGPIPE has its
+ * default action, where GNU is already dead from the signal. (A native
+ * program gets that signal only once its stdio call returns, so without
+ * this the message got out first.) */
+#include <errno.h>
+#include <signal.h>
+static inline void gnuWriteError(const char *prog, int err) {
+    if (err == EPIPE) {
+        struct sigaction sa;
+        if (sigaction(SIGPIPE, NULL, &sa) == 0 && sa.sa_handler == SIG_DFL) return;
+    }
+    fprintf(stderr, "%s: write error: %s\n", prog, strerror(err));
+}
+
 /* GNU's yesno(): one line from stdin, yes when it starts with y or Y. */
 static inline bool gnuYes(void) {
     char line[256];
