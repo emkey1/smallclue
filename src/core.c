@@ -3606,9 +3606,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  skip=N/seek=N: skip N input/output blocks before copying\n"
            "  conv=notrunc: don't truncate an existing output file first\n"
            "  Prints a records-in/records-out/bytes summary to stderr"},
-    {"diff", "diff [-u] [-q] FILE1 FILE2\n"
-             "  Unified diff (only mode implemented); -q brief \"differ\" message\n"
-             "  Exit status: 0 same, 1 differ, 2 error. No directory comparison."},
+    {"diff", "diff [OPTION]... FILE1 FILE2\n"
+           "  Compare files line by line; GNU diff compatible (normal, -c, -u, -e, -n, -y)\n"
+           "  -q -s -r -N -x PAT -i -b -w -B -E -Z -I RE -p -t -T --label -a"},
     {"cmp", "cmp [-s] [-l] FILE1 FILE2\n"
             "  Byte-for-byte comparison; default prints the first differing\n"
             "  byte/line offset (or an EOF message if one file is a prefix\n"

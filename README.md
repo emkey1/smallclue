@@ -37,7 +37,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **find**: Search for files and directories (`-name`, `-type`, `-exec`, `-delete`, `-maxdepth`/`-mindepth`, `-mtime`/`-newer`, `-size`, `-print0`, and full boolean logic: `-a`/`-and` (implicit between adjacent terms), `-o`/`-or`, `!`/`-not`, `\( \)` grouping).
 * **readlink** / **realpath**: Print resolved symbolic links or canonicalized absolute paths.
 * **install**: Copy files and set attributes (or create directories), like `make install`'s underlying tool.
-* **diff**: Compare files line by line (`-u` unified, `-q`).
+* **diff**: Compare files line by line; GNU diffutils compatible (normal, `-c`, `-u`, `-e`, `-n`, `-y`, `-r`, `-N`, `-x`, whitespace and case options).
 * **patch**: Apply a unified diff to files.
 * **cmp**: Compare two files byte by byte.
 * **dd**: Convert and copy a file block by block (`if=`/`of=`/`bs=`/`count=`/`skip=`/`seek=`/`conv=notrunc`).
