@@ -165,7 +165,7 @@ typedef struct {
     bool haveInt;
     int outIdx;     /* w W, s///w: index into outputs, -1 none */
     int rfileIdx;   /* R: index into rfiles */
-    char *fileName; /* r */
+    char *fileName; /* r; e: the command, "" for none */
 
     /* s */
     regex_t *re;
@@ -174,6 +174,8 @@ typedef struct {
     bool global;
     long occurrence;
     int printCount;
+    bool eval;      /* s///e */
+    int printPre;   /* p flags written before e: they print before it runs */
 
     /* y */
     unsigned char ymap[256];
@@ -666,7 +668,9 @@ static bool sedEndCommand(SedParser *p, char cmd) {
         p->pos++;
         return true;
     }
-    sedParseError(p, "extra characters after command '%c'", cmd);
+    (void)cmd;
+    p->pos++;   /* GNU counts the offending character */
+    sedParseError(p, "extra characters after command");
     return false;
 }
 
@@ -678,6 +682,16 @@ static char *sedReadToEol(SedParser *p) {
     char *s = strndup(p->s + start, p->pos - start);
     if (p->pos < p->len) p->pos++;
     return s;
+}
+
+/* The file name of r R w W and s///w; NULL, after GNU's message, when none. */
+static char *sedReadFileName(SedParser *p) {
+    sedSkipSpace(p);
+    if (p->pos >= p->len || p->s[p->pos] == '\n') {
+        sedParseError(p, "missing filename in r/R/w/W commands");
+        return NULL;
+    }
+    return sedReadToEol(p);
 }
 
 /* A label: up to ; or newline, trailing blanks dropped. */
@@ -875,8 +889,13 @@ static bool sedParseS(SedParser *p, SedCmd *cmd) {
     cmd->occurrence = 0;
     for (;;) {
         int c = sedPeek(p);
-        if (c == 'g') { cmd->global = true; p->pos++; }
-        else if (c == 'p') { cmd->printCount++; p->pos++; }
+        const char *excess = NULL;
+        if (c == 'g') { excess = cmd->global ? "multiple `g' options to `s' command" : NULL; cmd->global = true; p->pos++; }
+        else if (c == 'p') {
+            excess = cmd->printCount + cmd->printPre ? "multiple `p' options to `s' command" : NULL;
+            if (cmd->eval) cmd->printCount++; else cmd->printPre++;
+            p->pos++;
+        }
         else if (c == 'i' || c == 'I') { icase = true; p->pos++; }
         else if (c == 'm' || c == 'M') { ml = true; p->pos++; }
         else if (c != EOF && isdigit(c)) {
@@ -887,23 +906,35 @@ static bool sedParseS(SedParser *p, SedCmd *cmd) {
                 sedParseError(p, "number option to `s' command may not be zero");
                 return false;
             }
+            if (cmd->occurrence) excess = "multiple number options to `s' command";
             cmd->occurrence = n;
         } else if (c == 'w') {
             p->pos++;
-            char *name = sedReadToEol(p);
-            cmd->outIdx = sedFindOutput(p, name);
+            char *name = sedReadFileName(p);
+            cmd->outIdx = name ? sedFindOutput(p, name) : -1;
             free(name);
             if (cmd->outIdx < 0) {
                 sedBufFree(&pat);
                 return false;
             }
             break;
-        } else if (c == 'e') {
-            sedBufFree(&pat);
-            sedParseError(p, "the `e' flag is not supported");
-            return false;
-        } else {
+        } else if (c == 'e' && !p->prog->posix) {
+            cmd->eval = true;
+            p->pos++;
+        } else if (c == ' ' || c == '\t') {
+            p->pos++;
+        } else if (c == EOF || c == ';' || c == '\n' || c == '}' || c == '#') {
             break;
+        } else {
+            p->pos++;
+            sedBufFree(&pat);
+            sedParseError(p, "unknown option to `s'");
+            return false;
+        }
+        if (excess) {
+            sedBufFree(&pat);
+            sedParseError(p, "%s", excess);
+            return false;
         }
     }
     if (cmd->occurrence == 0) cmd->occurrence = 1;
@@ -1074,17 +1105,19 @@ static bool sedParseScript(SedProgram *prog, const char *script, size_t len) {
                 sedEndCommand(&p, (char)c);
                 break;
             case 'r': {
-                cmd->fileName = sedReadToEol(&p);
+                cmd->fileName = sedReadFileName(&p);
                 break;
             }
             case 'R': {
-                char *name = sedReadToEol(&p);
+                char *name = sedReadFileName(&p);
+                if (!name) break;
                 cmd->rfileIdx = sedFindRFile(prog, name);
                 free(name);
                 break;
             }
             case 'w': case 'W': {
-                char *name = sedReadToEol(&p);
+                char *name = sedReadFileName(&p);
+                if (!name) break;
                 cmd->outIdx = sedFindOutput(&p, name);
                 free(name);
                 break;
@@ -1097,6 +1130,13 @@ static bool sedParseScript(SedProgram *prog, const char *script, size_t len) {
                 break;
             case 'v':
                 free(sedReadLabel(&p));
+                break;
+            case 'e':
+                if (p.prog->posix) {
+                    sedParseError(&p, "unknown command: `%c'", c);
+                    break;
+                }
+                cmd->fileName = sedReadToEol(&p);
                 break;
             default:
                 p.pos--;
@@ -1298,6 +1338,38 @@ static void sedAppendReplacement(SedBuf *out, SedCmd *cmd, const char *s, regmat
     }
 }
 
+/* GNU's e: what `command` writes, run by /bin/sh. Status 4 when it cannot
+ * be started, as GNU's "error in subprocess". */
+static bool sedPipeRead(SedRun *r, const char *command, SedBuf *out) {
+    sedBufSet(out, "", 0);
+    fflush(r->out->fp);
+    FILE *fp = popen(command, "r");
+    if (!fp) {
+        fprintf(stderr, "sed: error in subprocess\n");
+        r->exitCode = 4;
+        r->quit = true;
+        return false;
+    }
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) sedBufAppend(out, buf, n);
+    pclose(fp);
+    return true;
+}
+
+/* The output of the pattern space run as a command, in its place, less one
+ * final delimiter: plain e, and s///e. */
+static void sedEvalPattern(SedRun *r) {
+    SedBuf res = {0};
+    if (!sedPipeRead(r, r->ps.data ? r->ps.data : "", &res)) {
+        sedBufFree(&res);
+        return;
+    }
+    if (res.len && res.data[res.len - 1] == r->prog->delim) res.data[--res.len] = '\0';
+    sedBufFree(&r->ps);
+    r->ps = res;
+}
+
 static bool sedSubstitute(SedRun *r, SedCmd *cmd) {
     SedBuf out = {0};
     sedBufReserve(&out, r->ps.len);
@@ -1353,6 +1425,10 @@ static bool sedSubstitute(SedRun *r, SedCmd *cmd) {
     sedBufFree(&r->ps);
     r->ps = out;
     if (!r->ps.data) sedBufSet(&r->ps, "", 0);
+    if (cmd->eval) {
+        for (int k = 0; k < cmd->printPre; k++) sedOutPattern(r, r->out, r->ps.data, r->ps.len, r->chomped);
+        sedEvalPattern(r);
+    }
     return true;
 }
 
@@ -1599,7 +1675,7 @@ static SedEnd sedExecute(SedRun *r, bool *restartWithoutRead) {
             case 's':
                 if (sedSubstitute(r, cmd)) {
                     r->tflag = true;
-                    for (int k = 0; k < cmd->printCount; k++)
+                    for (int k = 0; k < cmd->printCount + (cmd->eval ? 0 : cmd->printPre); k++)
                         sedOutPattern(r, r->out, r->ps.data, r->ps.len, r->chomped);
                     if (cmd->outIdx >= 0)
                         sedOutPattern(r, sedResolveOutput(r, cmd->outIdx), r->ps.data, r->ps.len, r->chomped);
@@ -1607,6 +1683,19 @@ static SedEnd sedExecute(SedRun *r, bool *restartWithoutRead) {
                 if (r->quit) return SED_END_NOPRINT;
                 break;
             case 'v':
+                break;
+            case 'e':
+                if (!*cmd->fileName) {
+                    sedEvalPattern(r);
+                } else {
+                    SedBuf res = {0};
+                    if (sedPipeRead(r, cmd->fileName, &res)) {
+                        sedOutText(r, r->out, res.data, res.len);
+                        fflush(r->out->fp);
+                    }
+                    sedBufFree(&res);
+                }
+                if (r->quit) return SED_END_NOPRINT;
                 break;
             case 'w':
                 sedOutPattern(r, sedResolveOutput(r, cmd->outIdx), r->ps.data, r->ps.len, r->chomped);

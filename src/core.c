@@ -15,6 +15,7 @@
 #include "sed_app.h"
 #include "stty_app.h"
 #include "ln_app.h"
+#include "uniq_app.h"
 #include "ls_app.h"
 #include "chmod_app.h"
 #include "date_app.h"
@@ -1472,7 +1473,6 @@ static int smallclueTouchCommand(int argc, char **argv);
 static int smallclueTsetCommand(int argc, char **argv);
 static int smallclueTtyCommand(int argc, char **argv);
 static int smallclueResizeCommand(int argc, char **argv);
-static int smallclueUniqCommand(int argc, char **argv);
 static int smallclueCutCommand(int argc, char **argv);
 static int smallclueTrCommand(int argc, char **argv);
 static int smallclueIdCommand(int argc, char **argv);
@@ -3609,13 +3609,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"diff", "diff [OPTION]... FILE1 FILE2\n"
            "  Compare files line by line; GNU diff compatible (normal, -c, -u, -e, -n, -y)\n"
            "  -q -s -r -N -x PAT -i -b -w -B -E -Z -I RE -p -t -T --label -a"},
-    {"cmp", "cmp [-s] [-l] FILE1 FILE2\n"
-            "  Byte-for-byte comparison; default prints the first differing\n"
-            "  byte/line offset (or an EOF message if one file is a prefix\n"
-            "  of the other). FILE may be '-' for stdin (only one side).\n"
-            "  -s: silent, exit status only\n"
-            "  -l: list every differing byte offset with both octal values\n"
-            "  Exit status: 0 same, 1 differ, 2 error"},
+    {"cmp", "cmp [OPTION]... FILE1 [FILE2 [SKIP1 [SKIP2]]]\n"
+           "  Compare two files byte by byte; GNU diffutils compatible\n"
+           "  -b print differing bytes, -l list all, -s status only,\n"
+           "  -i SKIP1[:SKIP2], -n LIMIT"},
     {"dirname", "dirname PATH...\n"
                 "  Strip last path component from each PATH, one per line\n"
                 "  -z/--zero: NUL-terminate output instead of newline"},
@@ -4021,14 +4018,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  -v version\n"
               "  -m machine\n"
               "  -p processor"},
-    {"uniq", "uniq [-c] [-d] [-u] [-i] [-f N] [-s N] [-w N] [FILE]\n"
-             "  -c count\n"
-             "  -d duplicates only\n"
-             "  -u unique only\n"
-             "  -i ignore case when comparing\n"
-             "  -f N: skip the first N whitespace-separated fields\n"
-             "  -s N: additionally skip the first N characters\n"
-             "  -w N: compare at most N characters (default: rest of line)"},
+    {"uniq", "uniq [OPTION]... [INPUT [OUTPUT]]\n"
+           "  Filter adjacent matching lines; GNU coreutils compatible\n"
+           "  -c -d -D --all-repeated[=METHOD] --group[=METHOD] -u -i -f N -s N -w N -z"},
     {"uptime", "uptime [-s]\n"
                "  Show app uptime since launch\n"
                "  -s show system uptime"},
@@ -18579,214 +18571,11 @@ static int smallclueResizeCommand(int argc, char **argv) {
     return 0;
 }
 
-typedef struct {
-    bool printCounts;
-    bool duplicatesOnly; /* -d: only print lines that had at least one repeat */
-    bool uniquesOnly;    /* -u: only print lines that had NO repeats */
-    bool ignoreCase;     /* -i */
-    int skipFields;      /* -f N: skip N leading whitespace-separated fields */
-    int skipChars;       /* -s N: additionally skip N leading characters */
-    int maxChars;         /* -w N: compare at most N characters (0 = rest of line) */
-} SmallclueUniqOptions;
 
-/* Skips `fields` leading whitespace-separated fields (blanks before each
- * field, then the field's non-blank run), matching GNU uniq -f: blanks
- * strictly between the skipped fields and the next one are NOT skipped
- * further, they just become part of the comparison key. */
-static const char *smallclueUniqSkipFields(const char *line, int fields) {
-    const char *p = line;
-    for (int i = 0; i < fields; ++i) {
-        while (*p == ' ' || *p == '\t') p++;
-        if (!*p) break;
-        while (*p && *p != ' ' && *p != '\t') p++;
-    }
-    return p;
-}
 
-static const char *smallclueUniqComparisonKey(const SmallclueUniqOptions *opts, const char *line) {
-    const char *key = line;
-    if (opts->skipFields > 0) {
-        key = smallclueUniqSkipFields(key, opts->skipFields);
-    }
-    if (opts->skipChars > 0) {
-        size_t len = strlen(key);
-        size_t skip = (size_t)opts->skipChars;
-        key += (skip < len) ? skip : len;
-    }
-    return key;
-}
 
-static int smallclueUniqCompareLines(const SmallclueUniqOptions *opts, const char *a, const char *b) {
-    const char *ka = smallclueUniqComparisonKey(opts, a);
-    const char *kb = smallclueUniqComparisonKey(opts, b);
-    if (opts->maxChars > 0) {
-        return opts->ignoreCase ? strncasecmp(ka, kb, (size_t)opts->maxChars)
-                                 : strncmp(ka, kb, (size_t)opts->maxChars);
-    }
-    return opts->ignoreCase ? strcasecmp(ka, kb) : strcmp(ka, kb);
-}
 
-static void smallclueUniqEmit(const SmallclueUniqOptions *opts, const char *line, long count) {
-    if (opts->duplicatesOnly && count < 2) return;
-    if (opts->uniquesOnly && count > 1) return;
-    if (opts->printCounts) {
-        printf("%7ld %s", count, line);
-    } else {
-        fputs(line, stdout);
-    }
-}
 
-static int smallclueUniqStream(FILE *fp, const char *path, const SmallclueUniqOptions *opts) {
-    char *line = NULL;
-    size_t cap = 0;
-    char *prev = NULL;
-    long count = 0;
-    int status = 0;
-    while (true) {
-        int read_err = 0;
-        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
-        if (len < 0) {
-            if (read_err) {
-                fprintf(stderr, "uniq: %s: %s\n",
-                        path ? path : "(stdin)",
-                        strerror(read_err));
-                status = 1;
-            }
-            break;
-        }
-        if (!prev || smallclueUniqCompareLines(opts, prev, line) != 0) {
-            if (prev) {
-                smallclueUniqEmit(opts, prev, count);
-                free(prev);
-            }
-            prev = strdup(line);
-            if (!prev) {
-                fprintf(stderr, "uniq: out of memory\n");
-                status = 1;
-                break;
-            }
-            count = 1;
-        } else {
-            count++;
-        }
-    }
-    if (status == 0 && prev) {
-        smallclueUniqEmit(opts, prev, count);
-    }
-    free(prev);
-    free(line);
-    return status;
-}
-
-static int smallclueUniqCommand(int argc, char **argv) {
-    SmallclueUniqOptions opts;
-    memset(&opts, 0, sizeof(opts));
-    int index = 1;
-    while (index < argc) {
-        const char *arg = argv[index];
-        if (!arg || arg[0] != '-') {
-            break;
-        }
-        if (strcmp(arg, "--") == 0) {
-            index++;
-            break;
-        }
-        if (strcmp(arg, "-c") == 0) {
-            opts.printCounts = true;
-            index++;
-            continue;
-        }
-        if (strcmp(arg, "-d") == 0) {
-            opts.duplicatesOnly = true;
-            index++;
-            continue;
-        }
-        if (strcmp(arg, "-u") == 0) {
-            opts.uniquesOnly = true;
-            index++;
-            continue;
-        }
-        if (strcmp(arg, "-i") == 0) {
-            opts.ignoreCase = true;
-            index++;
-            continue;
-        }
-        if (strcmp(arg, "-f") == 0 || strcmp(arg, "--skip-fields") == 0) {
-            if (index + 1 >= argc) {
-                fprintf(stderr, "uniq: option '%s' requires an argument\n", arg);
-                return 1;
-            }
-            opts.skipFields = atoi(argv[++index]);
-            index++;
-            continue;
-        }
-        if (strncmp(arg, "-f", 2) == 0 && isdigit((unsigned char)arg[2])) {
-            opts.skipFields = atoi(arg + 2);
-            index++;
-            continue;
-        }
-        if (strncmp(arg, "--skip-fields=", 14) == 0) {
-            opts.skipFields = atoi(arg + 14);
-            index++;
-            continue;
-        }
-        if (strcmp(arg, "-s") == 0 || strcmp(arg, "--skip-chars") == 0) {
-            if (index + 1 >= argc) {
-                fprintf(stderr, "uniq: option '%s' requires an argument\n", arg);
-                return 1;
-            }
-            opts.skipChars = atoi(argv[++index]);
-            index++;
-            continue;
-        }
-        if (strncmp(arg, "-s", 2) == 0 && isdigit((unsigned char)arg[2])) {
-            opts.skipChars = atoi(arg + 2);
-            index++;
-            continue;
-        }
-        if (strncmp(arg, "--skip-chars=", 13) == 0) {
-            opts.skipChars = atoi(arg + 13);
-            index++;
-            continue;
-        }
-        if (strcmp(arg, "-w") == 0 || strcmp(arg, "--check-chars") == 0) {
-            if (index + 1 >= argc) {
-                fprintf(stderr, "uniq: option '%s' requires an argument\n", arg);
-                return 1;
-            }
-            opts.maxChars = atoi(argv[++index]);
-            index++;
-            continue;
-        }
-        if (strncmp(arg, "-w", 2) == 0 && isdigit((unsigned char)arg[2])) {
-            opts.maxChars = atoi(arg + 2);
-            index++;
-            continue;
-        }
-        if (strncmp(arg, "--check-chars=", 14) == 0) {
-            opts.maxChars = atoi(arg + 14);
-            index++;
-            continue;
-        }
-        fprintf(stderr, "uniq: unsupported option '%s'\n", arg);
-        return 1;
-    }
-    if (index >= argc) {
-        return smallclueUniqStream(stdin, "(stdin)", &opts);
-    }
-    int status = 0;
-    for (int i = index; i < argc; ++i) {
-        FILE *fp = fopen(argv[i], "r");
-        if (!fp) {
-            fprintf(stderr, "uniq: %s: %s\n", argv[i], strerror(errno));
-            status = 1;
-            continue;
-        }
-        status |= smallclueUniqStream(fp, argv[i], &opts);
-        fclose(fp);
-    }
-    return status;
-}
 
 #define SMALLCLUE_CUT_MAX_RANGES 64
 

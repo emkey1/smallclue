@@ -777,6 +777,7 @@ static bool pExec(Find *f, FindNode *n, FindEntry *e) {
         for (int i = 0; i < n->argc; i++) argv[i] = findReplace(n->argv[i], subst);
         bool go = true;
         if (n->ask) {
+            fflush(stdout);   /* the names printed so far come first, as GNU has it */
             fprintf(stderr, "< %s ... %s > ? ", argv[0], subst);
             fflush(stderr);
             char line[256];

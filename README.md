@@ -39,7 +39,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **install**: Copy files and set attributes (or create directories), like `make install`'s underlying tool.
 * **diff**: Compare files line by line; GNU diffutils compatible (normal, `-c`, `-u`, `-e`, `-n`, `-y`, `-r`, `-N`, `-x`, whitespace and case options).
 * **patch**: Apply a unified diff to files.
-* **cmp**: Compare two files byte by byte.
+* **cmp**: Compare two files byte by byte; GNU diffutils compatible (`-b` `-l` `-s` `-i SKIP1[:SKIP2]` `-n` and SKIP operands with GNU number suffixes).
 * **dd**: Convert and copy a file block by block (`if=`/`of=`/`bs=`/`count=`/`skip=`/`seek=`/`conv=notrunc`).
 * **od**: Dump files in octal/hex/decimal/character format.
 
@@ -55,9 +55,9 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **more** / **less**: File paging filters.
 * **wc**: Word, line, character, and byte count (`-l`, `-w`, `-c`, `-m` locale-aware character count, `-L` max line length).
 * **sort**: Sort lines of text files.
-* **uniq**: Report or omit repeated lines.
+* **uniq**: Report or omit repeated lines; GNU coreutils compatible (`-c` `-d` `-D` `--all-repeated` `--group` `-u` `-i` `-f` `-s` `-w` `-z`, obsolete `-N`/`+N`, INPUT and OUTPUT).
 * **cut**: Remove sections from each line of files.
-* **sed**: POSIX stream editor with the GNU extensions Linux scripts use (`src/sed_app.c`): every command (`{}` `=` `a` `b` `c` `d` `D` `F` `g` `G` `h` `H` `i` `l` `n` `N` `p` `P` `q` `Q` `r` `R` `s` `t` `T` `w` `W` `x` `y` `z` `:`), addresses including `first~step`, `addr,+N`, `0,/re/` and `!`, `s` flags `g` `p` N `w` `i` `m` with `\U`/`\L` case conversion, `-n` `-E` `-i[SUFFIX]` (mode and owner kept) `-s` `-z` `-u`. Output matches GNU sed 4.9 on 134 cases; only `e` (run as a shell command) is left out.
+* **sed**: POSIX stream editor with the GNU extensions Linux scripts use (`src/sed_app.c`): every command (`{}` `=` `a` `b` `c` `d` `D` `F` `g` `G` `h` `H` `i` `l` `n` `N` `p` `P` `q` `Q` `r` `R` `s` `t` `T` `w` `W` `x` `y` `z` `:`), addresses including `first~step`, `addr,+N`, `0,/re/` and `!`, `e` (run a shell command), `s` flags `g` `p` N `w` `e` `i` `m` with `\U`/`\L` case conversion, `-n` `-E` `-i[SUFFIX]` (mode and owner kept) `-s` `-z` `-u`. Output matches GNU sed 4.9 on 159 cases.
 * **tr**: Translate or delete characters.
 * **tee**: Read from standard input and write to standard output and files.
 * **sum**: BSD/SysV checksum utility.
