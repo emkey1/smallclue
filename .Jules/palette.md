@@ -29,3 +29,7 @@
 ## YYYY-MM-DD - Dynamic Full-Width Inverse Video Headers
 **Learning:** Hardcoded inverse video headers in fullscreen applets do not stretch across the terminal, resulting in jagged resizing and poor visual hierarchy.
 **Action:** Always dynamically build header strings using `snprintf`, measure their length, calculate the remaining width via `pscalRuntimeDetectWindowCols()`, and append space padding so the inverse video highlight stretches cleanly across the terminal row.
+
+## YYYY-MM-DD - Dynamic Full-Width Pager Prompts
+**Learning:** Hardcoded inverse video formatting on pager prompts doesn't stretch to the end of the terminal line, resulting in disjointed inverse highlights and an unclear boundary between the prompt and file content when terminal widths vary.
+**Action:** Always assemble the entire prompt text into a single string (via `snprintf`), determine the terminal width with `pscalRuntimeDetectWindowCols()`, pad with spaces up to the terminal width, and emit the combined string so the inverse video covers the entire terminal row.

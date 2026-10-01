@@ -7235,21 +7235,31 @@ static int pagerPromptAndRead(const char *cmd_name, const char *detail) {
     const char *label = pager_command_name(cmd_name);
     bool md_mode = (label && strcmp(label, "md") == 0);
     bool color = smallclueColourWanted();
-    const char *inv = color ? "\033[7m" : "";
-    const char *rst = color ? "\033[0m" : "";
+    char raw_prompt[1024];
     if (detail && *detail) {
         if (md_mode) {
-            fprintf(stdout, "\r%s--%s %s-- (Space=advance, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)%s ",
-                    inv, label, detail, rst);
+            snprintf(raw_prompt, sizeof(raw_prompt), "--%s %s-- (Space=advance, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)", label, detail);
         } else {
-            fprintf(stdout, "\r%s--%s %s-- (Space=advance, b=prev, arrows=scroll, q=next file, Q=exit)%s ",
-                    inv, label, detail, rst);
+            snprintf(raw_prompt, sizeof(raw_prompt), "--%s %s-- (Space=advance, b=prev, arrows=scroll, q=next file, Q=exit)", label, detail);
         }
     } else if (md_mode) {
-        fprintf(stdout, "\r%s--%s-- (Space=advance, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)%s ", inv, label, rst);
+        snprintf(raw_prompt, sizeof(raw_prompt), "--%s-- (Space=advance, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)", label);
     } else {
-        fprintf(stdout, "\r%s--%s-- (Space=advance, b=prev, arrows=scroll, q=quit)%s ", inv, label, rst);
+        snprintf(raw_prompt, sizeof(raw_prompt), "--%s-- (Space=advance, b=prev, arrows=scroll, q=quit)", label);
     }
+
+    if (color) {
+        int cols = pscalRuntimeDetectWindowCols();
+        if (cols <= 0) cols = 80;
+        /* we need to account for the trailing space in non-color mode, which means we pad up to cols - 1 */
+        int raw_len = (int)strlen(raw_prompt);
+        int pad = cols - raw_len - 1;
+        if (pad < 0) pad = 0;
+        fprintf(stdout, "\r\033[7m%s%*s \033[0m", raw_prompt, pad, "");
+    } else {
+        fprintf(stdout, "\r%s ", raw_prompt);
+    }
+
     fflush(stdout);
     int key = pager_read_key();
     fputs("\r\x1b[K", stdout);
