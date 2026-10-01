@@ -19119,6 +19119,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
                 char **resized = (char **)realloc(headers, (size_t)headerCap * sizeof(char *));
                 if (!resized) {
                     fprintf(stderr, "wget: out of memory\n");
+                    smallclueSecureMemzero(userpwdBuf, sizeof(userpwdBuf));
                     free(headers);
                     free(postData);
                     free(args);
@@ -19167,6 +19168,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
             default:
                 fprintf(stderr, "usage: wget [-O file] [--method=METHOD] [--header=HEADER]... [--post-data=DATA]\n"
                                 "            [--user=USER] [--password=PASS] [--no-check-certificate] url...\n");
+                smallclueSecureMemzero(userpwdBuf, sizeof(userpwdBuf));
                 free(headers);
                 free(postData);
                 free(args);
@@ -19175,6 +19177,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
     }
     if (optind >= nargs) {
         fprintf(stderr, "wget: missing URL\n");
+        smallclueSecureMemzero(userpwdBuf, sizeof(userpwdBuf));
         free(headers);
         free(postData);
         free(args);
@@ -19182,6 +19185,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
     }
     if (output_path && (nargs - optind) != 1) {
         fprintf(stderr, "wget: -O is only supported with a single URL\n");
+        smallclueSecureMemzero(userpwdBuf, sizeof(userpwdBuf));
         free(headers);
         free(postData);
         free(args);
@@ -19212,6 +19216,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
         }
         status |= rc;
     }
+    smallclueSecureMemzero(userpwdBuf, sizeof(userpwdBuf));
     free(headers);
     free(postData);
     free(args);
