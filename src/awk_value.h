@@ -18,6 +18,7 @@ AwkValue awkValStrNum(const char *s);   /* from input: numeric-context if it loo
 AwkValue awkValCopy(const AwkValue *v);
 void awkValFree(AwkValue *v);
 
+double awkStrtod(const char *s, char **endp);
 bool awkLooksNumeric(const char *s, double *out);
 
 /* True if this value participates in numeric comparisons (uninitialized,

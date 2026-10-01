@@ -53,7 +53,7 @@ typedef struct {
 
 /* Parses the full program text. On a syntax error, prints a message to
  * stderr (prefixed "awk: syntax error") and returns NULL. */
-AwkProgram *awkParseProgram(const char *src);
+AwkProgram *awkParseProgram(const char *text, const char *srcName);
 
 AwkNode *awkNewNode(AwkNodeKind kind);
 

@@ -10,6 +10,7 @@
 #include "awk_lexer.h"
 
 #include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -36,6 +37,7 @@ static const char *kAwkBuiltins[] = {
     "length", "substr", "index", "split", "sub", "gsub", "match",
     "sprintf", "sin", "cos", "atan2", "exp", "log", "sqrt", "int",
     "rand", "srand", "tolower", "toupper", "system", "close", "fflush",
+    "systime", "strftime", "mktime",
     NULL
 };
 
@@ -48,6 +50,50 @@ void awkLexerInit(AwkLexer *lx, const char *src) {
     lx->parenDepth = 0;
     lx->bracketDepth = 0;
     lx->prevAllowsDivision = 0;
+    lx->srcName = NULL;
+    lx->error = 0;
+}
+
+char *awkUnescape(const char *s) {
+    size_t n = strlen(s);
+    char *out = (char *)malloc(n + 1), *o = out;
+    while (*s) {
+        if (*s != '\\' || !s[1]) { *o++ = *s++; continue; }
+        char e = s[1];
+        s += 2;
+        switch (e) {
+            case 'n': *o++ = '\n'; break;
+            case 't': *o++ = '\t'; break;
+            case 'r': *o++ = '\r'; break;
+            case 'a': *o++ = '\a'; break;
+            case 'b': *o++ = '\b'; break;
+            case 'f': *o++ = '\f'; break;
+            case 'v': *o++ = '\v'; break;
+            case '\\': case '"': case '/': *o++ = e; break;
+            case '\n': break; /* continued on the next line */
+            default:
+                if (e >= '0' && e <= '7') {
+                    int v = e - '0';
+                    for (int k = 0; k < 2 && *s >= '0' && *s <= '7'; ++k) v = v * 8 + (*s++ - '0');
+                    *o++ = (char)v;
+                } else {
+                    *o++ = '\\';
+                    *o++ = e;
+                }
+        }
+    }
+    *o = '\0';
+    return out;
+}
+
+/* mawk: a string or regex may not run past the end of its line. */
+static void awkRunaway(AwkLexer *lx, const char *what, char delim, const char *text) {
+    if (!lx->error) {
+        fputs("awk: ", stderr);
+        if (lx->srcName) fprintf(stderr, "%s: ", lx->srcName);
+        fprintf(stderr, "line %d: runaway %s %c%.10s ...\n", lx->line, what, delim, text ? text : "");
+    }
+    lx->error = 1;
 }
 
 void awkTokenFree(AwkToken *tok) {
@@ -113,7 +159,7 @@ AwkToken awkLexerNext(AwkLexer *lx) {
     AwkToken tok;
     memset(&tok, 0, sizeof(tok));
 
-    int sawSignificantNewline = 0;
+    int sawSignificantNewline = 0, nlLine = 0;
     for (;;) {
         char c = peekc(lx, 0);
         if (c == '\0') break;
@@ -138,6 +184,7 @@ AwkToken awkLexerNext(AwkLexer *lx) {
         if (c == '\n') {
             if (!sawSignificantNewline && !awkNewlineSuppressed(lx)) {
                 sawSignificantNewline = 1;
+                nlLine = lx->line;
             }
             lx->pos++;
             lx->line++;
@@ -148,7 +195,7 @@ AwkToken awkLexerNext(AwkLexer *lx) {
 
     if (sawSignificantNewline) {
         tok.type = AWK_TOK_NEWLINE;
-        tok.line = lx->line;
+        tok.line = nlLine;
         awkSetSignificant(lx, AWK_TOK_NEWLINE, 0);
         return tok;
     }
@@ -229,46 +276,22 @@ AwkToken awkLexerNext(AwkLexer *lx) {
     /* Strings */
     if (c == '"') {
         lx->pos++;
-        char *buf = NULL;
-        size_t len = 0, cap = 0;
-        while (peekc(lx, 0) != '\0' && peekc(lx, 0) != '"') {
-            char ch = peekc(lx, 0);
-            if (ch == '\\') {
-                char esc = peekc(lx, 1);
+        size_t start = lx->pos;
+        while (peekc(lx, 0) != '\0' && peekc(lx, 0) != '"' && peekc(lx, 0) != '\n') {
+            if (peekc(lx, 0) == '\\' && peekc(lx, 1) != '\0') {
+                if (peekc(lx, 1) == '\n') lx->line++;
                 lx->pos += 2;
-                switch (esc) {
-                    case 'n': appendChar(&buf, &len, &cap, '\n'); break;
-                    case 't': appendChar(&buf, &len, &cap, '\t'); break;
-                    case 'r': appendChar(&buf, &len, &cap, '\r'); break;
-                    case '\\': appendChar(&buf, &len, &cap, '\\'); break;
-                    case '"': appendChar(&buf, &len, &cap, '"'); break;
-                    case '/': appendChar(&buf, &len, &cap, '/'); break;
-                    case 'a': appendChar(&buf, &len, &cap, '\a'); break;
-                    case 'b': appendChar(&buf, &len, &cap, '\b'); break;
-                    case 'f': appendChar(&buf, &len, &cap, '\f'); break;
-                    case 'v': appendChar(&buf, &len, &cap, '\v'); break;
-                    default:
-                        if (esc >= '0' && esc <= '7') {
-                            int val = esc - '0';
-                            for (int i = 0; i < 2 && peekc(lx, 0) >= '0' && peekc(lx, 0) <= '7'; ++i) {
-                                val = val * 8 + (peekc(lx, 0) - '0');
-                                lx->pos++;
-                            }
-                            appendChar(&buf, &len, &cap, (char)val);
-                        } else {
-                            appendChar(&buf, &len, &cap, '\\');
-                            appendChar(&buf, &len, &cap, esc);
-                        }
-                        break;
-                }
             } else {
-                appendChar(&buf, &len, &cap, ch);
                 lx->pos++;
             }
         }
+        char *raw = strndup(lx->src + start, lx->pos - start);
+        char *buf = awkUnescape(raw);
+        free(raw);
         if (peekc(lx, 0) == '"') lx->pos++;
+        else awkRunaway(lx, "string constant", '"', buf);
         tok.type = AWK_TOK_STRING;
-        tok.text = buf ? buf : strdup("");
+        tok.text = buf;
         awkSetSignificant(lx, AWK_TOK_STRING, 1);
         return tok;
     }
@@ -311,6 +334,9 @@ AwkToken awkLexerNext(AwkLexer *lx) {
             lx->pos++;
         }
         if (peekc(lx, 0) == '/') lx->pos++;
+        else {
+            awkRunaway(lx, "regular expression", '/', buf);
+        }
         tok.type = AWK_TOK_ERE;
         tok.text = buf ? buf : strdup("");
         awkSetSignificant(lx, AWK_TOK_ERE, 1);

@@ -67,9 +67,14 @@ typedef struct {
     /* Set true right after lexing a NAME/FUNC_NAME/')'/']'/'$'/NUMBER/STRING,
      * so that a following '/' is division, not the start of a regex. */
     int prevAllowsDivision;
+    const char *srcName; /* named in errors, as the parser does */
+    int error;           /* a runaway string or regex was reported */
 } AwkLexer;
 
 void awkLexerInit(AwkLexer *lx, const char *src);
+/* String-literal escapes (\n, \t, \\, octal...) applied to s; the caller frees it.
+ * Also what -v, -F and command-line assignments get. */
+char *awkUnescape(const char *s);
 /* Returns the next token. Caller does not own token.text across calls
  * unless it copies it (strdup) -- the parser copies fields it needs into
  * AST nodes immediately. */

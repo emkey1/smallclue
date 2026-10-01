@@ -43,13 +43,47 @@ AwkValue awkValStr(const char *s) {
     return v;
 }
 
+/* strtod over what awk calls a number -- [sign] digits [. digits] [e[sign]
+ * digits] -- and nothing else: mawk reads "0x1A", "inf" and "nan" as 0. */
+double awkStrtod(const char *s, char **endp) {
+    const char *p = s;
+    while (isspace((unsigned char)*p)) p++;
+    const char *start = p;
+    if (*p == '+' || *p == '-') p++;
+    bool digits = false;
+    while (isdigit((unsigned char)*p)) p++, digits = true;
+    if (*p == '.') {
+        p++;
+        while (isdigit((unsigned char)*p)) p++, digits = true;
+    }
+    if (!digits) {
+        *endp = (char *)s;
+        return 0.0;
+    }
+    if (*p == 'e' || *p == 'E') {
+        const char *q = p + 1;
+        if (*q == '+' || *q == '-') q++;
+        if (isdigit((unsigned char)*q)) {
+            while (isdigit((unsigned char)*q)) q++;
+            p = q;
+        }
+    }
+    char buf[512];
+    size_t n = (size_t)(p - start);
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    memcpy(buf, start, n);
+    buf[n] = '\0';
+    *endp = (char *)p;
+    return strtod(buf, NULL);
+}
+
 bool awkLooksNumeric(const char *s, double *out) {
     if (!s) return false;
     while (isspace((unsigned char)*s)) s++;
     if (*s == '\0') return false;
     const char *start = s;
     char *end = NULL;
-    double d = strtod(start, &end);
+    double d = awkStrtod(start, &end);
     if (end == start) return false;
     while (isspace((unsigned char)*end)) end++;
     if (*end != '\0') return false;
@@ -126,7 +160,7 @@ double awkToNum(const AwkValue *v) {
             const char *s = v->str;
             while (isspace((unsigned char)*s)) s++;
             char *end = NULL;
-            double d = strtod(s, &end);
+            double d = awkStrtod(s, &end);
             if (end == s) return 0.0;
             return d;
         }
@@ -136,8 +170,8 @@ double awkToNum(const AwkValue *v) {
 
 char *awkFormatNum(double d, const char *fmt) {
     char buf[512];
-    if (isnan(d)) { return strdup("nan"); }
-    if (isinf(d)) { return strdup(d < 0 ? "-inf" : "inf"); }
+    if (isnan(d)) { return strdup(signbit(d) ? "-nan" : "+nan"); }   /* as mawk prints them */
+    if (isinf(d)) { return strdup(d < 0 ? "-inf" : "+inf"); }
     /* Check the magnitude bound FIRST: casting a double outside long
      * long's range (e.g. 1e20) to (long long) is undefined behavior in
      * C, caught by UBSan when this was `d == (double)(long long)d &&

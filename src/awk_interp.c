@@ -175,6 +175,7 @@ typedef struct {
     AwkValue returnValue;
     int exitCode;
     bool exiting;
+    bool fatal;          /* a run-time error: no more output, no END */
 
     char *record;
     char **fields;
@@ -182,8 +183,6 @@ typedef struct {
 
     FILE *curFile;
     bool curFileIsOwned;
-    char **argv;
-    int argc;
     int argIndex;
     bool anyFileOpened;
 
@@ -299,7 +298,8 @@ static double awkGetVarNum(const char *name) {
 /* ---------------- Regex helpers ---------------- */
 
 static bool awkRegexCompile(regex_t *re, const char *pattern) {
-    return regcomp(re, pattern, REG_EXTENDED) == 0;
+    /* "" matches the empty string everywhere; regcomp refuses it */
+    return regcomp(re, *pattern ? pattern : "()", REG_EXTENDED) == 0;
 }
 
 /* ---------------- Field management ---------------- */
@@ -490,6 +490,12 @@ static AwkStream *awkFindStream(const char *name) {
 }
 
 static FILE *awkOpenOutputStream(const char *name, AwkRedirKind kind) {
+    /* written through the descriptors already open, as mawk does: opening
+     * /dev/stderr afresh would truncate a file it shares with stdout */
+    if (kind != AWK_REDIR_PIPE) {
+        if (!strcmp(name, "/dev/stdout")) return stdout;
+        if (!strcmp(name, "/dev/stderr")) return stderr;
+    }
     AwkStream *s = awkFindStream(name);
     if (s && s->forWrite) return s->fp;
     const char *mode;
@@ -513,6 +519,7 @@ static FILE *awkOpenOutputStream(const char *name, AwkRedirKind kind) {
 }
 
 static FILE *awkOpenInputStream(const char *name, bool isPipe) {
+    if (!isPipe && (!strcmp(name, "-") || !strcmp(name, "/dev/stdin"))) return stdin;
     AwkStream *s = awkFindStream(name);
     if (s && !s->forWrite) return s->fp;
     FILE *fp = isPipe ? popen(name, "r") : fopen(name, "r");
@@ -560,7 +567,17 @@ static void awkCloseAllStreams(void) {
 static AwkValue awkEval(AwkNode *n);
 static AwkSignal awkExec(AwkNode *n);
 static void awkAssignLvalue(AwkNode *lv, AwkValue val);
-static AwkValue awkEvalLvalueCurrent(AwkNode *lv);
+/* An lvalue with its field number or subscript worked out once, before
+ * the value is read or written: a[i++] += 1 moves i by one. */
+typedef struct {
+    AwkNode *node;
+    int field;
+    char *key;
+} AwkLref;
+
+static AwkLref awkLrefResolve(AwkNode *lv);
+static AwkValue awkLrefGet(const AwkLref *r);
+static void awkLrefSet(AwkLref *r, AwkValue val);
 static bool awkGetlineFillLine(FILE *fp, char **outLine);
 static bool awkNextMainRecord(char **outLine);
 
@@ -575,7 +592,25 @@ static AwkFunc *awkFindFunc(const char *name) {
 
 /* ---------------- sprintf/printf ---------------- */
 
-static char *awkSprintfImpl(const char *fmt, AwkNode **args, int argCount, int startArg) {
+/* mawk's "run time error": the message, where input stood, and exit 2 with
+ * nothing more written and no END. */
+static void awkRuntimeError(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void awkRuntimeError(const char *fmt, ...) {
+    if (gInterp.fatal) return;
+    va_list ap;
+    va_start(ap, fmt);
+    fputs("awk: run time error: ", stderr);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "\n\tFILENAME=\"%s\" FNR=%.6g NR=%.6g\n", awkGetVarStr("FILENAME"), awkGetVarNum("FNR"),
+            awkGetVarNum("NR"));
+    gInterp.fatal = true;
+    gInterp.exiting = true;
+    gInterp.exitCode = 2;
+}
+
+static char *awkSprintfImpl(const char *fmt, AwkNode **args, int argCount, int startArg, const char *who,
+                            size_t *outLen) {
     size_t cap = 256, len = 0;
     char *out = (char *)malloc(cap);
     out[0] = '\0';
@@ -593,11 +628,22 @@ static char *awkSprintfImpl(const char *fmt, AwkNode **args, int argCount, int s
         size_t si = 0;
         spec[si++] = '%';
         while (*p == '-' || *p == '+' || *p == ' ' || *p == '0' || *p == '#') { spec[si++] = *p++; }
-        while (isdigit((unsigned char)*p)) { spec[si++] = *p++; }
+        /* a "*" width or precision takes the next argument */
+        #define AWK_STAR() do { \
+            if (argi >= argCount) { awkRuntimeError("not enough arguments passed to %s(\"%s\")", who, fmt); break; } \
+            AwkValue sv_ = awkEval(args[argi++]); \
+            si += (size_t)snprintf(spec + si, sizeof(spec) - si - 8, "%d", (int)awkToNum(&sv_)); \
+            awkValFree(&sv_); \
+        } while (0)
+        if (*p == '*') { p++; AWK_STAR(); }
+        else while (isdigit((unsigned char)*p) && si < 40) { spec[si++] = *p++; }
         if (*p == '.') {
             spec[si++] = *p++;
-            while (isdigit((unsigned char)*p)) { spec[si++] = *p++; }
+            if (*p == '*') { p++; AWK_STAR(); }
+            else while (isdigit((unsigned char)*p) && si < 40) { spec[si++] = *p++; }
         }
+        #undef AWK_STAR
+        if (gInterp.fatal) break;
         if (!*p) { spec[si] = '\0'; APPEND_STR(specStart); break; }
         char conv = *p++;
         char buf[512];
@@ -607,6 +653,9 @@ static char *awkSprintfImpl(const char *fmt, AwkNode **args, int argCount, int s
             av = awkEval(args[argi]);
             argi++;
             haveArg = true;
+        } else {
+            awkRuntimeError("not enough arguments passed to %s(\"%s\")", who, fmt);
+            break;
         }
         switch (conv) {
             case 'd': case 'i': {
@@ -632,22 +681,23 @@ static char *awkSprintfImpl(const char *fmt, AwkNode **args, int argCount, int s
                 break;
             }
             case 'c': {
-                spec[si++] = 's'; spec[si] = '\0';
-                char cbuf[2] = {0, 0};
-                const char *sarg = cbuf;
-                char *heapStr = NULL;
+                /* a NUL is written too, as mawk does for 0, 256 or "" */
+                spec[si++] = 'c'; spec[si] = '\0';
+                int ch = 0;
                 if (haveArg) {
-                    if (av.kind == AWK_V_STR || (av.kind == AWK_V_STRNUM && !awkIsNumericCtx(&av))) {
-                        cbuf[0] = (av.str && av.str[0]) ? av.str[0] : '\0';
-                    } else if (av.kind == AWK_V_STRNUM) {
-                        cbuf[0] = (av.str && av.str[0]) ? av.str[0] : '\0';
-                    } else {
-                        cbuf[0] = (char)(int)awkToNum(&av);
-                    }
+                    /* a field that looks like a number is one: "65" is A */
+                    if (av.kind == AWK_V_STR || (av.kind == AWK_V_STRNUM && !awkLooksNumeric(av.str, NULL)))
+                        ch = av.str ? (unsigned char)av.str[0] : 0;
+                    else ch = (unsigned char)(int)awkToNum(&av);
                 }
-                (void)heapStr;
-                snprintf(buf, sizeof(buf), spec, sarg);
-                APPEND_STR(buf);
+                int cn = snprintf(buf, sizeof(buf), spec, ch);
+                if (cn > (int)sizeof(buf) - 1) cn = (int)sizeof(buf) - 1;
+                if (cn > 0) {
+                    ENSURE((size_t)cn);
+                    memcpy(out + len, buf, (size_t)cn);
+                    len += (size_t)cn;
+                    out[len] = '\0';
+                }
                 break;
             }
             case 's': {
@@ -672,6 +722,7 @@ static char *awkSprintfImpl(const char *fmt, AwkNode **args, int argCount, int s
     }
     #undef APPEND_STR
     #undef ENSURE
+    if (outLen) *outLen = len;
     return out;
 }
 
@@ -704,75 +755,54 @@ static char *awkBuiltinSubstr(const char *s, double mArg, bool haveN, double nAr
 
 static __thread int gAwkRstart = 0, gAwkRlength = -1;  /* RSTART/RLENGTH */
 
+/* sub/gsub as POSIX and mawk have them: an empty match counts at every
+ * position not right after a previous match (gsub("x*", "-") on "aaa" gives -a-a-a-). */
 static int awkDoSub(const char *pattern, const char *repl, const char *target, bool global, char **outResult) {
     regex_t re;
     if (!awkRegexCompile(&re, pattern)) {
         *outResult = strdup(target);
         return 0;
     }
-    size_t cap = strlen(target) * 2 + 64, len = 0;
+    size_t tlen = strlen(target), cap = tlen * 2 + 64, len = 0;
     char *out = (char *)malloc(cap);
     out[0] = '\0';
     #define ENSURE2(n) do { if (len + (n) + 1 > cap) { while (len + (n) + 1 > cap) cap *= 2; out = (char*)realloc(out, cap); } } while (0)
     #define APPEND_N(s, n) do { ENSURE2(n); memcpy(out+len, s, n); len += (n); out[len]='\0'; } while(0)
-
-    const char *p = target;
+    size_t pos = 0;
+    long lastEnd = -1;
     int count = 0;
-    bool prevEmptyAtStart = false;
-    while (*p) {
+    while (pos <= tlen) {
         regmatch_t m;
-        int rc = regexec(&re, p, 1, &m, (p == target) ? 0 : REG_NOTBOL);
-        if (rc != 0) {
-            APPEND_N(p, strlen(p));
-            break;
-        }
-        APPEND_N(p, (size_t)m.rm_so);
-        if (m.rm_so == m.rm_eo) {
-            /* empty match: emit the char at this position (if any) and advance,
-             * to avoid an infinite loop, matching common awk gsub behavior */
-            if (!global) {
-                for (const char *rp = repl; *rp; ++rp) {
-                    if (*rp == '&') { /* empty match, nothing to substitute */ }
-                    else if (*rp == '\\' && (rp[1] == '&' || rp[1] == '\\')) { char c = rp[1]; APPEND_N(&c, 1); rp++; }
-                    else APPEND_N(rp, 1);
-                }
-                count++;
-                APPEND_N(p + m.rm_so, strlen(p + m.rm_so));
-                p += strlen(p);
-                break;
-            }
-            for (const char *rp = repl; *rp; ++rp) {
-                if (*rp == '&') { }
-                else if (*rp == '\\' && (rp[1] == '&' || rp[1] == '\\')) { char c = rp[1]; APPEND_N(&c, 1); rp++; }
-                else APPEND_N(rp, 1);
-            }
-            count++;
-            if (p[m.rm_so]) {
-                APPEND_N(p + m.rm_so, 1);
-                p += m.rm_so + 1;
-            } else {
-                p += m.rm_so;
-                break;
-            }
-            prevEmptyAtStart = true;
+        if (regexec(&re, target + pos, 1, &m, pos ? REG_NOTBOL : 0) != 0) break;
+        size_t so = pos + (size_t)m.rm_so, eo = pos + (size_t)m.rm_eo;
+        if (so == eo && (long)so == lastEnd) {
+            /* an empty match right after the last one: step over a character */
+            if (so >= tlen) break;
+            APPEND_N(target + pos, so - pos + 1);
+            pos = so + 1;
             continue;
         }
-        prevEmptyAtStart = false;
-        (void)prevEmptyAtStart;
-        const char *matched = p + m.rm_so;
-        size_t matchedLen = (size_t)(m.rm_eo - m.rm_so);
+        APPEND_N(target + pos, so - pos);
         for (const char *rp = repl; *rp; ++rp) {
-            if (*rp == '&') { APPEND_N(matched, matchedLen); }
-            else if (*rp == '\\' && (rp[1] == '&' || rp[1] == '\\')) { char c = rp[1]; APPEND_N(&c, 1); rp++; }
+            if (*rp == '&') APPEND_N(target + so, eo - so);
+            else if (*rp == '\\' && (rp[1] == '&' || rp[1] == '\\')) { APPEND_N(rp + 1, 1); rp++; }
             else APPEND_N(rp, 1);
         }
         count++;
-        p += m.rm_eo;
+        lastEnd = (long)eo;
         if (!global) {
-            APPEND_N(p, strlen(p));
+            pos = eo;
             break;
         }
+        if (eo == so) {
+            if (so >= tlen) { pos = tlen + 1; break; }
+            APPEND_N(target + so, 1);
+            pos = so + 1;
+        } else {
+            pos = eo;
+        }
     }
+    if (pos < tlen) APPEND_N(target + pos, tlen - pos);
     #undef APPEND_N
     #undef ENSURE2
     regfree(&re);
@@ -869,8 +899,10 @@ static AwkValue awkCallBuiltin(AwkNode *call) {
         awkValFree(&rv);
         AwkNode *targetNode = (argc >= 3) ? args[2] : NULL;
         char *targetStr;
+        AwkLref ref = {NULL, 0, NULL};
         if (targetNode) {
-            AwkValue tv = awkEvalLvalueCurrent(targetNode);
+            ref = awkLrefResolve(targetNode);
+            AwkValue tv = awkLrefGet(&ref);
             targetStr = awkToStrFmt(&tv, "%.6g");
             awkValFree(&tv);
         } else {
@@ -879,9 +911,10 @@ static AwkValue awkCallBuiltin(AwkNode *call) {
         char *result;
         int count = awkDoSub(pattern, repl, targetStr, global, &result);
         if (count > 0) {
-            if (targetNode) awkAssignLvalue(targetNode, awkValStr(result));
+            if (targetNode) awkLrefSet(&ref, awkValStr(result));
             else awkSetField(0, result);
         }
+        free(ref.key);
         free(pattern); free(repl); free(targetStr); free(result);
         return awkValNum((double)count);
     }
@@ -915,7 +948,7 @@ static AwkValue awkCallBuiltin(AwkNode *call) {
         AwkValue fv = awkEval(args[0]);
         char *fmt = awkToStrFmt(&fv, "%.6g");
         awkValFree(&fv);
-        char *r = awkSprintfImpl(fmt, args, argc, 1);
+        char *r = awkSprintfImpl(fmt, args, argc, 1, "sprintf", NULL);
         free(fmt);
         AwkValue rv = awkValStr(r);
         free(r);
@@ -959,6 +992,41 @@ static AwkValue awkCallBuiltin(AwkNode *call) {
         prevSeed = newSeed;
         gInterp.randState = newSeed;
         return awkValNum(old);
+    }
+    if (strcmp(name, "systime") == 0) return awkValNum((double)time(NULL));
+    if (strcmp(name, "strftime") == 0) {
+        /* mawk: strftime([format [, timestamp [, utc]]]), "%c" and now by default */
+        char *fmt = NULL;
+        time_t when = time(NULL);
+        bool utc = false;
+        if (argc >= 1) { AwkValue v = awkEval(args[0]); fmt = awkToStrFmt(&v, "%.6g"); awkValFree(&v); }
+        if (argc >= 2) { AwkValue v = awkEval(args[1]); when = (time_t)awkToNum(&v); awkValFree(&v); }
+        if (argc >= 3) { AwkValue v = awkEval(args[2]); utc = awkToNum(&v) != 0; awkValFree(&v); }
+        struct tm tm;
+        char buf[4096] = "";
+        if (utc ? gmtime_r(&when, &tm) : localtime_r(&when, &tm)) strftime(buf, sizeof(buf), fmt ? fmt : "%c", &tm);
+        free(fmt);
+        return awkValStr(buf);
+    }
+    if (strcmp(name, "mktime") == 0) {
+        /* "YYYY MM DD HH MM SS [DST]" in local time, -1 when malformed */
+        AwkValue v = awkEval(args[0]);
+        char *spec = awkToStrFmt(&v, "%.6g");
+        awkValFree(&v);
+        long f[7] = {0, 0, 0, 0, 0, 0, -1};
+        int got = sscanf(spec, "%ld %ld %ld %ld %ld %ld %ld", &f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6]);
+        free(spec);
+        if (got < 6) return awkValNum(-1);
+        struct tm tm;
+        memset(&tm, 0, sizeof(tm));
+        tm.tm_year = (int)(f[0] - 1900);
+        tm.tm_mon = (int)(f[1] - 1);
+        tm.tm_mday = (int)f[2];
+        tm.tm_hour = (int)f[3];
+        tm.tm_min = (int)f[4];
+        tm.tm_sec = (int)f[5];
+        tm.tm_isdst = got == 7 ? (int)f[6] : -1;
+        return awkValNum((double)mktime(&tm));
     }
     if (strcmp(name, "tolower") == 0 || strcmp(name, "toupper") == 0) {
         AwkValue v = awkEval(args[0]);
@@ -1121,83 +1189,75 @@ static AwkValue awkCallUser(AwkNode *call) {
 
 /* ---------------- Lvalue helpers ---------------- */
 
-static int awkSubscriptKey(AwkNode *n, char *buf, size_t bufSize) {
+/* The subscript list joined by SUBSEP; the caller frees it. */
+static char *awkSubscriptKey(AwkNode **list, int count) {
     const char *subsep = awkGetVarStr("SUBSEP");
-    buf[0] = '\0';
-    size_t used = 0;
-    for (int i = 0; i < n->listCount; ++i) {
-        AwkValue v = awkEval(n->list[i]);
-        char *s = awkToStrFmt(&v, "%.6g");
+    char *key = NULL;
+    size_t len = 0;
+    FILE *m = open_memstream(&key, &len);
+    for (int i = 0; i < count; ++i) {
+        AwkValue v = awkEval(list[i]);
+        char *s = awkToStrFmt(&v, awkGetVarStr("CONVFMT"));
         awkValFree(&v);
-        size_t sl = strlen(s);
-        size_t sepl = (i > 0) ? strlen(subsep) : 0;
-        if (used + sl + sepl < bufSize) {
-            if (i > 0) { memcpy(buf + used, subsep, sepl); used += sepl; }
-            memcpy(buf + used, s, sl); used += sl;
-            buf[used] = '\0';
-        }
+        if (i > 0) fputs(subsep, m);
+        fputs(s, m);
         free(s);
     }
-    return (int)used;
+    fclose(m);
+    return key;
 }
 
-static AwkValue awkEvalLvalueCurrent(AwkNode *lv) {
+static AwkLref awkLrefResolve(AwkNode *lv) {
+    AwkLref r = {lv, 0, NULL};
     if (lv->kind == AWK_E_FIELD) {
-        AwkValue idxV = awkEval(lv->a);
-        int idx = (int)awkToNum(&idxV);
-        awkValFree(&idxV);
-        return awkValStrNum(awkGetField(idx));
+        AwkValue v = awkEval(lv->a);
+        r.field = (int)awkToNum(&v);
+        awkValFree(&v);
+    } else if (lv->kind == AWK_E_ARRAYREF) {
+        r.key = awkSubscriptKey(lv->list, lv->listCount);
     }
-    if (lv->kind == AWK_E_VAR) {
-        return awkGetScalar(lv->str);
-    }
+    return r;
+}
+
+static AwkValue awkLrefGet(const AwkLref *r) {
+    AwkNode *lv = r->node;
+    if (lv->kind == AWK_E_FIELD) return awkValStrNum(awkGetField(r->field));
+    if (lv->kind == AWK_E_VAR) return awkGetScalar(lv->str);
     if (lv->kind == AWK_E_ARRAYREF) {
-        char key[512];
-        awkSubscriptKey(lv, key, sizeof(key));
-        AwkArray *arr = awkGetArrayFor(lv->str);
-        AwkArrayEntry *e = awkArrayGetOrCreate(arr, key);
+        AwkArrayEntry *e = awkArrayGetOrCreate(awkGetArrayFor(lv->str), r->key);
         return awkValCopy(&e->val);
     }
     return awkEval(lv);
 }
 
-static void awkAssignLvalue(AwkNode *lv, AwkValue val) {
+/* Stores val (taking it) and releases the reference. */
+static void awkLrefSet(AwkLref *r, AwkValue val) {
+    AwkNode *lv = r->node;
     if (lv->kind == AWK_E_FIELD) {
-        AwkValue idxV = awkEval(lv->a);
-        int idx = (int)awkToNum(&idxV);
-        awkValFree(&idxV);
-        if (idx == 0) {
-            char *s = awkToStrFmt(&val, "%.6g");
-            awkSetField(0, s);
-            free(s);
-        } else {
-            char *s = awkToStrFmt(&val, "%.6g");
-            awkSetField(idx, s);
-            free(s);
-        }
+        char *s = awkToStrFmt(&val, "%.6g");
+        awkSetField(r->field, s);
+        free(s);
         awkValFree(&val);
-        return;
-    }
-    if (lv->kind == AWK_E_VAR) {
-        if (strcmp(lv->str, "NF") == 0) {
-            int nf = (int)awkToNum(&val);
-            awkValFree(&val);
-            awkSetNF(nf);
-            return;
-        }
+    } else if (lv->kind == AWK_E_VAR && strcmp(lv->str, "NF") == 0) {
+        int nf = (int)awkToNum(&val);
+        awkValFree(&val);
+        awkSetNF(nf);
+    } else if (lv->kind == AWK_E_VAR) {
         awkSetScalar(lv->str, val);
-        return;
-    }
-    if (lv->kind == AWK_E_ARRAYREF) {
-        char key[512];
-        awkSubscriptKey(lv, key, sizeof(key));
-        AwkArray *arr = awkGetArrayFor(lv->str);
-        AwkArrayEntry *e = awkArrayGetOrCreate(arr, key);
+    } else if (lv->kind == AWK_E_ARRAYREF) {
+        AwkArrayEntry *e = awkArrayGetOrCreate(awkGetArrayFor(lv->str), r->key);
         awkValFree(&e->val);
         e->val = val;
-        return;
+    } else {
+        awkValFree(&val);
     }
-    awkValFree(&val);
+    free(r->key);
+    r->key = NULL;
+}
+
+static void awkAssignLvalue(AwkNode *lv, AwkValue val) {
+    AwkLref r = awkLrefResolve(lv);
+    awkLrefSet(&r, val);
 }
 
 /* ---------------- getline ---------------- */
@@ -1217,15 +1277,16 @@ static AwkValue awkEvalGetline(AwkNode *n) {
         awkValFree(&fv);
         FILE *fp = awkOpenInputStream(fname, false);
         free(fname);
-        if (fp) ok = awkGetlineFillLine(fp, &line);
-        if (ok && !n->a) awkSetScalar("NR", awkValNum(awkGetVarNum("NR") + 1));
+        if (!fp) return awkValNum(-1);
+        ok = awkGetlineFillLine(fp, &line);   /* "getline < file" sets $0 and NF, not NR */
     } else { /* CMD */
         AwkValue cv = awkEval(n->b);
         char *cmd = awkToStrFmt(&cv, "%.6g");
         awkValFree(&cv);
         FILE *fp = awkOpenInputStream(cmd, true);
         free(cmd);
-        if (fp) ok = awkGetlineFillLine(fp, &line);
+        if (!fp) return awkValNum(-1);
+        ok = awkGetlineFillLine(fp, &line);
         if (ok) {
             awkSetScalar("NR", awkValNum(awkGetVarNum("NR") + 1));
         }
@@ -1266,21 +1327,23 @@ static AwkValue awkEval(AwkNode *n) {
             return awkValStrNum(awkGetField(idx));
         }
         case AWK_E_ARRAYREF: {
-            char key[512];
-            awkSubscriptKey(n, key, sizeof(key));
-            AwkArray *arr = awkGetArrayFor(n->str);
-            AwkArrayEntry *e = awkArrayGetOrCreate(arr, key);
+            char *key = awkSubscriptKey(n->list, n->listCount);
+            AwkArrayEntry *e = awkArrayGetOrCreate(awkGetArrayFor(n->str), key);
+            free(key);
             return awkValCopy(&e->val);
         }
         case AWK_E_GROUP:
             return awkEval(n->list[0]);
         case AWK_E_ASSIGN: {
+            /* mawk's order: the place, then the right side, then the
+             * current value -- x += x++ sees the new x */
+            AwkLref ref = awkLrefResolve(n->a);
             AwkValue rhs;
             if (n->op == AWK_TOK_ASSIGN) {
                 rhs = awkEval(n->b);
             } else {
-                AwkValue cur = awkEvalLvalueCurrent(n->a);
                 AwkValue rv = awkEval(n->b);
+                AwkValue cur = awkLrefGet(&ref);
                 double a = awkToNum(&cur), b = awkToNum(&rv);
                 awkValFree(&cur); awkValFree(&rv);
                 double r;
@@ -1296,7 +1359,7 @@ static AwkValue awkEval(AwkNode *n) {
                 rhs = awkValNum(r);
             }
             AwkValue copy = awkValCopy(&rhs);
-            awkAssignLvalue(n->a, rhs);
+            awkLrefSet(&ref, rhs);
             return copy;
         }
         case AWK_E_TERNARY: {
@@ -1326,25 +1389,9 @@ static AwkValue awkEval(AwkNode *n) {
             return awkValNum(bt ? 1 : 0);
         }
         case AWK_E_IN: {
-            char key[512];
-            const char *subsep = awkGetVarStr("SUBSEP");
-            key[0] = '\0';
-            size_t used = 0;
-            for (int i = 0; i < n->listCount; ++i) {
-                AwkValue v = awkEval(n->list[i]);
-                char *s = awkToStrFmt(&v, "%.6g");
-                awkValFree(&v);
-                size_t sl = strlen(s);
-                size_t sepl = (i > 0) ? strlen(subsep) : 0;
-                if (used + sl + sepl < sizeof(key)) {
-                    if (i > 0) { memcpy(key + used, subsep, sepl); used += sepl; }
-                    memcpy(key + used, s, sl); used += sl;
-                    key[used] = '\0';
-                }
-                free(s);
-            }
-            AwkArray *arr = awkGetArrayFor(n->str);
-            AwkArrayEntry *e = awkArrayFind(arr, key);
+            char *key = awkSubscriptKey(n->list, n->listCount);
+            AwkArrayEntry *e = awkArrayFind(awkGetArrayFor(n->str), key);
+            free(key);
             return awkValNum(e ? 1 : 0);
         }
         case AWK_E_MATCH: {
@@ -1427,17 +1474,19 @@ static AwkValue awkEval(AwkNode *n) {
             return awkValNum(n->op == AWK_TOK_MINUS ? -d : d);
         }
         case AWK_E_PREINCR: case AWK_E_PREDECR: {
-            AwkValue cur = awkEvalLvalueCurrent(n->a);
+            AwkLref ref = awkLrefResolve(n->a);
+            AwkValue cur = awkLrefGet(&ref);
             double d = awkToNum(&cur) + (n->kind == AWK_E_PREINCR ? 1 : -1);
             awkValFree(&cur);
-            awkAssignLvalue(n->a, awkValNum(d));
+            awkLrefSet(&ref, awkValNum(d));
             return awkValNum(d);
         }
         case AWK_E_POSTINCR: case AWK_E_POSTDECR: {
-            AwkValue cur = awkEvalLvalueCurrent(n->a);
+            AwkLref ref = awkLrefResolve(n->a);
+            AwkValue cur = awkLrefGet(&ref);
             double d = awkToNum(&cur);
             awkValFree(&cur);
-            awkAssignLvalue(n->a, awkValNum(d + (n->kind == AWK_E_POSTINCR ? 1 : -1)));
+            awkLrefSet(&ref, awkValNum(d + (n->kind == AWK_E_POSTINCR ? 1 : -1)));
             return awkValNum(d);
         }
         case AWK_E_CALL:
@@ -1457,39 +1506,55 @@ static FILE *awkResolveOutput(AwkNode *n) {
     char *target = awkToStrFmt(&v, "%.6g");
     awkValFree(&v);
     FILE *fp = awkOpenOutputStream(target, n->redir);
-    if (!fp) fprintf(stderr, "awk: cannot open '%s' for output\n", target);
+    if (!fp && !gInterp.fatal) {
+        fprintf(stderr, "awk: cannot open \"%s\" for output (%s)\n", target, strerror(errno));
+        gInterp.fatal = gInterp.exiting = true;
+        gInterp.exitCode = 2;
+    }
     free(target);
-    return fp ? fp : stdout;
+    return fp;
 }
 
 static void awkDoPrint(AwkNode *n) {
-    FILE *out = awkResolveOutput(n);
+    /* the whole line first: a run-time error inside it writes nothing */
+    char *line = NULL;
+    size_t llen = 0;
+    FILE *mem = open_memstream(&line, &llen);
+    if (!mem) return;
     const char *ofs = awkGetVarStr("OFS");
-    const char *ors = awkGetVarStr("ORS");
     if (n->listCount == 0) {
-        fputs(awkGetField(0), out);
+        fputs(awkGetField(0), mem);
     } else {
         const char *ofmt = awkGetVarStr("OFMT");
         for (int i = 0; i < n->listCount; ++i) {
-            if (i > 0) fputs(ofs, out);
+            if (i > 0) fputs(ofs, mem);
             AwkValue v = awkEval(n->list[i]);
             char *s = awkToStrFmt(&v, ofmt);
-            fputs(s, out);
+            fputs(s, mem);
             free(s);
             awkValFree(&v);
         }
     }
-    fputs(ors, out);
+    fputs(awkGetVarStr("ORS"), mem);
+    fclose(mem);
+    if (!gInterp.fatal) {
+        FILE *out = awkResolveOutput(n);
+        if (out) fwrite(line, 1, llen, out);
+    }
+    free(line);
 }
 
 static void awkDoPrintf(AwkNode *n) {
     if (n->listCount == 0) return;
     FILE *out = awkResolveOutput(n);
+    if (!out) return;
     AwkValue fv = awkEval(n->list[0]);
     char *fmt = awkToStrFmt(&fv, "%.6g");
     awkValFree(&fv);
-    char *result = awkSprintfImpl(fmt, n->list, n->listCount, 1);
-    fputs(result, out);
+    /* what precedes a missing argument is still written, as mawk does */
+    size_t rlen;
+    char *result = awkSprintfImpl(fmt, n->list, n->listCount, 1, "printf", &rlen);
+    fwrite(result, 1, rlen, out);
     free(result);
     free(fmt);
 }
@@ -1497,6 +1562,8 @@ static void awkDoPrintf(AwkNode *n) {
 /* ---------------- Statement execution ---------------- */
 
 static AwkSignal awkExec(AwkNode *n) {
+    /* exit inside a function, or a run-time error, ends the rule here */
+    if (gInterp.exiting) return AWK_SIG_EXIT;
     if (!n) return AWK_SIG_NORMAL;
     switch (n->kind) {
         case AWK_S_BLOCK: {
@@ -1607,10 +1674,9 @@ static AwkSignal awkExec(AwkNode *n) {
             return AWK_SIG_RETURN;
         }
         case AWK_S_DELETE: {
-            char key[512];
-            awkSubscriptKey(n, key, sizeof(key));
-            AwkArray *arr = awkGetArrayFor(n->str);
-            awkArrayDelete(arr, key);
+            char *key = awkSubscriptKey(n->list, n->listCount);
+            awkArrayDelete(awkGetArrayFor(n->str), key);
+            free(key);
             return AWK_SIG_NORMAL;
         }
         case AWK_S_DELETE_ALL: {
@@ -1713,6 +1779,21 @@ static bool awkReadRecordFromFile(FILE *fp, char **outLine) {
         if (haveRe) {
             regmatch_t m;
             if (regexec(&re, buf, 1, &m, 0) == 0 && (size_t)m.rm_eo == len && m.rm_so != m.rm_eo) {
+                /* the separator is the longest match: "22" not "2" */
+                for (;;) {
+                    int d = fgetc(fp);
+                    if (d == EOF) break;
+                    if (len + 1 >= cap) { cap *= 2; buf = (char *)realloc(buf, cap); }
+                    buf[len++] = (char)d;
+                    buf[len] = '\0';
+                    regmatch_t m2;
+                    if (regexec(&re, buf + m.rm_so, 1, &m2, REG_NOTBOL) != 0 || m2.rm_so != 0 ||
+                        (size_t)m2.rm_eo != len - (size_t)m.rm_so) {
+                        ungetc(d, fp);
+                        buf[--len] = '\0';
+                        break;
+                    }
+                }
                 buf[m.rm_so] = '\0';
                 if (haveRe) regfree(&re);
                 *outLine = buf;
@@ -1738,52 +1819,66 @@ static bool awkLooksLikeAssignment(const char *s, char **outName, char **outVal)
     }
     if (isdigit((unsigned char)s[0])) return false;
     *outName = strndup(s, (size_t)(eq - s));
-    *outVal = strdup(eq + 1);
+    *outVal = awkUnescape(eq + 1);
     return true;
 }
 
+/* The next operand from ARGV as the program has left it: BEGIN may change
+ * ARGV and ARGC, and an empty or deleted entry is skipped. */
 static bool awkOpenNextFile(void) {
-    while (gInterp.argIndex < gInterp.argc) {
-        const char *arg = gInterp.argv[gInterp.argIndex++];
+    for (;;) {
+        if (gInterp.argIndex < 1) gInterp.argIndex = 1;
+        if (gInterp.argIndex >= (int)awkGetVarNum("ARGC")) return false;
+        char key[32];
+        snprintf(key, sizeof(key), "%d", gInterp.argIndex++);
+        AwkArrayEntry *e = awkArrayFind(awkGetArrayFor("ARGV"), key);
+        if (!e) continue;
+        char *arg = awkToStrFmt(&e->val, "%.6g");
         char *name = NULL, *val = NULL;
+        if (!*arg) {
+            free(arg);
+            continue;
+        }
         if (awkLooksLikeAssignment(arg, &name, &val)) {
             awkSetScalar(name, awkValStrNum(val));
-            free(name); free(val);
+            free(name); free(val); free(arg);
             continue;
         }
         gInterp.anyFileOpened = true;
         awkSetScalar("FILENAME", awkValStr(arg));
         awkSetScalar("FNR", awkValNum(0));
-        if (strcmp(arg, "-") == 0) {
+        if (strcmp(arg, "-") == 0 || strcmp(arg, "/dev/stdin") == 0) {
             gInterp.curFile = stdin;
             gInterp.curFileIsOwned = false;
         } else {
             FILE *fp = fopen(arg, "r");
             if (!fp) {
-                fprintf(stderr, "awk: can't open file %s\n", arg);
-                continue;
+                /* mawk stops here: exit 2, no END */
+                fprintf(stderr, "awk: cannot open \"%s\" (%s)\n", arg, strerror(errno));
+                gInterp.fatal = gInterp.exiting = true;
+                gInterp.exitCode = 2;
+                free(arg);
+                return false;
             }
             gInterp.curFile = fp;
             gInterp.curFileIsOwned = true;
         }
+        free(arg);
         return true;
     }
-    return false;
 }
 
 static bool awkNextMainRecord(char **outLine) {
     for (;;) {
         if (!gInterp.curFile) {
             if (!awkOpenNextFile()) {
-                if (!gInterp.anyFileOpened) {
-                    gInterp.curFile = stdin;
-                    gInterp.curFileIsOwned = false;
-                    gInterp.anyFileOpened = true;
-                    awkSetScalar("FILENAME", awkValStr(""));
-                    awkSetScalar("FNR", awkValNum(0));
-                } else {
-                    return false;
-                }
+                if (gInterp.anyFileOpened || gInterp.fatal) return false;
+                /* no file operands: standard input, once */
+                gInterp.curFile = stdin;
+                gInterp.curFileIsOwned = false;
+                gInterp.anyFileOpened = true;
+                awkSetScalar("FILENAME", awkValStr(""));
+                awkSetScalar("FNR", awkValNum(0));
             }
         }
         char *line = NULL;
@@ -1793,12 +1888,6 @@ static bool awkNextMainRecord(char **outLine) {
         }
         if (gInterp.curFileIsOwned) fclose(gInterp.curFile);
         gInterp.curFile = NULL;
-        if (gInterp.argIndex >= gInterp.argc && gInterp.anyFileOpened) {
-            /* if we already fell back to stdin-with-no-files, don't loop forever */
-            static __thread bool stdinDone = false;  /* else a 2nd awk reads no stdin */
-            if (stdinDone) return false;
-            stdinDone = true;
-        }
     }
 }
 
@@ -1917,7 +2006,13 @@ static void awkCollectFunctions(AwkProgram *prog) {
 }
 
 static void awkInitBuiltinVars(const char *fsOverride) {
-    awkSetScalar("FS", fsOverride ? awkValStr(fsOverride) : awkValStr(" "));
+    if (fsOverride) {
+        char *fs = awkUnescape(fsOverride);
+        awkSetScalar("FS", awkValStr(fs));
+        free(fs);
+    } else {
+        awkSetScalar("FS", awkValStr(" "));
+    }
     awkSetScalar("OFS", awkValStr(" "));
     awkSetScalar("ORS", awkValStr("\n"));
     awkSetScalar("RS", awkValStr("\n"));
@@ -1980,9 +2075,7 @@ int awkRunProgram(AwkProgram *prog, int argc, char **argv, int argStart,
         }
     }
 
-    gInterp.argv = argv + argStart;
-    gInterp.argc = nRealArgs;
-    gInterp.argIndex = 0;
+    gInterp.argIndex = 1;
 
     bool hasMainOrEnd = false;
     for (int i = 0; i < prog->itemCount; ++i) {
@@ -2063,8 +2156,8 @@ int awkRunProgram(AwkProgram *prog, int argc, char **argv, int argStart,
         }
     }
 
-    gInterp.exiting = false; /* END blocks run even after exit; only exit-inside-END is final */
-    for (int i = 0; i < prog->itemCount; ++i) {
+    gInterp.exiting = gInterp.fatal; /* END blocks run even after exit; not after a run-time error */
+    for (int i = 0; i < prog->itemCount && !gInterp.fatal; ++i) {
         AwkNode *it = prog->items[i];
         if (it->kind == AWK_ITEM_RULE && it->patKind == AWK_PAT_END) {
             AwkSignal sig = awkExec(it->c);

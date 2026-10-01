@@ -49,6 +49,8 @@ int smallclueAwkCommand(int argc, char **argv) {
     char **assigns = NULL;
     int assignCount = 0;
     char *progText = NULL;
+    const char *srcName = NULL;   /* a lone -f file, named in parse errors */
+    int srcCount = 0;
     bool haveProgSource = false;
 
     int argi = 1;
@@ -72,6 +74,7 @@ int smallclueAwkCommand(int argc, char **argv) {
             if (argi + 1 >= argc) { fprintf(stderr, "awk: -f requires an argument\n"); return 2; }
             char *content = awkReadWholeFile(argv[++argi]);
             if (!content) return 2;
+            srcName = srcCount++ ? NULL : argv[argi];
             if (progText) {
                 size_t oldLen = strlen(progText);
                 size_t addLen = strlen(content);
@@ -86,11 +89,15 @@ int smallclueAwkCommand(int argc, char **argv) {
         } else if (strncmp(arg, "-f", 2) == 0 && arg[2] != '\0') {
             char *content = awkReadWholeFile(arg + 2);
             if (!content) return 2;
+            srcName = srcCount++ ? NULL : arg + 2;
+            free(progText);
             progText = content;
             haveProgSource = true;
         } else if (strcmp(arg, "-e") == 0) {
             if (argi + 1 >= argc) { fprintf(stderr, "awk: -e requires an argument\n"); return 2; }
             const char *piece = argv[++argi];
+            srcName = NULL;
+            srcCount++;
             if (progText) {
                 size_t oldLen = strlen(progText);
                 size_t addLen = strlen(piece);
@@ -115,7 +122,7 @@ int smallclueAwkCommand(int argc, char **argv) {
         progText = strdup(argv[argi++]);
     }
 
-    AwkProgram *prog = awkParseProgram(progText);
+    AwkProgram *prog = awkParseProgram(progText, srcName);
     free(progText);
     if (!prog) {
         return 2;

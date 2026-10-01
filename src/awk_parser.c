@@ -26,6 +26,10 @@
 typedef struct {
     AwkLexer lx;
     AwkToken cur;
+    size_t curStart, curEnd;  /* source span of cur, for error messages */
+    const char *srcName;      /* the -f file, named in errors as mawk does */
+    char **calls;             /* user functions called, checked once all are defined */
+    int callCount;
     bool printCtx;
     bool error;
 } AwkParser;
@@ -38,17 +42,74 @@ AwkNode *awkNewNode(AwkNodeKind kind) {
 
 static void awkParserAdvance(AwkParser *p) {
     awkTokenFree(&p->cur);
+    p->curStart = p->lx.pos;
     p->cur = awkLexerNext(&p->lx);
+    p->curEnd = p->lx.pos;
+    if (p->lx.error) p->error = true;
 }
 
-static void awkSyntaxError(AwkParser *p, const char *msg) {
-    if (!p->error) {
-        fprintf(stderr, "awk: syntax error at line %d: %s\n", p->cur.line, msg);
-    }
+static void awkParseErrorAt(AwkParser *p, int line, const char *fmt, const char *a, const char *b) {
+    fputs("awk: ", stderr);
+    if (p->srcName) fprintf(stderr, "%s: ", p->srcName);
+    fprintf(stderr, "line %d: ", line);
+    fprintf(stderr, fmt, a, b);
+    fputc('\n', stderr);
     p->error = true;
 }
 
+/* mawk's wording: "syntax error at or near TOKEN", or "missing ) near
+ * TOKEN" when a closing bracket was due. */
+static void awkSyntaxError(AwkParser *p, const char *msg) {
+    if (p->error) return;
+    char near[64];
+    if (p->cur.type == AWK_TOK_EOF) {
+        snprintf(near, sizeof(near), "end of file");
+    } else if (p->cur.type == AWK_TOK_NEWLINE) {
+        snprintf(near, sizeof(near), "end of line");
+    } else {
+        const char *t = p->lx.src + p->curStart, *e = p->lx.src + p->curEnd;
+        while (t < e) {
+            if (*t == '#') { while (t < e && *t != '\n') t++; }
+            else if (strchr(" \t\r\n\\", *t)) t++;
+            else break;
+        }
+        snprintf(near, sizeof(near), "%.*s", (int)(e - t), t);
+    }
+    char want[2] = {0, 0};
+    if (!strncmp(msg, "expected '", 10) && strchr(")}", msg[10]) && msg[11] == '\'') want[0] = msg[10];
+    if (!want[0] && p->cur.type == AWK_TOK_RBRACE && p->lx.parenDepth > 0) want[0] = ')';
+    if (want[0]) awkParseErrorAt(p, p->cur.line, "missing %s near %s", want, near);
+    else awkParseErrorAt(p, p->cur.line, "syntax error at or near %s%s", near, "");
+}
+
 static bool awkCheck(AwkParser *p, AwkTokType t) { return p->cur.type == t; }
+
+/* mawk's argument counts for the builtins, checked as it does at parse time. */
+static void awkCheckBuiltinArgs(AwkParser *p, AwkNode *n) {
+    static const struct { const char *name; int min, max; } k[] = {
+        {"length", 0, 1}, {"substr", 2, 3}, {"index", 2, 2}, {"split", 2, 3}, {"sub", 2, 3}, {"gsub", 2, 3},
+        {"match", 2, 2}, {"sprintf", 1, 255}, {"sin", 1, 1}, {"cos", 1, 1}, {"atan2", 2, 2}, {"exp", 1, 1},
+        {"log", 1, 1}, {"sqrt", 1, 1}, {"int", 1, 1}, {"rand", 0, 0}, {"srand", 0, 1}, {"tolower", 1, 1},
+        {"toupper", 1, 1}, {"system", 1, 1}, {"close", 1, 1}, {"fflush", 0, 1}, {"systime", 0, 0},
+        {"strftime", 0, 3}, {"mktime", 1, 1},
+    };
+    for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
+        if (strcmp(k[i].name, n->str)) continue;
+        if ((n->listCount < k[i].min || n->listCount > k[i].max) && !p->error) {
+            char why[96];
+            if (i == 0) {
+                /* length is grammar in mawk, not a call */
+                awkParseErrorAt(p, p->cur.line, "syntax error at or near %s%s", ",", "");
+                return;
+            }
+            if (n->listCount < k[i].min) snprintf(why, sizeof(why), "%d (need %d)", n->listCount, k[i].min);
+            else snprintf(why, sizeof(why), "%d (maximum %d)", n->listCount, k[i].max);
+            awkParseErrorAt(p, p->cur.line, n->listCount < k[i].min ? "not enough arguments in call to %s: %s"
+                                                                    : "too many arguments in call to %s: %s", n->str, why);
+        }
+        return;
+    }
+}
 
 static bool awkAccept(AwkParser *p, AwkTokType t) {
     if (p->cur.type == t) { awkParserAdvance(p); return true; }
@@ -83,6 +144,7 @@ static AwkNode **parseStatementListUntil(AwkParser *p, int *count, AwkTokType st
 /* ---- Expression grammar ---- */
 
 static AwkNode *parsePrimary(AwkParser *p);
+static AwkNode *parseUnary(AwkParser *p);
 
 static bool awkNextIsRegexLikeUnaryStart(AwkParser *p) {
     switch (p->cur.type) {
@@ -180,21 +242,8 @@ static AwkNode *parsePrimary(AwkParser *p) {
             n->a = target;
             return n;
         }
-        case AWK_TOK_NOT: {
-            awkParserAdvance(p);
-            n = awkNewNode(AWK_E_UNARY);
-            n->op = AWK_TOK_NOT;
-            n->a = parseTernary(p); /* unary binds loosely enough to cover !a==b as !(a==b)? real awk: ! binds tighter than most; simplify via calling unary-precedence recursively below */
-            return n;
-        }
-        case AWK_TOK_MINUS: case AWK_TOK_PLUS: {
-            int op = p->cur.type;
-            awkParserAdvance(p);
-            n = awkNewNode(AWK_E_UNARY);
-            n->op = op;
-            n->a = parsePrimary(p);
-            return n;
-        }
+        case AWK_TOK_NOT: case AWK_TOK_MINUS: case AWK_TOK_PLUS:
+            return parseUnary(p);
         case AWK_TOK_LPAREN: {
             bool savedCtx = p->printCtx;
             p->printCtx = false;
@@ -254,6 +303,7 @@ static AwkNode *parsePrimary(AwkParser *p) {
                 awkExpect(p, AWK_TOK_RPAREN, "')'");
                 p->printCtx = savedCtx;
             }
+            awkCheckBuiltinArgs(p, n);
             return n;
         }
         case AWK_TOK_FUNC_NAME: {
@@ -262,6 +312,8 @@ static AwkNode *parsePrimary(AwkParser *p) {
             n = awkNewNode(AWK_E_CALL);
             n->str = name;
             n->isBuiltin = false;
+            p->calls = (char **)realloc(p->calls, sizeof(char *) * (size_t)(p->callCount + 1));
+            p->calls[p->callCount++] = name;
             awkExpect(p, AWK_TOK_LPAREN, "'('");
             bool savedCtx = p->printCtx;
             p->printCtx = false;
@@ -341,7 +393,7 @@ static AwkNode *parsePostfix(AwkParser *p) {
 static AwkNode *parsePower(AwkParser *p) {
     AwkNode *left = parsePostfix(p);
     if (awkAccept(p, AWK_TOK_CARET)) {
-        AwkNode *right = parsePower(p); /* right-assoc; also allows unary after ^ e.g. 2^-3 */
+        AwkNode *right = parseUnary(p); /* right-assoc; also a sign, as in 2^-3 */
         AwkNode *n = awkNewNode(AWK_E_BINOP);
         n->op = AWK_TOK_CARET;
         n->a = left; n->b = right;
@@ -350,12 +402,15 @@ static AwkNode *parsePower(AwkParser *p) {
     return left;
 }
 
+/* ! + - bind looser than ^ and tighter than * / %: -2^2 is -4, !0 + 1 is 2. */
 static AwkNode *parseUnary(AwkParser *p) {
-    /* Handles unary +/-/! at this precedence too, since real awk allows
-     * e.g. `-2^2` == -(2^2). parsePrimary already handles a leading
-     * unary operator for the common case; this level exists so unary
-     * binds looser than '^' but tighter than * / %. */
-    return parsePower(p);
+    int op = p->cur.type;
+    if (op != AWK_TOK_NOT && op != AWK_TOK_MINUS && op != AWK_TOK_PLUS) return parsePower(p);
+    awkParserAdvance(p);
+    AwkNode *n = awkNewNode(AWK_E_UNARY);
+    n->op = op;
+    n->a = parseUnary(p);
+    return n;
 }
 
 static AwkNode *parseMultiplicative(AwkParser *p) {
@@ -414,19 +469,20 @@ static AwkNode *parseConcat(AwkParser *p) {
 
 static AwkNode *parseRelational(AwkParser *p) {
     AwkNode *left = parseConcat(p);
-    int op = p->cur.type;
-    bool isRel = (op == AWK_TOK_LT || op == AWK_TOK_LE || op == AWK_TOK_GE ||
-                  op == AWK_TOK_NE || op == AWK_TOK_EQ ||
-                  (op == AWK_TOK_GT && !p->printCtx));
-    if (isRel) {
+    for (;;) {
+        /* left to right, as mawk chains them: 1 < 2 < 3 is (1 < 2) < 3 */
+        int op = p->cur.type;
+        bool isRel = (op == AWK_TOK_LT || op == AWK_TOK_LE || op == AWK_TOK_GE ||
+                      op == AWK_TOK_NE || op == AWK_TOK_EQ ||
+                      (op == AWK_TOK_GT && !p->printCtx));
+        if (!isRel) return left;
         awkParserAdvance(p);
         AwkNode *right = parseConcat(p);
         AwkNode *n = awkNewNode(AWK_E_CMP);
         n->op = op;
         n->a = left; n->b = right;
-        return n;
+        left = n;
     }
-    return left;
 }
 
 static AwkNode *parsePipeGetline(AwkParser *p) {
@@ -434,6 +490,7 @@ static AwkNode *parsePipeGetline(AwkParser *p) {
     while (!p->printCtx && awkCheck(p, AWK_TOK_PIPE)) {
         /* lookahead: only treat '|' specially if followed by getline */
         AwkLexer probe = p->lx;
+        probe.error = 1; /* the real pass reports it */
         AwkToken t = awkLexerNext(&probe);
         bool isGetline = (t.type == AWK_TOK_GETLINE);
         awkTokenFree(&t);
@@ -846,16 +903,32 @@ static AwkNode *parseFunctionDef(AwkParser *p) {
     return n;
 }
 
-AwkProgram *awkParseProgram(const char *src) {
+AwkProgram *awkParseProgram(const char *text, const char *srcName) {
     AwkParser parser;
     memset(&parser, 0, sizeof(parser));
+    /* mawk reads the program with a newline after it, which its line
+     * numbers in errors count */
+    size_t tlen = strlen(text);
+    char *src = (char *)malloc(tlen + 2);
+    memcpy(src, text, tlen);
+    memcpy(src + tlen, "\n", 2);
+    parser.srcName = srcName;
     awkLexerInit(&parser.lx, src);
-    parser.cur = awkLexerNext(&parser.lx);
+    parser.lx.srcName = srcName;
+    awkParserAdvance(&parser);
 
     AwkProgram *prog = (AwkProgram *)calloc(1, sizeof(AwkProgram));
     awkSkipTerms(&parser);
     while (!awkCheck(&parser, AWK_TOK_EOF) && !parser.error) {
         AwkNode *item;
+        if (awkCheck(&parser, AWK_TOK_RBRACE)) {
+            /* mawk names the stray brace, then fails on what follows it */
+            awkParseErrorAt(&parser, parser.cur.line, "extra '}'%s%s", "", "");
+            parser.error = false;
+            awkParserAdvance(&parser);
+            awkSyntaxError(&parser, "unexpected token");
+            break;
+        }
         if (awkCheck(&parser, AWK_TOK_FUNCTION)) {
             item = parseFunctionDef(&parser);
         } else {
@@ -880,7 +953,16 @@ AwkProgram *awkParseProgram(const char *src) {
         awkSkipTerms(&parser);
     }
 
+    for (int i = 0; i < parser.callCount && !parser.error; ++i) {
+        bool defined = false;
+        for (int k = 0; k < prog->itemCount && !defined; ++k)
+            defined = prog->items[k]->kind == AWK_ITEM_FUNC && prog->items[k]->str &&
+                      !strcmp(prog->items[k]->str, parser.calls[i]);
+        if (!defined) awkParseErrorAt(&parser, parser.cur.line, "function %s never defined%s", parser.calls[i], "");
+    }
+    free(parser.calls);
     awkTokenFree(&parser.cur);
+    free(src);
     if (parser.error) {
         free(prog->items);
         free(prog);
