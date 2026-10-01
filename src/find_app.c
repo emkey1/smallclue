@@ -27,6 +27,7 @@
 #endif
 #include "find_app.h"
 #include "app_hooks.h"
+#include "gnu_regex.h"
 #include "gnu_util.h"
 #include "spawn.h"
 
@@ -1073,24 +1074,6 @@ static char *findToEre(const char *s, char dialect) {
     return out;
 }
 
-/* glibc's messages, which GNU find prints. */
-static const char *findRegexMessage(int code) {
-    switch (code) {
-    case REG_EPAREN: return "Unmatched ( or \\(";
-    case REG_EBRACK: return "Unmatched [, [^, [:, [., or [=";
-    case REG_EBRACE: return "Unmatched \\{";
-    case REG_BADBR: return "Invalid content of \\{\\}";
-    case REG_BADRPT: return "Invalid preceding regular expression";
-    case REG_EESCAPE: return "Trailing backslash";
-    case REG_ERANGE: return "Invalid range end";
-    case REG_ECTYPE: return "Invalid character class name";
-    case REG_ESUBREG: return "Invalid back reference";
-    case REG_ECOLLATE: return "Invalid collation character";
-    case REG_ESPACE: return "Memory exhausted";
-    default: return "Invalid regular expression";
-    }
-}
-
 static bool findCompileRegex(Find *f, FindNode *n, const char *pat, bool icase) {
     bool ere = !f->emacs && (f->regexType & REG_EXTENDED);
     char *src = ere ? strdup(pat) : findToEre(pat, f->emacs ? 'e' : 'b');
@@ -1099,11 +1082,11 @@ static bool findCompileRegex(Find *f, FindNode *n, const char *pat, bool icase) 
     char *anchored = (char *)malloc(len);
     if (!anchored) { free(src); return false; }
     snprintf(anchored, len, "^(%s)$", src);
-    int r = regcomp(&n->re, anchored, REG_EXTENDED | (icase ? REG_ICASE : 0) | REG_NOSUB);
+    int r = regcomp(&n->re, anchored, gnuRegexFlags(REG_EXTENDED | (icase ? REG_ICASE : 0) | REG_NOSUB));
     free(anchored);
     free(src);
     if (r != 0) {
-        findErr(f, "failed to compile regular expression '%s': %s", pat, findRegexMessage(r));
+        findErr(f, "failed to compile regular expression '%s': %s", pat, gnuRegexMessage(r));
         return false;
     }
     n->reOk = true;

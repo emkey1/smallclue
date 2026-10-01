@@ -15,6 +15,7 @@
 #include "sed_app.h"
 #include "stty_app.h"
 #include "ln_app.h"
+#include "grep_app.h"
 #include "find_app.h"
 #include "xargs_app.h"
 #include "sort_app.h"
@@ -1467,7 +1468,6 @@ static int smallclueChmodCommand(int argc, char **argv);
 static int smallclueDateCommand(int argc, char **argv);
 static int smallclueCalCommand(int argc, char **argv);
 static int smallclueHistoryCommand(int argc, char **argv);
-static int smallclueGrepCommand(int argc, char **argv);
 static int smallclueWcCommand(int argc, char **argv);
 static int smallclueDuCommand(int argc, char **argv);
 static int smallclueTouchCommand(int argc, char **argv);
@@ -1576,7 +1576,6 @@ static int smallclueHelpCommand(int argc, char **argv);
 static int smallclueAddTabCommand(int argc, char **argv);
 #endif
 static int smallclueDmesgCommand(int argc, char **argv);
-
 
 /* Builds the reverse-DNS query name real nslookup/host display for a PTR
  * lookup (e.g. "8.8.8.8" -> "8.8.8.8.in-addr.arpa", "::1" ->
@@ -3392,7 +3391,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"false", smallclueFalseCommand, "Do nothing, unsuccessfully"},
     {"file", smallclueFileCommand, "Identify file types"},
     {"find", smallclueFindCommand, "Search for files"},
-    {"grep", smallclueGrepCommand, "Search for patterns"},
+    {"grep", smallclueGrepCommand, "Print lines that match patterns"},
     {"git", smallclueGitCommand, "Git plumbing and porcelain"},
     {"gzip", smallclueGzipCommand, "Compress files"},
     {"gunzip", smallclueGunzipCommand, "Decompress files"},
@@ -3636,21 +3635,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                "  -c stdout  -k keep original  -f force overwrite"},
     {"zcat", "zcat FILE...\n"
              "  Decompress to standard output"},
-    {"grep", "grep [-i] [-n] [-v] [-r|-R] [-E] [-c] [-o] [-w] [-x]\n"
-             "       [--color[=auto|always|never]] PATTERN [FILE...]\n"
-             "  -i ignore case\n"
-             "  -n line numbers\n"
-             "  -v invert match\n"
-             "  -r/-R recursive directory search\n"
-             "  -E extended regex (default: POSIX basic regex)\n"
-             "  -c print only a count of matching lines per file\n"
-             "  -o print only the matched portion, one match per line\n"
-             "  -w match whole words only\n"
-             "  -x match whole lines only\n"
-             "  --color=auto (the default) highlights only when stdout is a\n"
-             "     terminal that wants colour; NO_COLOR or TERM=dumb turn it off\n"
-             "  --color=always highlights regardless, outranking NO_COLOR and TERM\n"
-             "  --color=never never highlights"},
+    {"grep", "grep [OPTION]... PATTERNS [FILE]...\n"
+           "  Print lines that match; GNU grep compatible\n"
+           "  -E/-F/-G/-P, -e/-f, -i -v -w -x, -c -l -L -m -o -q -s, -b -H -h -n -T -Z\n"
+           "  -A/-B/-C/-NUM context, -r/-R with --include/--exclude/--exclude-dir, --color"},
     {"git", "git [-C PATH] [--no-pager] [-c key=value] <subcommand> [args]\n"
             "  Supported in this build:\n"
             "  init,\n"
@@ -5599,7 +5587,6 @@ static unsigned long long smallclueTopPrevTicksFor(const SmallclueTopPrevTicks *
     }
     return 0;
 }
-
 
 /* Interactive quit for top.
  *
@@ -13561,7 +13548,6 @@ static void smallcluePrintAppletList(FILE *out, const char *heading, bool color)
     }
 }
 
-
 static void print_usage(void) {
     fprintf(stderr, "This is smallclue. Usage:\n");
     fprintf(stderr, "  smallclue <applet> [arguments...]\n\n");
@@ -16703,7 +16689,6 @@ static void smallclueDfFormatSize(char *buf, size_t bufsize,
     snprintf(buf, bufsize, "%llu%c", rounded, suffixes[idx - 1]);
 }
 
-
 /* ---- df: GNU-compatible column selection ---------------------------------
  *
  * `-P`, `-i`, `-T` and `--output` are the shapes scripts parse, so they render
@@ -19109,7 +19094,6 @@ bool smallclueAppRunInProcess(int argc, char **argv, int *status) {
     return false;
 }
 
-
 /* Parses touch -t's [[CC]YY]MMDDhhmm[.ss] compact timestamp form. The
  * digit count before an optional ".ss" suffix tells us which of the three
  * year-width variants we're looking at. */
@@ -19357,7 +19341,6 @@ static long smallclueParseLong(const char *text) {
     }
     return value;
 }
-
 
 static void smallclueEmitTerminalSane(void) {
     fputs("\x1b[0m\x1b[?7h\x1b[?25h", stdout); // reset attributes, enable wrap & cursor
@@ -19771,7 +19754,6 @@ static int smallclueResizeCommand(int argc, char **argv) {
     return 0;
 }
 
-
 typedef struct {
     bool printCounts;
     bool duplicatesOnly; /* -d: only print lines that had at least one repeat */
@@ -19980,7 +19962,6 @@ static int smallclueUniqCommand(int argc, char **argv) {
     }
     return status;
 }
-
 
 #define SMALLCLUE_CUT_MAX_RANGES 64
 
@@ -21096,791 +21077,6 @@ out:
     free(unsets);
     smallclueEnvArgsFree(&a);
     return rc;
-}
-
-/* Highlights every non-overlapping regex match in [line, line+len) using
- * the already-compiled pattern. `len` is the byte length actually being
- * searched (the caller has already excluded any trailing '\n' so `$`/`.`
- * behave as end-of-line, not end-of-buffer -- see smallclueGrepMatches). */
-/* Darwin's BRE has none of GNU's extensions, and the gap is silent rather than
- * loud: `grep 'alpha\|beta'` matches BOTH lines under GNU grep and NOTHING
- * here, with a clean exit 1 that reads like an honest no-match. Carrying two
- * regex engines to fix that would be absurd, so a BRE pattern is rewritten into
- * the equivalent ERE and everything compiles as ERE.
- *
- * The mapping is the standard one: the escaping of the group, brace,
- * alternation and repetition operators is exactly INVERTED between the two
- * dialects, so `\(` becomes `(` and a bare `(` -- a literal in BRE -- becomes
- * `\(`. Bracket expressions pass through untouched, because inside [...] a
- * backslash is an ordinary character and none of those operators apply.
- *
- * Two BRE corners are not reproduced: a leading `*` and a `^`/`$` in the middle
- * of a pattern are literals in BRE and operators in ERE. POSIX leaves both
- * undefined and GNU grep documents them as unspecified, so a pattern relying on
- * either is already not portable -- whereas `\|` is idiomatic and common. */
-static char *smallclueBreToEre(const char *bre) {
-    size_t n = strlen(bre);
-    char *out = (char *) malloc(n * 2 + 1);
-    if (!out) {
-        return NULL;
-    }
-    char *w = out;
-    const char *p = bre;
-    bool inBracket = false;
-    while (*p) {
-        if (inBracket) {
-            if (*p == '[' && (p[1] == ':' || p[1] == '.' || p[1] == '=')) {
-                char kind = p[1];
-                *w++ = *p++;
-                *w++ = *p++;
-                while (*p && !(*p == kind && p[1] == ']')) {
-                    *w++ = *p++;
-                }
-                if (*p) { *w++ = *p++; }
-                if (*p) { *w++ = *p++; }
-                continue;
-            }
-            if (*p == ']') {
-                inBracket = false;
-            }
-            *w++ = *p++;
-            continue;
-        }
-        if (*p == '[') {
-            inBracket = true;
-            *w++ = *p++;
-            if (*p == '^') { *w++ = *p++; }
-            if (*p == ']') { *w++ = *p++; }  /* a ']' first in the set is literal */
-            continue;
-        }
-        if (*p == '\\' && p[1]) {
-            char c = p[1];
-            if (c == '(' || c == ')' || c == '{' || c == '}' ||
-                c == '|' || c == '+' || c == '?') {
-                *w++ = c;           /* an operator in BRE only when escaped */
-                p += 2;
-                continue;
-            }
-            *w++ = *p++;            /* \. \* \\ \1 ... keep the backslash */
-            *w++ = *p++;
-            continue;
-        }
-        if (*p == '(' || *p == ')' || *p == '{' || *p == '}' ||
-            *p == '|' || *p == '+' || *p == '?') {
-            *w++ = '\\';            /* literal in BRE, so escape it for ERE */
-            *w++ = *p++;
-            continue;
-        }
-        *w++ = *p++;
-    }
-    *w = '\0';
-    return out;
-}
-
-static void smallclueGrepFreePatterns(char **patterns, size_t count) {
-    for (size_t i = 0; i < count; ++i) {
-        free(patterns[i]);
-    }
-    free(patterns);
-}
-
-/* -f FILE: one pattern per line, and an empty file means "match nothing",
- * which is why a zero-pattern result is still a success here. */
-static bool smallclueGrepLoadPatternFile(const char *path, char ***patterns,
-                                         size_t *count, size_t *cap) {
-    FILE *fp = (strcmp(path, "-") == 0) ? stdin : fopen(path, "r");
-    if (!fp) {
-        fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
-        return false;
-    }
-    char *line = NULL;
-    size_t lcap = 0;
-    bool ok = true;
-    for (;;) {
-        int read_err = 0;
-        ssize_t len = smallclueGetlineStream(&line, &lcap, fp, &read_err);
-        if (len < 0) {
-            if (read_err) {
-                fprintf(stderr, "grep: %s: %s\n", path, strerror(read_err));
-                ok = false;
-            }
-            break;
-        }
-        if (len > 0 && line[len - 1] == '\n') {
-            line[len - 1] = '\0';
-        }
-        if (*count == *cap) {
-            size_t want = *cap ? *cap * 2 : 8;
-            char **grown = (char **) realloc(*patterns, want * sizeof(**patterns));
-            if (!grown) {
-                fprintf(stderr, "grep: out of memory\n");
-                ok = false;
-                break;
-            }
-            *patterns = grown;
-            *cap = want;
-        }
-        (*patterns)[*count] = strdup(line);
-        if (!(*patterns)[*count]) {
-            fprintf(stderr, "grep: out of memory\n");
-            ok = false;
-            break;
-        }
-        (*count)++;
-    }
-    free(line);
-    if (fp != stdin) {
-        fclose(fp);
-    }
-    return ok;
-}
-
-/* -F: quote every ERE metacharacter so the pattern matches as literal text. */
-static char *smallclueGrepQuoteLiteral(const char *text) {
-    size_t n = strlen(text);
-    char *out = (char *) malloc(n * 2 + 1);
-    if (!out) {
-        return NULL;
-    }
-    char *w = out;
-    for (const char *r = text; *r; ++r) {
-        if (strchr(".[]{}()*+?^$|\\", *r)) {
-            *w++ = '\\';
-        }
-        *w++ = *r;
-    }
-    *w = '\0';
-    return out;
-}
-
-static void smallclueGrepHighlightMatches(const char *line, size_t len, const regex_t *re) {
-    const char *cursor = line;
-    const char *end = line + len;
-    while (cursor <= end) {
-        regmatch_t pmatch[1];
-        /* regexec needs a NUL-terminated string; searching from `cursor`
-         * within the original NUL-terminated line buffer is safe as long
-         * as we never search past `end`. */
-        int eflags = (cursor == line) ? 0 : REG_NOTBOL;
-        int rc = regexec(re, cursor, 1, pmatch, eflags);
-        if (rc != 0 || cursor + pmatch[0].rm_so >= end) {
-            fwrite(cursor, 1, (size_t)(end - cursor), stdout);
-            return;
-        }
-        if (pmatch[0].rm_so > 0) {
-            fwrite(cursor, 1, (size_t)pmatch[0].rm_so, stdout);
-        }
-        const char *matchStart = cursor + pmatch[0].rm_so;
-        size_t matchLen = (size_t)(pmatch[0].rm_eo - pmatch[0].rm_so);
-        if (matchStart + matchLen > end) {
-            matchLen = (size_t)(end - matchStart);
-        }
-        fputs("\033[1;31m", stdout);
-        fwrite(matchStart, 1, matchLen, stdout);
-        fputs("\033[0m", stdout);
-        if (matchLen == 0) {
-            /* Zero-length match: emit one char verbatim to guarantee
-             * forward progress. */
-            if (matchStart >= end) return;
-            fwrite(matchStart, 1, 1, stdout);
-            cursor = matchStart + 1;
-        } else {
-            cursor = matchStart + matchLen;
-        }
-    }
-}
-
-static void smallclueGrepPrintMatch(const char *line, size_t len, const regex_t *re, int color_enabled,
-                                    const char *prefix_path, long line_number) {
-    if (prefix_path) {
-        if (color_enabled) fputs("\033[35m", stdout);
-        printf("%s", prefix_path);
-        if (color_enabled) fputs("\033[36m:\033[0m", stdout);
-        else putchar(':');
-    }
-    if (line_number > 0) {
-        if (color_enabled) fputs("\033[32m", stdout);
-        printf("%ld", line_number);
-        if (color_enabled) fputs("\033[36m:\033[0m", stdout);
-        else putchar(':');
-    }
-
-    if (!color_enabled) {
-        fwrite(line, 1, len, stdout);
-        return;
-    }
-    smallclueGrepHighlightMatches(line, len, re);
-}
-
-static bool smallclueGrepIsWordChar(char c) {
-    return isalnum((unsigned char)c) || c == '_';
-}
-
-/* Finds the first match satisfying -w's word-boundary constraint: the
- * match must not be immediately preceded or followed by a word
- * character. Retries at subsequent positions if the first regexec hit
- * isn't word-bounded, since the "real" word match may occur later in
- * the line. Portable (checks boundaries manually rather than relying on
- * \< \> regex extensions, which aren't guaranteed across regex(3)
- * implementations). */
-static bool smallclueGrepFindWordMatch(const char *line, size_t lineLen, const regex_t *re, regmatch_t *outMatch) {
-    size_t offset = 0;
-    while (offset <= lineLen) {
-        regmatch_t m;
-        int eflags = (offset > 0) ? REG_NOTBOL : 0;
-        if (regexec(re, line + offset, 1, &m, eflags) != 0) return false;
-        size_t start = offset + (size_t)m.rm_so;
-        size_t end = offset + (size_t)m.rm_eo;
-        bool leftOk = (start == 0) || !smallclueGrepIsWordChar(line[start - 1]);
-        bool rightOk = (end == lineLen) || !smallclueGrepIsWordChar(line[end]);
-        if (leftOk && rightOk) {
-            outMatch->rm_so = (regoff_t)start;
-            outMatch->rm_eo = (regoff_t)end;
-            return true;
-        }
-        size_t advance = (end > offset) ? (end - offset) : 1;
-        offset += advance;
-    }
-    return false;
-}
-
-/* Matches `line` (length lineLen, WITHOUT any trailing '\n' -- callers
- * must strip it first) against the compiled pattern, honoring -w
- * (whole word) / -x (whole line) if requested. Returns the match bounds
- * (relative to `line`) via outMatch when non-NULL. */
-static bool smallclueGrepMatchesEx(const char *line, size_t lineLen, const regex_t *re,
-                                   bool wordMode, bool lineMode, regmatch_t *outMatch) {
-    regmatch_t m;
-    if (lineMode) {
-        if (regexec(re, line, 1, &m, 0) != 0) return false;
-        if ((size_t)m.rm_so != 0 || (size_t)m.rm_eo != lineLen) return false;
-    } else if (wordMode) {
-        if (!smallclueGrepFindWordMatch(line, lineLen, re, &m)) return false;
-    } else {
-        if (regexec(re, line, 1, &m, 0) != 0) return false;
-    }
-    if (outMatch) *outMatch = m;
-    return true;
-}
-
-static bool smallclueGrepMatches(const char *line, size_t lineLen, const regex_t *re) {
-    return smallclueGrepMatchesEx(line, lineLen, re, false, false, NULL);
-}
-
-/* -o: prints every non-overlapping match on the line (honoring -w/-x),
- * one per output line, instead of the whole line. */
-static void smallclueGrepPrintAllMatches(const char *line, size_t lineLen, const regex_t *re,
-                                         bool wordMode, bool lineMode,
-                                         const char *prefixPath, long lineNo, bool numberLines) {
-    size_t offset = 0;
-    while (offset <= lineLen) {
-        regmatch_t m;
-        int eflags = (offset > 0) ? REG_NOTBOL : 0;
-        if (regexec(re, line + offset, 1, &m, eflags) != 0) break;
-        size_t start = offset + (size_t)m.rm_so;
-        size_t end = offset + (size_t)m.rm_eo;
-        bool ok = true;
-        if (lineMode) {
-            ok = (start == 0 && end == lineLen);
-        } else if (wordMode) {
-            bool leftOk = (start == 0) || !smallclueGrepIsWordChar(line[start - 1]);
-            bool rightOk = (end == lineLen) || !smallclueGrepIsWordChar(line[end]);
-            ok = leftOk && rightOk;
-        }
-        if (ok && end > start) {
-            if (prefixPath) printf("%s:", prefixPath);
-            if (numberLines) printf("%ld:", lineNo);
-            fwrite(line + start, 1, end - start, stdout);
-            putchar('\n');
-        }
-        size_t advance = (end > offset) ? (end - offset) : 1;
-        offset += advance;
-    }
-}
-
-typedef struct SmallclueGrepOptions {
-    bool numberLines;
-    bool invertMatch;
-    bool useColor;
-    bool recursive;
-    bool multiplePaths; /* prefix matched lines with the file path */
-    bool countOnly;      /* -c */
-    bool matchOnly;      /* -o */
-    bool wordMatch;      /* -w */
-    bool lineMatch;      /* -x */
-    bool quiet;          /* -q: no output, exit 0 on the first match */
-    bool filesWith;      /* -l: print the name of each matching file, once */
-    bool filesWithout;   /* -L: and the inverse */
-    bool noMessages;     /* -s: suppress unreadable-file complaints */
-    bool noFilename;     /* -h: never prefix with the file name */
-    bool withFilename;   /* -H: always prefix, even for one file */
-    bool fixedStrings;   /* -F: the pattern is literal text, not a regex */
-    long maxCount;       /* -m: stop after this many matching lines (0 = all) */
-} SmallclueGrepOptions;
-
-static int smallclueGrepScanStream(FILE *fp, const char *label, const regex_t *re,
-                                   const SmallclueGrepOptions *opts) {
-    int status = 1;
-    char *line = NULL;
-    size_t cap = 0;
-    long lineNo = 0;
-    long matchCount = 0;
-    for (;;) {
-        int read_err = 0;
-        ssize_t len = smallclueGetlineStream(&line, &cap, fp, &read_err);
-        if (len < 0) {
-            if (read_err) {
-                fprintf(stderr, "grep: %s: %s\n", label, strerror(read_err));
-            }
-            break;
-        }
-        lineNo++;
-        /* Strip any trailing '\n' before matching so `$`/`.` behave against
-         * the logical end of line, not an embedded newline (the same bug
-         * class fixed in sed) -- but still print with the original length
-         * so output formatting is unaffected. */
-        size_t matchLen = (size_t)len;
-        if (matchLen > 0 && line[matchLen - 1] == '\n') {
-            line[matchLen - 1] = '\0';
-            matchLen--;
-        }
-        bool found = smallclueGrepMatchesEx(line, matchLen, re, opts->wordMatch, opts->lineMatch, NULL);
-        if (opts->invertMatch ? !found : found) {
-            status = 0;
-            /* -q is an early exit, not just silence: `grep -q pat huge-file`
-               must stop reading at the first match, which is most of why
-               scripts use it. -l likewise needs only the first. */
-            if (opts->quiet || opts->filesWith || opts->filesWithout)
-                break;
-            if (opts->countOnly) {
-                matchCount++;
-                if (opts->maxCount > 0 && matchCount >= opts->maxCount) {
-                    break;
-                }
-            } else if (opts->matchOnly && !opts->invertMatch) {
-                smallclueGrepPrintAllMatches(line, matchLen, re, opts->wordMatch, opts->lineMatch,
-                                             opts->multiplePaths ? label : NULL,
-                                             opts->numberLines ? lineNo : 0, opts->numberLines);
-            } else {
-                /* Print only up to matchLen (line[] now has a NUL where the
-                 * original '\n' was), then re-add the newline explicitly --
-                 * printing the original `len` bytes here would emit that
-                 * stray NUL byte in place of the newline. */
-                smallclueGrepPrintMatch(line, matchLen, re, opts->useColor && !opts->invertMatch,
-                                        opts->multiplePaths ? label : NULL,
-                                        opts->numberLines ? lineNo : 0);
-                if (matchLen < (size_t)len) {
-                    fputc('\n', stdout);
-                }
-            }
-            /* -m counts matching lines and stops the file there. */
-            if (opts->maxCount > 0 && !opts->countOnly) {
-                if (++matchCount >= opts->maxCount) {
-                    break;
-                }
-            }
-        }
-    }
-    if (opts->quiet) {
-        /* Nothing at all on stdout; the exit status is the whole answer. */
-    } else if (opts->filesWith) {
-        if (status == 0) printf("%s\n", label);
-    } else if (opts->filesWithout) {
-        if (status != 0) printf("%s\n", label);
-    } else if (opts->countOnly) {
-        if (opts->multiplePaths) printf("%s:", label);
-        printf("%ld\n", matchCount);
-    }
-    /* -L inverts what "success" means for the caller. */
-    if (opts->filesWithout)
-        status = (status == 0) ? 1 : 0;
-    free(line);
-    return status;
-}
-
-static void smallclueGrepWalkPath(const char *path, const regex_t *re, const SmallclueGrepOptions *opts, int *status) {
-    struct stat st;
-    if (lstat(path, &st) != 0) {
-        if (!opts->noMessages) fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
-        *status = *status == 0 ? 0 : 2;
-        return;
-    }
-    if (S_ISDIR(st.st_mode)) {
-        if (!opts->recursive) {
-            if (!opts->noMessages) fprintf(stderr, "grep: %s: is a directory\n", path);
-            *status = *status == 0 ? 0 : 2;
-            return;
-        }
-        DIR *dir = opendir(path);
-        if (!dir) {
-            if (!opts->noMessages) fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
-            *status = *status == 0 ? 0 : 2;
-            return;
-        }
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL) {
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-                continue;
-            }
-            char child[PATH_MAX];
-            if (smallclueBuildPath(child, sizeof(child), path, entry->d_name) != 0) {
-                fprintf(stderr, "grep: %s/%s: %s\n", path, entry->d_name, strerror(errno));
-                *status = *status == 0 ? 0 : 2;
-                continue;
-            }
-            smallclueGrepWalkPath(child, re, opts, status);
-        }
-        closedir(dir);
-        return;
-    }
-    FILE *fp = fopen(path, "r");
-    if (!fp) {
-        if (!opts->noMessages) fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
-        *status = *status == 0 ? 0 : 2;
-        return;
-    }
-    int rc = smallclueGrepScanStream(fp, path, re, opts);
-    fclose(fp);
-    if (rc == 0) {
-        *status = 0;
-    } else if (*status != 0) {
-        *status = 1;
-    }
-}
-
-static int smallclueGrepCommand(int argc, char **argv) {
-    int index = 1;
-    SmallclueGrepOptions opts;
-    memset(&opts, 0, sizeof(opts));
-    bool extendedRegex = false;
-    bool ignoreCase = false;
-    int color_mode = 0; /* 0=auto, 1=always, -1=never */
-    /* -e may repeat and -f contributes one per line, so patterns accumulate
-     * rather than living in a single variable. */
-    char **patterns = NULL;
-    size_t patternCount = 0, patternCap = 0;
-    #define GREP_ADD_PATTERN(str) \
-        do { \
-            if (patternCount == patternCap) { \
-                size_t want = patternCap ? patternCap * 2 : 8; \
-                char **grown = (char **) realloc(patterns, want * sizeof(*patterns)); \
-                if (!grown) { \
-                    fprintf(stderr, "grep: out of memory\n"); \
-                    smallclueGrepFreePatterns(patterns, patternCount); \
-                    return 2; \
-                } \
-                patterns = grown; \
-                patternCap = want; \
-            } \
-            patterns[patternCount] = strdup(str); \
-            if (!patterns[patternCount]) { \
-                fprintf(stderr, "grep: out of memory\n"); \
-                smallclueGrepFreePatterns(patterns, patternCount); \
-                return 2; \
-            } \
-            patternCount++; \
-        } while (0)
-
-    while (index < argc) {
-        const char *arg = argv[index];
-        if (!arg || arg[0] != '-') {
-            break;
-        }
-        if (strcmp(arg, "--") == 0) {
-            index++;
-            break;
-        }
-        if (strncmp(arg, "--", 2) == 0) {
-            /* Support common long forms and treat unknown long opts as end of options. */
-            if (strcmp(arg, "--ignore-case") == 0 || strcmp(arg, "--ignore") == 0) {
-                ignoreCase = true;
-                index++;
-                continue;
-            }
-            if (strcmp(arg, "--invert-match") == 0 || strcmp(arg, "--invert") == 0) {
-                opts.invertMatch = true;
-                index++;
-                continue;
-            }
-            if (strcmp(arg, "--line-number") == 0 || strcmp(arg, "--number") == 0) {
-                opts.numberLines = true;
-                index++;
-                continue;
-            }
-            if (strcmp(arg, "--recursive") == 0) {
-                opts.recursive = true;
-                index++;
-                continue;
-            }
-            if (strcmp(arg, "--extended-regexp") == 0) {
-                extendedRegex = true;
-                index++;
-                continue;
-            }
-            if (strcmp(arg, "--count") == 0) {
-                opts.countOnly = true;
-                index++;
-                continue;
-            }
-            if (strcmp(arg, "--quiet") == 0 || strcmp(arg, "--silent") == 0) {
-                opts.quiet = true;
-                index++;
-                continue;
-            }
-            if (strcmp(arg, "--files-with-matches") == 0) {
-                opts.filesWith = true;
-                index++;
-                continue;
-            }
-            if (strcmp(arg, "--files-without-match") == 0) {
-                opts.filesWithout = true;
-                index++;
-                continue;
-            }
-            if (strcmp(arg, "--no-messages") == 0) {
-                opts.noMessages = true;
-                index++;
-                continue;
-            }
-            if (strncmp(arg, "--regexp=", 9) == 0) {
-                GREP_ADD_PATTERN(arg + 9);
-                index++;
-                continue;
-            }
-            if (strcmp(arg, "--regexp") == 0) {
-                if (index + 1 >= argc) {
-                    fprintf(stderr, "grep: option '--regexp' requires an argument\n");
-                    smallclueGrepFreePatterns(patterns, patternCount);
-                    return 2;
-                }
-                GREP_ADD_PATTERN(argv[++index]);
-                index++;
-                continue;
-            }
-            if (strncmp(arg, "--file=", 7) == 0 || strcmp(arg, "--file") == 0) {
-                const char *path = (arg[6] == '=') ? arg + 7
-                                 : (index + 1 < argc ? argv[++index] : NULL);
-                if (!path) {
-                    fprintf(stderr, "grep: option '--file' requires an argument\n");
-                    smallclueGrepFreePatterns(patterns, patternCount);
-                    return 2;
-                }
-                if (!smallclueGrepLoadPatternFile(path, &patterns, &patternCount, &patternCap)) {
-                    smallclueGrepFreePatterns(patterns, patternCount);
-                    return 2;
-                }
-                index++;
-                continue;
-            }
-            if (strncmp(arg, "--max-count=", 12) == 0) {
-                opts.maxCount = strtol(arg + 12, NULL, 10);
-                index++;
-                continue;
-            }
-            if (strcmp(arg, "--text") == 0 || strcmp(arg, "--binary-files=text") == 0) {
-                /* Every line is already read as text here. */
-                index++;
-                continue;
-            }
-            if (strcmp(arg, "--fixed-strings") == 0) {
-                opts.fixedStrings = true;
-                index++;
-                continue;
-            }
-            if (strcmp(arg, "--no-filename") == 0) {
-                opts.noFilename = true;
-                index++;
-                continue;
-            }
-            if (strcmp(arg, "--with-filename") == 0) {
-                opts.withFilename = true;
-                index++;
-                continue;
-            }
-            if (strcmp(arg, "--only-matching") == 0) {
-                opts.matchOnly = true;
-                index++;
-                continue;
-            }
-            if (strcmp(arg, "--word-regexp") == 0) {
-                opts.wordMatch = true;
-                index++;
-                continue;
-            }
-            if (strcmp(arg, "--line-regexp") == 0) {
-                opts.lineMatch = true;
-                index++;
-                continue;
-            }
-            if (strncmp(arg, "--color", 7) == 0 || strncmp(arg, "--colour", 8) == 0) {
-                const char *val = NULL;
-                if (strncmp(arg, "--color=", 8) == 0) val = arg + 8;
-                else if (strncmp(arg, "--colour=", 9) == 0) val = arg + 9;
-                else val = "auto"; /* implicit argument for --color */
-
-                if (strcasecmp(val, "always") == 0) color_mode = 1;
-                else if (strcasecmp(val, "never") == 0 || strcasecmp(val, "none") == 0) color_mode = -1;
-                else color_mode = 0;
-
-                index++;
-                continue;
-            }
-            /* Unrecognized long option: treat as start of pattern/paths. */
-            break;
-        }
-        for (const char *opt = arg + 1; *opt; ++opt) {
-            if (*opt == 'n') {
-                opts.numberLines = true;
-            } else if (*opt == 'i') {
-                ignoreCase = true;
-            } else if (*opt == 'v') {
-                opts.invertMatch = true;
-            } else if (*opt == 'r' || *opt == 'R') {
-                opts.recursive = true;
-            } else if (*opt == 'E') {
-                extendedRegex = true;
-            } else if (*opt == 'c') {
-                opts.countOnly = true;
-            } else if (*opt == 'o') {
-                opts.matchOnly = true;
-            } else if (*opt == 'w') {
-                opts.wordMatch = true;
-            } else if (*opt == 'x') {
-                opts.lineMatch = true;
-            } else if (*opt == 'q') {
-                opts.quiet = true;
-            } else if (*opt == 'l') {
-                opts.filesWith = true;
-            } else if (*opt == 'L') {
-                opts.filesWithout = true;
-            } else if (*opt == 's') {
-                opts.noMessages = true;
-            } else if (*opt == 'h') {
-                opts.noFilename = true;
-            } else if (*opt == 'H') {
-                opts.withFilename = true;
-            } else if (*opt == 'F') {
-                /* Fixed strings. Handled where the regex is compiled. */
-                opts.fixedStrings = true;
-            } else if (*opt == 'a') {
-                /* --text: lines are already read as text here. */
-            } else if (*opt == 'e' || *opt == 'f' || *opt == 'm') {
-                /* These take a value, attached (-m1, -ePAT) or as the next
-                 * word (-m 1, -e PAT). -e in particular is how a script passes
-                 * a pattern that begins with a dash. */
-                const char *value;
-                if (opt[1] != '\0') {
-                    value = opt + 1;
-                } else if (index + 1 < argc) {
-                    value = argv[++index];
-                } else {
-                    fprintf(stderr, "grep: option requires an argument -- %c\n", *opt);
-                    smallclueGrepFreePatterns(patterns, patternCount);
-                    return 2;
-                }
-                if (*opt == 'e') {
-                    GREP_ADD_PATTERN(value);
-                } else if (*opt == 'm') {
-                    opts.maxCount = strtol(value, NULL, 10);
-                } else {
-                    if (!smallclueGrepLoadPatternFile(value, &patterns, &patternCount,
-                                                      &patternCap)) {
-                        smallclueGrepFreePatterns(patterns, patternCount);
-                        return 2;
-                    }
-                }
-                break; /* the rest of this token was the value */
-            } else {
-                fprintf(stderr, "grep: unsupported option -%c\n", *opt);
-                smallclueGrepFreePatterns(patterns, patternCount);
-                return 1;
-            }
-        }
-        index++;
-    }
-    /* A positional pattern is only expected when no -e/-f supplied one. */
-    if (patternCount == 0) {
-        if (index >= argc) {
-            fprintf(stderr, "grep: missing pattern\n");
-            return 1;
-        }
-        GREP_ADD_PATTERN(argv[index++]);
-    }
-    #undef GREP_ADD_PATTERN
-
-    /* Every pattern is normalised to ERE -- literal-quoted for -F, translated
-     * from BRE otherwise -- so several of them can simply be joined with '|'
-     * and compiled once, leaving the single-regex matcher below untouched. */
-    char *combined = NULL;
-    size_t combinedLen = 0;
-    for (size_t i = 0; i < patternCount; ++i) {
-        char *converted = opts.fixedStrings ? smallclueGrepQuoteLiteral(patterns[i])
-                        : (extendedRegex ? strdup(patterns[i])
-                                         : smallclueBreToEre(patterns[i]));
-        if (!converted) {
-            fprintf(stderr, "grep: out of memory\n");
-            free(combined);
-            smallclueGrepFreePatterns(patterns, patternCount);
-            return 2;
-        }
-        size_t add = strlen(converted) + 4; /* "(" ")" "|" and the NUL */
-        char *grown = (char *) realloc(combined, combinedLen + add);
-        if (!grown) {
-            fprintf(stderr, "grep: out of memory\n");
-            free(converted);
-            free(combined);
-            smallclueGrepFreePatterns(patterns, patternCount);
-            return 2;
-        }
-        combined = grown;
-        combinedLen += (size_t) snprintf(combined + combinedLen, add, "%s(%s)",
-                                         i ? "|" : "", converted);
-        free(converted);
-    }
-    smallclueGrepFreePatterns(patterns, patternCount);
-
-    regex_t re;
-    int reFlags = REG_EXTENDED | (ignoreCase ? REG_ICASE : 0);
-    int rc = regcomp(&re, combined, reFlags);
-    if (rc != 0) {
-        char errbuf[256];
-        regerror(rc, &re, errbuf, sizeof(errbuf));
-        fprintf(stderr, "grep: invalid pattern '%s': %s\n", combined, errbuf);
-        free(combined);
-        return 2;
-    }
-    char *literal = combined; /* freed with the same name the old code used */
-
-    /* Same precedence as smallclueLsCommand, and here it matches GNU grep
-     * exactly (measured on 3.11): --color=auto goes quiet under NO_COLOR=1 and
-     * TERM=dumb, --color=always paints through both.
-     *
-     * When colour is off the match highlight simply goes away, with no marker
-     * standing in for it. grep's output IS the matching line -- every consumer
-     * downstream of a pipe parses it as such, and inserting a marker would
-     * corrupt the one thing callers rely on. GNU grep drops it the same way. */
-    if (color_mode == 0) {
-        color_mode = smallclueColourWanted() ? 1 : -1;
-    }
-    opts.useColor = (color_mode == 1);
-
-    int paths = argc - index;
-    int status;
-    if (paths <= 0) {
-        status = smallclueGrepScanStream(stdin, "(standard input)", &re, &opts);
-    } else {
-        opts.multiplePaths = (paths > 1) || opts.recursive;
-        /* Explicit -h/-H beat the "more than one file" heuristic, which is why
-           scripts use them: `grep -h pat a b` must not prefix. */
-        if (opts.noFilename) opts.multiplePaths = false;
-        if (opts.withFilename) opts.multiplePaths = true;
-        status = 1;
-        for (int i = index; i < argc; ++i) {
-            smallclueGrepWalkPath(argv[i], &re, &opts, &status);
-        }
-    }
-    regfree(&re);
-    return status;
 }
 
 typedef struct {
@@ -26607,7 +25803,6 @@ static int smallclueInitCommand(int argc, char **argv) {
     return 0;
 }
 
-
 static int smallclueMdevCommand(int argc, char **argv) {
     int scan = 0;
     smallclueResetGetopt();
@@ -26638,7 +25833,6 @@ static int smallclueMdevCommand(int argc, char **argv) {
         fprintf(stderr, "mdev: missing ACTION or DEVPATH env\n");
         return 1;
     }
-
 
     return 0;
 }
