@@ -15,6 +15,7 @@
 #include "sed_app.h"
 #include "stty_app.h"
 #include "ln_app.h"
+#include "xargs_app.h"
 #include "sort_app.h"
 #include "tail_app.h"
 #include "head_app.h"
@@ -1493,7 +1494,6 @@ static int smallclueTeeCommand(int argc, char **argv);
 static int smallclueScriptCommand(int argc, char **argv);
 static int smallclueTestCommand(int argc, char **argv);
 static int smallclueBracketCommand(int argc, char **argv);
-static int smallclueXargsCommand(int argc, char **argv);
 static int smallcluePsCommand(int argc, char **argv);
 static int smallclueKillCommand(int argc, char **argv);
 static int smallclueTimeoutCommand(int argc, char **argv);
@@ -3501,7 +3501,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"which", smallclueWhichCommand, "Locate a command"},
     {"whoami", smallclueWhoamiCommand, "Print effective user name"},
     {"yes", smallclueYesCommand, "Repeatedly print strings"},
-    {"xargs", smallclueXargsCommand, "Build command lines from stdin"},
+    {"xargs", smallclueXargsCommand, "Build and run command lines from input"},
     {"df", smallclueDfCommand, "Report filesystem usage"},
     {"dmesg", smallclueDmesgCommand, "Print the kernel ring buffer"},
 
@@ -4071,16 +4071,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  Repeatedly print STRING (default: y)"},
     {"no", "no [STRING...]\n"
            "  Repeatedly print STRING (default: n) and exit 1 on stop"},
-    {"xargs", "xargs [-n N] [-0] [-I REPLACE] [-t] COMMAND [initial-args]\n"
-              "  Build and run command lines from stdin (builtin applets\n"
-              "  or arbitrary external binaries via execvp)\n"
-              "  -n N max args per invocation (default: one invocation, all args)\n"
-              "  -0 NUL-delimited input (pairs with find -print0)\n"
-              "  -I REPLACE: one invocation per input line, substituting\n"
-              "    REPLACE wherever it appears in COMMAND's arguments\n"
-              "  -t print each command line before running it\n"
-              "  Without -0: single/double quotes group whitespace into one\n"
-              "    token (quotes stripped); backslash escapes the next char"},
+    {"xargs", "xargs [-0|-d DELIM] [-a FILE] [-E EOF] [-I R] [-L N] [-n N] [-P N] [-s N] [-r] [-t] [-p] [-x] [-o] [COMMAND [ARGS...]]\n"
+           "  Build and run command lines from input; GNU xargs compatible\n"
+           "  -n N args, -L N lines per command; -I R replace R; -P N in parallel\n"
+           "  Exits 123 if a command failed, 124 if one exited 255, 125 if one was killed"},
     {"df", "df [-hkPiTa] [--output[=FIELD_LIST]] [path ...]\n"
            "  With no path, lists every mounted filesystem (like real df)\n"
            "  -h human-readable sizes    -k 1K blocks (the default)\n"
@@ -4431,196 +4425,9 @@ static ssize_t smallclueGetlineStream(char **line, size_t *cap, FILE *stream, in
     return len;
 }
 
-/* Real xargs (without -0) gives single/double quotes and a backslash real
- * meaning: a quoted span groups whitespace into one token (the quote chars
- * themselves are stripped, no escape processing inside), and outside
- * quotes a backslash escapes the very next character literally -- most
- * commonly used to keep an embedded space from splitting a token. An
- * unmatched quote is a hard error, matching real xargs (verified against
- * GNU findutils xargs in Docker: `'hello world' foo` -> two tokens
- * "hello world" and "foo"; `a\ b c` -> "a b" and "c"; an unterminated
- * quote errors and exits 1 rather than silently absorbing the rest of
- * the input). */
-static bool smallclueReadTokensFromStdin(SmallclueLineVector *vec) {
-    char *token = NULL;
-    size_t tokcap = 0;
-    size_t toklen = 0;
-    char buf[16384];
-    int read_err = 0;
-    ssize_t n;
-    char quoteChar = '\0'; /* '\'' or '"' while inside a quoted span, else '\0' */
-    bool sawBackslash = false;
-    bool haveContent = false; /* true once any char (even from an empty "" pair) started this token */
 
-    while ((n = smallclueReadStream(stdin, buf, sizeof(buf), &read_err)) > 0) {
-        for (ssize_t i = 0; i < n; ++i) {
-            int ch = (unsigned char)buf[i];
-            if (sawBackslash) {
-                sawBackslash = false;
-            } else if (quoteChar == '\0' && ch == '\\') {
-                sawBackslash = true;
-                haveContent = true;
-                continue;
-            } else if (quoteChar == '\0' && (ch == '\'' || ch == '"')) {
-                quoteChar = (char)ch;
-                haveContent = true;
-                continue;
-            } else if (quoteChar != '\0' && ch == quoteChar) {
-                quoteChar = '\0';
-                continue;
-            } else if (quoteChar == '\0' && ((ch == ' ') || (ch >= '\t' && ch <= '\r'))) {
-                if (haveContent) {
-                    if (!smallclueLineVectorAppend(vec, token, toklen)) {
-                        free(token);
-                        return false;
-                    }
-                    toklen = 0;
-                    haveContent = false;
-                }
-                continue;
-            }
-            haveContent = true;
-            if (toklen + 1 >= tokcap) {
-                size_t newcap = tokcap ? tokcap * 2 : 64;
-                char *tmp = (char *)realloc(token, newcap);
-                if (!tmp) {
-                    free(token);
-                    return false;
-                }
-                token = tmp;
-                tokcap = newcap;
-            }
-            token[toklen++] = (char)ch;
-        }
-    }
-    if (read_err) {
-        free(token);
-        return false;
-    }
-    if (quoteChar != '\0') {
-        fprintf(stderr, "xargs: unmatched %s quote; by default quotes are special to xargs "
-                        "unless you use the -0 option\n",
-                quoteChar == '\'' ? "single" : "double");
-        free(token);
-        errno = 0; /* signals to the caller that this message is already complete */
-        return false;
-    }
-    if (haveContent) {
-        bool ok = smallclueLineVectorAppend(vec, token, toklen);
-        free(token);
-        return ok;
-    }
-    free(token);
-    return true;
-}
 
-/* xargs -0: tokens are separated by a literal NUL byte instead of
- * whitespace -- pairs safely with `find -print0`, since it makes no
- * assumption about filenames not containing spaces/newlines. */
-static bool smallclueReadNulTokensFromStdin(SmallclueLineVector *vec) {
-    char *token = NULL;
-    size_t tokcap = 0;
-    size_t toklen = 0;
-    char buf[16384];
-    int read_err = 0;
-    ssize_t n;
 
-    while ((n = smallclueReadStream(stdin, buf, sizeof(buf), &read_err)) > 0) {
-        for (ssize_t i = 0; i < n; ++i) {
-            char ch = buf[i];
-            if (ch == '\0') {
-                if (!smallclueLineVectorAppend(vec, token, toklen)) {
-                    free(token);
-                    return false;
-                }
-                toklen = 0;
-                continue;
-            }
-            if (toklen + 1 >= tokcap) {
-                size_t newcap = tokcap ? tokcap * 2 : 64;
-                char *tmp = (char *)realloc(token, newcap);
-                if (!tmp) {
-                    free(token);
-                    return false;
-                }
-                token = tmp;
-                tokcap = newcap;
-            }
-            token[toklen++] = ch;
-        }
-    }
-    if (read_err) {
-        free(token);
-        return false;
-    }
-    if (toklen > 0) {
-        bool ok = smallclueLineVectorAppend(vec, token, toklen);
-        free(token);
-        return ok;
-    }
-    free(token);
-    return true;
-}
-
-/* xargs -I: each line of input (whole line, not whitespace-split) becomes
- * one invocation of the command. */
-static bool smallclueReadLinesFromStdin(SmallclueLineVector *vec, bool nulDelimited) {
-    if (nulDelimited) {
-        return smallclueReadNulTokensFromStdin(vec);
-    }
-    char *line = NULL;
-    size_t cap = 0;
-    for (;;) {
-        int read_err = 0;
-        ssize_t len = smallclueGetlineStream(&line, &cap, stdin, &read_err);
-        if (len < 0) {
-            free(line);
-            return read_err == 0;
-        }
-        if (len > 0 && line[len - 1] == '\n') {
-            len--;
-        }
-        if (!smallclueLineVectorAppend(vec, line, (size_t)len)) {
-            free(line);
-            return false;
-        }
-    }
-}
-
-/* Runs one xargs invocation of `cmdArgv` (NULL-terminated, cmdArgv[0] is
- * the command name). Prefers the in-process builtin-applet dispatch when
- * the name matches one (fast, no fork), but falls back to fork+execvp for
- * anything else -- xargs previously could ONLY invoke other smallclue
- * applets, so `find . | xargs some-external-tool` failed outright even
- * though external binaries are exactly what a real Linux guest's xargs
- * needs to be able to run (including other smallclue-multicall symlinks
- * like ls/rm/grep, which execvp resolves to this same binary anyway). */
-static int smallclueXargsRunOne(char **cmdArgv, int cmdArgc, bool verbose) {
-    if (verbose) {
-        for (int i = 0; i < cmdArgc; ++i) {
-            fprintf(stderr, "%s%s", i > 0 ? " " : "", cmdArgv[i]);
-        }
-        fprintf(stderr, "\n");
-    }
-    const SmallclueApplet *target = smallclueFindApplet(cmdArgv[0]);
-    if (target) {
-        return smallclueDispatchApplet(target, cmdArgc, cmdArgv);
-    }
-    pid_t pid = smallclueSpawnSimple(cmdArgv[0], cmdArgv, 1);
-    if (pid < 0) {
-        fprintf(stderr, "xargs: %s: %s\n", cmdArgv[0], strerror(errno));
-        return 1;
-    }
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        fprintf(stderr, "xargs: waitpid: %s\n", strerror(errno));
-        return 1;
-    }
-    if (WIFEXITED(status)) {
-        return WEXITSTATUS(status);
-    }
-    return 1;
-}
 
 typedef struct {
     int pid;
@@ -6463,216 +6270,9 @@ static int smallclueTimeoutCommand(int argc, char **argv) {
     return 1;
 }
 
-/* xargs -I REPLACE mode: builds one invocation's argv by substituting
- * every base-arg token that equals `replaceStr` with `value`. Returns a
- * NULL-terminated argv the caller must free (each element + the array). */
-/* Replaces every occurrence of `needle` in `haystack` with `value`
- * (matching GNU xargs -I, which substitutes the placeholder wherever it
- * appears WITHIN an argument -- e.g. `echo "file: {}"` -- not only when
- * the entire argument equals the placeholder). Returns a newly allocated
- * string the caller must free. */
-static char *smallclueXargsSubstitute(const char *haystack, const char *needle, const char *value) {
-    size_t needleLen = strlen(needle);
-    size_t valueLen = strlen(value);
-    size_t count = 0;
-    for (const char *p = haystack; (p = strstr(p, needle)) != NULL; p += needleLen) {
-        count++;
-    }
-    size_t resultLen = strlen(haystack) + count * (valueLen > needleLen ? valueLen - needleLen : 0) + 1;
-    if (valueLen < needleLen) {
-        resultLen = strlen(haystack) + 1;
-    }
-    char *result = (char *)malloc(resultLen);
-    if (!result) return NULL;
-    char *out = result;
-    const char *cursor = haystack;
-    const char *match;
-    while ((match = strstr(cursor, needle)) != NULL) {
-        size_t prefixLen = (size_t)(match - cursor);
-        memcpy(out, cursor, prefixLen);
-        out += prefixLen;
-        memcpy(out, value, valueLen);
-        out += valueLen;
-        cursor = match + needleLen;
-    }
-    strcpy(out, cursor);
-    return result;
-}
 
-static char **smallclueXargsBuildIArgv(char **baseArgs, int baseCount, const char *replaceStr, const char *value) {
-    char **cmdArgv = (char **)calloc((size_t)baseCount + 1, sizeof(char *));
-    if (!cmdArgv) return NULL;
-    for (int i = 0; i < baseCount; ++i) {
-        cmdArgv[i] = smallclueXargsSubstitute(baseArgs[i], replaceStr, value);
-        if (!cmdArgv[i]) {
-            for (int k = 0; k < i; ++k) free(cmdArgv[k]);
-            free(cmdArgv);
-            return NULL;
-        }
-    }
-    return cmdArgv;
-}
 
-static void smallclueXargsFreeArgv(char **cmdArgv, int count) {
-    if (!cmdArgv) return;
-    for (int i = 0; i < count; ++i) {
-        free(cmdArgv[i]);
-    }
-    free(cmdArgv);
-}
 
-static int smallclueXargsCommand(int argc, char **argv) {
-    bool nulDelimited = false;
-    bool verbose = false;
-    const char *replaceStr = NULL;
-    int maxArgsPerInvocation = 0; /* 0 = unlimited (one invocation, all args) */
-
-    int argi = 1;
-    for (; argi < argc; ++argi) {
-        const char *arg = argv[argi];
-        if (strcmp(arg, "--") == 0) {
-            argi++;
-            break;
-        }
-        if (strcmp(arg, "-0") == 0) {
-            nulDelimited = true;
-        } else if (strcmp(arg, "-t") == 0) {
-            verbose = true;
-        } else if (strncmp(arg, "-I", 2) == 0 && arg[2] != '\0') {
-            /* Attached form, e.g. `-I{}` -- the common real-world spelling
-             * (`find . | xargs -I{} cmd {}`), not just `-I {}` separately. */
-            replaceStr = arg + 2;
-        } else if (strcmp(arg, "-I") == 0) {
-            if (argi + 1 >= argc) {
-                fprintf(stderr, "xargs: -I requires a replacement string\n");
-                return 1;
-            }
-            replaceStr = argv[++argi];
-        } else if (strncmp(arg, "-n", 2) == 0 && arg[2] != '\0') {
-            /* `xargs -n1` is one token, and far more common in scripts than
-             * the spaced form that was the only one accepted. */
-            maxArgsPerInvocation = atoi(arg + 2);
-        } else if (strcmp(arg, "-n") == 0 || strcmp(arg, "--max-args") == 0) {
-            if (argi + 1 >= argc) {
-                fprintf(stderr, "xargs: -n requires a count\n");
-                return 1;
-            }
-            maxArgsPerInvocation = atoi(argv[++argi]);
-        } else if (strncmp(arg, "--max-args=", 11) == 0) {
-            maxArgsPerInvocation = atoi(arg + 11);
-        } else if (strcmp(arg, "--null") == 0) {
-            nulDelimited = true;
-        } else if (strcmp(arg, "--verbose") == 0) {
-            verbose = true;
-        } else if (strncmp(arg, "--replace=", 10) == 0) {
-            replaceStr = arg + 10;
-        } else if (strcmp(arg, "--replace") == 0) {
-            replaceStr = "{}";
-        } else if (strcmp(arg, "-r") == 0 || strcmp(arg, "--no-run-if-empty") == 0) {
-            /* This xargs already skips empty input rather than running once. */
-        } else if (arg[0] == '-' && arg[1] != '\0') {
-            fprintf(stderr, "xargs: unsupported option '%s'\n", arg);
-            return 1;
-        } else {
-            break;
-        }
-    }
-    /* With no command, xargs runs echo. Debian's invoke-rc.d leans on exactly
-     * that -- `ls -d -Q ... | xargs` is how it collapses a listing onto one
-     * line -- and erroring here made that produce nothing at all. */
-    char *defaultCommand[] = { (char *) "echo", NULL };
-    int baseCount = (argi < argc) ? argc - argi : 1;
-    char **baseArgs = (argi < argc) ? &argv[argi] : defaultCommand;
-
-    int status = 0;
-
-    if (replaceStr) {
-        /* -I mode: one invocation per input LINE (not per whitespace
-         * token), substituting `replaceStr` wherever it appears in the
-         * base command's own args. */
-        SmallclueLineVector lines = {0};
-        if (!smallclueReadLinesFromStdin(&lines, nulDelimited)) {
-            perror("xargs");
-            smallclueLineVectorFree(&lines);
-            return 1;
-        }
-        for (size_t i = 0; i < lines.count; ++i) {
-            if (lines.items[i][0] == '\0') continue;
-            char **cmdArgv = smallclueXargsBuildIArgv(baseArgs, baseCount, replaceStr, lines.items[i]);
-            if (!cmdArgv) {
-                perror("xargs");
-                status = 1;
-                continue;
-            }
-            int rc = smallclueXargsRunOne(cmdArgv, baseCount, verbose);
-            if (rc != 0) status = 1;
-            smallclueXargsFreeArgv(cmdArgv, baseCount);
-        }
-        smallclueLineVectorFree(&lines);
-        return status;
-    }
-
-    SmallclueLineVector extra = {0};
-    bool ok = nulDelimited ? smallclueReadNulTokensFromStdin(&extra) : smallclueReadTokensFromStdin(&extra);
-    if (!ok) {
-        /* smallclueReadTokensFromStdin already reports unmatched-quote
-         * errors itself; only an out-of-memory condition reaches here
-         * without having printed anything, so perror() still applies. */
-        if (!nulDelimited && errno == 0) {
-            /* message already printed */
-        } else {
-            perror("xargs");
-        }
-        smallclueLineVectorFree(&extra);
-        return 1;
-    }
-
-    size_t batchSize = maxArgsPerInvocation > 0 ? (size_t)maxArgsPerInvocation : extra.count;
-    if (batchSize == 0) {
-        /* No input tokens at all: still run once with just the base
-         * command (matches traditional xargs, which runs the command
-         * with no extra args rather than skipping it, unless --no-run-
-         * if-empty is requested -- not implemented here). */
-        char **cmdArgv = (char **)calloc((size_t)baseCount + 1, sizeof(char *));
-        if (!cmdArgv) {
-            perror("xargs");
-            smallclueLineVectorFree(&extra);
-            return 1;
-        }
-        for (int i = 0; i < baseCount; ++i) {
-            cmdArgv[i] = strdup(baseArgs[i]);
-        }
-        status = smallclueXargsRunOne(cmdArgv, baseCount, verbose);
-        smallclueXargsFreeArgv(cmdArgv, baseCount);
-        smallclueLineVectorFree(&extra);
-        return status;
-    }
-
-    for (size_t start = 0; start < extra.count; start += batchSize) {
-        size_t end = start + batchSize;
-        if (end > extra.count) end = extra.count;
-        size_t batchCount = end - start;
-        size_t total = (size_t)baseCount + batchCount;
-        char **cmdArgv = (char **)calloc(total + 1, sizeof(char *));
-        if (!cmdArgv) {
-            perror("xargs");
-            status = 1;
-            break;
-        }
-        size_t index = 0;
-        for (int i = 0; i < baseCount; ++i) {
-            cmdArgv[index++] = strdup(baseArgs[i]);
-        }
-        for (size_t i = start; i < end; ++i) {
-            cmdArgv[index++] = strdup(extra.items[i]);
-        }
-        int rc = smallclueXargsRunOne(cmdArgv, (int)total, verbose);
-        if (rc != 0) status = 1;
-        smallclueXargsFreeArgv(cmdArgv, (int)total);
-    }
-    smallclueLineVectorFree(&extra);
-    return status;
-}
 
 static FILE *smallclueOpenTempFile(const char *tag) {
 #if defined(PSCAL_TARGET_IOS)
@@ -19513,6 +19113,21 @@ bool smallclueAppShouldAbort(int *status) {
 
 void smallclueAppClearPendingSignals(void) {
     smallclueClearPendingSignals();
+}
+
+bool smallclueAppRunInProcess(int argc, char **argv, int *status) {
+#if defined(PSCAL_TARGET_IOS)
+    const SmallclueApplet *target = smallclueFindApplet(argv[0]);
+    if (target) {
+        *status = smallclueDispatchApplet(target, argc, argv);
+        return true;
+    }
+#else
+    (void)argc;
+    (void)argv;
+    (void)status;
+#endif
+    return false;
 }
 
 

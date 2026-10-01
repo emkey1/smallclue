@@ -17,5 +17,9 @@ FILE *smallclueAppOpenRead(const char *path);
 bool smallclueAppShouldAbort(int *status);
 /* Forget interrupts that arrived before this command started. */
 void smallclueAppClearPendingSignals(void);
+/* Where the host cannot spawn an applet as a child (PSCAL on iOS), runs it
+ * as a call: true, with its exit status in *status. Elsewhere false, and the
+ * caller spawns it like any other program. */
+bool smallclueAppRunInProcess(int argc, char **argv, int *status);
 
 #endif /* SMALLCLUE_APP_HOOKS_H */
