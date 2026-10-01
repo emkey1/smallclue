@@ -68,8 +68,7 @@ static inline bool gnuUtf8Locale(void) {
  * backslash is doubled, \a \b \f \n \r \t \v are spelled so, other
  * unprintable bytes (and, outside UTF-8, every byte above 0x7f) become
  * \ooo, and the closing quote is backslashed. */
-static inline const char *gnuQuoteLocale(const char *s, char *buf, size_t size) {
-    bool utf8 = gnuUtf8Locale();
+static inline const char *gnuQuoteLocaleAs(bool utf8, const char *s, char *buf, size_t size) {
     const char *lq = utf8 ? "\xe2\x80\x98" : "'", *rq = utf8 ? "\xe2\x80\x99" : "'";
     size_t rql = strlen(rq), o = 0;
 #define GNU_QPUT(str, n) do { size_t n_ = (n); if (o + n_ < size) { memcpy(buf + o, (str), n_); o += n_; } } while (0)
@@ -99,6 +98,11 @@ static inline const char *gnuQuoteLocale(const char *s, char *buf, size_t size) 
 #undef GNU_QPUT
     buf[o < size ? o : size - 1] = '\0';
     return buf;
+}
+/* The style for the locale as the environment has it now; a program that
+ * changes its own environment (env -i) passes the style it started with. */
+static inline const char *gnuQuoteLocale(const char *s, char *buf, size_t size) {
+    return gnuQuoteLocaleAs(gnuUtf8Locale(), s, buf, size);
 }
 
 /* GNU's "PROG: write error: ..." -- except for EPIPE while SIGPIPE has its

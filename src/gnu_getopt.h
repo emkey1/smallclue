@@ -27,7 +27,8 @@ typedef struct {
     int argc;
     char **argv;
     const char *prog;          /* for messages */
-    const char *shorts;        /* "bln:" -- ':' after a letter takes an argument */
+    const char *shorts;        /* "bln:" -- ':' after a letter takes an argument; a
+                                * leading '+' stops at the first operand, as glibc's */
     const GnuLongOpt *longs;   /* in the program's own order (ambiguity lists it) */
     size_t nlongs;
     int ind;
@@ -115,7 +116,7 @@ static inline int gnuGetopt(GnuGetopt *g) {
                     return 1;
                 }
                 g->ops[g->nops++] = a;
-                if (getenv("POSIXLY_CORRECT")) g->done = true;
+                if (g->shorts[0] == '+' || getenv("POSIXLY_CORRECT")) g->done = true;
                 continue;
             }
             if (!strcmp(a, "--")) {
@@ -128,7 +129,7 @@ static inline int gnuGetopt(GnuGetopt *g) {
         }
     }
     char c = *g->cluster++;
-    const char *spec = c != ':' ? strchr(g->shorts, c) : NULL;
+    const char *spec = c != ':' && c != '+' ? strchr(g->shorts, c) : NULL;
     if (!spec) {
         fprintf(stderr, "%s: invalid option -- '%c'\n", g->prog, c);
         if (!*g->cluster) g->cluster = NULL;

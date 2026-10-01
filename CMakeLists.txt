@@ -477,6 +477,7 @@ set(SOURCES
     src/sed_app.c
     src/stty_app.c
     src/ln_app.c
+    src/env_app.c
     src/stat_app.c
     src/touch_app.c
     src/tr_app.c

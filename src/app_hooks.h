@@ -8,6 +8,7 @@
 #define SMALLCLUE_APP_HOOKS_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 
 /* fopen(path, "r") through the host's path translation. */
@@ -21,5 +22,10 @@ void smallclueAppClearPendingSignals(void);
  * as a call: true, with its exit status in *status. Elsewhere false, and the
  * caller spawns it like any other program. */
 bool smallclueAppRunInProcess(int argc, char **argv, int *status);
+/* The executable `name` runs as, through the host's command lookup (PSCAL's
+ * virtual paths on iOS); false to leave it to execvp. */
+bool smallclueAppResolveExec(const char *name, char *resolved, size_t size);
+/* Empty the environment, as env -i does. */
+void smallclueAppClearEnv(void);
 
 #endif /* SMALLCLUE_APP_HOOKS_H */

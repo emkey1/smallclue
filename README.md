@@ -35,7 +35,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **stat**: Display file or file-system status; GNU coreutils compatible (every `-c`/`--printf` directive with widths and precision, `-L -f -t`).
 * **basename** / **dirname**: Parse path components (multi-operand support; `basename` supports a `SUFFIX` operand).
 * **find**: Search for files and directories (`-name`, `-type`, `-exec`, `-delete`, `-maxdepth`/`-mindepth`, `-mtime`/`-newer`, `-size`, `-print0`, and full boolean logic: `-a`/`-and` (implicit between adjacent terms), `-o`/`-or`, `!`/`-not`, `\( \)` grouping).
-* **readlink** / **realpath**: Print resolved symbolic links or canonicalized absolute paths.
+* **readlink** / **realpath**: Print symlink values or canonical names; GNU coreutils compatible (`-f -e -m`, realpath `-L -P -s -q -z --relative-to --relative-base`).
 * **install**: Copy files and set attributes (or create directories), like `make install`'s underlying tool.
 * **diff**: Compare files line by line; GNU diffutils compatible (normal, `-c`, `-u`, `-e`, `-n`, `-y`, `-r`, `-N`, `-x`, whitespace and case options).
 * **patch**: Apply a unified diff to files.
@@ -96,7 +96,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 ### Shell & System
 * **sh** / **ash**: In standalone builds, smallclue's own POSIX shell (BusyBox-ash-class): pipelines, functions, full word expansion (`${var...}`, `$(...)`, `$((...))`, globbing, IFS splitting), heredocs, traps, job control (`jobs`/`fg`/`bg`/`wait`), `set -e/-u/-x/-o pipefail`, and interactive line editing with history and tab completion. Implemented in `src/shell/`: the lexer/parser are vendored from exsh, executed by a native AST-walking interpreter with no PSCAL VM dependency. In embedded PSCAL builds (`WITH_EXSH`), `sh` launches the PSCAL shell frontend (`exsh`) instead.
 * **dvtm**: Launch the dvtm terminal multiplexer applet (enabled in iOS/iPadOS chroot and Docker setup builds).
-* **env**: Run a program in a modified environment.
+* **env**: Run a command in a modified environment; GNU coreutils compatible (`-i -u -0 -C -S -v`, the signal options, exit statuses 125/126/127).
 * **ps**: Report a snapshot of current processes (real `/proc` parsing on Linux, with `STAT` column; supports `-e`/`-f`/`aux`-style argument forms and `-p PID`).
 * **top**: Show running processes sorted by %CPU (real `/proc`-based on Linux; shows PSCAL virtual processes on iOS/iPadOS).
 * **kill**: Send signals to processes.
