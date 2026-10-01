@@ -15,6 +15,7 @@
 #include "sed_app.h"
 #include "stty_app.h"
 #include "ln_app.h"
+#include "cp_app.h"
 #include "grep_app.h"
 #include "find_app.h"
 #include "xargs_app.h"
@@ -1458,8 +1459,6 @@ static int smallclueLsCommand(int argc, char **argv);
 static int smallclueCatCommand(int argc, char **argv);
 static int smallcluePagerCommand(int argc, char **argv);
 static int smallclueClearCommand(int argc, char **argv);
-static int smallclueCpCommand(int argc, char **argv);
-static int smallclueMvCommand(int argc, char **argv);
 static int smallclueInstallCommand(int argc, char **argv);
 static int smallclueRsyncCommand(int argc, char **argv);
 static int smallcluePwdCommand(int argc, char **argv);
@@ -3551,10 +3550,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  Clear the terminal"},
     {"cls", "cls\n"
             "  Clear the terminal (alias)"},
-    {"cp", "cp [-r|-R] [-a] [-p] SRC... DEST\n"
-           "  -r/-R  recursive copy (directories)\n"
-           "  -a     archive: recursive + preserve timestamps\n"
-           "  -p     preserve timestamps"},
+    {"cp", "cp [OPTION]... SOURCE... DEST (or -t DIR SOURCE...)\n"
+           "  Copy files; GNU cp compatible\n"
+           "  -r/-R -a -d -p --preserve -L/-P/-H -f -i -n -u -v -b/--backup -l -s -t -T -x --parents"},
     {"curl", "curl [options] URL...\n"
              "  Common: -o FILE,\n"
              "  -O (remote name)\n"
@@ -3752,8 +3750,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  Micro editor"},
     {"more", "more [FILE...]\n"
              "  Pager (alias of less)"},
-    {"mv", "mv SRC... DEST\n"
-           "  Move or rename files"},
+    {"mv", "mv [OPTION]... SOURCE... DEST (or -t DIR SOURCE...)\n"
+           "  Move or rename files; GNU mv compatible\n"
+           "  -f -i -n -u -v -b/--backup -S SUFFIX -t DIR -T"},
     {"install", "install [-m MODE] [-o OWNER] [-g GROUP] [-DpTv] SRC... DEST\n"
                 "       install -t DIR [options] SRC...\n"
                 "       install -d [-m MODE] [-o OWNER] [-g GROUP] DIRECTORY...\n"
@@ -21901,91 +21900,6 @@ static int smallclueCopyFile(const char *label, const char *src, const char *dst
     return status;
 }
 
-static void smallclueCopyPreserveTimes(const char *src, const char *dst, const struct stat *srcStat) {
-    struct timeval times[2];
-    times[0].tv_sec = srcStat->st_atime;
-    times[0].tv_usec = 0;
-    times[1].tv_sec = srcStat->st_mtime;
-    times[1].tv_usec = 0;
-    if (utimes(dst, times) != 0) {
-        fprintf(stderr, "cp: %s: failed to preserve timestamps from %s: %s\n", dst, src, strerror(errno));
-    }
-}
-
-/* Recursive copy for `cp -r`/`-a`/`-R`: files copy via smallclueCopyFile,
- * symlinks are recreated pointing at the same target (not followed and
- * copied as file content), directories are made then walked. preserveTimes
- * corresponds to -p/-a (mode is always preserved by smallclueCopyFile). */
-static int smallclueCopyRecursive(const char *label, const char *src, const char *dst, bool preserveTimes) {
-    struct stat srcStat;
-    if (lstat(src, &srcStat) != 0) {
-        fprintf(stderr, "%s: %s: %s\n", label, src, strerror(errno));
-        return -1;
-    }
-
-    if (S_ISLNK(srcStat.st_mode)) {
-        char linkTarget[PATH_MAX];
-        ssize_t n = readlink(src, linkTarget, sizeof(linkTarget) - 1);
-        if (n < 0) {
-            fprintf(stderr, "%s: %s: %s\n", label, src, strerror(errno));
-            return -1;
-        }
-        linkTarget[n] = '\0';
-        unlink(dst);
-        if (symlink(linkTarget, dst) != 0) {
-            fprintf(stderr, "%s: %s: %s\n", label, dst, strerror(errno));
-            return -1;
-        }
-        return 0;
-    }
-
-    if (S_ISDIR(srcStat.st_mode)) {
-        if (mkdir(dst, srcStat.st_mode & 07777) != 0 && errno != EEXIST) {
-            fprintf(stderr, "%s: %s: %s\n", label, dst, strerror(errno));
-            return -1;
-        }
-        DIR *dir = opendir(src);
-        if (!dir) {
-            fprintf(stderr, "%s: %s: %s\n", label, src, strerror(errno));
-            return -1;
-        }
-        struct dirent *entry;
-        int status = 0;
-        while ((entry = readdir(dir)) != NULL) {
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-                continue;
-            }
-            char childSrc[PATH_MAX];
-            char childDst[PATH_MAX];
-            if (smallclueBuildPath(childSrc, sizeof(childSrc), src, entry->d_name) != 0 ||
-                smallclueBuildPath(childDst, sizeof(childDst), dst, entry->d_name) != 0) {
-                fprintf(stderr, "%s: %s/%s: %s\n", label, src, entry->d_name, strerror(errno));
-                status = -1;
-                continue;
-            }
-            if (smallclueCopyRecursive(label, childSrc, childDst, preserveTimes) != 0) {
-                status = -1;
-            }
-        }
-        closedir(dir);
-        if (preserveTimes) {
-            smallclueCopyPreserveTimes(src, dst, &srcStat);
-        }
-        return status;
-    }
-
-    if (S_ISREG(srcStat.st_mode)) {
-        int rc = smallclueCopyFile(label, src, dst);
-        if (rc == 0 && preserveTimes) {
-            smallclueCopyPreserveTimes(src, dst, &srcStat);
-        }
-        return rc;
-    }
-
-    fprintf(stderr, "%s: %s: unsupported file type, skipping\n", label, src);
-    return 0;
-}
-
 static int smallclueMkdirParents(const char *path, mode_t mode, bool verbose) {
     if (!path || !*path) {
         errno = EINVAL;
@@ -23615,293 +23529,6 @@ static int smallclueTypeCommand(int argc, char **argv) {
             status = 1;
         }
     }
-    return status;
-}
-
-static int smallclueCpCommand(int argc, char **argv) {
-    bool recursive = false;
-    bool preserveTimes = false;
-    int argi = 1;
-    for (; argi < argc; ++argi) {
-        const char *arg = argv[argi];
-        if (arg[0] != '-' || strcmp(arg, "-") == 0) {
-            break;
-        }
-        if (strcmp(arg, "--") == 0) {
-            argi++;
-            break;
-        }
-        for (const char *p = arg + 1; *p; ++p) {
-            switch (*p) {
-                case 'r':
-                case 'R':
-                    recursive = true;
-                    break;
-                case 'a':
-                    recursive = true;
-                    preserveTimes = true;
-                    break;
-                case 'p':
-                    preserveTimes = true;
-                    break;
-                default:
-                    fprintf(stderr, "cp: unsupported option '%c'\n", *p);
-                    return 1;
-            }
-        }
-    }
-
-    if (argc - argi < 2) {
-        fprintf(stderr, "cp: missing file operand\n");
-        return 1;
-    }
-    const char *dest = argv[argc - 1];
-    char resolved_dest_root[PATH_MAX];
-    const char *dest_real = smallclueResolvePath(dest, resolved_dest_root, sizeof(resolved_dest_root));
-    struct stat dest_stat;
-    int dest_exists = (stat(dest_real, &dest_stat) == 0);
-    bool dest_is_dir = dest_exists && S_ISDIR(dest_stat.st_mode);
-    int source_count = (argc - 1) - argi;
-    if (source_count > 1 && !dest_is_dir) {
-        fprintf(stderr, "cp: target '%s' is not a directory\n", dest);
-        return 1;
-    }
-    int status = 0;
-    for (int i = argi; i < argi + source_count; ++i) {
-        char resolved_src[PATH_MAX];
-        const char *src = smallclueResolvePath(argv[i], resolved_src, sizeof(resolved_src));
-        struct stat src_stat;
-        if (lstat(src, &src_stat) != 0) {
-            fprintf(stderr, "cp: %s: %s\n", src, strerror(errno));
-            status = 1;
-            continue;
-        }
-        if (S_ISDIR(src_stat.st_mode) && !recursive) {
-            fprintf(stderr, "cp: -r not specified; omitting directory '%s'\n", src);
-            status = 1;
-            continue;
-        }
-        char target_path[PATH_MAX];
-        char resolved_dest[PATH_MAX];
-        const char *target = smallclueResolvePath(dest, resolved_dest, sizeof(resolved_dest));
-        if (dest_is_dir) {
-            if (smallclueBuildPath(target_path, sizeof(target_path), dest_real, smallclueLeafName(src)) != 0) {
-                fprintf(stderr, "cp: %s/%s: %s\n", dest, smallclueLeafName(src), strerror(errno));
-                status = 1;
-                continue;
-            }
-            target = target_path;
-        }
-        struct stat target_stat;
-        if (stat(target, &target_stat) == 0) {
-            if (target_stat.st_dev == src_stat.st_dev && target_stat.st_ino == src_stat.st_ino) {
-                fprintf(stderr, "cp: '%s' and '%s' are the same file\n", src, target);
-                status = 1;
-                continue;
-            }
-        }
-        if (S_ISDIR(src_stat.st_mode)) {
-            if (smallclueCopyRecursive("cp", src, target, preserveTimes) != 0) {
-                status = 1;
-            }
-        } else if (smallclueCopyFile("cp", src, target) != 0) {
-            status = 1;
-        } else if (preserveTimes) {
-            smallclueCopyPreserveTimes(src, target, &src_stat);
-        }
-    }
-    return status;
-}
-
-/* mv, with the options scripts use: -f, -i, -n, -u, -v, -T, -t DIR and the
- * long forms. It read none of them before, so `mv -f new old` took "-f" for a
- * file and failed with "target 'old' is not a directory" -- which is how
- * start-wayland.sh never updated a default user's labwc config. Operands are
- * gathered into a list of the applet's own (argv stays untouched, see
- * smallclueBorrowArgs). The last of -f, -i and -n wins, as in GNU mv. */
-static int smallclueMvCommand(int argc, char **argv) {
-    enum { MV_FORCE, MV_INTERACTIVE, MV_NO_CLOBBER } overwrite = MV_FORCE;
-    bool verbose = false, update = false, no_target_dir = false;
-    const char *target_dir = NULL;
-    int count = 0;
-    char **operands = smallclueBorrowArgs("mv", argc, argv, &count);
-    if (!operands) {
-        return 1;
-    }
-    count = 0; /* operands only; argv[0] is not one */
-    bool options_done = false;
-    for (int i = 1; i < argc; i++) {
-        char *arg = argv[i];
-        if (options_done || arg[0] != '-' || arg[1] == '\0') {
-            operands[count++] = arg;
-            continue;
-        }
-        if (!strcmp(arg, "--")) {
-            options_done = true;
-            continue;
-        }
-        if (arg[1] == '-') {
-            const char *name = arg + 2;
-            if (!strcmp(name, "force")) overwrite = MV_FORCE;
-            else if (!strcmp(name, "interactive")) overwrite = MV_INTERACTIVE;
-            else if (!strcmp(name, "no-clobber")) overwrite = MV_NO_CLOBBER;
-            else if (!strcmp(name, "verbose")) verbose = true;
-            else if (!strcmp(name, "update")) update = true;
-            else if (!strcmp(name, "no-target-directory")) no_target_dir = true;
-            else if (!strncmp(name, "target-directory=", 17)) target_dir = name + 17;
-            else if (!strcmp(name, "target-directory") && i + 1 < argc) target_dir = argv[++i];
-            else {
-                fprintf(stderr, "mv: unrecognized option '%s'\nTry 'mv --help' for more information.\n", arg);
-                free(operands);
-                return 1;
-            }
-            continue;
-        }
-        bool cluster_done = false;
-        for (const char *c = arg + 1; *c && !cluster_done; c++) {
-            switch (*c) {
-                case 'f': overwrite = MV_FORCE; break;
-                case 'i': overwrite = MV_INTERACTIVE; break;
-                case 'n': overwrite = MV_NO_CLOBBER; break;
-                case 'v': verbose = true; break;
-                case 'u': update = true; break;
-                case 'T': no_target_dir = true; break;
-                case 't':
-                    if (c[1]) {
-                        target_dir = c + 1;
-                    } else if (i + 1 < argc) {
-                        target_dir = argv[++i];
-                    } else {
-                        fprintf(stderr, "mv: option requires an argument -- 't'\nTry 'mv --help' for more information.\n");
-                        free(operands);
-                        return 1;
-                    }
-                    cluster_done = true; /* the rest of the cluster was the directory */
-                    break;
-                default:
-                    fprintf(stderr, "mv: invalid option -- '%c'\nTry 'mv --help' for more information.\n", *c);
-                    free(operands);
-                    return 1;
-            }
-        }
-    }
-    if (target_dir && no_target_dir) {
-        fprintf(stderr, "mv: cannot combine --target-directory (-t) and --no-target-directory (-T)\n");
-        free(operands);
-        return 1;
-    }
-    const char *dest;
-    int source_count;
-    if (target_dir) {
-        dest = target_dir;
-        source_count = count;
-        if (source_count < 1) {
-            fprintf(stderr, "mv: missing file operand\n");
-            free(operands);
-            return 1;
-        }
-    } else {
-        if (count < 1) {
-            fprintf(stderr, "mv: missing file operand\nTry 'mv --help' for more information.\n");
-            free(operands);
-            return 1;
-        }
-        if (count < 2) {
-            fprintf(stderr, "mv: missing destination file operand after '%s'\nTry 'mv --help' for more information.\n", operands[0]);
-            free(operands);
-            return 1;
-        }
-        dest = operands[count - 1];
-        source_count = count - 1;
-    }
-    char resolved_dest_root[PATH_MAX];
-    const char *dest_real = smallclueResolvePath(dest, resolved_dest_root, sizeof(resolved_dest_root));
-    struct stat dest_stat;
-    int dest_exists = (stat(dest_real, &dest_stat) == 0);
-    bool dest_is_dir = !no_target_dir && dest_exists && S_ISDIR(dest_stat.st_mode);
-    if (no_target_dir && source_count > 1) {
-        fprintf(stderr, "mv: extra operand '%s'\nTry 'mv --help' for more information.\n", operands[2]);
-        free(operands);
-        return 1;
-    }
-    if (target_dir && !dest_is_dir) {
-        fprintf(stderr, "mv: target directory '%s': %s\n", dest, dest_exists ? "Not a directory" : "No such file or directory");
-        free(operands);
-        return 1;
-    }
-    if (source_count > 1 && !dest_is_dir) {
-        fprintf(stderr, "mv: target '%s': %s\n", dest, dest_exists ? "Not a directory" : "No such file or directory");
-        free(operands);
-        return 1;
-    }
-    int status = 0;
-    for (int i = 0; i < source_count; ++i) {
-        char resolved_src[PATH_MAX];
-        const char *src = smallclueResolvePath(operands[i], resolved_src, sizeof(resolved_src));
-        char target_path[PATH_MAX];
-        char resolved_dest_dir[PATH_MAX];
-        const char *target = smallclueResolvePath(dest, resolved_dest_dir, sizeof(resolved_dest_dir));
-        if (dest_is_dir) {
-            if (smallclueBuildPath(target_path, sizeof(target_path), target, smallclueLeafName(src)) != 0) {
-                fprintf(stderr, "mv: %s/%s: %s\n", target, smallclueLeafName(src), strerror(errno));
-                status = 1;
-                continue;
-            }
-            target = target_path;
-        }
-        struct stat src_stat, target_stat;
-        if (lstat(src, &src_stat) != 0) {
-            fprintf(stderr, "mv: cannot stat '%s': %s\n", operands[i], strerror(errno));
-            status = 1;
-            continue;
-        }
-        if (lstat(target, &target_stat) == 0) {
-            if (S_ISDIR(target_stat.st_mode) && !S_ISDIR(src_stat.st_mode)) {
-                fprintf(stderr, "mv: cannot overwrite directory '%s' with non-directory '%s'\n", target, operands[i]);
-                status = 1;
-                continue;
-            }
-            if (overwrite == MV_NO_CLOBBER) {
-                continue;
-            }
-            if (update && src_stat.st_mtime <= target_stat.st_mtime) {
-                continue;
-            }
-            if (overwrite == MV_INTERACTIVE) {
-                fprintf(stderr, "mv: overwrite '%s'? ", target);
-                fflush(stderr);
-                char answer[64];
-                if (!fgets(answer, sizeof(answer), stdin) || (answer[0] != 'y' && answer[0] != 'Y')) {
-                    continue;
-                }
-            }
-        }
-        bool moved = rename(src, target) == 0;
-        if (!moved && errno == EXDEV) {
-            bool src_is_dir = S_ISDIR(src_stat.st_mode);
-            if (src_is_dir) {
-                if (smallclueCopyRecursive("mv", src, target, true) != 0) {
-                    status = 1;
-                    continue;
-                }
-            } else if (smallclueCopyFile("mv", src, target) != 0) {
-                status = 1;
-                continue;
-            }
-            if (smallclueRemovePathWithLabel("mv", src, src_is_dir, true, false) != 0) {
-                fprintf(stderr, "mv: %s: unable to remove after copy\n", src);
-                status = 1;
-            }
-            moved = true;
-        } else if (!moved) {
-            fprintf(stderr, "mv: cannot move '%s' to '%s': %s\n", operands[i], target, strerror(errno));
-            status = 1;
-        }
-        if (moved && verbose) {
-            printf("renamed '%s' -> '%s'\n", operands[i], dest_is_dir ? target : dest);
-        }
-    }
-    free(operands);
     return status;
 }
 

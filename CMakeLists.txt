@@ -477,6 +477,7 @@ set(SOURCES
     src/sed_app.c
     src/stty_app.c
     src/ln_app.c
+    src/cp_app.c
     src/grep_app.c
     src/find_app.c
     src/xargs_app.c
