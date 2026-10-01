@@ -108,7 +108,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **clear** / **cls**: Clear the terminal screen.
 * **sleep**: Delay for a specified amount of time.
 * **tset**: Modify terminal settings.
-* **stty**: Inspect or modify terminal settings.
+* **stty**: Print or change terminal settings, compatible with GNU coreutils 9 (`src/stty_app.c`): every mode and its `-` form, `raw`/`cooked`/`sane`/`cbreak` and the other combinations, control characters (`^X`, `^?`, `^-`, `undef`, numbers), `min`/`time`, speeds, `rows`/`cols`/`size`, `-F DEVICE`, and `-a`/`-g` with `-g` strings interchangeable with GNU's on Linux. Kept in Linux's termios terms on every host; where the host fronts a Linux tty (iSH-AOK) it uses the kernel's TCGETS/TCSETSW, so Linux-only settings (xcase, iuclc, olcuc, cmspar) work too.
 * **tty**: Report tty.
 * **resize**: Synchronize terminal row/column settings with the host.
 * **script**: Record terminal output to a file.

@@ -13,6 +13,7 @@
 #include "openssh_app.h"
 #include "openrsync_app.h"
 #include "sed_app.h"
+#include "stty_app.h"
 #include "tar_app.h"
 #include "gzip_app.h"
 #include "readlink_app.h"
@@ -1466,7 +1467,6 @@ static int smallclueDuCommand(int argc, char **argv);
 static int smallclueFindCommand(int argc, char **argv);
 static int smallclueTailCommand(int argc, char **argv);
 static int smallclueTouchCommand(int argc, char **argv);
-static int smallclueSttyCommand(int argc, char **argv);
 static int smallclueTsetCommand(int argc, char **argv);
 static int smallclueTtyCommand(int argc, char **argv);
 static int smallclueResizeCommand(int argc, char **argv);
@@ -3457,7 +3457,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"sleep", smallclueSleepCommand, "Delay for a number of seconds"},
     {"sort", smallclueSortCommand, "Sort lines of text"},
     {"stat", smallclueStatCommand, "Display file status"},
-    {"stty", smallclueSttyCommand, "Report terminal settings"},
+    {"stty", smallclueSttyCommand, "Print or change terminal settings"},
 #if defined(SMALLCLUE_WITH_EXSH)
     {"exsh", smallclueShCommand, "Run the PSCAL shell front end"},
     {"sh", smallclueShCommand, "Run the PSCAL shell front end"},
@@ -3931,8 +3931,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "    %u/%g uid/gid %U/%G user/group %i inode %h links\n"
              "    %d device %b blocks %B block-size %f raw mode(hex)\n"
              "    %X/%Y/%Z atime/mtime/ctime (epoch seconds), %% literal %"},
-    {"stty", "stty [reset] [sane] [ixon|-ixon]\n"
-             "  Report terminal settings; apply reset/sane; toggle flow control"},
+    {"stty", "stty [-F DEVICE] [-a|-g] [SETTING]...\n"
+             "  Print or change terminal settings, compatible with GNU stty: every\n"
+             "  mode, raw/cooked/sane/cbreak and the other combinations, control\n"
+             "  characters, min/time, speed, rows/cols/size, and -g save/restore"},
 #if defined(SMALLCLUE_WITH_EXSH)
     {"exsh", "exsh\n"
              "  Launch PSCAL shell front end"},
@@ -20495,10 +20497,6 @@ static long smallclueParseLong(const char *text) {
     return value;
 }
 
-static void smallclueEmitTerminalReset(void) {
-    fputs("\x1b" "c", stdout); // RIS: full reset
-    fflush(stdout);
-}
 
 static void smallclueEmitTerminalSane(void) {
     fputs("\x1b[0m\x1b[?7h\x1b[?25h", stdout); // reset attributes, enable wrap & cursor
@@ -20896,244 +20894,10 @@ static void smallclueApplyWindowSize(int rows, int cols) {
     }
 }
 
-static const char *smallclueBaudLabel(speed_t speed) {
-#define CASE_BAUD(val) case val: return #val
-    switch (speed) {
-    CASE_BAUD(B0);
-    CASE_BAUD(B50);
-    CASE_BAUD(B75);
-    CASE_BAUD(B110);
-    CASE_BAUD(B134);
-    CASE_BAUD(B150);
-    CASE_BAUD(B200);
-    CASE_BAUD(B300);
-    CASE_BAUD(B600);
-    CASE_BAUD(B1200);
-    CASE_BAUD(B1800);
-    CASE_BAUD(B2400);
-    CASE_BAUD(B4800);
-    CASE_BAUD(B9600);
-#ifdef B19200
-    CASE_BAUD(B19200);
-#endif
-#ifdef B38400
-    CASE_BAUD(B38400);
-#endif
-#ifdef B57600
-    CASE_BAUD(B57600);
-#endif
-#ifdef B115200
-    CASE_BAUD(B115200);
-#endif
-#ifdef B230400
-    CASE_BAUD(B230400);
-#endif
-    default:
-        break;
-    }
-    static char unknown[32];
-    snprintf(unknown, sizeof(unknown), "%lu", (unsigned long)speed);
-    return unknown;
-#undef CASE_BAUD
-}
 
-static void smallclueDescribeControlChar(const char *label, cc_t value) {
-    const char *repr = NULL;
-    char buffer[8];
-#ifdef _POSIX_VDISABLE
-    if (value == _POSIX_VDISABLE) {
-        repr = "undef";
-    } else
-#endif
-    if (value == 0) {
-        repr = "^@";
-    } else if (value < 32) {
-        buffer[0] = '^';
-        buffer[1] = (char)('A' + value - 1);
-        buffer[2] = '\0';
-        repr = buffer;
-    } else if (value == 127) {
-        repr = "^?";
-    } else if (isprint((unsigned char)value)) {
-        buffer[0] = (char)value;
-        buffer[1] = '\0';
-        repr = buffer;
-    } else {
-        snprintf(buffer, sizeof(buffer), "%u", (unsigned)value);
-        repr = buffer;
-    }
-    printf("%s = %s; ", label, repr);
-}
 
-static int smallclueSttyReport(void) {
-    if (!pscalRuntimeStdinHasRealTTY()) {
-        fprintf(stderr, "stty: stdin is not a tty (running in virtual terminal)\n");
-        int rows = pscalRuntimeDetectWindowRows();
-        int cols = pscalRuntimeDetectWindowCols();
-        if (rows <= 0) rows = 24;
-        if (cols <= 0) cols = 80;
-        printf("speed ? baud; rows %d; columns %d;\n", rows, cols);
-        return 0;
-    }
-    struct termios tio;
-    if (smallclueTcgetattr(STDIN_FILENO, &tio) != 0) {
-        perror("stty");
-        return 1;
-    }
-    speed_t ospeed = cfgetospeed(&tio);
-    struct winsize ws;
-    int rows = -1;
-    int cols = -1;
-    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0) {
-        rows = ws.ws_row;
-        cols = ws.ws_col;
-    }
-    if (rows <= 0) {
-        rows = pscalRuntimeDetectWindowRows();
-    }
-    if (cols <= 0) {
-        cols = pscalRuntimeDetectWindowCols();
-    }
-    if (rows <= 0) rows = 24;
-    if (cols <= 0) cols = 80;
-    const char *baud_label = smallclueBaudLabel(ospeed);
-    bool emit_speed = true;
-#ifdef B0
-    if (ospeed == B0) {
-#ifdef B115200
-        baud_label = "B115200";
-#else
-        emit_speed = false;
-#endif
-    }
-#endif
-    if (emit_speed && baud_label) {
-        printf("speed %s baud; rows %d; columns %d;\n", baud_label, rows, cols);
-    } else {
-        printf("rows %d; columns %d;\n", rows, cols);
-    }
 
-#ifdef VINTR
-    smallclueDescribeControlChar("intr", tio.c_cc[VINTR]);
-#endif
-#ifdef VQUIT
-    smallclueDescribeControlChar("quit", tio.c_cc[VQUIT]);
-#endif
-#ifdef VERASE
-    smallclueDescribeControlChar("erase", tio.c_cc[VERASE]);
-#endif
-#ifdef VKILL
-    smallclueDescribeControlChar("kill", tio.c_cc[VKILL]);
-#endif
-#ifdef VEOF
-    smallclueDescribeControlChar("eof", tio.c_cc[VEOF]);
-#endif
-#ifdef VSTART
-    smallclueDescribeControlChar("start", tio.c_cc[VSTART]);
-#endif
-#ifdef VSTOP
-    smallclueDescribeControlChar("stop", tio.c_cc[VSTOP]);
-#endif
-#ifdef VSUSP
-    smallclueDescribeControlChar("susp", tio.c_cc[VSUSP]);
-#endif
-    printf("\n");
-#ifdef VMIN
-    printf("min = %u; ", (unsigned)tio.c_cc[VMIN]);
-#endif
-#ifdef VTIME
-    printf("time = %u;", (unsigned)tio.c_cc[VTIME]);
-#endif
-    printf("\n");
-    return 0;
-}
 
-// XON/XOFF flow control. Shell startup files reach for this: zprezto's
-// environment module runs `stty -ixon <$TTY >$TTY` so that ^S and ^Q stay
-// available as key bindings instead of freezing the terminal.
-static int smallclueSttySetIxon(bool enable) {
-    if (!pscalRuntimeStdinHasRealTTY()) {
-        // Report it but succeed, exactly as tset's control-char path does. A
-        // nonzero exit here would surface on every login for a terminal we
-        // simply cannot configure, which is the failure this argument exists
-        // to stop.
-        fprintf(stderr, "stty: stdin is not a tty (cannot set flow control)\n");
-        return 0;
-    }
-    struct termios tio;
-    if (smallclueTcgetattr(STDIN_FILENO, &tio) != 0) {
-        perror("stty");
-        return 1;
-    }
-    if (enable) {
-        tio.c_iflag |= IXON;
-    } else {
-        tio.c_iflag &= ~(tcflag_t) IXON;
-    }
-    if (smallclueTcsetattr(STDIN_FILENO, TCSANOW, &tio) != 0) {
-        perror("stty");
-        return 1;
-    }
-    return 0;
-}
-
-static int smallclueSttyCommand(int argc, char **argv) {
-    if (argc <= 1) {
-        return smallclueSttyReport();
-    }
-    bool requestReset = false;
-    bool requestSane = false;
-    bool requestIxon = false;
-    bool ixonEnable = false;
-    int index = 1;
-    while (index < argc) {
-        const char *arg = argv[index];
-        if (strcmp(arg, "reset") == 0) {
-            requestReset = true;
-            index += 1;
-            continue;
-        }
-        if (strcmp(arg, "sane") == 0) {
-            requestSane = true;
-            index += 1;
-            continue;
-        }
-        if (strcmp(arg, "ixon") == 0 || strcmp(arg, "-ixon") == 0) {
-            requestIxon = true;
-            ixonEnable = (arg[0] != '-');
-            index += 1;
-            continue;
-        }
-        if (strcmp(arg, "rows") == 0 || strcmp(arg, "cols") == 0 ||
-            strcmp(arg, "columns") == 0 || strcmp(arg, "size") == 0) {
-            fprintf(stderr, "stty: rows/columns are not supported; use resize\n");
-            return 1;
-        }
-        fprintf(stderr, "stty: unsupported argument '%s'\n", arg);
-        return 1;
-    }
-
-    if (requestReset) {
-        smallclueEmitTerminalReset();
-    }
-    if (requestSane) {
-        smallclueEmitTerminalSane();
-    }
-    // After sane, which turns flow control back on -- `stty sane -ixon` has to
-    // end with it off.
-    if (requestIxon) {
-        int rc = smallclueSttySetIxon(ixonEnable);
-        if (rc != 0) {
-            return rc;
-        }
-    }
-
-    if (requestReset || requestSane || requestIxon) {
-        return 0;
-    }
-    fprintf(stderr, "Usage: stty [reset] [sane] [ixon|-ixon]\n");
-    return 1;
-}
 
 static int smallclueResizeCommand(int argc, char **argv) {
     (void)argv;
