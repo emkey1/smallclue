@@ -45,7 +45,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 
 ### Archives & Compression
 * **tar**: Create, extract, or list tar archives (`-c`/`-x`/`-t`, `-z` for `.tar.gz`).
-* **gzip** / **gunzip**: Compress/decompress files (via the already-linked zlib dependency).
+* **gzip / gunzip / zcat**: GNU gzip 1.13 compatible (GNU's header, in-place with attributes kept, `-c -d -t -l -v -f -k -r -q -n -N -S -1..-9`, its warnings and exit statuses, concatenated members, trailing data).
 
 ### Text Processing & Filtering
 * **cat**: Concatenate files; GNU coreutils compatible (`-A -b -e -E -n -s -t -T -u -v`, state carried across files).
