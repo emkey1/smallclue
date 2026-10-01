@@ -23,7 +23,7 @@ Functionally similar to BusyBox, `SmallCLUE` combines many common tools (like `l
 * **rm**: Remove files and directories (`-r`/`-R`, `-f`, `-i`, `--preserve-root`).
 * **mkdir** / **rmdir**: Create or remove directories.
 * **touch**: Update file timestamps or create empty files (`-c`, `-d`, `-t`, `-r`).
-* **ln**: Create links (symbolic and hard; `-f` force, `-s` symbolic, directory-target auto-append).
+* **ln**: Make links, compatible with GNU coreutils 9 (`src/ln_app.c`): all four forms (`TARGET LINK`, `TARGET`, `TARGET... DIR`, `-t DIR TARGET...`) and `-s -f -n -T -t -v -i -r -L -P -d/-F -b --backup[=CONTROL] -S`; `-f` replaces atomically. Matches GNU ln 9.4 on 95 cases (resulting tree, output, status).
 * **mount** / **umount**: Add or remove filesystem mounts (real `mount(2)`/`umount(2)` syscall wrappers on Linux; `umount` supports `-l`/`-f` lazy/force unmount).
 * **pwd**: Print working directory.
 * **chmod**: Change file modes/permissions (supports octal and symbolic `u+x`, `-R` recursive).

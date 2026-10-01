@@ -14,6 +14,7 @@
 #include "openrsync_app.h"
 #include "sed_app.h"
 #include "stty_app.h"
+#include "ln_app.h"
 #include "tar_app.h"
 #include "gzip_app.h"
 #include "readlink_app.h"
@@ -1505,7 +1506,6 @@ static void smallclueEmitTerminalSane(void);
 static bool smallclueSessionPtyName(char *buf, size_t buf_len);
 #endif
 static int smallclueRmdirCommand(int argc, char **argv);
-static int smallclueLnCommand(int argc, char **argv);
 static int smallclueTypeCommand(int argc, char **argv);
 static int smallclueFileCommand(int argc, char **argv);
 static int smallclueStatCommand(int argc, char **argv);
@@ -3723,11 +3723,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  Signals: HUP INT TERM KILL etc."},
     {"less", "less [FILE...]\n"
              "  Pager; navigation: j/k, /, n, g/G, q"},
-    {"ln", "ln [-s] [-f] TARGET LINK\n"
-           "       ln [-s] [-f] TARGET... DIRECTORY\n"
-           "  -s symbolic link  -f force overwrite\n"
-           "  When the last operand is a directory, each target's basename\n"
-           "  is created inside it"},
+    {"ln", "ln [OPTION]... [-T] TARGET LINK_NAME | TARGET | TARGET... DIRECTORY |\n"
+           "   -t DIRECTORY TARGET...\n"
+           "  GNU ln compatible: -s -f -n -T -t -v -i -r -L -P -d/-F, -b,\n"
+           "  --backup[=CONTROL], -S SUFFIX; -f replaces atomically"},
     {"ls", "ls [-a] [-A] [-l] [-n] [-1] [-C] [-t] [-S] [-X] [-v] [-r] [-R] [-h] [-d] [-i]\n"
            "     [--color[=auto|always|never]] [path ...]\n"
            "  -a show entries starting with '.' (including . and ..)\n"
@@ -26229,79 +26228,7 @@ static int smallclueStatCommand(int argc, char **argv) {
     return status;
 }
 
-static int smallclueLnCreateOne(const char *target, const char *linkname, bool symbolic, bool force) {
-    if (force) {
-        unlink(linkname);
-    }
-    if (symbolic) {
-        if (symlink(target, linkname) != 0) {
-            fprintf(stderr, "ln: cannot create symbolic link '%s': %s\n", linkname, strerror(errno));
-            return 1;
-        }
-    } else {
-        if (link(target, linkname) != 0) {
-            fprintf(stderr, "ln: cannot create link '%s': %s\n", linkname, strerror(errno));
-            return 1;
-        }
-    }
-    return 0;
-}
 
-static int smallclueLnCommand(int argc, char **argv) {
-    int symbolic = 0;
-    int force = 0;
-    int opt;
-    smallclueResetGetopt();
-    while ((opt = getopt(argc, argv, "sf")) != -1) {
-        switch (opt) {
-            case 's':
-                symbolic = 1;
-                break;
-            case 'f':
-                force = 1;
-                break;
-            default:
-                fprintf(stderr, "ln: invalid option -- %c\n", optopt);
-                return 1;
-        }
-    }
-    int nOperands = argc - optind;
-    if (nOperands < 2) {
-        fprintf(stderr, "ln: missing file operand\n");
-        return 1;
-    }
-
-    const char *lastArg = argv[argc - 1];
-    struct stat destStat;
-    bool destIsDir = (nOperands > 2) || (stat(lastArg, &destStat) == 0 && S_ISDIR(destStat.st_mode));
-
-    if (!destIsDir) {
-        /* Classic two-operand form: `ln [-s] TARGET LINKNAME`. */
-        return smallclueLnCreateOne(argv[optind], argv[optind + 1], symbolic, force);
-    }
-
-    /* `ln [-s] TARGET... DIRECTORY` -- matches GNU ln's auto-append of each
-     * target's basename inside the destination directory instead of
-     * requiring the caller to spell out the link path (e.g.
-     * `ln -s /usr/bin/foo /usr/local/bin/` now creates
-     * /usr/local/bin/foo, rather than failing with EEXIST against the
-     * directory itself). */
-    int status = 0;
-    for (int i = optind; i < argc - 1; ++i) {
-        const char *target = argv[i];
-        const char *base = smallclueLeafName(target);
-        char linkname[PATH_MAX];
-        if (smallclueBuildPath(linkname, sizeof(linkname), lastArg, base) != 0) {
-            fprintf(stderr, "ln: %s/%s: %s\n", lastArg, base, strerror(errno));
-            status = 1;
-            continue;
-        }
-        if (smallclueLnCreateOne(target, linkname, symbolic, force) != 0) {
-            status = 1;
-        }
-    }
-    return status;
-}
 
 static char *smallclueSearchPath(const char *name) {
     if (!name || !*name) {
