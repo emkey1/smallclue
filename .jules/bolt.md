@@ -33,3 +33,6 @@
 ## YYYY-MM-DD - Optimize cmp applet via block reads
 **Learning:** For utilities like `cmp` that compare inputs byte-by-byte, using `fgetc` introduces substantial function-call and buffering overhead. Profiling shows that reading data in 16KB blocks directly into stack arrays dramatically speeds up byte processing.
 **Action:** Replace `fgetc` with standard `fread` and stack buffers in high-throughput byte-comparison loops like `cmp` to minimize stdio execution overhead.
+## $(date +%Y-%m-%d) - Optimization of wc -m block read
+**Learning:** In the `wc` applet's wide character processing path (`smallclueWcProcessFileWide`), per-chunk dynamic allocations (`malloc`/`free`) and byte-by-byte iteration create a significant bottleneck. Using a fixed-size stack array and unrolling the inner loop speeds up processing considerably. However, when replacing locale-dependent functions like `isspace()`, you must not substitute them with manual ASCII range checks (`c == ' ' || (c >= '\t' && c <= '\r')`) as this introduces bugs in non-default locales.
+**Action:** When optimizing loop operations on streams, prefer fixed-size stack buffers over `malloc`. Unroll inner loops by a factor of 16 for byte scanning, but retain the standard `isspace()` call inside the unrolled loop macro to guarantee correctness across locales.
