@@ -17715,6 +17715,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
                 free(headers);
                 free(postData);
                 free(args);
+                smallclueSecureMemzero(userpwdBuf, sizeof(userpwdBuf));
                 return 1;
         }
     }
@@ -17723,6 +17724,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
         free(headers);
         free(postData);
         free(args);
+        smallclueSecureMemzero(userpwdBuf, sizeof(userpwdBuf));
         return 1;
     }
     if (output_path && (nargs - optind) != 1) {
@@ -17730,6 +17732,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
         free(headers);
         free(postData);
         free(args);
+        smallclueSecureMemzero(userpwdBuf, sizeof(userpwdBuf));
         return 1;
     }
 
@@ -17763,6 +17766,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
     free(headers);
     free(postData);
     free(args);
+    smallclueSecureMemzero(userpwdBuf, sizeof(userpwdBuf));
     return status ? 1 : 0;
 }
 
