@@ -53,6 +53,7 @@
 #include "init_app.h"
 #include "tput_app.h"
 #include "free_app.h"
+#include "mount_app.h"
 #include "dd_app.h"
 #include "od_app.h"
 #include "seq_app.h"
@@ -19892,165 +19893,11 @@ static bool smallclueMountRemoveFstabEntry(const char *target) {
 }
 #endif
 
-#if defined(__linux__) || defined(linux) || defined(__linux)
-/*
- * The kernel mount(2) syscall has no "auto" filesystem type -- that's a
- * mount(8) userspace convention. Real util-linux mount resolves it via
- * libblkid, falling back (per mount(8)) to trying every non-"nodev" type
- * listed in /proc/filesystems. Mirror that fallback here so unqualified
- * `mount device dir` doesn't fail with ENODEV.
- */
-static bool smallclueMountAutoProbe(const char *source, const char *target,
-                                     unsigned long flags, const void *data,
-                                     int *out_errno) {
-    FILE *fp = fopen("/proc/filesystems", "r");
-    if (!fp) {
-        if (out_errno) *out_errno = errno;
-        return false;
-    }
-    char line[128];
-    int last_errno = ENODEV;
-    bool mounted = false;
-    while (fgets(line, sizeof(line), fp)) {
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
-        char *tab = strchr(line, '\t');
-        if (!tab) continue;
-        *tab = '\0';
-        const char *nodev_marker = line;
-        const char *fstype = tab + 1;
-        if (nodev_marker[0] != '\0' || fstype[0] == '\0') continue;
-        if (mount(source, target, fstype, flags, data) == 0) {
-            mounted = true;
-            break;
-        }
-        last_errno = errno;
-    }
-    fclose(fp);
-    if (out_errno) *out_errno = last_errno;
-    return mounted;
-}
-#endif
 
 static int smallclueMountCommand(int argc, char **argv) {
-#if defined(__linux__) || defined(linux) || defined(__linux)
-    const char *usage = "usage: mount [-t type] [-o options] device dir\n";
-    const char *type = NULL;
-    char *options = NULL;
-    unsigned long flags = 0;
-
-    smallclueResetGetopt();
-    int opt;
-    while ((opt = getopt(argc, argv, "t:o:")) != -1) {
-        switch (opt) {
-            case 't':
-                type = optarg;
-                break;
-            case 'o':
-                if (options) {
-                    size_t old_len = strlen(options);
-                    size_t new_len = old_len + 1 + strlen(optarg) + 1;
-                    char *new_opts = (char *)realloc(options, new_len);
-                    if (new_opts) {
-                        options = new_opts;
-                        strcat(options, ",");
-                        strcat(options, optarg);
-                    }
-                } else {
-                    options = strdup(optarg);
-                }
-                break;
-            default:
-                if (options) free(options);
-                fputs(usage, stderr);
-                return 1;
-        }
-    }
-
-    if (optind >= argc) {
-        if (options) free(options);
-        FILE *fp = fopen("/proc/mounts", "r");
-        if (!fp) fp = fopen("/etc/mtab", "r");
-        if (!fp) {
-             perror("mount: cannot read mounts");
-             return 1;
-        }
-        char buf[1024];
-        while (fgets(buf, sizeof(buf), fp)) {
-            fputs(buf, stdout);
-        }
-        fclose(fp);
-        return 0;
-    }
-
-    if (optind + 1 >= argc) {
-        if (options) free(options);
-        fputs(usage, stderr);
-        return 1;
-    }
-
-    const char *source = argv[optind];
-    const char *target = argv[optind + 1];
-
-    char *data = NULL;
-    if (options) {
-        char *opts = strdup(options);
-        char *token = strtok(opts, ",");
-        while (token) {
-            bool is_flag = true;
-            if (strcmp(token, "ro") == 0) flags |= MS_RDONLY;
-            else if (strcmp(token, "rw") == 0) flags &= ~MS_RDONLY;
-            else if (strcmp(token, "nosuid") == 0) flags |= MS_NOSUID;
-            else if (strcmp(token, "suid") == 0) flags &= ~MS_NOSUID;
-            else if (strcmp(token, "nodev") == 0) flags |= MS_NODEV;
-            else if (strcmp(token, "dev") == 0) flags &= ~MS_NODEV;
-            else if (strcmp(token, "noexec") == 0) flags |= MS_NOEXEC;
-            else if (strcmp(token, "exec") == 0) flags &= ~MS_NOEXEC;
-#ifdef MS_REMOUNT
-            else if (strcmp(token, "remount") == 0) flags |= MS_REMOUNT;
-#endif
-#ifdef MS_BIND
-            else if (strcmp(token, "bind") == 0) flags |= MS_BIND;
-#endif
-            else is_flag = false;
-
-            if (!is_flag) {
-                 if (!data) {
-                     data = strdup(token);
-                 } else {
-                     size_t old_len = strlen(data);
-                     size_t new_len = old_len + 1 + strlen(token) + 1;
-                     char *new_data = (char *)realloc(data, new_len);
-                     if (new_data) {
-                         data = new_data;
-                         strcat(data, ",");
-                         strcat(data, token);
-                     }
-                 }
-            }
-            token = strtok(NULL, ",");
-        }
-        free(opts);
-        free(options);
-    }
-
-    bool need_probe = !type || strcmp(type, "auto") == 0;
-    int rc;
-    int mount_errno = 0;
-    if (need_probe) {
-        rc = smallclueMountAutoProbe(source, target, flags, data, &mount_errno) ? 0 : -1;
-    } else {
-        rc = mount(source, target, type, flags, data);
-        mount_errno = errno;
-    }
-    if (data) free(data);
-
-    if (rc != 0) {
-        errno = mount_errno;
-        perror("mount");
-        return 1;
-    }
-    return 0;
+#if defined(__linux__) || defined(linux) || defined(__linux) || defined(SMALLCLUE_HOST_LINUX_MOUNT)
+    /* mount_app.c: util-linux's interface over Linux's mount(2). */
+    return smallclueMountLinux(argc, argv);
 #elif defined(PSCAL_TARGET_IOS)
     const char *usage = "usage: mount [-p] [-t type] [-o options] [source] dir\n";
     const char *type = NULL;
@@ -20293,39 +20140,8 @@ static int smallclueMountCommand(int argc, char **argv) {
 }
 
 static int smallclueUmountCommand(int argc, char **argv) {
-#if defined(__linux__) || defined(linux) || defined(__linux)
-    const char *usage = "usage: umount [-l] [-f] dir\n";
-    bool lazy = false;
-    bool force = false;
-    smallclueResetGetopt();
-    int opt;
-    while ((opt = getopt(argc, argv, "lf")) != -1) {
-        switch (opt) {
-            case 'l':
-                lazy = true;
-                break;
-            case 'f':
-                force = true;
-                break;
-            default:
-                fputs(usage, stderr);
-                return 1;
-        }
-    }
-    if (optind + 1 != argc) {
-        fputs(usage, stderr);
-        return 1;
-    }
-    const char *target = argv[optind];
-    int flags = 0;
-    if (lazy) flags |= MNT_DETACH;
-    if (force) flags |= MNT_FORCE;
-    int rc = flags ? umount2(target, flags) : umount(target);
-    if (rc != 0) {
-        perror("umount");
-        return 1;
-    }
-    return 0;
+#if defined(__linux__) || defined(linux) || defined(__linux) || defined(SMALLCLUE_HOST_LINUX_MOUNT)
+    return smallclueUmountLinux(argc, argv);
 #elif defined(PSCAL_TARGET_IOS)
     const char *usage = "usage: umount [-p] dir\n";
     bool persist_to_fstab = false;
