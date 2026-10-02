@@ -51,6 +51,8 @@
 #include "nohup_app.h"
 #include "cmp_app.h"
 #include "init_app.h"
+#include "tput_app.h"
+#include "free_app.h"
 #include "dd_app.h"
 #include "od_app.h"
 #include "seq_app.h"
@@ -3644,6 +3646,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"file", smallclueFileCommand, "Identify file types"},
     {"find", smallclueFindCommand, "Search for files"},
     {"grep", smallclueGrepCommand, "Print lines that match patterns"},
+    {"free", smallclueFreeCommand, "Display amount of free and used memory"},
     {"git", smallclueGitCommand, "Git plumbing and porcelain"},
     {"gzip", smallclueGzipCommand, "Compress files"},
     {"gunzip", smallclueGunzipCommand, "Decompress files"},
@@ -3700,6 +3703,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"ps", smallcluePsCommand, "Show simple process information"},
     {"pwd", smallcluePwdCommand, "Print working directory"},
     {"reboot", smallclueHaltCommand, "Reboot the system"},
+    {"reset", smallclueResetCommand, "Restore the terminal to a sane state"},
     {"resize", smallclueResizeCommand, "Synchronize terminal rows/columns"},
     {"readlink", smallclueReadlinkCommand, "Print resolved symbolic links or canonical paths"},
     {"realpath", smallclueRealpathCommand, "Print the canonicalized absolute path"},
@@ -3737,6 +3741,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"timeout", smallclueTimeoutCommand, "Run a command with a time limit"},
     {"tty", smallclueTtyCommand, "Print terminal name"},
     {"traceroute", smallclueTracerouteCommand, "Trace network path to a host"},
+    {"tput", smallclueTputCommand, "Print terminal capabilities from terminfo"},
     {"tr", smallclueTrCommand, "Translate or delete characters"},
     {"true", smallclueTrueCommand, "Do nothing, successfully"},
     {"sv", smallclueSvCommand, "Control services supervised by runit"},
@@ -3880,6 +3885,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  Print lines that match; GNU grep compatible\n"
            "  -E/-F/-G/-P, -e/-f, -i -v -w -x, -c -l -L -m -o -q -s, -b -H -h -n -T -Z\n"
            "  -A/-B/-C/-NUM context, -r/-R with --include/--exclude/--exclude-dir, --color"},
+    {"free", "free [-b|-k|-m|-g|-h] [--si] [-w] [-l] [-t] [-s N] [-c N]\n"
+             "  Memory and swap from /proc/meminfo, as procps-ng 4's free reports\n"
+             "  them: used is total - available; buff/cache is buffers + cache"},
     {"git", "git [-C PATH] [--no-pager] [-c key=value] <subcommand> [args]\n"
             "  Supported in this build:\n"
             "  init,\n"
@@ -4098,6 +4106,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  Print working directory"},
     {"reboot", "reboot [-f]\n"
              "  Reboot the system"},
+    {"reset", "reset\n"
+              "  stty sane, then the terminal's reset strings and a visible cursor"},
     {"resize", "resize [COLUMNS ROWS]\n"
                "  Report or set terminal size"},
     {"readlink", "readlink [-f|-e|-m] [-nqsvz] PATH...\n"
@@ -4221,6 +4231,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  BSD (-r, default) or System V (-s) checksums; GNU coreutils compatible"},
     {"tty", "tty [-s]\n"
             "  Print terminal name"},
+    {"tput", "tput [-T term] [-S] capname [parameters...]\n"
+             "  Print a terminfo capability for $TERM (or -T term): a string\n"
+             "  (setaf 1, cup 5 10, sgr0, clear...), a number (cols, lines, colors)\n"
+             "  or, as the exit status, a flag (am, bce...). init and reset print the\n"
+             "  terminal's initialisation strings; -S reads capnames from stdin.\n"
+             "  Exit 1: absent; 2: usage; 3: unknown terminal; 4: unknown capability"},
     {"tr", "tr [OPTION]... STRING1 [STRING2]\n"
            "  Translate, squeeze or delete characters; GNU coreutils compatible\n"
            "  -c -d -s -t; \\NNN escapes, ranges, [:class:], [=c=], [c*n]"},
