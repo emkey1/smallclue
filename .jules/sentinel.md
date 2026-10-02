@@ -45,3 +45,7 @@
 **Vulnerability:** The password wiping logic used `smallclueSecureMemzero(pass, strlen(pass))`, which zeros out the password characters but leaves the null terminator byte untouched on the heap before the buffer is freed.
 **Learning:** While zeroing the characters removes the secret, leaving the null terminator untouched can theoretically lead to a 1-byte heap disclosure or hint at string lengths, and it violates the best practice of clearing the entire allocated buffer for sensitive data.
 **Prevention:** Always zero out at least `strlen(pass) + 1` bytes for dynamically allocated strings to ensure no remnants, including terminators, remain on the heap.
+## 2024-11-20 - [Local Stack Buffer Password Disclosure in wget]
+**Vulnerability:** The `wget` applet copied passwords into a local stack buffer (`userpwdBuf`) using `snprintf` but failed to securely clear the buffer before returning on early exits or completion.
+**Learning:** Stack-allocated buffers containing sensitive data must be explicitly zeroed using `smallclueSecureMemzero` across all execution paths (including early returns and error conditions) to prevent memory disclosure vulnerabilities.
+**Prevention:** Always identify and secure all exit paths of functions that handle sensitive data on the stack, ensuring proper cleanup before returning.
