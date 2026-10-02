@@ -514,3 +514,46 @@ done:
     fflush(stdout);
     return status;
 }
+
+/* printenv [-0] [VARIABLE]...: GNU coreutils'. With no names, every
+ * variable as NAME=value; with names, each one's value, and exit status 1
+ * if any of them is unset. -0 (--null) ends each with NUL, not newline. */
+int smallcluePrintenvCommand(int argc, char **argv) {
+    extern char **environ;
+    char end = '\n';
+    int i = 1;
+    for (; i < argc; i++) {
+        if (strcmp(argv[i], "-0") == 0 || strcmp(argv[i], "--null") == 0) {
+            end = '\0';
+        } else if (strcmp(argv[i], "--") == 0) {
+            i++;
+            break;
+        } else if (strcmp(argv[i], "--help") == 0) {
+            printf("Usage: printenv [OPTION]... [VARIABLE]...\n");
+            return 0;
+        } else if (argv[i][0] == '-' && argv[i][1]) {
+            fprintf(stderr, "printenv: invalid option -- '%s'\n", argv[i] + 1);
+            return 2;
+        } else {
+            break;
+        }
+    }
+    if (i >= argc) {
+        for (char **e = environ; e && *e; e++) {
+            fputs(*e, stdout);
+            fputc(end, stdout);
+        }
+        return 0;
+    }
+    int status = 0;
+    for (; i < argc; i++) {
+        const char *v = strchr(argv[i], '=') ? NULL : getenv(argv[i]);
+        if (!v) {
+            status = 1;
+            continue;
+        }
+        fputs(v, stdout);
+        fputc(end, stdout);
+    }
+    return status;
+}

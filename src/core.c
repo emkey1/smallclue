@@ -3710,6 +3710,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"nohup", smallclueNohupCommand, "Run a command immune to hangups"},
     {"passwd", smallcluePasswdCommand, "Change user password", smallcluePasswdAvailable},
     {"patch", smallcluePatchCommand, "Apply a unified diff to files"},
+    {"printenv", smallcluePrintenvCommand, "Print all or part of the environment"},
     {"printf", smallcluePrintfCommand, "Format and print data"},
     {"pbcopy", smallcluePbcopyCommand, "Copy stdin to the system clipboard"},
     {"pbpaste", smallcluePbpasteCommand, "Paste the system clipboard to stdout"},
@@ -4087,6 +4088,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  -p N strip N leading path components (default 1)\n"
               "  FILE overrides the target path for a single-file patch\n"
               "  Context-diff/plain-diff formats are not supported, only unified"},
+    {"printenv", "printenv [-0] [VARIABLE]...\n"
+                 "  Print the environment, or each VARIABLE's value (exit 1 if one is unset)"},
     {"printf", "printf FORMAT [ARGUMENT...]\n"
                "  Format and print ARGUMENTs per FORMAT (like the shell builtin)\n"
                "  Conversions: %d %i %o %u %x %X %e %f %g %c %s %b %%\n"
