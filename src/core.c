@@ -2552,6 +2552,238 @@ static int smallclueSuCommand(int argc, char **argv) {
     }
 }
 
+/* login [-p] [-h HOST] [-f USER | USER]
+ *
+ * util-linux's and busybox's shape. -f is "already authenticated": only root
+ * may say so, and it is how a terminal is opened for a user without asking --
+ * iSH-AOK's terminals run `login -f root`, or `login -f <name>` for "Open
+ * Everything as Default User". Without -f, login asks for the name (if not
+ * given) and the password, checked against /etc/shadow.
+ *
+ * Then: groups, gid, uid; an environment cleared to TERM (all of it kept with
+ * -p) plus HOME, SHELL, USER, LOGNAME and PATH; the home directory (or /); and
+ * the shell as a login shell, argv[0] "-<name>". A shell in /etc/passwd that
+ * does not exist falls back to SMALLCLUE_FALLBACK_SHELL and then /bin/sh, so
+ * a broken account entry does not leave a terminal with nothing in it.
+ */
+#ifndef SMALLCLUE_FALLBACK_SHELL
+#define SMALLCLUE_FALLBACK_SHELL "/bin/sh"
+#endif
+
+static int smallclueLoginCommand(int argc, char **argv) {
+    const char *usage = "usage: login [-p] [-h host] [-f username | username]\n";
+    const char *user = NULL;
+    bool preauth = false;
+    bool preserve = false;
+    int i = 1;
+    for (; i < argc; i++) {
+        const char *arg = argv[i];
+        if (strcmp(arg, "--") == 0) {
+            i++;
+            break;
+        }
+        if (arg[0] != '-' || arg[1] == '\0') {
+            break;
+        }
+        if (strcmp(arg, "-p") == 0) {
+            preserve = true;
+        } else if (strcmp(arg, "-h") == 0) {
+            if (++i >= argc) {
+                fputs(usage, stderr);
+                return 1;
+            }
+        } else if (strcmp(arg, "-f") == 0) {
+            preauth = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                user = argv[++i];
+            }
+        } else if (strncmp(arg, "-f", 2) == 0) {
+            preauth = true;
+            user = arg + 2;
+        } else if (strcmp(arg, "--help") == 0) {
+            fputs(usage, stdout);
+            return 0;
+        } else {
+            fprintf(stderr, "login: unrecognized option '%s'\n", arg);
+            fputs(usage, stderr);
+            return 1;
+        }
+    }
+    if (!user && i < argc) {
+        user = argv[i++];
+    }
+    if (geteuid() != 0) {
+        fprintf(stderr, "login: must be run as root\n");
+        return 1;
+    }
+    if (preauth && getuid() != 0) {
+        fprintf(stderr, "login: -f is for root only\n");
+        return 1;
+    }
+
+    char nameBuf[256];
+    struct passwd *pw = NULL;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (!user) {
+            fputs("login: ", stdout);
+            fflush(stdout);
+            if (!fgets(nameBuf, sizeof(nameBuf), stdin)) {
+                return 1;
+            }
+            nameBuf[strcspn(nameBuf, "\r\n")] = '\0';
+            if (nameBuf[0] == '\0') {
+                continue;
+            }
+            user = nameBuf;
+        }
+        pw = getpwnam(user);
+        if (preauth) {
+            if (!pw) {
+                fprintf(stderr, "login: no such user: %s\n", user);
+                return 1;
+            }
+            break;
+        }
+#if defined(__linux__) || defined(linux) || defined(__linux) || defined(SMALLCLUE_HAVE_SHADOW_AUTH)
+        /* Ask for the password whether or not the account exists, so the
+         * prompt does not say which names are real. */
+        char *pass = smallclueGetPass("Password: ");
+        if (!pass) {
+            return 1;
+        }
+        struct spwd *sp = pw ? getspnam(user) : NULL;
+        bool ok = false;
+        if (sp && sp->sp_pwdp && sp->sp_pwdp[0] != '*' && sp->sp_pwdp[0] != '!') {
+            if (sp->sp_pwdp[0] == '\0') {
+                ok = true;   /* an empty field: no password at all */
+            } else {
+                char *encrypted = crypt(pass, sp->sp_pwdp);
+                ok = encrypted && strcmp(encrypted, sp->sp_pwdp) == 0;
+            }
+        }
+        smallclueSecureMemzero(pass, strlen(pass) + 1);
+        free(pass);
+        if (ok) {
+            break;
+        }
+        fprintf(stderr, "Login incorrect\n");
+        pw = NULL;
+        user = NULL;
+#else
+        fprintf(stderr, "login: authentication not supported on this platform\n");
+        return 1;
+#endif
+    }
+    if (!pw) {
+        return 1;
+    }
+
+    /* Copy what is needed: getpwnam's buffer is shared, and the calls below
+     * may reuse it. */
+    char name[256], home[PATH_MAX], shell[PATH_MAX];
+    snprintf(name, sizeof(name), "%s", pw->pw_name);
+    snprintf(home, sizeof(home), "%s", pw->pw_dir && pw->pw_dir[0] ? pw->pw_dir : "/");
+    snprintf(shell, sizeof(shell), "%s", pw->pw_shell ? pw->pw_shell : "");
+    uid_t uid = pw->pw_uid;
+    gid_t gid = pw->pw_gid;
+
+    const char *shellCandidates[] = { shell, SMALLCLUE_FALLBACK_SHELL, "/bin/sh" };
+    const char *useShell = NULL;
+    for (size_t k = 0; k < sizeof(shellCandidates) / sizeof(shellCandidates[0]); k++) {
+        if (shellCandidates[k][0] == '/' && access(shellCandidates[k], X_OK) == 0) {
+            useShell = shellCandidates[k];
+            break;
+        }
+    }
+    if (!useShell) {
+        fprintf(stderr, "login: no shell: %s\n", shell[0] ? shell : "(none)");
+        return 1;
+    }
+    if (useShell != shellCandidates[0] && shell[0]) {
+        fprintf(stderr, "login: %s: no such shell, using %s\n", shell, useShell);
+    }
+
+    if (initgroups(name, gid) != 0) {
+        perror("login: initgroups");
+        return 1;
+    }
+    if (setgid(gid) != 0) {
+        perror("login: setgid");
+        return 1;
+    }
+    if (setuid(uid) != 0) {
+        perror("login: setuid");
+        return 1;
+    }
+
+    if (!preserve) {
+        char term[256] = "";
+        const char *t = getenv("TERM");
+        if (t) {
+            snprintf(term, sizeof(term), "%s", t);
+        }
+        /* By name, through unsetenv: clearenv() is glibc's (Darwin has none),
+         * and an embedding that keeps a per-process environment of its own
+         * reaches it through environ and unsetenv, not through libc's. */
+        for (;;) {
+            extern char **environ;
+            char **env = environ;
+            if (!env || !env[0]) {
+                break;
+            }
+            const char *eq = strchr(env[0], '=');
+            size_t len = eq ? (size_t)(eq - env[0]) : strlen(env[0]);
+            char var[256];
+            if (len == 0 || len >= sizeof(var)) {
+                break;   /* nothing unsetenv could name; leave the rest */
+            }
+            memcpy(var, env[0], len);
+            var[len] = '\0';
+            if (unsetenv(var) != 0) {
+                break;
+            }
+        }
+        if (term[0]) {
+            setenv("TERM", term, 1);
+        }
+    }
+    setenv("HOME", home, 1);
+    setenv("SHELL", useShell, 1);
+    setenv("USER", name, 1);
+    setenv("LOGNAME", name, 1);
+    setenv("PATH", uid == 0 ? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                            : "/usr/local/bin:/usr/bin:/bin", 1);
+    if (chdir(home) != 0) {
+        fprintf(stderr, "login: cannot change directory to %s: %s\n", home, strerror(errno));
+        if (chdir("/") == 0) {
+            setenv("HOME", "/", 1);
+        }
+    }
+
+    /* The message of the day, unless the account asked for quiet. */
+    char hush[PATH_MAX];
+    snprintf(hush, sizeof(hush), "%s/.hushlogin", home);
+    if (access(hush, F_OK) != 0) {
+        FILE *motd = fopen("/etc/motd", "r");
+        if (motd) {
+            char line[512];
+            while (fgets(line, sizeof(line), motd)) {
+                fputs(line, stdout);
+            }
+            fclose(motd);
+            fflush(stdout);
+        }
+    }
+
+    const char *base = strrchr(useShell, '/');
+    base = base ? base + 1 : useShell;
+    char arg0[PATH_MAX];
+    snprintf(arg0, sizeof(arg0), "-%s", base);
+    execl(useShell, arg0, (char *)NULL);
+    fprintf(stderr, "login: cannot run %s: %s\n", useShell, strerror(errno));
+    return 127;
+}
+
 static void smallclueSecureMemzero(void *ptr, size_t len) {
     if (!ptr) return;
     volatile unsigned char *p = (volatile unsigned char *)ptr;
@@ -3429,6 +3661,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"kill", smallclueKillCommand, "Send signals to processes"},
     {"less", smallcluePagerCommand, "Paginate file contents"},
     {"ln", smallclueLnCommand, "Create links"},
+    {"login", smallclueLoginCommand, "Begin a session on the system"},
     {"ls", smallclueLsCommand, "List directory contents"},
     {"md", smallclueMarkdownCommand, "Read Markdown documents"},
     {"mdev", smallclueMdevCommand, "Device manager"},
@@ -3723,6 +3956,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "   -t DIRECTORY TARGET...\n"
            "  GNU ln compatible: -s -f -n -T -t -v -i -r -L -P -d/-F, -b,\n"
            "  --backup[=CONTROL], -S SUFFIX; -f replaces atomically"},
+    {"login", "login [-p] [-h host] [-f username | username]\n"
+              "  Start a login session: authenticate (or -f, root only: already\n"
+              "  authenticated), take the account's ids, a clean environment (-p keeps\n"
+              "  it), its home directory and its shell as a login shell"},
     {"ls", "ls [OPTION]... [FILE]...\n"
            "  List directory contents; GNU ls compatible\n"
            "  -a -A -l -1 -C -x -m -R -d -F -p -i -s -h --si -t -S -X -v -U -r -c -u\n"
