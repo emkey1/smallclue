@@ -510,6 +510,8 @@ set(SOURCES
     src/nohup_app.c
     src/cmp_app.c
     src/init_app.c
+    src/utmp_rec.c
+    src/who_app.c
     src/tput_app.c
     src/free_app.c
     src/mount_app.c

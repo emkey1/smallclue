@@ -28,6 +28,7 @@
 
 #include "init_app.h"
 #include "spawn.h"
+#include "utmp_rec.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -93,6 +94,28 @@ static pid_t initStartScript(const char *script) {
     return smallclueSpawn(&request);
 }
 
+/* A child init reaped: if it was a login session (login records its own pid
+ * and execs the shell in place), its utmp record is marked ended and the
+ * logout goes to wtmp -- what sysvinit does for the sessions it reaps. */
+static void initReaped(pid_t pid) {
+    smallclueUtmpProcessEnded(pid);
+}
+
+/* The boot time, from /proc/stat's btime, or now. */
+static int64_t initBootTime(void) {
+    FILE *f = fopen("/proc/stat", "r");
+    long long btime = 0;
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "btime %lld", &btime) == 1)
+                break;
+        }
+        fclose(f);
+    }
+    return btime > 0 ? (int64_t) btime : (int64_t) time(NULL);
+}
+
 /* Reap until PID has exited, the deadline (seconds from now; 0 = none) passes,
  * or a shutdown is requested while STOP_ON_SHUTDOWN. Every other child that
  * exits meanwhile is reaped too: init is the parent of every orphan. Returns
@@ -105,6 +128,9 @@ static bool initWaitFor(pid_t pid, int timeoutSeconds, bool stopOnShutdown, int 
         }
         int status = 0;
         pid_t reaped = waitpid(-1, &status, deadline ? WNOHANG : 0);
+        if (reaped > 0) {
+            initReaped(reaped);
+        }
         if (reaped == pid) {
             if (statusOut) {
                 *statusOut = status;
@@ -135,6 +161,7 @@ static void initReapFor(int seconds) {
         int status = 0;
         pid_t reaped = waitpid(-1, &status, WNOHANG);
         if (reaped > 0) {
+            initReaped(reaped);
             continue;
         }
         if (reaped < 0 && errno == ECHILD) {
@@ -175,6 +202,7 @@ static void initShutdown(bool isPid1) {
     if (!isPid1) {
         return;   /* service mode: everything else is not ours to stop */
     }
+    smallclueUtmpShutdown(true);
     kill(-1, SIGTERM);
     kill(-1, SIGCONT);
     initReapFor(3);
@@ -222,8 +250,12 @@ int smallclueInitCommand(int argc, char **argv) {
     signal(SIGTSTP, SIG_IGN);
     signal(SIGHUP, SIG_IGN);
 
-    /* After a restore, what rc started is running again already. */
+    /* After a restore, what rc started is running again already, and the
+     * boot it recorded is still the boot. */
     if (!initWasRestored()) {
+        if (isPid1) {
+            smallclueUtmpBoot(initBootTime(), '2');
+        }
         initRunRc();
     }
 
@@ -232,6 +264,9 @@ int smallclueInitCommand(int argc, char **argv) {
     while (!initShutdownSignal) {
         int status = 0;
         pid_t reaped = waitpid(-1, &status, 0);
+        if (reaped > 0) {
+            initReaped(reaped);
+        }
         if (reaped < 0 && errno == ECHILD) {
             sleep(1);
         }
@@ -250,16 +285,16 @@ int smallclueInitCommand(int argc, char **argv) {
  *     /etc/init.d/reboot:25      reboot -d -f ${netdown}
  *     /etc/init.d/umountnfs.sh:36  halt -w
  *
- * Most of them describe hardware and bookkeeping this system does not have --
- * there is no wtmp to write (-d, -w), no interfaces of its own to bring down
- * (-i), and no disks to spin down (-h, -H) -- so they are accepted and do
- * nothing, which is the honest behaviour rather than a refusal that breaks the
- * script.
+ * Most of them describe hardware this system does not have -- no interfaces
+ * of its own to bring down (-i), and no disks to spin down (-h, -H) -- so they
+ * are accepted and do nothing, which is the honest behaviour rather than a
+ * refusal that breaks the script. init writes the shutdown record to wtmp on
+ * its way down, so -d (skip it) changes nothing either.
  *
  * -w is the exception and must not be lumped in with them: it means "write the
  * wtmp record and DO NOT halt". umountnfs.sh runs it midway through shutdown,
  * so treating it as just another no-op flag would turn that line into a real
- * halt. It returns without stopping anything.
+ * halt. It writes the record and returns without stopping anything.
  *
  * The request itself goes to init, as busybox's does: USR1 halt, USR2
  * poweroff, TERM reboot. -f would call reboot(2) directly on Linux; a system
@@ -290,7 +325,7 @@ int smallclueHaltCommand(int argc, char **argv) {
                        strcmp(lopt, "no-wall") == 0 || strcmp(lopt, "halt") == 0 ||
                        strcmp(lopt, "hddown") == 0 || strcmp(lopt, "ifdown") == 0 ||
                        strcmp(lopt, "no-sync") == 0) {
-                /* Nothing here keeps a wtmp, an interface list or a disk. */
+                /* No interfaces or disks here; init writes the wtmp record. */
             } else if (strcmp(lopt, "help") == 0) {
                 fputs(usage, stdout);
                 return 0;
@@ -306,7 +341,7 @@ int smallclueHaltCommand(int argc, char **argv) {
                 case 'w': recordOnly = 1; break;
                 case 'p': poweroff = 1; break;
                 case 'f': /* no reboot(2) to call: init is the way down */ break;
-                case 'd': /* skip the wtmp record: there is none */ break;
+                case 'd': /* skip the wtmp record: init writes it */ break;
                 case 'n': /* skip the sync: nothing is buffered here */ break;
                 case 'i': /* bring interfaces down: none are ours */ break;
                 case 'h': case 'H': /* park the disks: there are none */ break;
@@ -320,6 +355,7 @@ int smallclueHaltCommand(int argc, char **argv) {
 
     if (recordOnly) {
         /* -w records and returns; stopping here is the whole point of it. */
+        smallclueUtmpShutdown(false);
         return 0;
     }
 

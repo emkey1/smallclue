@@ -51,6 +51,8 @@
 #include "nohup_app.h"
 #include "cmp_app.h"
 #include "init_app.h"
+#include "utmp_rec.h"
+#include "who_app.h"
 #include "tput_app.h"
 #include "free_app.h"
 #include "mount_app.h"
@@ -2590,6 +2592,7 @@ static int smallclueSuCommand(int argc, char **argv) {
 static int smallclueLoginCommand(int argc, char **argv) {
     const char *usage = "usage: login [-p] [-h host] [-f username | username]\n";
     const char *user = NULL;
+    const char *remoteHost = NULL;
     bool preauth = false;
     bool preserve = false;
     int i = 1;
@@ -2609,6 +2612,7 @@ static int smallclueLoginCommand(int argc, char **argv) {
                 fputs(usage, stderr);
                 return 1;
             }
+            remoteHost = argv[i];
         } else if (strcmp(arg, "-f") == 0) {
             preauth = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') {
@@ -2718,6 +2722,18 @@ static int smallclueLoginCommand(int argc, char **argv) {
     }
     if (useShell != shellCandidates[0] && shell[0]) {
         fprintf(stderr, "login: %s: no such shell, using %s\n", shell, useShell);
+    }
+
+    /* The session, in utmp and wtmp, while this is still root: who, w,
+     * users and last read it. The shell is exec'd in place below and keeps
+     * this pid, so the record names the session's process; init marks it
+     * ended when it reaps that pid. Only for a terminal -- a login on a pipe
+     * has no line to record. */
+    {
+        char utLine[33], utId[5];
+        if (smallclueUtmpLineForFd(STDIN_FILENO, utLine, utId)) {
+            smallclueUtmpLogin(getpid(), utLine, utId, name, remoteHost);
+        }
     }
 
     if (initgroups(name, gid) != 0) {
@@ -3662,6 +3678,8 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"find", smallclueFindCommand, "Search for files"},
     {"grep", smallclueGrepCommand, "Print lines that match patterns"},
     {"free", smallclueFreeCommand, "Display amount of free and used memory"},
+    {"who", smallclueWhoCommand, "Show who is logged in"},
+    {"users", smallclueUsersCommand, "Print the names of users logged in"},
     {"git", smallclueGitCommand, "Git plumbing and porcelain"},
     {"gzip", smallclueGzipCommand, "Compress files"},
     {"gunzip", smallclueGunzipCommand, "Decompress files"},
@@ -3900,6 +3918,12 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  Print lines that match; GNU grep compatible\n"
            "  -E/-F/-G/-P, -e/-f, -i -v -w -x, -c -l -L -m -o -q -s, -b -H -h -n -T -Z\n"
            "  -A/-B/-C/-NUM context, -r/-R with --include/--exclude/--exclude-dir, --color"},
+    {"who", "who [-bHmqru] [FILE | am i]\n"
+            "  Who is logged in, from /var/run/utmp: name, terminal, login time,\n"
+            "  host. -b boot time, -r runlevel, -q names and count, -H header,\n"
+            "  -u idle time and pid, -m (or `who am i`) this terminal only"},
+    {"users", "users [FILE]\n"
+              "  The names of the users logged in, sorted, on one line"},
     {"free", "free [-b|-k|-m|-g|-h] [--si] [-w] [-l] [-t] [-s N] [-c N]\n"
              "  Memory and swap from /proc/meminfo, as procps-ng 4's free reports\n"
              "  them: used is total - available; buff/cache is buffers + cache"},
@@ -13988,25 +14012,23 @@ static int64_t smallclueAppUptimeSeconds(void) {
 
 /* The guest's /var/run/utmp is LINUX's layout, and a native program is Darwin
    code -- <utmpx.h> here would parse it with the wrong struct and produce
-   nonsense. So the layout is spelled out: Linux's struct utmp is 384 bytes with
-   ut_type at 0, ut_user at 44, and USER_PROCESS == 7. Stable across glibc and
-   musl on every arch AOK emulates.
+   nonsense. utmp_rec.c reads it by offset, in the record size the guest's
+   glibc uses: 384 bytes on x86, 400 on aarch64 and riscv64. (This read 384
+   everywhere, which on an arm64 root miscounted from the second record on.)
    Returns -1 when there is no utmp to read, which is different from "nobody is
    logged in" and is printed differently. */
 static int smallclueUtmpUserCount(void) {
-    static const char *paths[] = { "/var/run/utmp", "/run/utmp", NULL };
+    static const char *paths[] = { SMALLCLUE_UTMP_PATH, "/run/utmp", NULL };
     for (int i = 0; paths[i]; i++) {
-        FILE *fp = fopen(paths[i], "rb");
-        if (!fp) continue;
-        unsigned char rec[384];
+        SmallclueUtmp *recs = NULL;
+        int n = smallclueUtmpReadAll(paths[i], &recs);
+        if (n < 0) continue;
         int users = 0;
-        while (fread(rec, sizeof(rec), 1, fp) == 1) {
-            int32_t type;
-            memcpy(&type, rec, sizeof(type));
-            if (type == 7 && rec[44] != '\0')   /* USER_PROCESS with a name */
+        for (int k = 0; k < n; k++) {
+            if (recs[k].type == SMALLCLUE_UT_USER_PROCESS && recs[k].user[0] != '\0')
                 users++;
         }
-        fclose(fp);
+        free(recs);
         return users;
     }
     return -1;
