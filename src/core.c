@@ -1549,6 +1549,20 @@ typedef struct {
     const char *postData; /* NULL = no request body */
     const char *userpwd;  /* NULL = no auth; else "user:password" */
     bool insecureTls;     /* true = skip TLS certificate/host verification */
+    /* curl's own options; all zero for wget, which keeps its behaviour. */
+    bool noFollow;        /* curl without -L: a redirect is the answer */
+    bool nobody;          /* -I: HEAD, headers to the output */
+    bool includeHeaders;  /* -i: headers before the body */
+    bool failOnError;     /* -f: an error status is a failure, no body */
+    bool failWithBody;    /* --fail-with-body: the same, body kept */
+    bool silent;          /* -s: no error message ... */
+    bool showError;       /* -S: ... unless this */
+    bool curlStatus;      /* report and return curl's own exit codes */
+    const char *userAgent;
+    const char *dumpHeaderPath;  /* -D FILE ("-" = stdout) */
+    const char *writeOut;        /* -w FORMAT */
+    long maxTime;                /* -m seconds, 0 = none */
+    long connectTimeout;         /* --connect-timeout seconds */
 } SmallclueHttpRequestOptions;
 
 static int smallclueHttpFetch(const char *cmd_name, const char *url, const char *destinationPath,
@@ -3812,14 +3826,13 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  Copy files; GNU cp compatible\n"
            "  -r/-R -a -d -p --preserve -L/-P/-H -f -i -n -u -v -b/--backup -l -s -t -T -x --parents"},
     {"curl", "curl [options] URL...\n"
-             "  Common: -o FILE,\n"
-             "  -O (remote name)\n"
-             "  -L (follow)\n"
-             "  -X METHOD\n"
-             "  -d DATA (repeatable, joined with '&')\n"
-             "  -H HEADER (repeatable)\n"
-             "  -u USER:PASS (basic auth)\n"
-             "  -k (skip TLS verification)"},
+             "  -o FILE, -O (remote name), -L (follow redirects), -I (head), -i (headers too)\n"
+             "  -f / --fail-with-body (error status fails), -s (silent), -S (errors anyway)\n"
+             "  -w FORMAT (%{http_code} %{url_effective} %{content_type} %{size_download}\n"
+             "  %{time_total} %{num_redirects} %{http_version}), -D FILE (headers)\n"
+             "  -X METHOD, -H HEADER, -d DATA (@FILE; --data-raw, --data-binary), -G\n"
+             "  -A AGENT, -e REFERER, -u USER:PASS, -k, -m SECS, --connect-timeout SECS\n"
+             "  --retry N. Short options bundle (-fsSL). Exit status is curl's code"},
     {"cut", "cut -f LIST [-d DELIM] [-s] [FILE...]\n"
             "       cut -c LIST [FILE...]\n"
             "  -f fields, -c characters/bytes: LIST is N, N-M, N-, or -M,\n"
@@ -12781,7 +12794,102 @@ static struct curl_slist *smallclueCurlApplyRequestOptions(CURL *curl, const Sma
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
     }
+    if (reqOpts->noFollow) {
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+    }
+    if (reqOpts->userAgent) {
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, reqOpts->userAgent);
+    }
+    if (reqOpts->maxTime > 0) {
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, reqOpts->maxTime);
+    }
+    if (reqOpts->connectTimeout > 0) {
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, reqOpts->connectTimeout);
+    }
+    if (reqOpts->nobody) {
+        curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    }
+    if (reqOpts->includeHeaders || reqOpts->nobody) {
+        curl_easy_setopt(curl, CURLOPT_HEADER, 1L);
+    }
+    if (reqOpts->failOnError) {
+        curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    }
     return headerList;
+}
+
+/* curl -w: %{variable} from the finished transfer, \n-style escapes, and
+ * %{stderr}/%{stdout} to switch where the rest goes. */
+static void smallclueCurlWriteOut(CURL *curl, const char *fmt, CURLcode res) {
+    FILE *out = stdout;
+    for (const char *p = fmt; *p; p++) {
+        if (*p == '\\' && p[1]) {
+            p++;
+            fputc(*p == 'n' ? '\n' : *p == 't' ? '\t' : *p == 'r' ? '\r' : *p, out);
+            continue;
+        }
+        if (*p == '%' && p[1] == '%') {
+            fputc('%', out);
+            p++;
+            continue;
+        }
+        if (*p != '%' || p[1] != '{') {
+            fputc(*p, out);
+            continue;
+        }
+        const char *end = strchr(p + 2, '}');
+        if (!end) {
+            fputs(p, out);
+            break;
+        }
+        char var[64];
+        size_t n = (size_t)(end - (p + 2));
+        if (n >= sizeof(var)) n = sizeof(var) - 1;
+        memcpy(var, p + 2, n);
+        var[n] = '\0';
+        p = end;
+        long l = 0;
+        double d = 0;
+        char *str = NULL;
+        curl_off_t off = 0;
+        if (!strcmp(var, "http_code") || !strcmp(var, "response_code")) {
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &l);
+            fprintf(out, "%03ld", l);
+        } else if (!strcmp(var, "url_effective") || !strcmp(var, "url")) {
+            curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &str);
+            fputs(str ? str : "", out);
+        } else if (!strcmp(var, "content_type")) {
+            curl_easy_getinfo(curl, CURLINFO_CONTENT_TYPE, &str);
+            fputs(str ? str : "", out);
+        } else if (!strcmp(var, "num_redirects")) {
+            curl_easy_getinfo(curl, CURLINFO_REDIRECT_COUNT, &l);
+            fprintf(out, "%ld", l);
+        } else if (!strcmp(var, "size_download")) {
+            curl_easy_getinfo(curl, CURLINFO_SIZE_DOWNLOAD_T, &off);
+            fprintf(out, "%lld", (long long)off);
+        } else if (!strcmp(var, "time_total")) {
+            curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &d);
+            fprintf(out, "%.6f", d);
+        } else if (!strcmp(var, "http_version")) {
+            curl_easy_getinfo(curl, CURLINFO_HTTP_VERSION, &l);
+            fputs(l == 3 ? "2" : l == 30 ? "3" : l == 1 ? "1" : l == 2 ? "1.1" : "0", out);
+        } else if (!strcmp(var, "exitcode")) {
+            fprintf(out, "%d", (int)res);
+        } else if (!strcmp(var, "errormsg")) {
+            fputs(res == CURLE_OK ? "" : curl_easy_strerror(res), out);
+        } else if (!strcmp(var, "stderr")) {
+            out = stderr;
+        } else if (!strcmp(var, "stdout")) {
+            out = stdout;
+        }
+    }
+    fflush(stdout);
+    fflush(stderr);
+}
+
+static size_t smallclueCurlHeaderFileCallback(char *contents, size_t size, size_t nmemb, void *userp) {
+    FILE *f = (FILE *)userp;
+    return f ? fwrite(contents, size, nmemb, f) : size * nmemb;
 }
 
 static size_t smallclueCurlWriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
@@ -12888,17 +12996,52 @@ static int smallclueHttpFetch(const char *cmd_name, const char *url, const char 
     struct curl_slist *headerList = smallclueCurlApplyRequestOptions(curl, reqOpts);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, smallclueCurlWriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, dest);
+    FILE *headerFile = NULL;
+    bool closeHeaderFile = false;
+    if (reqOpts && reqOpts->dumpHeaderPath) {
+        if (strcmp(reqOpts->dumpHeaderPath, "-") == 0) {
+            headerFile = stdout;
+        } else {
+            headerFile = fopen(reqOpts->dumpHeaderPath, "wb");
+            closeHeaderFile = headerFile != NULL;
+        }
+        if (headerFile) {
+            curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, smallclueCurlHeaderFileCallback);
+            curl_easy_setopt(curl, CURLOPT_HEADERDATA, headerFile);
+        }
+    }
     CURLcode res = curl_easy_perform(curl);
     if (close_dest) {
         fclose(dest);
     } else {
         fflush(dest);
     }
+    if (closeHeaderFile) {
+        fclose(headerFile);
+    }
     if (headerList) curl_slist_free_all(headerList);
+    long httpCode = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+    char failDetail[96] = "";
+    if (res == CURLE_OK && reqOpts && reqOpts->failWithBody && httpCode >= 400) {
+        res = CURLE_HTTP_RETURNED_ERROR;
+        snprintf(failDetail, sizeof(failDetail), "The requested URL returned error: %ld", httpCode);
+    }
+    if (reqOpts && reqOpts->writeOut) {
+        smallclueCurlWriteOut(curl, reqOpts->writeOut, res);
+    }
     if (res != CURLE_OK) {
-        fprintf(stderr, "%s: %s: %s\n", cmd_name ? cmd_name : "curl", url, curl_easy_strerror(res));
+        if (reqOpts && reqOpts->curlStatus) {
+            /* curl's own shape: "curl: (6) Could not resolve host: x". */
+            if (!reqOpts->silent || reqOpts->showError) {
+                fprintf(stderr, "curl: (%d) %s\n", (int)res,
+                        failDetail[0] ? failDetail : curl_easy_strerror(res));
+            }
+        } else {
+            fprintf(stderr, "%s: %s: %s\n", cmd_name ? cmd_name : "curl", url, curl_easy_strerror(res));
+        }
         curl_easy_cleanup(curl);
-        return 1;
+        return reqOpts && reqOpts->curlStatus ? (int)res : 1;
     }
     curl_easy_cleanup(curl);
     return 0;
@@ -17129,8 +17272,65 @@ static int smallclueMarkdownCommand(int argc, char **argv) {
     return status ? 1 : 0;
 }
 
+/* curl. Options as curl spells them, short ones bundled (-fsSL) and long ones
+ * with or without "=": -o/-O, -L, -I, -i, -f, --fail-with-body, -s, -S, -w,
+ * -D, -A, -e, -m, --connect-timeout, -X, -H, -d (and --data-raw,
+ * --data-binary, --data-ascii, with @FILE), -G, -u, -k, --retry, --url.
+ * Accepted and quiet: --compressed, -#, --progress-bar, -v (no trace),
+ * --http1.1, --http2, --create-dirs, -N. Exit status is curl's own code. */
+static bool smallclueCurlAppend(char **buf, size_t *len, const char *add, size_t addLen, char sep) {
+    size_t sepLen = (*len > 0 && sep) ? 1 : 0;
+    char *grown = (char *)realloc(*buf, *len + sepLen + addLen + 1);
+    if (!grown) {
+        return false;
+    }
+    *buf = grown;
+    if (sepLen) {
+        (*buf)[(*len)++] = sep;
+    }
+    memcpy(*buf + *len, add, addLen);
+    *len += addLen;
+    (*buf)[*len] = '\0';
+    return true;
+}
+
+/* -d @file reads the file (stripping CR and LF, as curl does for -d);
+ * --data-binary @file reads it verbatim; @- is stdin. */
+static char *smallclueCurlDataValue(const char *value, bool binary, bool raw, size_t *lenOut) {
+    if (raw || value[0] != '@') {
+        *lenOut = strlen(value);
+        return strdup(value);
+    }
+    FILE *f = strcmp(value + 1, "-") == 0 ? stdin : fopen(value + 1, "rb");
+    if (!f) {
+        fprintf(stderr, "curl: Failed to open %s\n", value + 1);
+        return NULL;
+    }
+    char *buf = NULL;
+    size_t len = 0;
+    char chunk[4096];
+    size_t n;
+    while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            if (!binary && (chunk[i] == '\n' || chunk[i] == '\r')) {
+                continue;
+            }
+            if (!smallclueCurlAppend(&buf, &len, &chunk[i], 1, 0)) {
+                break;
+            }
+        }
+    }
+    if (f != stdin) {
+        fclose(f);
+    }
+    if (!buf) {
+        buf = strdup("");
+    }
+    *lenOut = len;
+    return buf;
+}
+
 static int smallclueCurlCommand(int argc, char **argv) {
-    smallclueResetGetopt();
     const char *output_path = NULL;
     int use_remote_name = 0;
     const char *method = NULL;
@@ -17140,95 +17340,219 @@ static int smallclueCurlCommand(int argc, char **argv) {
     size_t postDataLen = 0;
     const char *userpwd = NULL;
     bool insecureTls = false;
-    int opt;
-    while ((opt = getopt(argc, argv, "o:OX:H:d:u:k")) != -1) {
-        switch (opt) {
-            case 'o':
-                output_path = optarg;
-                break;
-            case 'O':
-                use_remote_name = 1;
-                break;
-            case 'X':
-                method = optarg;
-                break;
-            case 'u':
-                userpwd = optarg;
-                break;
-            case 'k':
-                insecureTls = true;
-                break;
-            case 'H': {
-                if (headerCount == headerCap) {
-                    headerCap = headerCap ? headerCap * 2 : 8;
-                    char **resized = (char **)realloc(headers, (size_t)headerCap * sizeof(char *));
-                    if (!resized) {
-                        fprintf(stderr, "curl: out of memory\n");
-                        free(headers);
-                        free(postData);
-                        return 1;
-                    }
-                    headers = resized;
-                }
-                headers[headerCount++] = optarg;
-                break;
-            }
-            case 'd': {
-                /* Real curl joins repeated -d values with '&', like
-                 * concatenating form fields. */
-                size_t addLen = strlen(optarg);
-                size_t sepLen = (postDataLen > 0) ? 1 : 0;
-                char *resized = (char *)realloc(postData, postDataLen + sepLen + addLen + 1);
-                if (!resized) {
-                    fprintf(stderr, "curl: out of memory\n");
-                    free(headers);
-                    free(postData);
-                    return 1;
-                }
-                postData = resized;
-                if (sepLen) postData[postDataLen++] = '&';
-                memcpy(postData + postDataLen, optarg, addLen);
-                postDataLen += addLen;
-                postData[postDataLen] = '\0';
-                break;
-            }
-            default:
-                fprintf(stderr, "usage: curl [-o file | -O] [-X METHOD] [-H HEADER]... [-d DATA]... [-u USER:PASS] [-k] url...\n");
-                free(headers);
-                free(postData);
-                return 1;
+    bool getMode = false;
+    int retries = 0;
+    char *referer = NULL;
+    const char *urls[64];
+    int urlCount = 0;
+    SmallclueHttpRequestOptions reqOpts;
+    memset(&reqOpts, 0, sizeof(reqOpts));
+    reqOpts.noFollow = true;
+    reqOpts.curlStatus = true;
+    reqOpts.userAgent = "curl/8.17.0";
+    int status = 0;
+
+#define CURL_FAIL(code) do { status = (code); goto done; } while (0)
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        if (arg[0] != '-' || arg[1] == '\0') {
+            if (urlCount < 64) urls[urlCount++] = arg;
+            continue;
         }
+        /* Long options, as --name VALUE or --name=VALUE. */
+        if (arg[1] == '-') {
+            char name[64];
+            const char *eq = strchr(arg, '=');
+            size_t nlen = eq ? (size_t)(eq - arg - 2) : strlen(arg + 2);
+            if (nlen >= sizeof(name)) nlen = sizeof(name) - 1;
+            memcpy(name, arg + 2, nlen);
+            name[nlen] = '\0';
+            const char *value = eq ? eq + 1 : NULL;
+            static const char *const takesValue[] = {
+                "output", "request", "header", "data", "data-raw", "data-binary",
+                "data-ascii", "user", "user-agent", "referer", "write-out",
+                "dump-header", "max-time", "connect-timeout", "retry", "url",
+                "retry-delay", "retry-max-time", "max-redirs", NULL
+            };
+            bool needs = false;
+            for (int k = 0; takesValue[k]; k++) {
+                if (!strcmp(name, takesValue[k])) needs = true;
+            }
+            if (needs && !value) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "curl: option --%s: requires parameter\n", name);
+                    CURL_FAIL(2);
+                }
+                value = argv[++i];
+            }
+            if (!strcmp(name, "output")) output_path = value;
+            else if (!strcmp(name, "remote-name")) use_remote_name = 1;
+            else if (!strcmp(name, "location")) reqOpts.noFollow = false;
+            else if (!strcmp(name, "head")) reqOpts.nobody = true;
+            else if (!strcmp(name, "include")) reqOpts.includeHeaders = true;
+            else if (!strcmp(name, "fail")) reqOpts.failOnError = true;
+            else if (!strcmp(name, "fail-with-body")) reqOpts.failWithBody = true;
+            else if (!strcmp(name, "silent")) reqOpts.silent = true;
+            else if (!strcmp(name, "show-error")) reqOpts.showError = true;
+            else if (!strcmp(name, "insecure")) insecureTls = true;
+            else if (!strcmp(name, "get")) getMode = true;
+            else if (!strcmp(name, "request")) method = value;
+            else if (!strcmp(name, "user")) userpwd = value;
+            else if (!strcmp(name, "user-agent")) reqOpts.userAgent = value;
+            else if (!strcmp(name, "referer")) { free(referer); referer = NULL; size_t l = strlen(value) + 10; referer = malloc(l); if (referer) snprintf(referer, l, "Referer: %s", value); }
+            else if (!strcmp(name, "write-out")) reqOpts.writeOut = value;
+            else if (!strcmp(name, "dump-header")) reqOpts.dumpHeaderPath = value;
+            else if (!strcmp(name, "max-time")) reqOpts.maxTime = (long)(strtod(value, NULL) + 0.999);
+            else if (!strcmp(name, "connect-timeout")) reqOpts.connectTimeout = (long)(strtod(value, NULL) + 0.999);
+            else if (!strcmp(name, "retry")) retries = atoi(value);
+            else if (!strcmp(name, "url")) { if (urlCount < 64) urls[urlCount++] = value; }
+            else if (!strcmp(name, "header")) goto add_header_long;
+            else if (!strncmp(name, "data", 4)) {
+                bool binary = !strcmp(name, "data-binary");
+                bool raw = !strcmp(name, "data-raw");
+                size_t len = 0;
+                char *v = smallclueCurlDataValue(value, binary, raw, &len);
+                if (!v) CURL_FAIL(26);
+                bool ok = smallclueCurlAppend(&postData, &postDataLen, v, len, '&');
+                free(v);
+                if (!ok) CURL_FAIL(27);
+            }
+            else if (!strcmp(name, "compressed") || !strcmp(name, "progress-bar") ||
+                     !strcmp(name, "verbose") || !strcmp(name, "http1.1") ||
+                     !strcmp(name, "http2") || !strcmp(name, "create-dirs") ||
+                     !strcmp(name, "no-buffer") || !strcmp(name, "globoff") ||
+                     !strcmp(name, "retry-delay") || !strcmp(name, "retry-max-time") ||
+                     !strcmp(name, "max-redirs") || !strcmp(name, "no-progress-meter") ||
+                     !strcmp(name, "retry-connrefused") || !strcmp(name, "tlsv1.2") ||
+                     !strcmp(name, "proto") || !strcmp(name, "ipv4") || !strcmp(name, "ipv6")) {
+                /* nothing to do here */
+            } else if (!strcmp(name, "help")) {
+                fprintf(stdout, "usage: curl [options] url...\n");
+                goto done;
+            } else if (!strcmp(name, "version")) {
+                printf("curl 8.17.0 (smallclue; NSURLSession)\nProtocols: http https\n");
+                goto done;
+            } else {
+                fprintf(stderr, "curl: option --%s: is unknown\n", name);
+                CURL_FAIL(2);
+            }
+            continue;
+add_header_long:
+            if (headerCount == headerCap) {
+                headerCap = headerCap ? headerCap * 2 : 8;
+                char **resized = (char **)realloc(headers, (size_t)headerCap * sizeof(char *));
+                if (!resized) CURL_FAIL(27);
+                headers = resized;
+            }
+            headers[headerCount++] = (char *)value;
+            continue;
+        }
+        /* Short options, bundled: -fsSL, -sSo file, -ofile. */
+        for (const char *c = arg + 1; *c; c++) {
+            char o = *c;
+            const char *value = NULL;
+            if (strchr("oXHdueAwDmT", o)) {
+                value = c[1] ? c + 1 : (i + 1 < argc ? argv[++i] : NULL);
+                if (!value) {
+                    fprintf(stderr, "curl: option -%c: requires parameter\n", o);
+                    CURL_FAIL(2);
+                }
+            }
+            switch (o) {
+                case 'o': output_path = value; break;
+                case 'O': use_remote_name = 1; break;
+                case 'L': reqOpts.noFollow = false; break;
+                case 'I': reqOpts.nobody = true; break;
+                case 'i': reqOpts.includeHeaders = true; break;
+                case 'f': reqOpts.failOnError = true; break;
+                case 's': reqOpts.silent = true; break;
+                case 'S': reqOpts.showError = true; break;
+                case 'k': insecureTls = true; break;
+                case 'G': getMode = true; break;
+                case 'X': method = value; break;
+                case 'u': userpwd = value; break;
+                case 'A': reqOpts.userAgent = value; break;
+                case 'w': reqOpts.writeOut = value; break;
+                case 'D': reqOpts.dumpHeaderPath = value; break;
+                case 'm': reqOpts.maxTime = (long)(strtod(value, NULL) + 0.999); break;
+                case 'e': {
+                    free(referer);
+                    size_t l = strlen(value) + 10;
+                    referer = malloc(l);
+                    if (referer) snprintf(referer, l, "Referer: %s", value);
+                    break;
+                }
+                case 'H':
+                    if (headerCount == headerCap) {
+                        headerCap = headerCap ? headerCap * 2 : 8;
+                        char **resized = (char **)realloc(headers, (size_t)headerCap * sizeof(char *));
+                        if (!resized) CURL_FAIL(27);
+                        headers = resized;
+                    }
+                    headers[headerCount++] = (char *)value;
+                    break;
+                case 'd': {
+                    size_t len = 0;
+                    char *v = smallclueCurlDataValue(value, false, false, &len);
+                    if (!v) CURL_FAIL(26);
+                    bool ok = smallclueCurlAppend(&postData, &postDataLen, v, len, '&');
+                    free(v);
+                    if (!ok) CURL_FAIL(27);
+                    break;
+                }
+                case 'T':
+                    fprintf(stderr, "curl: -T (upload) is not supported by this curl\n");
+                    CURL_FAIL(2);
+                case '#': case 'v': case 'N': case 'g': case '4': case '6': break;
+                default:
+                    fprintf(stderr, "curl: option -%c: is unknown\n", o);
+                    CURL_FAIL(2);
+            }
+            if (value) {
+                break;   /* the rest of this word was the value */
+            }
+        }
+    }
+    if (referer) {
+        if (headerCount == headerCap) {
+            headerCap = headerCap ? headerCap * 2 : 8;
+            char **resized = (char **)realloc(headers, (size_t)headerCap * sizeof(char *));
+            if (!resized) CURL_FAIL(27);
+            headers = resized;
+        }
+        headers[headerCount++] = referer;
     }
     if (output_path && use_remote_name) {
         fprintf(stderr, "curl: -o and -O may not be used together\n");
-        free(headers);
-        free(postData);
-        return 1;
+        CURL_FAIL(2);
     }
-    if (optind >= argc) {
-        fprintf(stderr, "curl: missing URL\n");
-        free(headers);
-        free(postData);
-        return 1;
+    if (urlCount == 0) {
+        fprintf(stderr, "curl: no URL specified\n");
+        CURL_FAIL(2);
     }
-    if (output_path && (argc - optind) != 1) {
+    if (output_path && urlCount != 1) {
         fprintf(stderr, "curl: -o is only supported with a single URL\n");
-        free(headers);
-        free(postData);
-        return 1;
+        CURL_FAIL(2);
     }
-    SmallclueHttpRequestOptions reqOpts;
-    memset(&reqOpts, 0, sizeof(reqOpts));
     reqOpts.method = method;
     reqOpts.headers = headers;
     reqOpts.headerCount = headerCount;
-    reqOpts.postData = postData;
+    reqOpts.postData = getMode ? NULL : postData;
     reqOpts.userpwd = userpwd;
     reqOpts.insecureTls = insecureTls;
 
-    int status = 0;
-    for (int i = optind; i < argc; ++i) {
-        const char *url = argv[i];
+    for (int u = 0; u < urlCount; ++u) {
+        const char *url = urls[u];
+        char *withQuery = NULL;
+        if (getMode && postData) {
+            /* -G: the data goes on the URL as a query string. */
+            size_t l = strlen(url) + postDataLen + 2;
+            withQuery = malloc(l);
+            if (withQuery) {
+                snprintf(withQuery, l, "%s%c%s", url, strchr(url, '?') ? '&' : '?', postData);
+                url = withQuery;
+            }
+        }
         const char *destination = NULL;
         char derived[PATH_MAX];
         if (output_path) {
@@ -17237,11 +17561,28 @@ static int smallclueCurlCommand(int argc, char **argv) {
             smallclueUrlSuggestFilename(url, derived, sizeof(derived));
             destination = derived;
         }
-        status |= smallclueHttpFetch("curl", url, destination, &reqOpts);
+        int rc = 0;
+        for (int attempt = 0; attempt <= retries; attempt++) {
+            rc = smallclueHttpFetch("curl", url, destination, &reqOpts);
+            /* --retry: transient failures only, as curl's are. */
+            if (rc != 6 && rc != 7 && rc != 28 && rc != 35 && rc != 56) {
+                break;
+            }
+            if (attempt < retries) {
+                sleep(1u << (attempt < 5 ? attempt : 5));
+            }
+        }
+        free(withQuery);
+        if (rc != 0) {
+            status = rc;
+        }
     }
+done:
+#undef CURL_FAIL
     free(headers);
     free(postData);
-    return status ? 1 : 0;
+    free(referer);
+    return status;
 }
 
 static int smallclueWgetCommand(int argc, char **argv) {
@@ -17252,6 +17593,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
     const char *wgetUser = NULL;
     const char *wgetPassword = NULL;
     bool insecureTls = false;
+    bool wgetQuiet = false;
     char userpwdBuf[512];
     userpwdBuf[0] = '\0';
 
@@ -17261,9 +17603,14 @@ static int smallclueWgetCommand(int argc, char **argv) {
      * out before calling getopt(), gathering the survivors into a vector of
      * our own rather than compacting argv (see smallclueBorrowArgs). */
     int nargs = 0;
-    char **args = smallclueBorrowArgs("wget", argc, argv, &nargs);
+    /* Twice argc: --output-document=FILE becomes -O FILE, two words. */
+    char **args = (char **)calloc((size_t)(argc > 0 ? argc : 0) * 2 + 1, sizeof(*args));
     if (!args) {
+        fprintf(stderr, "wget: out of memory\n");
         return 1;
+    }
+    if (argc > 0) {
+        args[nargs++] = argv[0];
     }
     for (int i = 1; i < argc; ++i) {
         if (strncmp(argv[i], "--header=", 9) == 0) {
@@ -17303,6 +17650,24 @@ static int smallclueWgetCommand(int argc, char **argv) {
             insecureTls = true;
             continue;
         }
+        /* Quietness and resumption, which this wget has no output or partial
+         * files for -- accepted, so `wget -qO- URL | sh` works. */
+        if (strcmp(argv[i], "--quiet") == 0) {
+            wgetQuiet = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--no-verbose") == 0 ||
+            strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "--continue") == 0 ||
+            strcmp(argv[i], "--timestamping") == 0 || strcmp(argv[i], "--no-clobber") == 0 ||
+            strcmp(argv[i], "--show-progress") == 0 || strcmp(argv[i], "--progress=dot") == 0 ||
+            strcmp(argv[i], "--progress=bar") == 0) {
+            continue;
+        }
+        if (strncmp(argv[i], "--output-document=", 18) == 0) {
+            args[nargs++] = (char *)"-O";
+            args[nargs++] = argv[i] + 18;
+            continue;
+        }
         args[nargs++] = argv[i];
     }
     if (wgetUser) {
@@ -17312,11 +17677,16 @@ static int smallclueWgetCommand(int argc, char **argv) {
     smallclueResetGetopt();
     const char *output_path = NULL;
     int opt;
-    while ((opt = getopt(nargs, args, "O:")) != -1) {
+    while ((opt = getopt(nargs, args, "O:qvncN")) != -1) {
         switch (opt) {
             case 'O':
                 output_path = optarg;
                 break;
+            case 'q':
+                wgetQuiet = true;
+                break;
+            case 'v': case 'n': case 'c': case 'N':
+                break;   /* -nv, -c, -N: see --no-verbose above */
             default:
                 fprintf(stderr, "usage: wget [-O file] [--method=METHOD] [--header=HEADER]... [--post-data=DATA]\n"
                                 "            [--user=USER] [--password=PASS] [--no-check-certificate] url...\n");
@@ -17360,8 +17730,11 @@ static int smallclueWgetCommand(int argc, char **argv) {
             destination = derived;
         }
         int rc = smallclueHttpFetch("wget", url, destination, &reqOpts);
-        if (rc == 0) {
-            printf("Saved %s -> %s\n", url, destination ? destination : "(stdout)");
+        /* On stderr, as wget's own messages are: with -O- the download IS
+         * stdout, and `wget -qO- URL | sh` must hand sh nothing else. */
+        if (rc == 0 && !wgetQuiet) {
+            fprintf(stderr, "Saved %s -> %s\n", url,
+                    destination && strcmp(destination, "-") != 0 ? destination : "(stdout)");
         }
         status |= rc;
     }
