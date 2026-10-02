@@ -18643,11 +18643,9 @@ static int smallclueWcProcessFileWide(const char *path, FILE *fp, SmallclueWcCou
         /* Character decode: work off a carry buffer so a multibyte
          * sequence split across two reads still decodes correctly. */
         size_t avail = carryLen + (size_t)n;
-        unsigned char *scratch = (unsigned char *)malloc(avail > 0 ? avail : 1);
-        if (!scratch) {
-            fprintf(stderr, "wc: out of memory\n");
-            return 1;
-        }
+
+        /* Bolt optimization: Use fixed-size stack array instead of malloc/free per loop iteration */
+        unsigned char scratch[sizeof(buf) + sizeof(carry)];
         if (carryLen) memcpy(scratch, carry, carryLen);
         memcpy(scratch + carryLen, buf, (size_t)n);
 
@@ -18688,7 +18686,6 @@ static int smallclueWcProcessFileWide(const char *path, FILE *fp, SmallclueWcCou
             pos += rc;
             carryLen = 0;
         }
-        free(scratch);
     }
 
     if (cur_line_length > max_line_length) max_line_length = cur_line_length;
