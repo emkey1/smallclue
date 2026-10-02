@@ -157,8 +157,8 @@ static void grepParseColors(Grep *g) {
 
 /* --- Patterns. --- */
 
-/* Copies a bracket expression [...] starting at p; returns its end. */
-static const char *grepBracket(GnuBuf *b, const char *p) {
+/* The end of a bracket expression [...] starting at p. */
+static const char *grepBracketEnd(const char *p) {
     const char *q = p + 1;
     if (*q == '^') q++;
     if (*q == ']') q++;
@@ -171,8 +171,91 @@ static const char *grepBracket(GnuBuf *b, const char *p) {
         }
     }
     if (*q == ']') q++;
+    return q;
+}
+
+/* Copies a bracket expression [...] starting at p; returns its end. */
+static const char *grepBracket(GnuBuf *b, const char *p) {
+    const char *q = grepBracketEnd(p);
     gnuBufPut(b, p, (size_t)(q - p));
     return q;
+}
+
+/* Whether a basic expression has a `$` just before `\|`. GNU anchors there
+ * (`^x: PASS\($\|[^A-Za-z]\)` matches "x: PASS"); the host's enhanced
+ * basic syntax anchors `$` only at the end and before `\)` and reads this one
+ * as a literal dollar. Such a pattern goes through grepBasicToExtended. */
+static bool grepBasicDollarBeforeAlt(const char *pat) {
+    for (const char *p = pat; *p;) {
+        if (*p == '[') {
+            p = grepBracketEnd(p);
+        } else if (*p == '\\' && p[1]) {
+            p += 2;
+        } else if (*p == '$' && p[1] == '\\' && p[2] == '|') {
+            return true;
+        } else {
+            p++;
+        }
+    }
+    return false;
+}
+
+/* -G as an extended expression, with GNU's basic-syntax rules: \( \) \{ \}
+ * \| \+ \? are the operators and their bare forms literal; `^` anchors at
+ * the start of the expression, a group or a branch, `$` at the end, before
+ * \) and before \|, and each is literal elsewhere; `*` is literal where
+ * nothing precedes it. In extended syntax `$` anchors wherever it stands, so
+ * the host reads a `$` before an alternation the way GNU does. */
+static char *grepBasicToExtended(const char *pat) {
+    GnuBuf b = {NULL, 0, 0};
+    gnuBufPut(&b, "", 0);
+    bool atStart = true;   /* nothing yet in this expression, group or branch */
+    for (const char *p = pat; *p;) {
+        if (*p == '[') {
+            p = grepBracket(&b, p);
+            atStart = false;
+            continue;
+        }
+        if (*p == '\\' && p[1]) {
+            char c = p[1];
+            p += 2;
+            if (c == '(' || c == '|') {
+                gnuBufPutc(&b, c);
+                atStart = true;
+                continue;
+            }
+            if (strchr("){}+?", c)) {
+                gnuBufPutc(&b, c);
+            } else if (strchr("123456789`'<>bBwWsS", c) || strchr(".[]*^$\\", c)) {
+                gnuBufPutc(&b, '\\');
+                gnuBufPutc(&b, c);
+            } else {
+                gnuBufPutc(&b, c);   /* means nothing to GNU: the character itself */
+            }
+            atStart = false;
+            continue;
+        }
+        char c = *p++;
+        if (c == '^') {
+            if (atStart) {
+                gnuBufPutc(&b, '^');   /* still at the start: "^*" is a literal star */
+                continue;
+            }
+            gnuBufPut(&b, "\\^", 2);
+        } else if (c == '$') {
+            bool anchor = !*p || (p[0] == '\\' && (p[1] == ')' || p[1] == '|'));
+            gnuBufPut(&b, anchor ? "$" : "\\$", anchor ? 1 : 2);
+        } else if (c == '*' && atStart) {
+            gnuBufPut(&b, "\\*", 2);
+        } else if (strchr("(){}|+?", c)) {
+            gnuBufPutc(&b, '\\');
+            gnuBufPutc(&b, c);
+        } else {
+            gnuBufPutc(&b, c);
+        }
+        atStart = false;
+    }
+    return b.s;
 }
 
 /* -G and -E: a backslash that means nothing to GNU leaves the character
@@ -485,7 +568,14 @@ static bool grepCompile(Grep *g, const char *pat) {
         flags = REG_EXTENDED;
         if (!src) return false;
         break;
-    default: src = grepTranslateGnu(pat, false); break;
+    default:
+        if (grepBasicDollarBeforeAlt(pat)) {
+            src = grepBasicToExtended(pat);
+            flags = REG_EXTENDED;
+        } else {
+            src = grepTranslateGnu(pat, false);
+        }
+        break;
     }
     if (!src) return false;
     if (icase) flags |= REG_ICASE;
