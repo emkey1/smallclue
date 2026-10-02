@@ -4848,6 +4848,45 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
     bool no_edit = false;
     bool reset_author = false;
 
+    /* Bundled short options, as git takes them: -am MSG, -qam MSG, -amMSG.
+     * Split into the single-letter forms the loop below knows, on the stack
+     * (no allocation to clean up -- this runs as a function call inside its
+     * host). Anything with a letter outside a/s/q/m is left as it was. */
+    char *expanded[256];
+    int expandedCount = 0;
+    bool didExpand = false;
+    for (int i = 0; i < argc && expandedCount < 250; ++i) {
+        char *arg = argv[i];
+        bool bundle = arg && arg[0] == '-' && arg[1] && arg[1] != '-' && arg[2];
+        for (const char *c = bundle ? arg + 1 : ""; bundle && *c; c++) {
+            if (*c == 'm') {
+                break;
+            }
+            if (!strchr("asq", *c)) {
+                bundle = false;
+            }
+        }
+        if (!bundle) {
+            expanded[expandedCount++] = arg;
+            continue;
+        }
+        didExpand = true;
+        for (char *c = arg + 1; *c && expandedCount < 250; c++) {
+            if (*c == 'm') {
+                expanded[expandedCount++] = (char *)"-m";
+                if (c[1]) {
+                    expanded[expandedCount++] = c + 1;
+                }
+                break;
+            }
+            expanded[expandedCount++] = *c == 'a' ? (char *)"-a" : *c == 's' ? (char *)"-s" : (char *)"-q";
+        }
+    }
+    if (didExpand) {
+        argc = expandedCount;
+        argv = expanded;
+    }
+
     for (int i = 0; i < argc; ++i) {
         const char *arg = argv[i];
         if (!arg) {
@@ -5399,12 +5438,24 @@ static int smallclueGitCheckoutRef(git_repository *repo,
     if (!repo || !ref_name || !checkout_opts) {
         return -1;
     }
-    if (git_repository_set_head(repo, ref_name) != 0) {
-        smallclueGitPrintLibgitError("checkout: failed to update HEAD");
+    /* The tree first, then HEAD. The other order -- set_head, then
+     * git_checkout_head -- compares the NEW head with itself: a SAFE checkout
+     * then finds nothing to do, and `checkout -b x HEAD~5` or `checkout master`
+     * moved the branch while the index and the files stayed where they were,
+     * showing every difference as staged. */
+    git_object *target = NULL;
+    if (git_revparse_single(&target, repo, ref_name) != 0 || !target) {
+        smallclueGitPrintLibgitError("checkout: cannot resolve branch");
         return 1;
     }
-    if (git_checkout_head(repo, checkout_opts) != 0) {
+    int rc = git_checkout_tree(repo, target, checkout_opts);
+    git_object_free(target);
+    if (rc != 0) {
         smallclueGitPrintLibgitError("checkout failed");
+        return 1;
+    }
+    if (git_repository_set_head(repo, ref_name) != 0) {
+        smallclueGitPrintLibgitError("checkout: failed to update HEAD");
         return 1;
     }
     return 0;
@@ -7648,6 +7699,16 @@ static int smallclueGitCommandLog(git_repository *repo, int argc, char **argv) {
         if (strncmp(arg, "--max-count=", 12) == 0) {
             max_count = atoi(arg + 12);
             if (max_count < 0) max_count = -1;
+            continue;
+        }
+        /* -<n>, git's shorthand for -n <n>: `git log -1`. */
+        if (arg[0] == '-' && arg[1] >= '0' && arg[1] <= '9' &&
+            strspn(arg + 1, "0123456789") == strlen(arg + 1)) {
+            max_count = atoi(arg + 1);
+            continue;
+        }
+        if (strncmp(arg, "-n", 2) == 0 && arg[2] >= '0' && arg[2] <= '9') {
+            max_count = atoi(arg + 2);
             continue;
         }
         if (strcmp(arg, "--author") == 0 && i + 1 < argc) {
