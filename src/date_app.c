@@ -56,25 +56,6 @@ typedef struct {
     const char *zone;     /* abbreviation */
 } DateWhen;
 
-typedef struct {
-    char *s;
-    size_t n, cap;
-} DateBuf;
-
-static void dbPut(DateBuf *b, const char *s, size_t n) {
-    if (b->n + n + 1 > b->cap) {
-        size_t cap = b->cap ? b->cap : 128;
-        while (cap < b->n + n + 1) cap *= 2;
-        char *v = (char *)realloc(b->s, cap);
-        if (!v) return;
-        b->s = v;
-        b->cap = cap;
-    }
-    memcpy(b->s + b->n, s, n);
-    b->n += n;
-    b->s[b->n] = '\0';
-}
-
 static const char *const dateDays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
 static const char *const dateMonths[] = {"January", "February", "March", "April", "May", "June", "July",
                                          "August", "September", "October", "November", "December"};
@@ -100,7 +81,7 @@ static int dateIsoWeek(const struct tm *tm, int *isoYear) {
 }
 
 /* Emits one conversion: text, or a number with GNU's padding rules. */
-static void dateEmit(DateBuf *b, const char *text, bool numeric, char defPad, int defWidth, char pad, int width,
+static void dateEmit(GnuBuf *b, const char *text, bool numeric, char defPad, int defWidth, char pad, int width,
                      bool upper, bool swap) {
     char buf[128];
     snprintf(buf, sizeof(buf), "%s", text);
@@ -119,17 +100,17 @@ static void dateEmit(DateBuf *b, const char *text, bool numeric, char defPad, in
     int w = width >= 0 ? width : (pad == '-' ? 0 : defWidth);
     char p = pad == '_' ? ' ' : pad == '0' ? '0' : pad == '-' ? 0 : (numeric ? defPad : ' ');
     if (!numeric && pad == '0') p = '0';
-    if (p == '0' && neg) { dbPut(b, "-", 1); neg = false; }
-    for (int i = len; i < w && p; i++) dbPut(b, &p, 1);
-    if (neg) dbPut(b, "-", 1);
-    dbPut(b, t, strlen(t));
+    if (p == '0' && neg) { gnuBufPut(b, "-", 1); neg = false; }
+    for (int i = len; i < w && p; i++) gnuBufPut(b, &p, 1);
+    if (neg) gnuBufPut(b, "-", 1);
+    gnuBufPut(b, t, strlen(t));
 }
 
-static void dateFormat(DateBuf *b, const char *fmt, const DateWhen *w) {
+static void dateFormat(GnuBuf *b, const char *fmt, const DateWhen *w) {
     const struct tm *tm = &w->tm;
     char num[64];
     for (const char *p = fmt; *p; p++) {
-        if (*p != '%') { dbPut(b, p, 1); continue; }
+        if (*p != '%') { gnuBufPut(b, p, 1); continue; }
         const char *start = p++;
         char pad = 0;
         bool upper = false, swap = false;
@@ -148,7 +129,7 @@ static void dateFormat(DateBuf *b, const char *fmt, const DateWhen *w) {
         while (*p == ':') { colons++; p++; }
         if (*p == 'E' || *p == 'O') p++;
         char c = *p;
-        if (!c) { dbPut(b, start, (size_t)(p - start)); break; }
+        if (!c) { gnuBufPut(b, start, (size_t)(p - start)); break; }
 #define NUM(v, dw) do { snprintf(num, sizeof(num), "%ld", (long)(v)); dateEmit(b, num, true, '0', dw, pad, width, upper, swap); } while (0)
 #define SNUM(v, dw) do { snprintf(num, sizeof(num), "%ld", (long)(v)); dateEmit(b, num, true, ' ', dw, pad, width, upper, swap); } while (0)
 #define TXT(s) dateEmit(b, s, false, ' ', 0, pad, width, upper, swap)
@@ -159,7 +140,7 @@ static void dateFormat(DateBuf *b, const char *fmt, const DateWhen *w) {
         case 'b': case 'h': { char t[4]; snprintf(t, 4, "%s", dateMonths[tm->tm_mon]); TXT(t); break; }
         case 'B': TXT(dateMonths[tm->tm_mon]); break;
         case 'c': {
-            DateBuf sub = {NULL, 0, 0};
+            GnuBuf sub = {NULL, 0, 0};
             dateFormat(&sub, "%a %b %e %H:%M:%S %Y", w);
             TXT(sub.s ? sub.s : "");
             free(sub.s);
@@ -168,7 +149,7 @@ static void dateFormat(DateBuf *b, const char *fmt, const DateWhen *w) {
         case 'C': NUM((tm->tm_year + 1900) / 100, 2); break;
         case 'd': NUM(tm->tm_mday, 2); break;
         case 'D': case 'x': {
-            DateBuf sub = {NULL, 0, 0};
+            GnuBuf sub = {NULL, 0, 0};
             dateFormat(&sub, "%m/%d/%y", w);
             TXT(sub.s ? sub.s : "");
             free(sub.s);
@@ -176,7 +157,7 @@ static void dateFormat(DateBuf *b, const char *fmt, const DateWhen *w) {
         }
         case 'e': SNUM(tm->tm_mday, 2); break;
         case 'F': {
-            DateBuf sub = {NULL, 0, 0};
+            GnuBuf sub = {NULL, 0, 0};
             dateFormat(&sub, "%+4Y-%m-%d", w);
             TXT(sub.s ? sub.s : "");
             free(sub.s);
@@ -197,21 +178,21 @@ static void dateFormat(DateBuf *b, const char *fmt, const DateWhen *w) {
             int digits = width > 0 ? width : 9;
             if (digits < 9) num[digits] = '\0';
             else for (int i = 9; i < digits && i < 60; i++) { num[i] = '0'; num[i + 1] = '\0'; }
-            dbPut(b, num, strlen(num));
+            gnuBufPut(b, num, strlen(num));
             break;
         }
         case 'p': TXT(tm->tm_hour < 12 ? "AM" : "PM"); break;
         case 'P': TXT(tm->tm_hour < 12 ? "am" : "pm"); break;
         case 'q': NUM(tm->tm_mon / 3 + 1, 1); break;
         case 'r': {
-            DateBuf sub = {NULL, 0, 0};
+            GnuBuf sub = {NULL, 0, 0};
             dateFormat(&sub, "%I:%M:%S %p", w);
             TXT(sub.s ? sub.s : "");
             free(sub.s);
             break;
         }
         case 'R': {
-            DateBuf sub = {NULL, 0, 0};
+            GnuBuf sub = {NULL, 0, 0};
             dateFormat(&sub, "%H:%M", w);
             TXT(sub.s ? sub.s : "");
             free(sub.s);
@@ -221,7 +202,7 @@ static void dateFormat(DateBuf *b, const char *fmt, const DateWhen *w) {
         case 'S': NUM(tm->tm_sec, 2); break;
         case 't': TXT("\t"); break;
         case 'T': case 'X': {
-            DateBuf sub = {NULL, 0, 0};
+            GnuBuf sub = {NULL, 0, 0};
             dateFormat(&sub, "%H:%M:%S", w);
             TXT(sub.s ? sub.s : "");
             free(sub.s);
@@ -253,14 +234,14 @@ static void dateFormat(DateBuf *b, const char *fmt, const DateWhen *w) {
             /* %+4Y from %F: a year of at least four digits */
             if (p[1] == '4' && p[2] == 'Y') {
                 snprintf(num, sizeof(num), "%04d", tm->tm_year + 1900);
-                dbPut(b, num, strlen(num));
+                gnuBufPut(b, num, strlen(num));
                 p += 2;
             } else {
-                dbPut(b, start, (size_t)(p - start + 1));
+                gnuBufPut(b, start, (size_t)(p - start + 1));
             }
             break;
         }
-        default: dbPut(b, start, (size_t)(p - start + 1)); break;
+        default: gnuBufPut(b, start, (size_t)(p - start + 1)); break;
         }
 #undef NUM
 #undef SNUM
@@ -917,8 +898,8 @@ static bool datePrint(const char *fmt, struct timespec when, bool utc) {
         fprintf(stderr, "date: time %jd is out of range\n", (intmax_t)when.tv_sec);
         return false;
     }
-    DateBuf b = {NULL, 0, 0};
-    dbPut(&b, "", 0);
+    GnuBuf b = {NULL, 0, 0};
+    gnuBufPut(&b, "", 0);
     dateFormat(&b, fmt, &w);
     fwrite(b.s, 1, b.n, stdout);
     putchar('\n');

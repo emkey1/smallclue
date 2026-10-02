@@ -120,29 +120,6 @@ static const char *const lsColorNames[] = {"lc", "rc", "ec", "rs", "no", "fi", "
 
 /* --- Quoting (gnulib quotearg, as ls uses it). --- */
 
-typedef struct {
-    char *s;
-    size_t n, cap;
-} LsBuf;
-
-static void lbPut(LsBuf *b, const char *s, size_t n) {
-    if (b->n + n + 1 > b->cap) {
-        size_t cap = b->cap ? b->cap : 64;
-        while (cap < b->n + n + 1) cap *= 2;
-        char *v = (char *)realloc(b->s, cap);
-        if (!v) return;
-        b->s = v;
-        b->cap = cap;
-    }
-    memcpy(b->s + b->n, s, n);
-    b->n += n;
-    b->s[b->n] = '\0';
-}
-
-static void lbPutc(LsBuf *b, char c) {
-    lbPut(b, &c, 1);
-}
-
 static size_t lsUtf8Len(const unsigned char *s, size_t n) {
     if (s[0] < 0x80) return 1;
     size_t k = (s[0] & 0xe0) == 0xc0 ? 2 : (s[0] & 0xf0) == 0xe0 ? 3 : (s[0] & 0xf8) == 0xf0 ? 4 : 0;
@@ -158,7 +135,7 @@ static bool lsShellSpecial(unsigned char c, size_t i) {
 }
 
 /* Appends `name` quoted per the style; returns whether outer quotes were used. */
-static bool lsQuote(const Ls *ls, const char *name, LsBuf *out) {
+static bool lsQuote(const Ls *ls, const char *name, GnuBuf *out) {
     const unsigned char *s = (const unsigned char *)name;
     size_t len = strlen(name);
     int style = ls->quoting;
@@ -168,8 +145,8 @@ static bool lsQuote(const Ls *ls, const char *name, LsBuf *out) {
             size_t k = utf8 ? lsUtf8Len(s + i, len - i) : 1;
             if (k == 0) k = 1;
             bool printable = k > 1 || isprint(s[i]) || (!utf8 && s[i] >= 0x80);
-            if (!printable && ls->hideControl) lbPutc(out, '?');
-            else lbPut(out, name + i, k);
+            if (!printable && ls->hideControl) gnuBufPutc(out, '?');
+            else gnuBufPut(out, name + i, k);
             i += k;
         }
         return false;
@@ -179,17 +156,17 @@ static bool lsQuote(const Ls *ls, const char *name, LsBuf *out) {
         for (size_t i = 0; i < len; i++)
             if (s[i] == '"' || s[i] == '\\' || (s[i] < 0x80 && !isprint(s[i]))) plain = false;
         if (plain) {
-            lbPut(out, name, len);
+            gnuBufPut(out, name, len);
             return false;
         }
         style = Q_C;
     }
     if (style == Q_C || style == Q_ESCAPE) {
         bool c = style == Q_C;
-        if (c) lbPutc(out, '"');
+        if (c) gnuBufPutc(out, '"');
         for (size_t i = 0; i < len;) {
             size_t k = utf8 ? lsUtf8Len(s + i, len - i) : 1;
-            if (k > 1) { lbPut(out, name + i, k); i += k; continue; }
+            if (k > 1) { gnuBufPut(out, name + i, k); i += k; continue; }
             unsigned char ch = s[i++];
             const char *esc = NULL;
             switch (ch) {
@@ -205,31 +182,31 @@ static bool lsQuote(const Ls *ls, const char *name, LsBuf *out) {
             case ' ': if (!c) esc = "\\ "; break;
             default: break;
             }
-            if (esc) { lbPut(out, esc, strlen(esc)); continue; }
+            if (esc) { gnuBufPut(out, esc, strlen(esc)); continue; }
             if (!isprint(ch)) {
                 char o[8];
                 snprintf(o, sizeof(o), "\\%03o", ch);
-                lbPut(out, o, 4);
+                gnuBufPut(out, o, 4);
                 continue;
             }
-            lbPutc(out, (char)ch);
+            gnuBufPutc(out, (char)ch);
         }
-        if (c) lbPutc(out, '"');
+        if (c) gnuBufPutc(out, '"');
         return c;
     }
     if (style == Q_LOCALE || style == Q_CLOCALE) {
-        lbPut(out, utf8 ? "\xe2\x80\x98" : "'", utf8 ? 3 : 1);
+        gnuBufPut(out, utf8 ? "\xe2\x80\x98" : "'", utf8 ? 3 : 1);
         for (size_t i = 0; i < len;) {
             size_t k = utf8 ? lsUtf8Len(s + i, len - i) : 1;
-            if (k > 1) { lbPut(out, name + i, k); i += k; continue; }
+            if (k > 1) { gnuBufPut(out, name + i, k); i += k; continue; }
             unsigned char ch = s[i++];
-            if (ch == '\\') lbPut(out, "\\\\", 2);
-            else if (ch == '\n') lbPut(out, "\\n", 2);
-            else if (ch == '\t') lbPut(out, "\\t", 2);
-            else if (!isprint(ch)) { char o[8]; snprintf(o, sizeof(o), "\\%03o", ch); lbPut(out, o, 4); }
-            else lbPutc(out, (char)ch);
+            if (ch == '\\') gnuBufPut(out, "\\\\", 2);
+            else if (ch == '\n') gnuBufPut(out, "\\n", 2);
+            else if (ch == '\t') gnuBufPut(out, "\\t", 2);
+            else if (!isprint(ch)) { char o[8]; snprintf(o, sizeof(o), "\\%03o", ch); gnuBufPut(out, o, 4); }
+            else gnuBufPutc(out, (char)ch);
         }
-        lbPut(out, utf8 ? "\xe2\x80\x99" : "'", utf8 ? 3 : 1);
+        gnuBufPut(out, utf8 ? "\xe2\x80\x99" : "'", utf8 ? 3 : 1);
         return true;
     }
     /* The shell styles. */
@@ -251,23 +228,23 @@ static bool lsQuote(const Ls *ls, const char *name, LsBuf *out) {
     }
     if (control && escape) needs = true;
     if (!needs) {
-        lbPut(out, name, len);
+        gnuBufPut(out, name, len);
         return false;
     }
     /* "it's" is written in double quotes when nothing else needs them. */
     if (single && !control && !strpbrk(name, "\"$`\\!")) {
-        lbPutc(out, '"');
-        lbPut(out, name, len);
-        lbPutc(out, '"');
+        gnuBufPutc(out, '"');
+        gnuBufPut(out, name, len);
+        gnuBufPutc(out, '"');
         return true;
     }
-    lbPutc(out, '\'');
+    gnuBufPutc(out, '\'');
     for (size_t i = 0; i < len;) {
         size_t k = utf8 ? lsUtf8Len(s + i, len - i) : 1;
-        if (k > 1) { lbPut(out, name + i, k); i += k; continue; }
+        if (k > 1) { gnuBufPut(out, name + i, k); i += k; continue; }
         unsigned char ch = s[i++];
         if (ch == '\'') {
-            lbPut(out, "'\\''", 4);
+            gnuBufPut(out, "'\\''", 4);
         } else if (!isprint(ch) && !(!utf8 && ch >= 0x80)) {
             if (escape) {
                 char e[16];
@@ -275,15 +252,15 @@ static bool lsQuote(const Ls *ls, const char *name, LsBuf *out) {
                                   : ch == '\b' ? "\\b" : ch == '\f' ? "\\f" : ch == '\v' ? "\\v" : NULL;
                 if (named) snprintf(e, sizeof(e), "'$'%s''", named);
                 else snprintf(e, sizeof(e), "'$'\\%03o''", ch);
-                lbPut(out, e, strlen(e));
+                gnuBufPut(out, e, strlen(e));
             } else {
-                lbPutc(out, ls->hideControl ? '?' : (char)ch);
+                gnuBufPutc(out, ls->hideControl ? '?' : (char)ch);
             }
         } else {
-            lbPutc(out, (char)ch);
+            gnuBufPutc(out, (char)ch);
         }
     }
-    lbPutc(out, '\'');
+    gnuBufPutc(out, '\'');
     /* '' left by an escape at either end is redundant, as quotearg drops it */
     if (out->n >= 2 && !memcmp(out->s + out->n - 2, "''", 2) && out->n >= 3 && out->s[out->n - 3] == '\'') {
         out->n -= 2;
@@ -426,69 +403,6 @@ static bool lsStat(Ls *ls, LsFile *f, bool follow, bool cmdline) {
 
 /* --- Sorting. --- */
 
-static int lsVerOrder(const char *s, size_t pos, size_t len) {
-    if (pos == len) return -1;
-    unsigned char c = (unsigned char)s[pos];
-    if (isdigit(c)) return 0;
-    if (isalpha(c)) return c;
-    if (c == '~') return -2;
-    return c + UCHAR_MAX + 1;
-}
-
-static int lsVerRev(const char *a, size_t al, const char *b, size_t bl) {
-    size_t i = 0, j = 0;
-    while (i < al || j < bl) {
-        int first = 0;
-        while ((i < al && !isdigit((unsigned char)a[i])) || (j < bl && !isdigit((unsigned char)b[j]))) {
-            int x = lsVerOrder(a, i, al), y = lsVerOrder(b, j, bl);
-            if (x != y) return x - y;
-            i++;
-            j++;
-        }
-        while (i < al && a[i] == '0') i++;
-        while (j < bl && b[j] == '0') j++;
-        while (i < al && j < bl && isdigit((unsigned char)a[i]) && isdigit((unsigned char)b[j])) {
-            if (!first) first = (unsigned char)a[i] - (unsigned char)b[j];
-            i++;
-            j++;
-        }
-        if (i < al && isdigit((unsigned char)a[i])) return 1;
-        if (j < bl && isdigit((unsigned char)b[j])) return -1;
-        if (first) return first;
-    }
-    return 0;
-}
-
-static size_t lsVerPrefix(const char *s, size_t n) {
-    size_t prefix = 0;
-    for (size_t i = 0;;) {
-        if (i == n) return prefix;
-        i++;
-        prefix = i;
-        while (i + 1 < n && s[i] == '.' && (isalpha((unsigned char)s[i + 1]) || s[i + 1] == '~'))
-            for (i += 2; i < n && (isalnum((unsigned char)s[i]) || s[i] == '~'); i++) {}
-    }
-}
-
-static int lsFilevercmp(const char *a, const char *b) {
-    size_t al = strlen(a), bl = strlen(b);
-    if (!al) return -(bl != 0);
-    if (!bl) return 1;
-    if (a[0] == '.') {
-        if (b[0] != '.') return -1;
-        if (al == 1) return -(bl != 1);
-        if (bl == 1) return 1;
-        bool ad = a[1] == '.' && al == 2, bd = b[1] == '.' && bl == 2;
-        if (ad) return -!bd;
-        if (bd) return 1;
-    } else if (b[0] == '.') {
-        return 1;
-    }
-    size_t ap = lsVerPrefix(a, al), bp = lsVerPrefix(b, bl);
-    int r = lsVerRev(a, ap, b, bp);
-    return r || (ap == al && bp == bl) ? r : lsVerRev(a, al, b, bl);
-}
-
 typedef struct {
     const Ls *ls;
 } LsSortCtx;
@@ -520,7 +434,7 @@ static int lsCompare(const void *pa, const void *pb) {
         break;
     }
     case S_VERSION:
-        r = lsFilevercmp(a->name, b->name);
+        r = gnuFilevercmp(a->name, strlen(a->name), b->name, strlen(b->name));
         if (!r) r = lsCmpName(a, b);
         break;
     case S_EXT: {
@@ -672,7 +586,7 @@ static char lsIndicatorChar(const Ls *ls, mode_t m, bool statOk) {
 
 /* The width the name and its decorations take in a listing. */
 static size_t lsFrillsWidth(const Ls *ls, const LsFile *f) {
-    LsBuf b = {NULL, 0, 0};
+    GnuBuf b = {NULL, 0, 0};
     bool quoted = lsQuote(ls, f->name, &b);
     size_t w = b.s ? lsWidth(b.s) : 0;
     free(b.s);
@@ -684,7 +598,7 @@ static size_t lsFrillsWidth(const Ls *ls, const LsFile *f) {
 }
 
 static void lsPrintName(Ls *ls, const LsFile *f, const char *name, mode_t mode, bool statOk, const char *code, bool align) {
-    LsBuf b = {NULL, 0, 0};
+    GnuBuf b = {NULL, 0, 0};
     bool quoted = lsQuote(ls, name, &b);
     if (align && ls->someQuoted && !quoted) putchar(' ');
     (void)f;
@@ -726,7 +640,7 @@ static void lsComputeWidths(Ls *ls, const LsFiles *fs) {
     for (size_t i = 0; i < fs->n; i++) {
         const LsFile *f = &fs->v[i];
         if (alignQuotes && !ls->someQuoted) {
-            LsBuf b = {NULL, 0, 0};
+            GnuBuf b = {NULL, 0, 0};
             if (lsQuote(ls, f->name, &b)) ls->someQuoted = true;
             free(b.s);
         }
@@ -747,11 +661,14 @@ static void lsComputeWidths(Ls *ls, const LsFiles *fs) {
         n = gr ? (int)lsWidth(gr->gr_name) : snprintf(buf, sizeof(buf), "%u", (unsigned)f->st.st_gid);
         if (n > ls->wGroup) ls->wGroup = n;
         if (S_ISCHR(f->st.st_mode) || S_ISBLK(f->st.st_mode)) {
-            unsigned maj = (unsigned)((f->st.st_rdev >> 8) & 0xfff) | (unsigned)((f->st.st_rdev >> 32) & ~0xfffu);
-            unsigned min = (unsigned)(f->st.st_rdev & 0xff) | (unsigned)((f->st.st_rdev >> 12) & ~0xffu);
+            unsigned maj, min;
 #if defined(__APPLE__)
             maj = (unsigned)major(f->st.st_rdev);
             min = (unsigned)minor(f->st.st_rdev);
+#else
+            /* Darwin's dev_t is 32 bits: shifting it by 32 is undefined */
+            maj = (unsigned)((f->st.st_rdev >> 8) & 0xfff) | (unsigned)((f->st.st_rdev >> 32) & ~0xfffu);
+            min = (unsigned)(f->st.st_rdev & 0xff) | (unsigned)((f->st.st_rdev >> 12) & ~0xffu);
 #endif
             n = snprintf(buf, sizeof(buf), "%u", maj);
             if (n > ls->wMajor) ls->wMajor = n;
@@ -1024,21 +941,11 @@ static bool lsHidden(const Ls *ls, const char *name) {
     return false;
 }
 
-static char *lsJoin(const char *dir, const char *name) {
-    size_t dl = strlen(dir), nl = strlen(name);
-    char *p = (char *)malloc(dl + nl + 2);
-    if (!p) return NULL;
-    memcpy(p, dir, dl);
-    if (dl == 0 || dir[dl - 1] != '/') p[dl++] = '/';
-    memcpy(p + dl, name, nl + 1);
-    return p;
-}
-
 static void lsDir(Ls *ls, const char *name, const char *path, bool cmdline, bool header);
 
 static void lsHeader(Ls *ls, const char *name) {
     if (ls->printedSomething) putchar('\n');
-    LsBuf b = {NULL, 0, 0};
+    GnuBuf b = {NULL, 0, 0};
     lsQuote(ls, name, &b);
     fputs(b.s ? b.s : "", stdout);
     free(b.s);
@@ -1063,7 +970,7 @@ static void lsDir(Ls *ls, const char *name, const char *path, bool cmdline, bool
         LsFile f;
         memset(&f, 0, sizeof(f));
         f.name = strdup(de->d_name);
-        f.path = lsJoin(path, de->d_name);
+        f.path = gnuPathJoin(path, de->d_name);
         if (!f.name || !f.path) { free(f.name); free(f.path); continue; }
         bool need = ls->format == F_LONG || ls->sort == S_SIZE || ls->sort == S_TIME || ls->recursive ||
                     ls->indicator != I_NONE || ls->color || ls->inode || ls->size || ls->groupDirsFirst || 1;
@@ -1088,7 +995,7 @@ static void lsDir(Ls *ls, const char *name, const char *path, bool cmdline, bool
         for (size_t i = 0; i < fs.n; i++) {
             LsFile *f = &fs.v[i];
             if (!lsIsDir(f) || !strcmp(f->name, ".") || !strcmp(f->name, "..")) continue;
-            char *shown = lsJoin(name, f->name);
+            char *shown = gnuPathJoin(name, f->name);
             if (shown) lsDir(ls, shown, f->path, false, true);
             free(shown);
         }

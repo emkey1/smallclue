@@ -198,71 +198,6 @@ static int sortMonth(const char *s, const char *lim) {
     return 0;
 }
 
-/* gnulib's filevercmp, as `sort -V` and `ls -v` use it. */
-static int sortVerOrder(const char *s, size_t pos, size_t len) {
-    if (pos == len) return -1;
-    unsigned char c = (unsigned char)s[pos];
-    if (isdigit(c)) return 0;
-    if (isalpha(c)) return c;
-    if (c == '~') return -2;
-    return c + UCHAR_MAX + 1;
-}
-
-static int sortVerRevCmp(const char *a, size_t al, const char *b, size_t bl) {
-    size_t i = 0, j = 0;
-    while (i < al || j < bl) {
-        int firstDiff = 0;
-        while ((i < al && !isdigit((unsigned char)a[i])) || (j < bl && !isdigit((unsigned char)b[j]))) {
-            int ac = sortVerOrder(a, i, al), bc = sortVerOrder(b, j, bl);
-            if (ac != bc) return ac - bc;
-            i++;
-            j++;
-        }
-        while (i < al && a[i] == '0') i++;
-        while (j < bl && b[j] == '0') j++;
-        while (i < al && j < bl && isdigit((unsigned char)a[i]) && isdigit((unsigned char)b[j])) {
-            if (!firstDiff) firstDiff = (unsigned char)a[i] - (unsigned char)b[j];
-            i++;
-            j++;
-        }
-        if (i < al && isdigit((unsigned char)a[i])) return 1;
-        if (j < bl && isdigit((unsigned char)b[j])) return -1;
-        if (firstDiff) return firstDiff;
-    }
-    return 0;
-}
-
-/* Length without the trailing run of (\.[A-Za-z~][A-Za-z0-9~]*)* suffixes. */
-static size_t sortVerPrefix(const char *s, size_t n) {
-    size_t prefix = 0;
-    for (size_t i = 0;;) {
-        if (i == n) return prefix;
-        i++;
-        prefix = i;
-        while (i + 1 < n && s[i] == '.' && (isalpha((unsigned char)s[i + 1]) || s[i + 1] == '~'))
-            for (i += 2; i < n && (isalnum((unsigned char)s[i]) || s[i] == '~'); i++) {}
-    }
-}
-
-static int sortVersion(const char *a, size_t al, const char *b, size_t bl) {
-    if (al == 0) return -(bl != 0);
-    if (bl == 0) return 1;
-    if (a[0] == '.') {
-        if (b[0] != '.') return -1;
-        bool adot = al == 1, bdot = bl == 1;
-        if (adot) return -!bdot;
-        if (bdot) return 1;
-        bool add = a[1] == '.' && al == 2, bdd = b[1] == '.' && bl == 2;
-        if (add) return -!bdd;
-        if (bdd) return 1;
-    } else if (b[0] == '.') {
-        return 1;
-    }
-    size_t ap = sortVerPrefix(a, al), bp = sortVerPrefix(b, bl);
-    int r = sortVerRevCmp(a, ap, b, bp);
-    return r || (ap == al && bp == bl) ? r : sortVerRevCmp(a, al, b, bl);
-}
-
 static uint64_t sortHash(uint64_t seed, const char *s, size_t n) {
     uint64_t h = seed ^ 0xcbf29ce484222325ULL;
     for (size_t i = 0; i < n; i++) {
@@ -358,7 +293,7 @@ static int sortKeyCompare(SortCtx *x, const SortLine *a, const SortLine *b) {
                 if (!diff) diff = (lena > lenb) - (lena < lenb);
             }
         } else if (k->version) {
-            diff = sortVersion(ta, lena, tb, lenb);
+            diff = gnuFilevercmp(ta, lena, tb, lenb);
         } else {
             diff = memcmp(ta, tb, lena < lenb ? lena : lenb);
             if (!diff) diff = (lena > lenb) - (lena < lenb);

@@ -157,31 +157,8 @@ static void grepParseColors(Grep *g) {
 
 /* --- Patterns. --- */
 
-typedef struct {
-    char *s;
-    size_t n, cap;
-} GrepBuf;
-
-static void grepPut(GrepBuf *b, const char *s, size_t n) {
-    if (b->n + n + 1 > b->cap) {
-        size_t cap = b->cap ? b->cap : 64;
-        while (cap < b->n + n + 1) cap *= 2;
-        char *v = (char *)realloc(b->s, cap);
-        if (!v) return;
-        b->s = v;
-        b->cap = cap;
-    }
-    memcpy(b->s + b->n, s, n);
-    b->n += n;
-    b->s[b->n] = '\0';
-}
-
-static void grepPutc(GrepBuf *b, char c) {
-    grepPut(b, &c, 1);
-}
-
 /* Copies a bracket expression [...] starting at p; returns its end. */
-static const char *grepBracket(GrepBuf *b, const char *p) {
+static const char *grepBracket(GnuBuf *b, const char *p) {
     const char *q = p + 1;
     if (*q == '^') q++;
     if (*q == ']') q++;
@@ -194,7 +171,7 @@ static const char *grepBracket(GrepBuf *b, const char *p) {
         }
     }
     if (*q == ']') q++;
-    grepPut(b, p, (size_t)(q - p));
+    gnuBufPut(b, p, (size_t)(q - p));
     return q;
 }
 
@@ -202,8 +179,8 @@ static const char *grepBracket(GrepBuf *b, const char *p) {
  * standing for itself. The host's enhanced syntax would otherwise read some
  * of them (\d) as something GNU does not. */
 static char *grepTranslateGnu(const char *pat, bool ere) {
-    GrepBuf b = {NULL, 0, 0};
-    grepPut(&b, "", 0);
+    GnuBuf b = {NULL, 0, 0};
+    gnuBufPut(&b, "", 0);
     for (const char *p = pat; *p;) {
         if (*p == '[') {
             p = grepBracket(&b, p);
@@ -214,32 +191,32 @@ static char *grepTranslateGnu(const char *pat, bool ere) {
             bool keep = strchr("123456789`'<>bBwWsS", c) || strchr(".[]*^$\\", c) ||
                         (ere ? strchr("(){}|+?", c) != NULL : strchr("(){}|+?", c) != NULL);
             if (keep) {
-                grepPut(&b, p, 2);
+                gnuBufPut(&b, p, 2);
             } else {
-                grepPutc(&b, c);
+                gnuBufPutc(&b, c);
             }
             p += 2;
             continue;
         }
-        grepPutc(&b, *p++);
+        gnuBufPutc(&b, *p++);
     }
     return b.s;
 }
 
 /* -F: every character literal, as a basic expression. */
 static char *grepTranslateFixed(const char *pat) {
-    GrepBuf b = {NULL, 0, 0};
-    grepPut(&b, "", 0);
+    GnuBuf b = {NULL, 0, 0};
+    gnuBufPut(&b, "", 0);
     for (const char *p = pat; *p; p++) {
-        if (strchr(".[]*^$\\", *p)) grepPutc(&b, '\\');
-        grepPutc(&b, *p);
+        if (strchr(".[]*^$\\", *p)) gnuBufPutc(&b, '\\');
+        gnuBufPutc(&b, *p);
     }
     return b.s;
 }
 
 /* Appends a Perl class escape (\d \w \s \h and negations) as bracket
  * content; inBracket says whether we are already inside [...]. */
-static bool grepPerlClass(GrepBuf *b, char c, bool inBracket) {
+static bool grepPerlClass(GnuBuf *b, char c, bool inBracket) {
     const char *pos = NULL, *neg = NULL;
     switch (c) {
     case 'd': pos = "0-9"; break;
@@ -254,26 +231,26 @@ static bool grepPerlClass(GrepBuf *b, char c, bool inBracket) {
     }
     if (inBracket) {
         if (neg) return false;   /* [^...] inside a set has no POSIX spelling */
-        grepPut(b, pos, strlen(pos));
+        gnuBufPut(b, pos, strlen(pos));
         return true;
     }
-    grepPut(b, neg ? "[^" : "[", neg ? 2 : 1);
-    grepPut(b, neg ? neg : pos, strlen(neg ? neg : pos));
-    grepPutc(b, ']');
+    gnuBufPut(b, neg ? "[^" : "[", neg ? 2 : 1);
+    gnuBufPut(b, neg ? neg : pos, strlen(neg ? neg : pos));
+    gnuBufPutc(b, ']');
     return true;
 }
 
-static void grepPerlLiteral(GrepBuf *b, char c) {
-    if (strchr(".[]*^$\\(){}|+?", c)) grepPutc(b, '\\');
-    grepPutc(b, c);
+static void grepPerlLiteral(GnuBuf *b, char c) {
+    if (strchr(".[]*^$\\(){}|+?", c)) gnuBufPutc(b, '\\');
+    gnuBufPutc(b, c);
 }
 
 /* -P into the host's extended syntax. Sets *icase for a leading (?i),
  * *prefixGroup when a \K or leading (?<=...) splits off a prefix, and
  * *bodyGroup when the reported match is a group. NULL after a message. */
 static char *grepTranslatePerl(const char *pat, bool *icase, int *prefixGroup, int *bodyGroup) {
-    GrepBuf b = {NULL, 0, 0};
-    grepPut(&b, "", 0);
+    GnuBuf b = {NULL, 0, 0};
+    gnuBufPut(&b, "", 0);
     const char *p = pat;
     *prefixGroup = *bodyGroup = 0;
     if (!strncmp(p, "(?i)", 4)) {
@@ -282,9 +259,9 @@ static char *grepTranslatePerl(const char *pat, bool *icase, int *prefixGroup, i
     }
     /* A leading lookbehind is a prefix that is matched but not reported. */
     bool split = false;
-    GrepBuf prefix = {NULL, 0, 0};
-    grepPut(&prefix, "", 0);
-    GrepBuf *out = &b;
+    GnuBuf prefix = {NULL, 0, 0};
+    gnuBufPut(&prefix, "", 0);
+    GnuBuf *out = &b;
     if (!strncmp(p, "(?<=", 4)) {
         split = true;
         out = &prefix;
@@ -299,7 +276,7 @@ static char *grepTranslatePerl(const char *pat, bool *icase, int *prefixGroup, i
                 if (split) goto unsupported;
                 split = true;
                 /* everything so far was the prefix */
-                grepPut(&prefix, b.s, b.n);
+                gnuBufPut(&prefix, b.s, b.n);
                 b.n = 0;
                 b.s[0] = '\0';
                 p += 2;
@@ -313,12 +290,12 @@ static char *grepTranslatePerl(const char *pat, bool *icase, int *prefixGroup, i
             }
             if (c == 'E') { p += 2; continue; }
             if (grepPerlClass(out, c, false)) { p += 2; continue; }
-            if (c == 'A') { grepPutc(out, '^'); p += 2; continue; }
-            if (c == 'z' || c == 'Z') { grepPutc(out, '$'); p += 2; continue; }
-            if (c == 't') { grepPutc(out, '\t'); p += 2; continue; }
-            if (c == 'n') { grepPutc(out, '\n'); p += 2; continue; }
-            if (c == 'r') { grepPutc(out, '\r'); p += 2; continue; }
-            if (c == 'e') { grepPutc(out, '\33'); p += 2; continue; }
+            if (c == 'A') { gnuBufPutc(out, '^'); p += 2; continue; }
+            if (c == 'z' || c == 'Z') { gnuBufPutc(out, '$'); p += 2; continue; }
+            if (c == 't') { gnuBufPutc(out, '\t'); p += 2; continue; }
+            if (c == 'n') { gnuBufPutc(out, '\n'); p += 2; continue; }
+            if (c == 'r') { gnuBufPutc(out, '\r'); p += 2; continue; }
+            if (c == 'e') { gnuBufPutc(out, '\33'); p += 2; continue; }
             if (c == 'x') {
                 const char *q = p + 2;
                 int v = 0, k = 0;
@@ -334,22 +311,22 @@ static char *grepTranslatePerl(const char *pat, bool *icase, int *prefixGroup, i
                 continue;
             }
             if (strchr("bB123456789", c) || ispunct((unsigned char)c)) {
-                grepPut(out, p, 2);
+                gnuBufPut(out, p, 2);
                 p += 2;
                 continue;
             }
-            grepPutc(out, c);
+            gnuBufPutc(out, c);
             p += 2;
             continue;
         }
         if (*p == '[') {
             /* Perl escapes inside a set. */
             const char *q = p + 1;
-            grepPutc(out, '[');
-            if (*q == '^') grepPutc(out, *q++);
+            gnuBufPutc(out, '[');
+            if (*q == '^') gnuBufPutc(out, *q++);
             bool closeLiteral = false, dashLiteral = false;
-            GrepBuf body = {NULL, 0, 0};
-            grepPut(&body, "", 0);
+            GnuBuf body = {NULL, 0, 0};
+            gnuBufPut(&body, "", 0);
             if (*q == ']') { closeLiteral = true; q++; }
             while (*q && *q != ']') {
                 if (*q == '\\' && q[1]) {
@@ -357,33 +334,33 @@ static char *grepTranslatePerl(const char *pat, bool *icase, int *prefixGroup, i
                     if (grepPerlClass(&body, c, true)) { q += 2; continue; }
                     if (c == ']') closeLiteral = true;
                     else if (c == '-') dashLiteral = true;
-                    else if (c == 't') grepPutc(&body, '\t');
-                    else if (c == 'n') grepPutc(&body, '\n');
-                    else grepPutc(&body, c);
+                    else if (c == 't') gnuBufPutc(&body, '\t');
+                    else if (c == 'n') gnuBufPutc(&body, '\n');
+                    else gnuBufPutc(&body, c);
                     q += 2;
                     continue;
                 }
                 if (*q == '[' && q[1] == ':') {
                     const char *close = strstr(q + 2, ":]");
                     if (close) {
-                        grepPut(&body, q, (size_t)(close + 2 - q));
+                        gnuBufPut(&body, q, (size_t)(close + 2 - q));
                         q = close + 2;
                         continue;
                     }
                 }
-                grepPutc(&body, *q++);
+                gnuBufPutc(&body, *q++);
             }
-            if (closeLiteral) grepPutc(out, ']');
-            grepPut(out, body.s, body.n);
-            if (dashLiteral) grepPutc(out, '-');
-            grepPutc(out, ']');
+            if (closeLiteral) gnuBufPutc(out, ']');
+            gnuBufPut(out, body.s, body.n);
+            if (dashLiteral) gnuBufPutc(out, '-');
+            gnuBufPutc(out, ']');
             free(body.s);
             if (*q == ']') q++;
             p = q;
             continue;
         }
         if (*p == '(' && p[1] == '?') {
-            if (p[2] == ':') { grepPutc(out, '('); depth++; p += 3; continue; }
+            if (p[2] == ':') { gnuBufPutc(out, '('); depth++; p += 3; continue; }
             if (p[2] == '=' && depth == 0 && !lookahead) {
                 /* A trailing lookahead: matched, not reported. */
                 lookahead = p;
@@ -402,7 +379,7 @@ static char *grepTranslatePerl(const char *pat, bool *icase, int *prefixGroup, i
             }
             depth--;
         }
-        grepPutc(out, *p++);
+        gnuBufPutc(out, *p++);
     }
     if (lookahead) {
         /* (?=X) at the end: X must follow, so it joins the regex as a group
@@ -423,35 +400,35 @@ static char *grepTranslatePerl(const char *pat, bool *icase, int *prefixGroup, i
         char *tr = inner ? grepTranslatePerl(inner, &ic, &pg, &bg) : NULL;
         free(inner);
         if (!tr) { free(b.s); free(prefix.s); return NULL; }
-        GrepBuf all = {NULL, 0, 0};
-        grepPut(&all, "", 0);
+        GnuBuf all = {NULL, 0, 0};
+        gnuBufPut(&all, "", 0);
         int group = 1;
         if (split) {
-            grepPutc(&all, '(');
-            grepPut(&all, prefix.s, prefix.n);
-            grepPutc(&all, ')');
+            gnuBufPutc(&all, '(');
+            gnuBufPut(&all, prefix.s, prefix.n);
+            gnuBufPutc(&all, ')');
             *prefixGroup = group++;
         }
-        grepPutc(&all, '(');
-        grepPut(&all, b.s, b.n);
-        grepPutc(&all, ')');
+        gnuBufPutc(&all, '(');
+        gnuBufPut(&all, b.s, b.n);
+        gnuBufPutc(&all, ')');
         *bodyGroup = group;
-        grepPutc(&all, '(');
-        grepPut(&all, tr, strlen(tr));
-        grepPutc(&all, ')');
+        gnuBufPutc(&all, '(');
+        gnuBufPut(&all, tr, strlen(tr));
+        gnuBufPutc(&all, ')');
         free(tr);
         free(b.s);
         free(prefix.s);
         return all.s;
     }
     if (split) {
-        GrepBuf all = {NULL, 0, 0};
-        grepPut(&all, "", 0);
-        grepPutc(&all, '(');
-        grepPut(&all, prefix.s, prefix.n);
-        grepPut(&all, ")(", 2);
-        grepPut(&all, b.s, b.n);
-        grepPutc(&all, ')');
+        GnuBuf all = {NULL, 0, 0};
+        gnuBufPut(&all, "", 0);
+        gnuBufPutc(&all, '(');
+        gnuBufPut(&all, prefix.s, prefix.n);
+        gnuBufPut(&all, ")(", 2);
+        gnuBufPut(&all, b.s, b.n);
+        gnuBufPutc(&all, ')');
         *prefixGroup = 1;
         *bodyGroup = 2;
         free(b.s);
@@ -470,18 +447,18 @@ unsupported:
 /* GNU reads an unfinished interval ("a{1") as literal text; the host's
  * extended syntax rejects it. Escapes each '{' that does not start one. */
 static char *grepLiteralBraces(const char *pat) {
-    GrepBuf b = {NULL, 0, 0};
-    grepPut(&b, "", 0);
+    GnuBuf b = {NULL, 0, 0};
+    gnuBufPut(&b, "", 0);
     for (const char *p = pat; *p; p++) {
-        if (*p == '\\' && p[1]) { grepPut(&b, p, 2); p++; continue; }
+        if (*p == '\\' && p[1]) { gnuBufPut(&b, p, 2); p++; continue; }
         if (*p == '[') { p = grepBracket(&b, p) - 1; continue; }
         if (*p == '{') {
             const char *q = p + 1;
             while (isdigit((unsigned char)*q)) q++;
             if (*q == ',') { q++; while (isdigit((unsigned char)*q)) q++; }
-            if (*q != '}' || q == p + 1) { grepPut(&b, "\\{", 2); continue; }
+            if (*q != '}' || q == p + 1) { gnuBufPut(&b, "\\{", 2); continue; }
         }
-        grepPutc(&b, *p);
+        gnuBufPutc(&b, *p);
     }
     return b.s;
 }

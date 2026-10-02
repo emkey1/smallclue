@@ -893,6 +893,7 @@ echo "Compiling smallclue (iSH/32-bit static)..."
     src/fmt_app.c \
     src/fold_app.c \
     src/git_app.c \
+    src/gnu_util.c \
     src/gzip_app.c \
     src/nl_app.c \
     src/nohup_app.c \

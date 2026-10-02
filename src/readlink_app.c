@@ -24,26 +24,6 @@
 
 enum { CAN_EXISTING, CAN_ALL_BUT_LAST, CAN_MISSING };
 
-typedef struct {
-    char *s;
-    size_t len, cap;
-} RlBuf;
-
-static bool rlPut(RlBuf *b, const char *s, size_t n) {
-    if (b->len + n + 1 > b->cap) {
-        size_t cap = b->cap ? b->cap : 256;
-        while (b->len + n + 1 > cap) cap *= 2;
-        char *p = (char *)realloc(b->s, cap);
-        if (!p) return false;
-        b->s = p;
-        b->cap = cap;
-    }
-    memcpy(b->s + b->len, s, n);
-    b->len += n;
-    b->s[b->len] = '\0';
-    return true;
-}
-
 /* gnulib's suffix_requires_dir_check: a trailing "/", "/." or a "/.." anywhere. */
 static bool rlSuffixNeedsDir(const char *end) {
     while (*end == '/') {
@@ -58,10 +38,10 @@ static bool rlSuffixNeedsDir(const char *end) {
     return false;
 }
 
-static void rlDropLast(RlBuf *r) {
-    while (r->len > 1 && r->s[r->len - 1] != '/') r->len--;
-    if (r->len > 1) r->len--;
-    r->s[r->len] = '\0';
+static void rlDropLast(GnuBuf *r) {
+    while (r->n > 1 && r->s[r->n - 1] != '/') r->n--;
+    if (r->n > 1) r->n--;
+    r->s[r->n] = '\0';
 }
 
 /* The canonical name, malloc'd; NULL with errno set. */
@@ -70,13 +50,13 @@ static char *rlCanon(const char *name, int mode, bool nolinks) {
         errno = ENOENT;
         return NULL;
     }
-    RlBuf r = {0};
+    GnuBuf r = {0};
     if (name[0] != '/') {
         char cwd[PATH_MAX];
         if (!getcwd(cwd, sizeof(cwd))) return NULL;
-        rlPut(&r, cwd, strlen(cwd));
+        gnuBufPut(&r, cwd, strlen(cwd));
     } else {
-        rlPut(&r, "/", 1);
+        gnuBufPut(&r, "/", 1);
     }
     char *work = strdup(name);
     if (!work) {
@@ -100,9 +80,9 @@ static char *rlCanon(const char *name, int mode, bool nolinks) {
             start = end;
             continue;
         }
-        size_t before = r.len;
-        if (r.s[r.len - 1] != '/') rlPut(&r, "/", 1);
-        rlPut(&r, start, clen);
+        size_t before = r.n;
+        if (r.s[r.n - 1] != '/') gnuBufPut(&r, "/", 1);
+        gnuBufPut(&r, start, clen);
         bool last = true;
         for (const char *p = end; *p; p++)
             if (*p != '/') {
@@ -132,11 +112,11 @@ static char *rlCanon(const char *name, int mode, bool nolinks) {
                 work = next;
                 start = work;
                 if (target[0] == '/') {
-                    r.len = 1;
+                    r.n = 1;
                     r.s[1] = '\0';
                 } else {
-                    r.len = before;
-                    r.s[r.len] = '\0';
+                    r.n = before;
+                    r.s[r.n] = '\0';
                 }
                 continue;
             }

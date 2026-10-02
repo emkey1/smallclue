@@ -81,20 +81,6 @@ static int gzByte(GzIn *in) {
     return in->buf[in->pos++];
 }
 
-static bool gzWriteAll(int fd, const void *b, size_t n) {
-    const unsigned char *p = (const unsigned char *)b;
-    while (n) {
-        ssize_t w = write(fd, p, n);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        p += w;
-        n -= (size_t)w;
-    }
-    return true;
-}
-
 static const char *gzBase(const char *path) {
     const char *s = strrchr(path, '/');
     return s ? s + 1 : path;
@@ -110,11 +96,11 @@ static bool gzCompress(Gz *g, int in, int out, const char *inName, const char *s
     hdr[6] = (unsigned char)(mtime >> 16);
     hdr[7] = (unsigned char)(mtime >> 24);
     hdr[8] = g->level == 9 ? 2 : g->level == 1 ? 4 : 0;
-    if (!gzWriteAll(out, hdr, 10)) goto werr;
+    if (!gnuWriteAll(out, hdr, 10)) goto werr;
     uintmax_t outBytes = 10;
     if (storeName) {
         size_t nl = strlen(storeName) + 1;
-        if (!gzWriteAll(out, storeName, nl)) goto werr;
+        if (!gnuWriteAll(out, storeName, nl)) goto werr;
         outBytes += nl;
     }
     z_stream z;
@@ -146,7 +132,7 @@ static bool gzCompress(Gz *g, int in, int out, const char *inName, const char *s
             z.avail_out = sizeof(obuf);
             deflate(&z, flush);
             size_t have = sizeof(obuf) - z.avail_out;
-            if (!gzWriteAll(out, obuf, have)) {
+            if (!gnuWriteAll(out, obuf, have)) {
                 deflateEnd(&z);
                 goto werr;
             }
@@ -157,7 +143,7 @@ static bool gzCompress(Gz *g, int in, int out, const char *inName, const char *s
     unsigned char tr[8] = {(unsigned char)crc, (unsigned char)(crc >> 8), (unsigned char)(crc >> 16),
                            (unsigned char)(crc >> 24), (unsigned char)total, (unsigned char)(total >> 8),
                            (unsigned char)(total >> 16), (unsigned char)(total >> 24)};
-    if (!gzWriteAll(out, tr, 8)) goto werr;
+    if (!gnuWriteAll(out, tr, 8)) goto werr;
     *rawIn = total;
     *rawOut = deflated;
     (void)outBytes;
@@ -240,9 +226,9 @@ static int gzDecompress(Gz *g, GzIn *in, int out, const char *inName, GzMember *
         int h = gzHeader(in, &m);
         if (h == 1 && member == 0 && g->force && g->toStdout && g->mode == GZ_DECOMPRESS) {
             /* -dcf: not ours, so copy it as it is */
-            gzWriteAll(out, in->buf, in->len);
+            gnuWriteAll(out, in->buf, in->len);
             ssize_t n;
-            while ((n = read(in->fd, in->buf, sizeof(in->buf))) > 0) gzWriteAll(out, in->buf, (size_t)n);
+            while ((n = read(in->fd, in->buf, sizeof(in->buf))) > 0) gnuWriteAll(out, in->buf, (size_t)n);
             *passedThrough = true;
             return 0;
         }
@@ -299,7 +285,7 @@ static int gzDecompress(Gz *g, GzIn *in, int out, const char *inName, GzMember *
             size += (uint32_t)have;
             produced += have;
             if (firstMember) firstMember->produced = produced;
-            if (out >= 0 && have && !gzWriteAll(out, obuf, have)) {
+            if (out >= 0 && have && !gnuWriteAll(out, obuf, have)) {
                 inflateEnd(&z);
                 fprintf(stderr, "gzip: %s: %s\n", g->toStdout ? "stdout" : nm, strerror(errno));
                 return 1;

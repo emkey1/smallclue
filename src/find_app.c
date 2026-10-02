@@ -828,16 +828,6 @@ static bool findEval(Find *f, FindNode *n, FindEntry *e) {
     }
 }
 
-static char *findJoin(const char *dir, const char *name) {
-    size_t dl = strlen(dir), nl = strlen(name);
-    char *p = (char *)malloc(dl + nl + 2);
-    if (!p) return NULL;
-    memcpy(p, dir, dl);
-    if (dl == 0 || dir[dl - 1] != '/') p[dl++] = '/';
-    memcpy(p + dl, name, nl + 1);
-    return p;
-}
-
 static void findVisit(Find *f, const char *path, const char *real, const char *start, int depth) {
     char q[4096], q2[4096];
     FindEntry e;
@@ -901,8 +891,8 @@ static void findVisit(Find *f, const char *path, const char *real, const char *s
                 f->nanc++;
             }
             for (size_t i = 0; i < n && !f->quit; i++) {
-                char *cp = findJoin(path, names[i]);
-                char *cr = real == path ? cp : findJoin(real, names[i]);
+                char *cp = gnuPathJoin(path, names[i]);
+                char *cr = real == path ? cp : gnuPathJoin(real, names[i]);
                 if (cp && cr) findVisit(f, cp, cr, start, depth + 1);
                 if (cr != cp) free(cr);
                 free(cp);

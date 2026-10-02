@@ -94,16 +94,6 @@ static void cpFail(Cp *c, const char *fmt, ...) {
     c->status = 1;
 }
 
-static char *cpJoin(const char *dir, const char *name) {
-    size_t dl = strlen(dir), nl = strlen(name);
-    char *p = (char *)malloc(dl + nl + 2);
-    if (!p) return NULL;
-    memcpy(p, dir, dl);
-    if (dl == 0 || dir[dl - 1] != '/') p[dl++] = '/';
-    memcpy(p + dl, name, nl + 1);
-    return p;
-}
-
 /* The last component, without trailing slashes. */
 static char *cpBase(const char *path) {
     size_t len = strlen(path);
@@ -285,8 +275,8 @@ static bool cpDir(Cp *c, const char *srcDisp, const char *src, const char *dstDi
         qsort(names, n, sizeof(CpEntry), cpByInode);
         for (size_t i = 0; i < n; i++) {
             if (!c->intoSelf) {
-                char *sd = cpJoin(srcDisp, names[i].name), *sr = cpJoin(src, names[i].name);
-                char *dd = cpJoin(dstDisp, names[i].name), *dr = cpJoin(dst, names[i].name);
+                char *sd = gnuPathJoin(srcDisp, names[i].name), *sr = gnuPathJoin(src, names[i].name);
+                char *dd = gnuPathJoin(dstDisp, names[i].name), *dr = gnuPathJoin(dst, names[i].name);
                 if (sd && sr && dd && dr && !cpCopy(c, sd, sr, dd, dr, false, topDev)) ok = false;
                 free(sd); free(sr); free(dd); free(dr);
             }
@@ -515,7 +505,7 @@ static bool cpRemoveTree(Cp *c, const char *disp, const char *path, bool verbose
             closedir(d);
             qsort(names, n, sizeof(CpEntry), cpByInode);
             for (size_t i = 0; i < n; i++) {
-                char *cd = cpJoin(disp, names[i].name), *cp = cpJoin(path, names[i].name);
+                char *cd = gnuPathJoin(disp, names[i].name), *cp = gnuPathJoin(path, names[i].name);
                 if (cd && cp) cpRemoveTree(c, cd, cp, verbose);
                 free(cd); free(cp); free(names[i].name);
             }
@@ -982,14 +972,14 @@ static int cpMain(int argc, char **argv, bool mv) {
         } else if (c.parents) {
             const char *rel = src;
             while (*rel == '/') rel++;
-            dst = cpJoin(dir, rel);
+            dst = gnuPathJoin(dir, rel);
             /* Make the leading directories, copying their modes. */
             if (dst) {
                 char *walk = strdup(rel);
                 char *slash = walk;
                 while (walk && (slash = strchr(slash, '/'))) {
                     *slash = '\0';
-                    char *sd = cpJoin(dir, walk);
+                    char *sd = gnuPathJoin(dir, walk);
                     struct stat ps, ds;
                     if (sd && stat(sd, &ds) != 0) {
                         char *srcPart = strndup(src, (size_t)(rel - src) + strlen(walk));
@@ -1008,7 +998,7 @@ static int cpMain(int argc, char **argv, bool mv) {
             }
         } else {
             char *b = cpBase(src);
-            dst = b ? cpJoin(dir, b) : NULL;
+            dst = b ? gnuPathJoin(dir, b) : NULL;
             free(b);
         }
         if (!dst) { c.status = 1; continue; }

@@ -1128,16 +1128,6 @@ static char **diffList(const char *dir, size_t *n) {
     return v;
 }
 
-static char *diffJoin(const char *a, const char *b) {
-    size_t la = strlen(a), lb = strlen(b);
-    char *p = (char *)malloc(la + lb + 2);
-    if (!p) return NULL;
-    memcpy(p, a, la);
-    if (la && a[la - 1] != '/') p[la++] = '/';
-    memcpy(p + la, b, lb + 1);
-    return p;
-}
-
 static void diffDirs(Diff *d, const char *d0, const char *d1);
 
 static void diffPair(Diff *d, const char *p0, const char *p1, bool top) {
@@ -1182,7 +1172,7 @@ static void diffDirs(Diff *d, const char *d0, const char *d1) {
             if (cmp >= 0) j++;
             continue;
         }
-        char *p0 = diffJoin(d0, name), *p1 = diffJoin(d1, name);
+        char *p0 = gnuPathJoin(d0, name), *p1 = gnuPathJoin(d1, name);
         if (cmp == 0) {
             struct stat s0, s1;
             bool dir0 = stat(p0, &s0) == 0 && S_ISDIR(s0.st_mode);
@@ -1538,11 +1528,11 @@ int smallclueDiffCommand(int argc, char **argv) {
         bool dir1 = strcmp(p1, "-") && stat(p1, &s1) == 0 && S_ISDIR(s1.st_mode);
         if (dir0 && !dir1 && strcmp(p1, "-")) {
             const char *base = strrchr(p1, '/');
-            alloc = diffJoin(p0, base ? base + 1 : p1);
+            alloc = gnuPathJoin(p0, base ? base + 1 : p1);
             p0 = alloc;
         } else if (dir1 && !dir0 && strcmp(p0, "-")) {
             const char *base = strrchr(p0, '/');
-            alloc = diffJoin(p1, base ? base + 1 : p0);
+            alloc = gnuPathJoin(p1, base ? base + 1 : p0);
             p1 = alloc;
         }
         if (!strcmp(p0, "-") || !strcmp(p1, "-")) diffFiles(d, p0, p1, NULL, false, false);

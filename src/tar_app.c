@@ -220,25 +220,11 @@ static bool tarIoOpenWrite(Tar *t, int fd) {
     return true;
 }
 
-static bool tarWriteFd(int fd, const void *b, size_t n) {
-    const unsigned char *p = (const unsigned char *)b;
-    while (n) {
-        ssize_t w = write(fd, p, n);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        p += w;
-        n -= (size_t)w;
-    }
-    return true;
-}
-
 static bool tarIoWrite(Tar *t, const void *b, size_t n) {
     TarIo *io = &t->io;
     io->total += n;
     if (io->pipe) return fwrite(b, 1, n, io->pipe) == n;
-    if (!io->gzip) return tarWriteFd(io->fd, b, n);
+    if (!io->gzip) return gnuWriteAll(io->fd, b, n);
     io->crc = crc32(io->crc, (const Bytef *)b, (uInt)n);
     io->rawLen += n;
     io->z.next_in = (Bytef *)b;
@@ -247,7 +233,7 @@ static bool tarIoWrite(Tar *t, const void *b, size_t n) {
         io->z.next_out = io->zbuf;
         io->z.avail_out = sizeof(io->zbuf);
         deflate(&io->z, Z_NO_FLUSH);
-        if (!tarWriteFd(io->fd, io->zbuf, sizeof(io->zbuf) - io->z.avail_out)) return false;
+        if (!gnuWriteAll(io->fd, io->zbuf, sizeof(io->zbuf) - io->z.avail_out)) return false;
     } while (io->z.avail_out == 0);
     return true;
 }
@@ -263,13 +249,13 @@ static bool tarIoClose(Tar *t) {
             io->z.next_out = io->zbuf;
             io->z.avail_out = sizeof(io->zbuf);
             rc = deflate(&io->z, Z_FINISH);
-            if (!tarWriteFd(io->fd, io->zbuf, sizeof(io->zbuf) - io->z.avail_out)) ok = false;
+            if (!gnuWriteAll(io->fd, io->zbuf, sizeof(io->zbuf) - io->z.avail_out)) ok = false;
         } while (rc != Z_STREAM_END);
         deflateEnd(&io->z);
         unsigned char tr[8] = {(unsigned char)io->crc, (unsigned char)(io->crc >> 8), (unsigned char)(io->crc >> 16),
                                (unsigned char)(io->crc >> 24), (unsigned char)io->rawLen, (unsigned char)(io->rawLen >> 8),
                                (unsigned char)(io->rawLen >> 16), (unsigned char)(io->rawLen >> 24)};
-        if (!tarWriteFd(io->fd, tr, 8)) ok = false;
+        if (!gnuWriteAll(io->fd, tr, 8)) ok = false;
     } else if (!io->writing && io->gzip) {
         inflateEnd(&io->z);
     }
@@ -549,16 +535,6 @@ static bool tarExcluded(const Tar *t, const char *name) {
     return false;
 }
 
-static char *tarJoin(const char *a, const char *b) {
-    size_t la = strlen(a), lb = strlen(b);
-    char *r = (char *)malloc(la + lb + 2);
-    memcpy(r, a, la);
-    size_t o = la;
-    if (la && a[la - 1] != '/') r[o++] = '/';
-    memcpy(r + o, b, lb + 1);
-    return r;
-}
-
 /* --- Create. --- */
 
 static bool tarPutHeader(Tar *t, const char *name, const char *link, char type, mode_t mode, uintmax_t uid,
@@ -639,8 +615,8 @@ static void tarAddDirEntries(Tar *t, const char *fsPath, const char *archName) {
     }
     closedir(d);
     for (size_t i = 0; i < n; i++) {
-        char *fp = tarJoin(fsPath, names[i]);
-        char *an = tarJoin(archName, names[i]);
+        char *fp = gnuPathJoin(fsPath, names[i]);
+        char *an = gnuPathJoin(archName, names[i]);
         tarAdd(t, fp, an, false);
         free(fp);
         free(an);
@@ -651,6 +627,7 @@ static void tarAddDirEntries(Tar *t, const char *fsPath, const char *archName) {
 
 static void tarAdd(Tar *t, const char *fsPath, const char *archName, bool top) {
     struct stat st;
+    char *verboseName = NULL;   /* freed at werr, which a hard link can reach first */
     if ((t->deref ? stat(fsPath, &st) : lstat(fsPath, &st)) != 0) {
         tarErr(t, "%s: Cannot stat: %s", archName, strerror(errno));
         return;
@@ -698,7 +675,6 @@ static void tarAdd(Tar *t, const char *fsPath, const char *archName, bool top) {
         t->links[t->nlinks].name = strdup(name);
         t->nlinks++;
     }
-    char *verboseName = NULL;
     if (S_ISDIR(st.st_mode)) {
         size_t n = strlen(name);
         verboseName = (char *)malloc(n + 2);
@@ -1115,7 +1091,7 @@ static bool tarExtractOne(Tar *t, const TarEntry *e, const char *path) {
                 ok = false;
                 break;
             }
-            if (!tarWriteFd(fd, buf, k)) {
+            if (!gnuWriteAll(fd, buf, k)) {
                 tarErr(t, "%s: Cannot write: %s", path, strerror(errno));
                 break;
             }
@@ -1223,12 +1199,12 @@ static int tarReadArchive(Tar *t, TarName *names, size_t nnames, const char *bas
                 r = -2;
             }
         } else {
-            char *fs = base ? tarJoin(base, path) : strdup(path);
+            char *fs = base ? gnuPathJoin(base, path) : strdup(path);
             TarEntry x = e;
             char *linkFs = NULL;
             if (e.type == '1') {
                 char *lp = tarMemberPath(t, e.link);
-                linkFs = lp ? (base ? tarJoin(base, lp) : strdup(lp)) : strdup(e.link);
+                linkFs = lp ? (base ? gnuPathJoin(base, lp) : strdup(lp)) : strdup(e.link);
                 free(lp);
                 x.link = linkFs;
             }
@@ -1328,14 +1304,14 @@ static int tarAppend(Tar *t, TarItem *items, size_t nitems) {
     char *base = NULL;
     for (size_t i = 0; i < nitems; i++) {
         if (items[i].chdir) {
-            char *nb = base && items[i].value[0] != '/' ? tarJoin(base, items[i].value) : strdup(items[i].value);
+            char *nb = base && items[i].value[0] != '/' ? gnuPathJoin(base, items[i].value) : strdup(items[i].value);
             free(base);
             base = nb;
             continue;
         }
         if (t->op == 'u') {
             struct stat st;
-            char *fp = base ? tarJoin(base, items[i].value) : strdup(items[i].value);
+            char *fp = base ? gnuPathJoin(base, items[i].value) : strdup(items[i].value);
             bool newer = true;
             if (lstat(fp, &st) == 0)
                 for (size_t k = 0; k < nseen; k++)
@@ -1344,7 +1320,7 @@ static int tarAppend(Tar *t, TarItem *items, size_t nitems) {
             free(fp);
             continue;
         }
-        char *fp = base ? tarJoin(base, items[i].value) : strdup(items[i].value);
+        char *fp = base ? gnuPathJoin(base, items[i].value) : strdup(items[i].value);
         tarAdd(t, fp, items[i].value, true);
         free(fp);
     }
@@ -1384,7 +1360,7 @@ static int tarCreate(Tar *t, TarItem *items, size_t nitems) {
     char *base = NULL;
     for (size_t i = 0; i < nitems; i++) {
         if (items[i].chdir) {
-            char *nb = base && items[i].value[0] != '/' ? tarJoin(base, items[i].value) : strdup(items[i].value);
+            char *nb = base && items[i].value[0] != '/' ? gnuPathJoin(base, items[i].value) : strdup(items[i].value);
             free(base);
             base = nb;
             struct stat st;
@@ -1396,7 +1372,7 @@ static int tarCreate(Tar *t, TarItem *items, size_t nitems) {
             }
             continue;
         }
-        char *fp = base ? tarJoin(base, items[i].value) : strdup(items[i].value);
+        char *fp = base ? gnuPathJoin(base, items[i].value) : strdup(items[i].value);
         tarAdd(t, fp, items[i].value, true);
         free(fp);
     }
@@ -1723,7 +1699,7 @@ int smallclueTarCommand(int argc, char **argv) {
         char *base = NULL;
         for (size_t i = 0; i < nitems; i++) {
             if (items[i].chdir) {
-                char *nb = base && items[i].value[0] != '/' ? tarJoin(base, items[i].value) : strdup(items[i].value);
+                char *nb = base && items[i].value[0] != '/' ? gnuPathJoin(base, items[i].value) : strdup(items[i].value);
                 free(base);
                 base = nb;
                 continue;

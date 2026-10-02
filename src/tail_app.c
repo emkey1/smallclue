@@ -28,6 +28,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -411,6 +412,16 @@ static bool tailPidAlive(long pid) {
     return kill((pid_t)pid, 0) == 0 || errno != ESRCH;
 }
 
+/* GNU's check_output_alive: a pipe or socket whose reader has gone shows
+ * POLLERR or POLLHUP on our end, and tail -f | head would otherwise wait
+ * forever, since nothing is written to draw the SIGPIPE. */
+static bool tailOutputGone(void) {
+    struct stat st;
+    if (fstat(STDOUT_FILENO, &st) != 0 || !(S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))) return false;
+    struct pollfd pfd = {STDOUT_FILENO, POLLRDBAND, 0};
+    return poll(&pfd, 1, 0) >= 0 && (pfd.revents & (POLLERR | POLLHUP));
+}
+
 static int tailForever(TailState *s, TailFile *files, int n) {
     struct timespec nap;
     nap.tv_sec = (time_t)s->o->sleep;
@@ -429,6 +440,10 @@ static int tailForever(TailState *s, TailFile *files, int n) {
             return 1;
         }
         if (!alive) return s->status;
+        if (tailOutputGone()) {
+            raise(SIGPIPE);
+            return 1;
+        }
         if (!any) nanosleep(&nap, NULL);
     }
 }
