@@ -744,6 +744,7 @@ gcc -std=c99 ${PORTABILITY_DEFS} -DSMALLCLUE_WITH_SH ${EXTRA_C_DEFS} ${DVTM_EXTR
     src/chown_app.c \
     src/chroot_app.c \
     src/cmp_app.c \
+    src/init_app.c \
     src/comm_app.c \
     src/dd_app.c \
     src/diff_app.c \

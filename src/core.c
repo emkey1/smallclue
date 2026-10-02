@@ -50,6 +50,7 @@
 #include "base64_app.h"
 #include "nohup_app.h"
 #include "cmp_app.h"
+#include "init_app.h"
 #include "dd_app.h"
 #include "od_app.h"
 #include "seq_app.h"
@@ -314,7 +315,7 @@ static bool smallclueJoinPath2(char *out,
     return written > 0 && (size_t)written < outSize;
 }
 
-static bool smallclueResolveEtcEntry(const char *entryName,
+bool smallclueResolveEtcEntry(const char *entryName,
                                      int accessMode,
                                      char *outPath,
                                      size_t outPathSize) {
@@ -356,7 +357,7 @@ static bool smallclueResolveEtcEntry(const char *entryName,
     return false;
 }
 
-static bool smallclueResolveExshPath(char *outPath, size_t outPathSize) {
+bool smallclueResolveExshPath(char *outPath, size_t outPathSize) {
     if (!outPath || outPathSize == 0) {
         return false;
     }
@@ -1524,10 +1525,7 @@ static int smallclueSshKeygenCommand(int argc, char **argv);
 static int smallclueSshCopyIdCommand(int argc, char **argv);
 static int smallcluePbcopyCommand(int argc, char **argv);
 static int smallcluePbpasteCommand(int argc, char **argv);
-static int smallclueInitCommand(int argc, char **argv);
-static int smallclueRunitCommand(int argc, char **argv);
 static int smallclueMdevCommand(int argc, char **argv);
-static int smallclueHaltCommand(int argc, char **argv);
 #if defined(SMALLCLUE_WITH_EXSH)
 extern int exsh_main(int argc, char **argv);
 static int smallclueShCommand(int argc, char **argv);
@@ -3508,6 +3506,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"traceroute", smallclueTracerouteCommand, "Trace network path to a host"},
     {"tr", smallclueTrCommand, "Translate or delete characters"},
     {"true", smallclueTrueCommand, "Do nothing, successfully"},
+    {"sv", smallclueSvCommand, "Control services supervised by runit"},
     {"sum", smallclueSumCommand, "Checksum (BSD/SysV)"},
     {"type", smallclueTypeCommand, "Describe command names"},
     {"uname", smallclueUnameCommand, "Show system information"},
@@ -3691,8 +3690,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  reflog,\n"
             "  blame,\n"
             "  describe"},
-    {"halt", "halt [-f]\n"
-             "  Halt the system"},
+    {"halt", "halt|poweroff|reboot [-dfhHinpw]\n"
+             "  Ask init to halt, power off or reboot (SIGUSR1, SIGUSR2, SIGTERM)\n"
+             "  -w only writes the record, which here is nothing, and halts nothing"},
     {"head", "head [-c [-]NUM | -n [-]NUM] [-q|-v] [-z] [FILE...]\n"
            "  Print the first 10 lines (or NUM lines/bytes) of each FILE\n"
            "  -c NUM bytes; -n NUM lines; a leading '-': all but the last NUM\n"
@@ -3703,7 +3703,8 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"id", "id\n"
            "  Show uid/gid info"},
     {"init", "init [--service-mode|-S|--allow-non-pid1]\n"
-             "  System initialization (PID 1 by default)\n"
+             "  PID 1: run /etc/rc, reap orphans, and on SIGTERM (reboot), SIGUSR1\n"
+             "  (halt) or SIGUSR2 (poweroff) run /etc/rc.shutdown and stop everything\n"
              "  --service-mode allows compatibility startup when PID != 1"},
 #if SMALLCLUE_HAS_IFADDRS
     {"ipaddr", "ipaddr [-4|-6] [-a]\n"
@@ -3880,8 +3881,10 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  Synchronize files and directories (OpenRsync-compatible applet)\n"
               "  Common: -a -v -z -r --delete --exclude PATTERN --include PATTERN\n"
               "  Remote paths use host:path syntax over SSH"},
-    {"runit", "runit\n"
-             "  Service supervisor"},
+    {"runit", "runit [DIR]\n"
+             "  Supervise DIR/<name>/run (default /etc/service): start each, restart\n"
+             "  one that dies (with a backoff), honour DIR/<name>/down. State in\n"
+             "  /run/service/<name>/. Control it with sv"},
     {"sed", "sed [-nEsuz] [-i[SUFFIX]] [-l N] [-e SCRIPT]... [-f FILE]... [SCRIPT] [FILE...]\n"
             "  POSIX sed with GNU's extensions: {} = a b c d D F g G h H i l n N p P\n"
             "  q Q r R s t T w W x y z : #; addresses N, $, /re/I, first~step,\n"
@@ -3974,6 +3977,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                 "  --preserve-status: exit with COMMAND's own status instead of 124\n"
                 "  Exit 124 on timeout (unless --preserve-status), 125 on usage/setup\n"
                 "  error, 126/127 if COMMAND can't be invoked, else COMMAND's status"},
+    {"sv", "sv [-w SEC] status|up|down|restart|start|stop SERVICE...\n"
+           "  Control a service runit supervises; SERVICE is a name under\n"
+           "  /etc/service or a path. Waits up to SEC (7) for the change"},
     {"sum", "sum [OPTION]... [FILE]...\n"
            "  BSD (-r, default) or System V (-s) checksums; GNU coreutils compatible"},
     {"tty", "tty [-s]\n"
@@ -22076,136 +22082,6 @@ static int smallcluePbpasteCommand(int argc, char **argv) {
     return written < 0 ? 1 : 0;
 }
 
-static int smallclueInitCommand(int argc, char **argv) {
-    bool allowNonPid1 = false;
-    for (int i = 1; i < argc; ++i) {
-        const char *arg = argv[i] ? argv[i] : "";
-        if (strcmp(arg, "--service-mode") == 0 ||
-            strcmp(arg, "--allow-non-pid1") == 0 ||
-            strcmp(arg, "-S") == 0) {
-            allowNonPid1 = true;
-            continue;
-        }
-        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
-            printf("usage: init [--service-mode|-S|--allow-non-pid1]\n");
-            printf("  --service-mode        allow init compatibility mode when PID != 1\n");
-            printf("  --allow-non-pid1      same as --service-mode\n");
-            return 0;
-        }
-        fprintf(stderr, "init: unknown option '%s'\n", arg);
-        fprintf(stderr, "usage: init [--service-mode|-S|--allow-non-pid1]\n");
-        return 1;
-    }
-    pid_t selfPid = getpid();
-    if (selfPid != 1 && !allowNonPid1) {
-        fprintf(stderr, "init: must be run as PID 1\n");
-        fprintf(stderr, "init: use --service-mode to run in compatibility mode on iOS/iPadOS\n");
-        return 1;
-    }
-    if (selfPid != 1) {
-        printf("init: compatibility mode enabled (pid=%d)\n", (int)selfPid);
-    }
-
-    /* Basic init implementation:
-     * 1. Block signals
-     * 2. Run /etc/rc if present
-     * 3. Reap zombies loop
-     */
-
-    printf("smallclue init: starting...\n");
-
-    char rcPath[PATH_MAX];
-    if (smallclueResolveEtcEntry("rc", F_OK, rcPath, sizeof(rcPath))) {
-        printf("smallclue init: running %s\n", rcPath);
-        /* The exec cascade -- rc itself, then rc under exsh if it turns out
-         * not to be directly executable -- expressed as spawn.h's attempt
-         * list rather than as fork()-and-try-each-in-the-child. That is what
-         * the list is for: a platform running smallclue as host code inside
-         * one process (iSH-AOK) has no fork() to return twice, and the raw
-         * fork() here failed with ENOSYS, so init on such a platform printed
-         * "fork failed for /etc/rc" and supervised nothing. */
-        char *rcArgv[] = { (char *)rcPath, NULL };
-        char exshPath[PATH_MAX];
-        char *exshArgv[] = { exshPath, (char *)rcPath, NULL };
-        SmallclueSpawnAttempt initAttempts[2];
-        size_t initAttemptCount = 0;
-        initAttempts[initAttemptCount++] = (SmallclueSpawnAttempt){ rcPath, rcArgv, 0 };
-        if (smallclueResolveExshPath(exshPath, sizeof(exshPath))) {
-            initAttempts[initAttemptCount++] = (SmallclueSpawnAttempt){ exshPath, exshArgv, 0 };
-        }
-        SmallclueSpawnRequest initRequest = { initAttempts, initAttemptCount, 0 };
-        pid_t pid = smallclueSpawn(&initRequest);
-        if (pid > 0) {
-            /* A single waitpid(pid, ...) here only ever reaps rc itself --
-             * for the entire time rc is running (which for an interactive
-             * session can be the whole guest lifetime), any orphaned or
-             * double-forked background process reparented to us as PID 1
-             * would accumulate as an unreaped zombie, since nothing else
-             * in this init calls wait() until final shutdown.
-             *
-             * waitpid(-1, ...) blocks until ANY child changes state and
-             * reaps it, whichever child that is -- looping on that instead
-             * of targeting `pid` directly means every orphan that exits
-             * while rc runs gets reaped as it happens, with no signal
-             * handler needed. We keep looping past any non-rc child until
-             * we see rc's own pid, at which point we've both reaped rc and
-             * captured its exit status for the log message below. */
-            int rcStatus = 0;
-            bool haveRcStatus = false;
-            for (;;) {
-                int status = 0;
-                pid_t reaped = waitpid(-1, &status, 0);
-                if (reaped < 0) {
-                    if (errno == EINTR) {
-                        continue;
-                    }
-                    fprintf(stderr, "init: waitpid(%s) failed: %s\n", rcPath, strerror(errno));
-                    break;
-                }
-                if (reaped == pid) {
-                    rcStatus = status;
-                    haveRcStatus = true;
-                    break;
-                }
-                /* Some other reparented child exited -- reaped and
-                 * discarded; keep waiting for rc specifically. */
-            }
-            if (haveRcStatus && (!WIFEXITED(rcStatus) || WEXITSTATUS(rcStatus) != 0)) {
-                if (WIFEXITED(rcStatus)) {
-                    fprintf(stderr, "init: %s exited with status %d\n",
-                            rcPath, WEXITSTATUS(rcStatus));
-                } else if (WIFSIGNALED(rcStatus)) {
-                    fprintf(stderr, "init: %s terminated by signal %d\n",
-                            rcPath, WTERMSIG(rcStatus));
-                }
-            }
-        } else {
-            fprintf(stderr, "init: failed to start %s: %s\n", rcPath, strerror(errno));
-        }
-    } else {
-        const char *etcRoot = getenv("PSCALI_ETC_ROOT");
-        if (etcRoot && etcRoot[0] == '/') {
-            printf("smallclue init: rc not found (checked %s/rc and /etc/rc)\n",
-                   etcRoot);
-        } else {
-            printf("smallclue init: /etc/rc not found\n");
-        }
-    }
-
-    /* Ignore signals that might terminate us */
-    signal(SIGTERM, SIG_IGN);
-    signal(SIGINT, SIG_IGN);
-    signal(SIGTSTP, SIG_IGN);
-    signal(SIGQUIT, SIG_IGN);
-
-    if (getpid() == 1) {
-        printf("smallclue init: rc exited, shutting down...\n");
-        kill(-1, SIGTERM);
-        sleep(1);
-        kill(-1, SIGKILL);
-    }
-    return 0;
-}
 
 static int smallclueMdevCommand(int argc, char **argv) {
     int scan = 0;
@@ -22241,160 +22117,4 @@ static int smallclueMdevCommand(int argc, char **argv) {
     return 0;
 }
 
-static int smallclueRunitCommand(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
 
-    // Minimal runit implementation:
-    // Scans /etc/service (or arg) and spawns 'run' scripts.
-    // Does not implement full supervision (restart, control).
-
-    char default_service_dir[PATH_MAX];
-    const char *service_dir = "/etc/service";
-    if (argc > 1) {
-        service_dir = argv[1];
-    } else if (smallclueResolveEtcEntry("service", R_OK,
-                                        default_service_dir,
-                                        sizeof(default_service_dir))) {
-        service_dir = default_service_dir;
-    }
-
-    DIR *dir = opendir(service_dir);
-    if (!dir) {
-        fprintf(stderr, "runit: cannot open service directory '%s': %s\n", service_dir, strerror(errno));
-        return 1;
-    }
-
-    printf("runit: starting services in %s\n", service_dir);
-
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue;
-
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/%s/run", service_dir, entry->d_name);
-
-        if (access(path, X_OK) == 0) {
-            printf("runit: starting %s\n", entry->d_name);
-            /* smallclueSpawnSimple, not fork()+execl: see spawn.h. The
-             * fork() this replaces returned -1 on a platform without one,
-             * and nothing here inspected the result, so runit announced
-             * "starting NAME", started nothing, and then sat in the reap
-             * loop below forever with no children to reap. */
-            char *runArgv[] = { path, NULL };
-            if (smallclueSpawnSimple(path, runArgv, 0) < 0) {
-                fprintf(stderr, "runit: failed to exec %s: %s\n", path, strerror(errno));
-            }
-        }
-    }
-    closedir(dir);
-
-    // Reap children
-    while (1) {
-        int status;
-        pid_t pid = wait(&status);
-        if (pid < 0) {
-            if (errno == ECHILD) {
-                // No children left, sleep to avoid busy loop
-                sleep(1);
-            }
-            continue;
-        }
-    }
-    return 0;
-}
-
-/* halt, poweroff and reboot share one applet, told apart by argv[0], and take
- * sysvinit's option set because that is what Debian's own rc scripts pass:
- *
- *     /etc/init.d/halt:63        halt -d -f $netdown $poweroff $hddown
- *     /etc/init.d/reboot:25      reboot -d -f ${netdown}
- *     /etc/init.d/umountnfs.sh:36  halt -w
- *
- * Most of them describe hardware and bookkeeping this guest does not have --
- * there is no wtmp to write (-d, -w), no interfaces of its own to bring down
- * (-i), and no disks to spin down (-h, -H) -- so they are accepted and do
- * nothing, which is the honest behaviour rather than a refusal that breaks the
- * script.
- *
- * -w is the exception and must not be lumped in with them: it means "write the
- * wtmp record and DO NOT halt". umountnfs.sh runs it midway through shutdown,
- * so treating it as just another no-op flag would turn that line into a real
- * halt. It returns without stopping anything. */
-static int smallclueHaltCommand(int argc, char **argv) {
-    static const char *usage = "usage: halt|poweroff|reboot [-dfhHinpw]\n";
-    int force = 0;
-    int recordOnly = 0;
-
-    for (int argi = 1; argi < argc; ++argi) {
-        const char *arg = argv[argi];
-        if (strcmp(arg, "--") == 0) {
-            break;
-        }
-        if (arg[0] != '-' || arg[1] == '\0') {
-            continue;
-        }
-        if (arg[1] == '-') {
-            const char *lopt = arg + 2;
-            if (strcmp(lopt, "force") == 0) {
-                force = 1;
-            } else if (strcmp(lopt, "wtmp-only") == 0) {
-                recordOnly = 1;
-            } else if (strcmp(lopt, "no-wtmp") == 0 || strcmp(lopt, "no-wall") == 0 ||
-                       strcmp(lopt, "poweroff") == 0 || strcmp(lopt, "halt") == 0 ||
-                       strcmp(lopt, "hddown") == 0 || strcmp(lopt, "ifdown") == 0 ||
-                       strcmp(lopt, "no-sync") == 0) {
-                /* Nothing here keeps a wtmp, an interface list or a disk. */
-            } else if (strcmp(lopt, "help") == 0) {
-                fputs(usage, stdout);
-                return 0;
-            } else {
-                fprintf(stderr, "%s: unrecognized option '%s'\n",
-                        argc > 0 ? argv[0] : "halt", arg);
-                fputs(usage, stderr);
-                return 1;
-            }
-            continue;
-        }
-        for (const char *p = arg + 1; *p; ++p) {
-            switch (*p) {
-                case 'f': force = 1; break;
-                case 'w': recordOnly = 1; break;
-                case 'd': /* skip the wtmp record: there is none */ break;
-                case 'n': /* skip the sync: nothing is buffered here */ break;
-                case 'i': /* bring interfaces down: none are ours */ break;
-                case 'h': case 'H': /* park the disks: there are none */ break;
-                case 'p': /* power off rather than halt: same thing here */ break;
-                default:
-                    fprintf(stderr, "%s: illegal option -- %c\n",
-                            argc > 0 ? argv[0] : "halt", *p);
-                    fputs(usage, stderr);
-                    return 1;
-            }
-        }
-    }
-
-    const char *cmd = "halt";
-    if (argc > 0) cmd = argv[0];
-
-    if (recordOnly) {
-        /* -w records and returns; stopping here is the whole point of it. */
-        return 0;
-    }
-
-    printf("System %s requested%s...\n", cmd, force ? " (forced)" : "");
-
-    // On a real system, we would signal init (PID 1).
-    // kill(1, SIGTERM);
-
-#if defined(PSCAL_TARGET_IOS)
-    // On iOS/PSCAL, we can just exit the shell runtime.
-    exit(0);
-#else
-    // On Linux, invoke reboot() syscall if we are root/init?
-    // For now, just exit.
-    exit(0);
-#endif
-
-    return 0;
-}

@@ -509,6 +509,7 @@ set(SOURCES
     src/base64_app.c
     src/nohup_app.c
     src/cmp_app.c
+    src/init_app.c
     src/dd_app.c
     src/od_app.c
     src/seq_app.c
