@@ -13860,18 +13860,30 @@ static int smallclueUnameCommand(int argc, char **argv) {
 #endif /* SMALLCLUE_UNAME_FROM_KERNEL */
     const char *os = (sysname && !strcmp(sysname, "Linux")) ? "GNU/Linux" : sysname;
 #if defined(SMALLCLUE_UNAME_FROM_KERNEL)
-    /* "GNU/Linux" is what glibc's coreutils say; a musl system (Alpine) says
-     * "Linux", and so does a system with no C library at all, such as
-     * iSH-AOK's native mode. So GNU only where glibc's dynamic loader is
-     * there to say so -- it used to be every system without a MUSL loader,
-     * which called a root with no GNU in it GNU/Linux. */
+    /* The operating system is the kernel plus the userland around it, and
+     * the userland is whoever's C library the root has: "GNU/Linux" where
+     * glibc's loader is (Devuan, Arch -- what their own uname says), "Linux"
+     * where musl's is (Alpine, as busybox says), and "AOK/Linux" where there
+     * is neither: iSH-AOK's native mode, whose userland is iSH-AOK's own
+     * programs. It used to be GNU/Linux for everything without a musl
+     * loader, which named a root with no GNU in it after GNU. */
     if (sysname && !strcmp(sysname, "Linux")) {
         static const char *const glibc_loaders[] = {
             "/lib/ld-linux-aarch64.so.1", "/lib64/ld-linux-x86-64.so.2",
             "/lib/ld-linux.so.2", "/lib/ld-linux-riscv64-lp64d.so.1",
             "/lib/ld-linux-armhf.so.3", "/lib64/ld-linux-aarch64.so.1",
         };
-        os = "Linux";
+        static const char *const musl_loaders[] = {
+            "/lib/ld-musl-aarch64.so.1", "/lib/ld-musl-x86_64.so.1", "/lib/ld-musl-i386.so.1",
+            "/lib/ld-musl-riscv64.so.1", "/lib/ld-musl-armhf.so.1",
+        };
+        os = "AOK/Linux";
+        for (size_t i = 0; i < sizeof(musl_loaders) / sizeof(musl_loaders[0]); i++) {
+            if (access(musl_loaders[i], F_OK) == 0) {
+                os = "Linux";
+                break;
+            }
+        }
         for (size_t i = 0; i < sizeof(glibc_loaders) / sizeof(glibc_loaders[0]); i++) {
             if (access(glibc_loaders[i], F_OK) == 0) {
                 os = "GNU/Linux";
