@@ -17651,6 +17651,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
     char **args = (char **)calloc((size_t)(argc > 0 ? argc : 0) * 2 + 1, sizeof(*args));
     if (!args) {
         fprintf(stderr, "wget: out of memory\n");
+        smallclueSecureMemzero(userpwdBuf, sizeof(userpwdBuf));
         return 1;
     }
     if (argc > 0) {
@@ -17666,6 +17667,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
                     free(headers);
                     free(postData);
                     free(args);
+                    smallclueSecureMemzero(userpwdBuf, sizeof(userpwdBuf));
                     return 1;
                 }
                 headers = resized;
@@ -17737,6 +17739,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
                 free(headers);
                 free(postData);
                 free(args);
+                smallclueSecureMemzero(userpwdBuf, sizeof(userpwdBuf));
                 return 1;
         }
     }
@@ -17745,6 +17748,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
         free(headers);
         free(postData);
         free(args);
+        smallclueSecureMemzero(userpwdBuf, sizeof(userpwdBuf));
         return 1;
     }
     if (output_path && (nargs - optind) != 1) {
@@ -17752,6 +17756,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
         free(headers);
         free(postData);
         free(args);
+        smallclueSecureMemzero(userpwdBuf, sizeof(userpwdBuf));
         return 1;
     }
 
@@ -17785,6 +17790,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
     free(headers);
     free(postData);
     free(args);
+    smallclueSecureMemzero(userpwdBuf, sizeof(userpwdBuf));
     return status ? 1 : 0;
 }
 
