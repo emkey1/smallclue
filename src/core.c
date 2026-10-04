@@ -5997,8 +5997,10 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         qsort(entries, count, sizeof(SmallclueTopEntry), smallclueTopCompareEntries);
 
-        if (!batch && isatty(STDOUT_FILENO)) {
+        if (!batch && pscalRuntimeStdoutIsInteractive()) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
+        } else if (iterations > 0) {
+            fputs("\n", stdout);
         }
 
         double load[3] = {0, 0, 0};
@@ -6069,10 +6071,8 @@ static int smallclueTopCommand(int argc, char **argv) {
         for (size_t i = 0; i < count; ++i) free(entries[i].command);
         free(entries);
 
-        if (max_iterations > 0) {
-            iterations++;
-            if (iterations >= max_iterations) break;
-        }
+        iterations++;
+        if (max_iterations > 0 && iterations >= max_iterations) break;
 
         /* Sleep in slices so a keypress is noticed promptly, instead of one
          * long nanosleep that only ends on a signal. This is what makes 'q'
@@ -14441,9 +14441,11 @@ static int smallclueWatchCommand(int argc, char **argv) {
          * -- and the leading newline belongs to that question, standing in for
          * the clear when there was none. The banner's reverse video is the only
          * decoration here, and it is the only thing gated on colour. */
-        const bool cleared = isatty(STDOUT_FILENO) != 0;
+        const bool cleared = pscalRuntimeStdoutIsInteractive();
         if (cleared) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
+        } else if (iterations > 0) {
+            fputs("\n", stdout);
         }
         if (smallclueColourWanted()) {
             fputs("\033[7m", stdout);
@@ -14485,11 +14487,9 @@ static int smallclueWatchCommand(int argc, char **argv) {
             status = abort_status;
             goto watch_done;
         }
-        if (max_iterations > 0) {
-            iterations++;
-            if (iterations >= max_iterations) {
-                break;
-            }
+        iterations++;
+        if (max_iterations > 0 && iterations >= max_iterations) {
+            break;
         }
         struct timespec ts;
         ts.tv_sec = (time_t)interval;
