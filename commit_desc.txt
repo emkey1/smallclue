@@ -1,0 +1,5 @@
+🚨 Severity: CRITICAL
+💡 Vulnerability: The `wget` applet in `src/core.c` copied sensitive user credentials into a stack-allocated buffer (`userpwdBuf`) but failed to explicitly zero out this buffer before returning.
+🎯 Impact: Even if a buffer is allocated on the stack and goes out of scope, its contents remain in stack memory unless explicitly zeroed. If the stack is later reused or read, these credentials can be disclosed.
+🔧 Fix: Explicitly zeroed out `userpwdBuf` using `smallclueSecureMemzero(userpwdBuf, sizeof(userpwdBuf));` across all return paths, both success and error.
+✅ Verification: Ran `setup_posix_env.sh` and the test suite (`test_*.sh`) to confirm no regressions.
