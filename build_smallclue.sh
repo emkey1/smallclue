@@ -793,6 +793,8 @@ gcc -std=c99 ${PORTABILITY_DEFS} -DSMALLCLUE_WITH_SH ${EXTRA_C_DEFS} ${DVTM_EXTR
     src/split_app.c \
     src/tac_app.c \
     src/tar_app.c \
+    src/utmp_rec.c \
+    src/who_app.c \
     ${OPENRSYNC_OBJS} \
     ${OPENSSH_LIBS} \
     ${DVTM_LIBS} \
