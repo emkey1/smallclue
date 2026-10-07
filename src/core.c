@@ -19059,6 +19059,10 @@ typedef struct {
     uint64_t max_line_length;
 } SmallclueWcCounts;
 
+static const char is_space_lookup[256] = {
+    [' '] = 1, ['\t'] = 1, ['\n'] = 1, ['\v'] = 1, ['\f'] = 1, ['\r'] = 1
+};
+
 static int smallclueWcProcessFileFast(const char *path, FILE *fp, SmallclueWcCounts *counts) {
     uint64_t lines = 0;
     uint64_t words = 0;
@@ -19075,7 +19079,7 @@ static int smallclueWcProcessFileFast(const char *path, FILE *fp, SmallclueWcCou
         #define PROCESS_CHAR(idx) do { \
             unsigned char c = (unsigned char)buf[idx]; \
             lines += (c == '\n'); \
-            if ((c == ' ') || (c >= '\t' && c <= '\r')) { \
+            if (is_space_lookup[c]) { \
                 in_word = 0; \
             } else if (!in_word) { \
                 words++; \
@@ -19108,9 +19112,8 @@ static int smallclueWcProcessFileFast(const char *path, FILE *fp, SmallclueWcCou
                 lines++;
             }
 
-            /* Bolt optimization: inline space check instead of isspace() to avoid function call overhead */
-            int is_sp = (c == ' ') || (c >= '\t' && c <= '\r');
-            if (is_sp) {
+            /* Bolt optimization: static array lookup for space check to avoid function call and branching overhead */
+            if (is_space_lookup[c]) {
                 in_word = 0;
             } else if (!in_word) {
                 words++;
