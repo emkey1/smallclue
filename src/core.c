@@ -3370,7 +3370,7 @@ static char *smallclueGetPass(const char *prompt) {
 #endif
 
 static int smallcluePasswdCommand(int argc, char **argv) {
-#if defined(__linux__) || defined(linux) || defined(__linux)
+#if defined(__linux__) || defined(linux) || defined(__linux) || defined(SMALLCLUE_HAVE_SHADOW_AUTH)
     const char *username = NULL;
     if (argc > 1) {
         username = argv[1];
@@ -3523,26 +3523,61 @@ static int smallcluePasswdCommand(int argc, char **argv) {
         return 1;
     }
 
-    struct spwd *entry;
+    /* The new file is the old one's in everything but this account's hash:
+     * same mode, same owner (Debian's is root:shadow 0640, and a 0600 copy
+     * locks out everything that reads it as group shadow). */
+    struct stat shadow_st;
+    if (fstat(fileno(fp), &shadow_st) == 0) {
+        (void) fchmod(fd, shadow_st.st_mode & 07777);
+        (void) fchown(fd, shadow_st.st_uid, shadow_st.st_gid);
+    }
+
+    /* Line by line, and only this account's second and third fields change:
+     * every other line, and this one's ageing fields, go through as they are.
+     * (fgetspent/putspent would rewrite each of them from a struct, and are
+     * not everywhere this runs.) */
+    char line[4096];
+    size_t name_len = strlen(username);
+    long today = (long) (time(NULL) / (24 * 3600));
     int found = 0;
-    while ((entry = fgetspent(fp)) != NULL) {
-        if (strcmp(entry->sp_namp, username) == 0) {
-            entry->sp_pwdp = hashed;
-            entry->sp_lstchg = time(NULL) / (24 * 3600);
+    int failed = 0;
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        size_t len = strlen(line);
+        if (len == sizeof(line) - 1 && line[len - 1] != '\n') {
+            fprintf(stderr, "passwd: a line of /etc/shadow is too long; nothing changed\n");
+            failed = 1;
+            break;
+        }
+        if (strncmp(line, username, name_len) == 0 && line[name_len] == ':') {
+            char *hash_end = strchr(line + name_len + 1, ':');
+            char *rest = hash_end != NULL ? strchr(hash_end + 1, ':') : NULL;
             found = 1;
+            if (fprintf(out_fp, "%s:%s:%ld%s", username, hashed, today,
+                        rest != NULL ? rest : "\n") < 0)
+                failed = 1;
+        } else if (fputs(line, out_fp) == EOF) {
+            failed = 1;
         }
-        if (putspent(entry, out_fp) != 0) {
+        if (failed) {
             fprintf(stderr, "passwd: error writing to temporary file\n");
-            fclose(fp);
-            fclose(out_fp);
-            unlink("/etc/shadow.tmp");
-            ulckpwdf();
-            return 1;
+            break;
         }
+    }
+    if (!failed && ferror(fp)) {
+        fprintf(stderr, "passwd: error reading /etc/shadow\n");
+        failed = 1;
     }
 
     fclose(fp);
-    fclose(out_fp);
+    if (fclose(out_fp) != 0 && !failed) {
+        fprintf(stderr, "passwd: error writing to temporary file\n");
+        failed = 1;
+    }
+    if (failed) {
+        unlink("/etc/shadow.tmp");
+        ulckpwdf();
+        return 1;
+    }
 
     if (!found) {
         fprintf(stderr, "passwd: user '%s' not found during update\n", username);
