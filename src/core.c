@@ -16318,7 +16318,19 @@ static int smallcluePingAttempt(int family, const struct sockaddr *target_addr, 
         timeout_ms = 1;
     }
 
-    int sock = socket(family, SOCK_DGRAM, family == AF_INET6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP);
+    int proto = family == AF_INET6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP;
+    int sock = socket(family, SOCK_DGRAM, proto);
+    /* A "ping socket" is for the groups net.ipv4.ping_group_range admits,
+     * and a new network namespace's admits nobody: EACCES, to root too. In
+     * a sandbox (unshare -n, bubblewrap) that left every ping at 100% loss.
+     * iputils falls back to a raw socket there, which whoever holds
+     * CAP_NET_RAW in the namespace may have, and so does this. A raw socket
+     * hears the request it sent as well as the reply, and an IPv4 one hears
+     * them under an IP header; the decoders below skip the one and step
+     * over the other already. */
+    if (sock < 0 && (errno == EACCES || errno == EPERM)) {
+        sock = socket(family, SOCK_RAW, proto);
+    }
     if (sock < 0) {
         return -1;
     }
