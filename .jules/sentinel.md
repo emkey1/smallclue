@@ -45,3 +45,8 @@
 **Vulnerability:** The password wiping logic used `smallclueSecureMemzero(pass, strlen(pass))`, which zeros out the password characters but leaves the null terminator byte untouched on the heap before the buffer is freed.
 **Learning:** While zeroing the characters removes the secret, leaving the null terminator untouched can theoretically lead to a 1-byte heap disclosure or hint at string lengths, and it violates the best practice of clearing the entire allocated buffer for sensitive data.
 **Prevention:** Always zero out at least `strlen(pass) + 1` bytes for dynamically allocated strings to ensure no remnants, including terminators, remain on the heap.
+
+## 2024-05-30 - Fix memory disclosure in wget
+**Vulnerability:** Memory disclosure vulnerability in `wget` due to unzeroed stack buffer `userpwdBuf` containing sensitive authentication credentials.
+**Learning:** Stack buffers containing sensitive data (like `userpwdBuf` used for HTTP Basic Auth) can persist in memory after function return if not explicitly cleared, even on failure paths.
+**Prevention:** Always use secure memory zeroing (e.g., `smallclueSecureMemzero`) to clear sensitive stack buffers across all execution paths, including early returns and error conditions.
