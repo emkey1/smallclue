@@ -1565,6 +1565,8 @@ typedef struct {
     const char *writeOut;        /* -w FORMAT */
     long maxTime;                /* -m seconds, 0 = none */
     long connectTimeout;         /* --connect-timeout seconds */
+    long idleTimeout;            /* wget -T: seconds with nothing arriving */
+    int *resultCode;             /* where to leave the CURLcode, if anywhere */
 } SmallclueHttpRequestOptions;
 
 static int smallclueHttpFetch(const char *cmd_name, const char *url, const char *destinationPath,
@@ -4167,8 +4169,16 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                "  Copy stdin to system clipboard"},
     {"pbpaste", "pbpaste\n"
                 "  Paste system clipboard to stdout"},
-    {"ping", "ping [-4|-6] [-c count] [-t timeout_ms] HOST\n"
-             "  ICMP echo ping (IPv4 and IPv6)"},
+    {"ping", "ping [-46nqD] [-c COUNT] [-W SECS] [-w SECS] [-i SECS] [-s SIZE]\n"
+             "     [-t TTL] [-I ADDRESS] HOST\n"
+             "  ICMP echo ping (IPv4 and IPv6), with Linux ping's options:\n"
+             "  -c COUNT  stop after COUNT echoes (default 4)\n"
+             "  -W SECS   wait this long for each reply (default 3)\n"
+             "  -w SECS   stop after this long, whatever the count\n"
+             "  -i SECS   pause between echoes (default 1)\n"
+             "  -s SIZE   data bytes in each echo (default 56)\n"
+             "  -t TTL    time to live (over 255: a reply timeout in ms)\n"
+             "  -q        only the summary;  -D  a timestamp on each line"},
     {"poweroff", "poweroff [-f]\n"
              "  Power off the system"},
     {"ps", "ps [-e|-A|-a] [-f] [-p PID[,PID...]] [-u USER[,USER...]]\n"
@@ -4350,14 +4360,19 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  Count lines/words/bytes; -m chars (locale-aware),\n"
            "  -L max line length (tabs expand to 8-col stops)"},
     {"wget", "wget [options] URL...\n"
-             "  Common: -O FILE\n"
+             "  -O FILE (- for stdout), -P DIR\n"
+             "  -T SECS, --timeout=SECS (to connect, and between reads)\n"
+             "  --connect-timeout=SECS, --read-timeout=SECS\n"
+             "  -t N, --tries=N (0: for ever), --waitretry=SECS, --retry-connrefused\n"
+             "  -U AGENT, --user-agent=AGENT\n"
+             "  --spider (only ask whether it is there), -S (show the response headers)\n"
              "  --method=METHOD\n"
              "  --header=HEADER (repeatable)\n"
              "  --post-data=DATA\n"
              "  --user=USER --password=PASS\n"
              "  --no-check-certificate\n"
-             "  -q\n"
-             "  -nv"},
+             "  -q, -nv, -o LOGFILE, -a LOGFILE\n"
+             "  Exit status as wget's: 8 an error from the server, 4 the network, 5 TLS"},
     {"which", "which [-a] program ...\n"
               "  Locate a command"},
     {"whoami", "whoami\n"
@@ -12868,6 +12883,12 @@ static struct curl_slist *smallclueCurlApplyRequestOptions(CURL *curl, const Sma
     if (reqOpts->connectTimeout > 0) {
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, reqOpts->connectTimeout);
     }
+    if (reqOpts->idleTimeout > 0) {
+        /* "Under a byte a second for this long": a read timeout, which is
+         * not a limit on the whole transfer as CURLOPT_TIMEOUT is. */
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, reqOpts->idleTimeout);
+    }
     if (reqOpts->nobody) {
         curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
     }
@@ -13092,6 +13113,9 @@ static int smallclueHttpFetch(const char *cmd_name, const char *url, const char 
     if (reqOpts && reqOpts->writeOut) {
         smallclueCurlWriteOut(curl, reqOpts->writeOut, res);
     }
+    if (reqOpts && reqOpts->resultCode) {
+        *reqOpts->resultCode = (int)res;
+    }
     if (res != CURLE_OK) {
         if (reqOpts && reqOpts->curlStatus) {
             /* curl's own shape: "curl: (6) Could not resolve host: x". */
@@ -13099,7 +13123,7 @@ static int smallclueHttpFetch(const char *cmd_name, const char *url, const char 
                 fprintf(stderr, "curl: (%d) %s\n", (int)res,
                         failDetail[0] ? failDetail : curl_easy_strerror(res));
             }
-        } else {
+        } else if (!(reqOpts && reqOpts->silent)) {
             fprintf(stderr, "%s: %s: %s\n", cmd_name ? cmd_name : "curl", url, curl_easy_strerror(res));
         }
         curl_easy_cleanup(curl);
@@ -16167,8 +16191,17 @@ static int smallclueDfCommand(int argc, char **argv) {
     return status;
 }
 enum {
-    SMALLCLUE_PING_PAYLOAD_SIZE = 56
+    SMALLCLUE_PING_PAYLOAD_SIZE = 56,
+    SMALLCLUE_PING_PAYLOAD_MAX = 65507
 };
+
+/* What the options ask of each echo beyond its address and timeout. */
+typedef struct {
+    size_t payload;                  /* -s: data bytes after the ICMP header */
+    int ttl;                         /* -t: 0 = the system's own */
+    struct sockaddr_storage source;  /* -I ADDRESS */
+    socklen_t source_len;            /* 0 = none */
+} SmallcluePingExtra;
 
 static uint16_t smallclueInternetChecksum(const void *data, size_t len) {
     const uint8_t *bytes = (const uint8_t *)data;
@@ -16268,10 +16301,21 @@ static bool smallcluePing6DecodeReply(const unsigned char *buf, size_t len,
 }
 
 static int smallcluePingAttempt(int family, const struct sockaddr *target_addr, socklen_t target_len,
-        int timeout_ms, uint16_t ident, uint16_t seq, double *out_ms, size_t *out_reply_len) {
+        int timeout_ms, uint16_t ident, uint16_t seq, const SmallcluePingExtra *extra,
+        double *out_ms, size_t *out_reply_len) {
     if (!target_addr) {
         errno = EINVAL;
         return -1;
+    }
+    size_t payload = extra ? extra->payload : SMALLCLUE_PING_PAYLOAD_SIZE;
+    if (payload > SMALLCLUE_PING_PAYLOAD_MAX) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+    /* SO_RCVTIMEO of zero is "wait for ever", the opposite of what a
+     * timeout rounded down to nothing meant. */
+    if (timeout_ms < 1) {
+        timeout_ms = 1;
     }
 
     int sock = socket(family, SOCK_DGRAM, family == AF_INET6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP);
@@ -16287,15 +16331,39 @@ static int smallcluePingAttempt(int family, const struct sockaddr *target_addr, 
         return -1;
     }
 
+    if (extra && extra->ttl > 0) {
+        int ttl = extra->ttl;
+        int rc = (family == AF_INET6)
+            ? setsockopt(sock, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &ttl, sizeof(ttl))
+            : setsockopt(sock, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));
+        if (rc < 0) {
+            close(sock);
+            return -1;
+        }
+    }
+    if (extra && extra->source_len > 0 && extra->source.ss_family == family &&
+            bind(sock, (const struct sockaddr *)&extra->source, extra->source_len) < 0) {
+        close(sock);
+        return -1;
+    }
+
     if (connect(sock, target_addr, target_len) < 0) {
         close(sock);
         return -1;
     }
 
-    unsigned char packet[sizeof(struct icmp6_hdr) + SMALLCLUE_PING_PAYLOAD_SIZE];
     size_t hdrLen = (family == AF_INET6) ? sizeof(struct icmp6_hdr) : ICMP_MINLEN;
-    size_t packetLen = hdrLen + SMALLCLUE_PING_PAYLOAD_SIZE;
-    memset(packet, 0, sizeof(packet));
+    size_t packetLen = hdrLen + payload;
+    /* One block for the request and, after it, room for the reply (which on
+     * some stacks comes with its IP header). */
+    size_t replyCap = packetLen + 128;
+    unsigned char *packet = (unsigned char *)calloc(1, packetLen + replyCap);
+    if (!packet) {
+        close(sock);
+        errno = ENOMEM;
+        return -1;
+    }
+    unsigned char *reply = packet + packetLen;
     for (size_t i = hdrLen; i < packetLen; ++i) {
         packet[i] = (unsigned char)(i & 0xffu);
     }
@@ -16320,30 +16388,38 @@ static int smallcluePingAttempt(int family, const struct sockaddr *target_addr, 
 
     struct timespec start;
     if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        int saved = errno;
+        free(packet);
         close(sock);
+        errno = saved;
         return -1;
     }
 
     ssize_t sent = send(sock, packet, packetLen, 0);
     if (sent != (ssize_t)packetLen) {
-        if (sent >= 0) {
-            errno = EIO;
-        }
+        int saved = sent >= 0 ? EIO : errno;
+        free(packet);
         close(sock);
+        errno = saved;
         return -1;
     }
 
-    unsigned char reply[1500];
     for (;;) {
-        ssize_t received = recv(sock, reply, sizeof(reply), 0);
+        ssize_t received = recv(sock, reply, replyCap, 0);
         if (received < 0) {
+            int saved = errno;
+            free(packet);
             close(sock);
+            errno = saved;
             return -1;
         }
 
         struct timespec end;
         if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+            int saved = errno;
+            free(packet);
             close(sock);
+            errno = saved;
             return -1;
         }
 
@@ -16363,13 +16439,34 @@ static int smallcluePingAttempt(int family, const struct sockaddr *target_addr, 
         if (out_reply_len) {
             *out_reply_len = reply_len;
         }
+        free(packet);
         close(sock);
         return 0;
     }
 }
 
+static double smallcluePingNowMs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+/* A count of seconds as ping's options give one: "2", "0.5", "1.25". */
+static bool smallcluePingParseSeconds(const char *text, double min, double *out) {
+    char *end = NULL;
+    errno = 0;
+    double v = strtod(text, &end);
+    if (errno != 0 || end == text || *end != '\0' || !(v >= min) || v > 86400.0 * 365.0) {
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
 static int smallcluePingCommand(int argc, char **argv) {
-    const char *usage = "usage: ping [-4|-6] [-c count] [-t timeout_ms] host\n";
+    const char *usage =
+        "usage: ping [-46nqD] [-c count] [-W timeout] [-w deadline] [-i interval]\n"
+        "            [-s size] [-t ttl] [-I address] host\n";
     if (argc <= 1) {
         fputs(usage, stderr);
         return 1;
@@ -16377,10 +16474,22 @@ static int smallcluePingCommand(int argc, char **argv) {
 
     smallclueResetGetopt();
     int count = 4;
+    bool countGiven = false;
     int timeout_ms = 3000;
+    double deadline_s = 0.0;   /* -w: 0 = none */
+    double interval_s = 1.0;
+    bool quiet = false;
+    bool timestamps = false;
     int forceFamily = AF_UNSPEC;
+    SmallcluePingExtra extra;
+    memset(&extra, 0, sizeof(extra));
+    extra.payload = SMALLCLUE_PING_PAYLOAD_SIZE;
     int opt;
-    while ((opt = getopt(argc, argv, "46c:t:")) != -1) {
+    /* The option letters are iputils' (and BusyBox's), which is what a script
+     * written for Linux passes: -W and -w and -i in seconds, -t a TTL. Those
+     * that only change how ping paces or labels itself (-n, -v, -A, -U, -O,
+     * -b, -a, -d, -r, -R, -L) are accepted and change nothing. */
+    while ((opt = getopt(argc, argv, "46c:t:W:w:i:s:I:qnvDAUObadrRL")) != -1) {
         switch (opt) {
             case '4':
                 forceFamily = AF_INET;
@@ -16391,30 +16500,112 @@ static int smallcluePingCommand(int argc, char **argv) {
             case 'c':
                 count = atoi(optarg);
                 if (count <= 0) {
-                    count = 4;
+                    fprintf(stderr, "ping: invalid argument: '%s': out of range: 1 <= value\n", optarg);
+                    return 2;
+                }
+                countGiven = true;
+                break;
+            case 't': {
+                /* A TTL, as on Linux. This option was once a timeout in
+                 * milliseconds here, and no TTL is over 255, so a larger
+                 * value still means that. */
+                int v = atoi(optarg);
+                if (v <= 0) {
+                    fprintf(stderr, "ping: invalid argument: '%s'\n", optarg);
+                    return 2;
+                }
+                if (v <= 255) {
+                    extra.ttl = v;
+                } else {
+                    timeout_ms = v;
                 }
                 break;
-            case 't':
-                timeout_ms = atoi(optarg);
-                if (timeout_ms <= 0) {
-                    timeout_ms = 3000;
+            }
+            case 'W': {
+                double secs = 0.0;
+                if (!smallcluePingParseSeconds(optarg, 0.0, &secs)) {
+                    fprintf(stderr, "ping: invalid argument: '%s'\n", optarg);
+                    return 2;
                 }
+                timeout_ms = secs * 1000.0 > (double)INT_MAX ? INT_MAX : (int)(secs * 1000.0 + 0.5);
+                if (timeout_ms < 1) {
+                    timeout_ms = 1;
+                }
+                break;
+            }
+            case 'w':
+                if (!smallcluePingParseSeconds(optarg, 0.0, &deadline_s)) {
+                    fprintf(stderr, "ping: invalid argument: '%s'\n", optarg);
+                    return 2;
+                }
+                break;
+            case 'i':
+                if (!smallcluePingParseSeconds(optarg, 0.0, &interval_s)) {
+                    fprintf(stderr, "ping: invalid argument: '%s'\n", optarg);
+                    return 2;
+                }
+                break;
+            case 's': {
+                char *end = NULL;
+                long v = strtol(optarg, &end, 10);
+                if (end == optarg || *end != '\0' || v < 0 || v > SMALLCLUE_PING_PAYLOAD_MAX) {
+                    fprintf(stderr, "ping: invalid argument: '%s': out of range: 0 <= value <= %d\n",
+                            optarg, SMALLCLUE_PING_PAYLOAD_MAX);
+                    return 2;
+                }
+                extra.payload = (size_t)v;
+                break;
+            }
+            case 'I': {
+                /* An address to send from is bound; an interface name is
+                 * taken as said, there being one way out of here. */
+                struct sockaddr_in *in4 = (struct sockaddr_in *)&extra.source;
+                struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&extra.source;
+                memset(&extra.source, 0, sizeof(extra.source));
+                extra.source_len = 0;
+                if (inet_pton(AF_INET, optarg, &in4->sin_addr) == 1) {
+                    in4->sin_family = AF_INET;
+                    extra.source_len = sizeof(*in4);
+                } else {
+                    memset(&extra.source, 0, sizeof(extra.source));
+                    if (inet_pton(AF_INET6, optarg, &in6->sin6_addr) == 1) {
+                        in6->sin6_family = AF_INET6;
+                        extra.source_len = sizeof(*in6);
+                    }
+                }
+                break;
+            }
+            case 'q':
+                quiet = true;
+                break;
+            case 'D':
+                timestamps = true;
+                break;
+            case 'n': case 'v': case 'A': case 'U': case 'O': case 'b':
+            case 'a': case 'd': case 'r': case 'R': case 'L':
                 break;
             default:
                 fputs(usage, stderr);
-                return 1;
+                return 2;
         }
     }
     if (optind >= argc) {
         fputs(usage, stderr);
-        return 1;
+        return 2;
     }
+    /* A deadline with no count is "until the deadline", as on Linux. */
+    bool unlimited = deadline_s > 0.0 && !countGiven;
 
     const char *host = argv[optind];
 #if defined(PSCAL_TARGET_IOS)
     if (PSCALRuntimePingHost) {
         char *output = NULL;
-        int status = PSCALRuntimePingHost(host, count, timeout_ms, &output);
+        int runtimeCount = count;
+        if (unlimited) {
+            double n = deadline_s / (interval_s > 0.01 ? interval_s : 0.01);
+            runtimeCount = n < 1.0 ? 1 : (n > 1000.0 ? 1000 : (int)n);
+        }
+        int status = PSCALRuntimePingHost(host, runtimeCount, timeout_ms, &output);
         if (output) {
             fputs(output, stdout);
             free(output);
@@ -16431,7 +16622,7 @@ static int smallcluePingCommand(int argc, char **argv) {
     int gai = pscalHostsGetAddrInfo(host, NULL, &hints, &res);
     if (gai != 0) {
         fprintf(stderr, "ping: %s: %s\n", host, gai_strerror(gai));
-        return 1;
+        return 2;
     }
 
     struct addrinfo *selected = NULL;
@@ -16446,7 +16637,7 @@ static int smallcluePingCommand(int argc, char **argv) {
     if (!selected) {
         fprintf(stderr, "ping: %s: no ICMP-capable address resolved\n", host);
         pscalHostsFreeAddrInfo(res);
-        return 1;
+        return 2;
     }
 
     struct sockaddr_storage target_addr;
@@ -16461,19 +16652,36 @@ static int smallcluePingCommand(int argc, char **argv) {
         addrbuf[sizeof(addrbuf) - 1] = '\0';
     }
 
-    printf("PING %s (%s): %d data bytes\n", host, addrbuf, SMALLCLUE_PING_PAYLOAD_SIZE);
+    printf("PING %s (%s): %zu data bytes\n", host, addrbuf, extra.payload);
+    fflush(stdout);
 
+    int transmitted = 0;
     int successes = 0;
     double min_ms = 0.0;
     double max_ms = 0.0;
     double total_ms = 0.0;
     uint16_t ident = (uint16_t)(getpid() & 0xffff);
+    double began_ms = smallcluePingNowMs();
+    double deadline_ms = deadline_s * 1000.0;
 
-    for (int i = 0; i < count; ++i) {
+    for (int i = 0; unlimited || i < count; ++i) {
+        int wait_ms = timeout_ms;
+        if (deadline_s > 0.0) {
+            double left = deadline_ms - (smallcluePingNowMs() - began_ms);
+            if (left <= 0.0) {
+                break;
+            }
+            /* No reply is waited for past the deadline. */
+            if (left < (double)wait_ms) {
+                wait_ms = (int)left;
+            }
+        }
         double elapsed_ms = 0.0;
         size_t reply_len = 0;
+        transmitted++;
         int rc = smallcluePingAttempt(family, (struct sockaddr *)&target_addr, target_len,
-            timeout_ms, ident, (uint16_t)(i + 1), &elapsed_ms, &reply_len);
+            wait_ms, ident, (uint16_t)(i + 1), &extra, &elapsed_ms, &reply_len);
+        int attemptErrno = errno;
         if (rc == 0) {
             successes++;
             if (successes == 1 || elapsed_ms < min_ms) {
@@ -16483,27 +16691,63 @@ static int smallcluePingCommand(int argc, char **argv) {
                 max_ms = elapsed_ms;
             }
             total_ms += elapsed_ms;
-            printf("%zu bytes from %s: icmp_seq=%d time=%.3f ms\n",
-                reply_len, addrbuf, i + 1, elapsed_ms);
-        } else {
-            printf("Request timeout for icmp_seq %d (%s)\n", i + 1, strerror(errno));
         }
-        fflush(stdout);
-        if (i + 1 < count) {
-            usleep(1000000);
+        if (!quiet) {
+            if (timestamps) {
+                struct timeval now;
+                gettimeofday(&now, NULL);
+                printf("[%lld.%06d] ", (long long)now.tv_sec, (int)now.tv_usec);
+            }
+            if (rc == 0) {
+                printf("%zu bytes from %s: icmp_seq=%d time=%.3f ms\n",
+                    reply_len, addrbuf, i + 1, elapsed_ms);
+            } else {
+                printf("Request timeout for icmp_seq %d (%s)\n", i + 1, strerror(attemptErrno));
+            }
+            fflush(stdout);
+        }
+        if (!unlimited && i + 1 >= count) {
+            break;
+        }
+        double pause_ms = interval_s * 1000.0;
+        if (deadline_s > 0.0) {
+            double left = deadline_ms - (smallcluePingNowMs() - began_ms);
+            if (left <= 0.0) {
+                break;
+            }
+            if (pause_ms > left) {
+                pause_ms = left;
+            }
+        }
+        if (pause_ms >= 1.0) {
+            struct timespec pause;
+            pause.tv_sec = (time_t)(pause_ms / 1000.0);
+            pause.tv_nsec = (long)((pause_ms - (double)pause.tv_sec * 1000.0) * 1e6);
+            nanosleep(&pause, NULL);
         }
     }
 
+    /* The loss as Linux's ping writes it -- "0%", "50%", "33.3333%" -- which
+     * is what `grep -o '[0-9]*% packet loss'` in a script is written for. */
     printf("--- %s ping statistics ---\n", host);
-    printf("%d packets transmitted, %d packets received, %.1f%% packet loss\n",
-        count, successes, count > 0 ? ((double)(count - successes) * 100.0 / (double)count) : 0.0);
+    printf("%d packets transmitted, %d packets received, %g%% packet loss\n",
+        transmitted, successes,
+        transmitted > 0 ? ((double)(transmitted - successes) * 100.0 / (double)transmitted) : 0.0);
     if (successes > 0) {
         printf("round-trip min/avg/max = %.3f/%.3f/%.3f ms\n",
             min_ms, total_ms / (double)successes, max_ms);
     }
 
     pscalHostsFreeAddrInfo(res);
-    return (successes > 0) ? 0 : 1;
+    /* Linux's rule: no reply at all is 1, and so is a count that the deadline
+     * cut short of its replies. */
+    if (successes == 0) {
+        return 1;
+    }
+    if (deadline_s > 0.0 && countGiven && successes < count) {
+        return 1;
+    }
+    return 0;
 }
 
 #define TELNET_DEFAULT_PORT 23
@@ -17673,6 +17917,17 @@ static int smallclueWgetCommand(int argc, char **argv) {
     const char *wgetPassword = NULL;
     bool insecureTls = false;
     bool wgetQuiet = false;
+    bool wgetSpider = false;
+    bool wgetServerResponse = false;
+    bool retryConnRefused = false;
+    const char *userAgent = NULL;
+    const char *prefixDir = NULL;
+    const char *logPath = NULL;
+    bool logAppend = false;
+    /* Seconds; 0 = not given. --timeout is all three at once, as in wget. */
+    long connectTimeout = 0, readTimeout = 0;
+    int tries = 1;
+    long waitRetry = 10;
     char userpwdBuf[512];
     userpwdBuf[0] = '\0';
 
@@ -17738,14 +17993,61 @@ static int smallclueWgetCommand(int argc, char **argv) {
         if (strcmp(argv[i], "--no-verbose") == 0 ||
             strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "--continue") == 0 ||
             strcmp(argv[i], "--timestamping") == 0 || strcmp(argv[i], "--no-clobber") == 0 ||
-            strcmp(argv[i], "--show-progress") == 0 || strcmp(argv[i], "--progress=dot") == 0 ||
-            strcmp(argv[i], "--progress=bar") == 0) {
+            strcmp(argv[i], "--show-progress") == 0 || strncmp(argv[i], "--progress=", 11) == 0 ||
+            /* Nothing here to switch off, or only one way to do it. */
+            strcmp(argv[i], "--no-cache") == 0 || strcmp(argv[i], "--no-hsts") == 0 ||
+            strcmp(argv[i], "--no-cookies") == 0 || strcmp(argv[i], "--no-proxy") == 0 ||
+            strcmp(argv[i], "--no-dns-cache") == 0 || strcmp(argv[i], "--inet4-only") == 0 ||
+            strcmp(argv[i], "--inet6-only") == 0 || strncmp(argv[i], "--max-redirect=", 15) == 0 ||
+            strncmp(argv[i], "--wait=", 7) == 0) {
             continue;
         }
-        if (strncmp(argv[i], "--output-document=", 18) == 0) {
-            args[nargs++] = (char *)"-O";
-            args[nargs++] = argv[i] + 18;
+        if (strcmp(argv[i], "--spider") == 0) {
+            wgetSpider = true;
             continue;
+        }
+        if (strcmp(argv[i], "--server-response") == 0) {
+            wgetServerResponse = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--retry-connrefused") == 0) {
+            retryConnRefused = true;
+            continue;
+        }
+        if (strncmp(argv[i], "--waitretry=", 12) == 0) {
+            waitRetry = strtol(argv[i] + 12, NULL, 10);
+            if (waitRetry < 0) waitRetry = 0;
+            continue;
+        }
+        /* The timeouts wget keeps apart; --timeout (-T below) is all of them. */
+        if (strncmp(argv[i], "--connect-timeout=", 18) == 0 || strncmp(argv[i], "--dns-timeout=", 14) == 0) {
+            long v = (long)(strtod(strchr(argv[i], '=') + 1, NULL) + 0.999);
+            if (v > 0 && (connectTimeout == 0 || v > connectTimeout)) connectTimeout = v;
+            continue;
+        }
+        if (strncmp(argv[i], "--read-timeout=", 15) == 0) {
+            readTimeout = (long)(strtod(argv[i] + 15, NULL) + 0.999);
+            continue;
+        }
+        {
+            /* Long spellings of options getopt() takes below. */
+            static const struct { const char *name; const char *shortOpt; } spelled[] = {
+                {"--output-document=", "-O"}, {"--timeout=", "-T"}, {"--tries=", "-t"},
+                {"--user-agent=", "-U"}, {"--directory-prefix=", "-P"},
+                {"--output-file=", "-o"}, {"--append-output=", "-a"},
+            };
+            size_t k = 0;
+            for (; k < sizeof(spelled) / sizeof(spelled[0]); k++) {
+                size_t l = strlen(spelled[k].name);
+                if (strncmp(argv[i], spelled[k].name, l) == 0) {
+                    args[nargs++] = (char *)spelled[k].shortOpt;
+                    args[nargs++] = argv[i] + l;
+                    break;
+                }
+            }
+            if (k < sizeof(spelled) / sizeof(spelled[0])) {
+                continue;
+            }
         }
         args[nargs++] = argv[i];
     }
@@ -17756,7 +18058,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
     smallclueResetGetopt();
     const char *output_path = NULL;
     int opt;
-    while ((opt = getopt(nargs, args, "O:qvncN")) != -1) {
+    while ((opt = getopt(nargs, args, "O:qvncNT:t:U:P:o:a:w:S46")) != -1) {
         switch (opt) {
             case 'O':
                 output_path = optarg;
@@ -17764,15 +18066,58 @@ static int smallclueWgetCommand(int argc, char **argv) {
             case 'q':
                 wgetQuiet = true;
                 break;
-            case 'v': case 'n': case 'c': case 'N':
+            case 'T': {
+                /* Seconds for each wait on the network -- to connect, and
+                 * for more of the answer -- not for the whole download. */
+                char *end = NULL;
+                double secs = strtod(optarg, &end);
+                if (end == optarg || *end != '\0' || secs < 0) {
+                    fprintf(stderr, "wget: invalid timeout '%s'\n", optarg);
+                    free(headers);
+                    free(postData);
+                    free(args);
+                    return 2;
+                }
+                connectTimeout = readTimeout = (long)(secs + 0.999);
+                break;
+            }
+            case 't': {
+                char *end = NULL;
+                long n = strtol(optarg, &end, 10);
+                if (end == optarg || *end != '\0' || n < 0) {
+                    fprintf(stderr, "wget: invalid number of tries '%s'\n", optarg);
+                    free(headers);
+                    free(postData);
+                    free(args);
+                    return 2;
+                }
+                /* 0 is "for ever" to wget. */
+                tries = (n == 0 || n > INT_MAX) ? INT_MAX : (int)n;
+                break;
+            }
+            case 'U':
+                userAgent = optarg;
+                break;
+            case 'P':
+                prefixDir = optarg;
+                break;
+            case 'o': case 'a':
+                logPath = optarg;
+                logAppend = opt == 'a';
+                break;
+            case 'S':
+                wgetServerResponse = true;
+                break;
+            case 'v': case 'n': case 'c': case 'N': case 'w': case '4': case '6':
                 break;   /* -nv, -c, -N: see --no-verbose above */
             default:
-                fprintf(stderr, "usage: wget [-O file] [--method=METHOD] [--header=HEADER]... [--post-data=DATA]\n"
+                fprintf(stderr, "usage: wget [-q] [-O file] [-P dir] [-T seconds] [-t tries] [-U agent] [-S] [--spider]\n"
+                                "            [--method=METHOD] [--header=HEADER]... [--post-data=DATA]\n"
                                 "            [--user=USER] [--password=PASS] [--no-check-certificate] url...\n");
                 free(headers);
                 free(postData);
                 free(args);
-                return 1;
+                return 2;
         }
     }
     if (optind >= nargs) {
@@ -17798,29 +18143,124 @@ static int smallclueWgetCommand(int argc, char **argv) {
     reqOpts.postData = postData;
     reqOpts.userpwd = wgetUser ? userpwdBuf : NULL;
     reqOpts.insecureTls = insecureTls;
+    reqOpts.userAgent = userAgent;
+    reqOpts.connectTimeout = connectTimeout;
+    reqOpts.idleTimeout = readTimeout;
+    /* An error status is a failed download, as it is to wget (exit 8), not
+     * the server's error page saved under the file's name. */
+    reqOpts.failOnError = true;
+    /* -q is quiet about failures too; the exit status says it. */
+    reqOpts.silent = wgetQuiet;
+    reqOpts.nobody = wgetSpider;
+    if (wgetServerResponse) {
+        reqOpts.dumpHeaderPath = "/dev/stderr";
+    }
+    int curlCode = 0;
+    reqOpts.resultCode = &curlCode;
+
+    /* -o/-a: wget's own lines go to a file. They are few here. */
+    FILE *logFile = stderr;
+    if (logPath) {
+        logFile = fopen(logPath, logAppend ? "a" : "w");
+        if (!logFile) {
+            fprintf(stderr, "wget: %s: %s\n", logPath, strerror(errno));
+            free(headers);
+            free(postData);
+            free(args);
+            return 3;
+        }
+    }
+    if (prefixDir && *prefixDir && !output_path && !wgetSpider) {
+        /* -P makes its directory, parents and all. */
+        char dir[PATH_MAX];
+        snprintf(dir, sizeof(dir), "%s", prefixDir);
+        for (char *slash = dir + 1; *slash; slash++) {
+            if (*slash == '/') {
+                *slash = '\0';
+                mkdir(dir, 0777);
+                *slash = '/';
+            }
+        }
+        mkdir(dir, 0777);
+    }
 
     int status = 0;
     for (int i = optind; i < nargs; ++i) {
         const char *url = args[i];
         const char *destination = output_path;
         char derived[PATH_MAX];
-        if (!destination) {
+        char prefixed[PATH_MAX];
+        bool madeName = false;
+        if (wgetSpider) {
+            /* Only whether it is there: nothing is kept. */
+            destination = "/dev/null";
+        } else if (!destination) {
             smallclueUrlSuggestFilename(url, derived, sizeof(derived));
             destination = derived;
+            if (prefixDir && *prefixDir) {
+                snprintf(prefixed, sizeof(prefixed), "%s/%s", prefixDir, derived);
+                destination = prefixed;
+            }
+            struct stat before;
+            madeName = lstat(destination, &before) != 0;
         }
-        int rc = smallclueHttpFetch("wget", url, destination, &reqOpts);
+        int rc = 0;
+        for (int attempt = 1; ; attempt++) {
+            curlCode = 0;
+            rc = smallclueHttpFetch("wget", url, destination, &reqOpts);
+            if (rc == 0 || attempt >= tries) {
+                break;
+            }
+            /* What wget tries again: the network letting go part-way or not
+             * answering in time. An answer that is an error is final, and
+             * so is a refused connection unless --retry-connrefused. */
+            bool transient = curlCode == 6 || curlCode == 18 || curlCode == 28 || curlCode == 35 ||
+                             curlCode == 52 || curlCode == 55 || curlCode == 56 ||
+                             (curlCode == 7 && retryConnRefused);
+            if (!transient) {
+                break;
+            }
+            long pause = attempt < waitRetry ? attempt : waitRetry;
+            if (pause > 0) {
+                sleep((unsigned)pause);
+            }
+        }
         /* On stderr, as wget's own messages are: with -O- the download IS
          * stdout, and `wget -qO- URL | sh` must hand sh nothing else. */
         if (rc == 0 && !wgetQuiet) {
-            fprintf(stderr, "Saved %s -> %s\n", url,
-                    destination && strcmp(destination, "-") != 0 ? destination : "(stdout)");
+            if (wgetSpider) {
+                fprintf(logFile, "Remote file exists: %s\n", url);
+            } else {
+                fprintf(logFile, "Saved %s -> %s\n", url,
+                        destination && strcmp(destination, "-") != 0 ? destination : "(stdout)");
+            }
         }
-        status |= rc;
+        if (rc != 0) {
+            /* A name this run made for a download that did not happen is
+             * not left behind empty. */
+            struct stat after;
+            if (madeName && lstat(destination, &after) == 0 && S_ISREG(after.st_mode) && after.st_size == 0) {
+                unlink(destination);
+            }
+            /* wget's exit statuses: 8 the server said no, 5 TLS, 4 the
+             * network; the first failure is the one reported. */
+            int code = curlCode == 22 ? 8
+                     : (curlCode == 35 || curlCode == 51 || curlCode == 58 || curlCode == 59 || curlCode == 60) ? 5
+                     : (curlCode == 6 || curlCode == 7 || curlCode == 18 || curlCode == 28 ||
+                        curlCode == 52 || curlCode == 55 || curlCode == 56) ? 4
+                     : 1;
+            if (status == 0) {
+                status = code;
+            }
+        }
+    }
+    if (logFile != stderr) {
+        fclose(logFile);
     }
     free(headers);
     free(postData);
     free(args);
-    return status ? 1 : 0;
+    return status;
 }
 
 static int smallclueClearCommand(int argc, char **argv) {
