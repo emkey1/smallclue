@@ -33,3 +33,6 @@
 ## YYYY-MM-DD - Optimize cmp applet via block reads
 **Learning:** For utilities like `cmp` that compare inputs byte-by-byte, using `fgetc` introduces substantial function-call and buffering overhead. Profiling shows that reading data in 16KB blocks directly into stack arrays dramatically speeds up byte processing.
 **Action:** Replace `fgetc` with standard `fread` and stack buffers in high-throughput byte-comparison loops like `cmp` to minimize stdio execution overhead.
+## 2024-10-14 - Optimize `smallclueWcProcessFileWide` in `src/core.c`
+**Learning:** Found a performance bottleneck in `smallclueWcProcessFileWide` where `malloc` and `free` were used per iteration in a hot file-processing loop, and byte scanning was not unrolled like the fast path `smallclueWcProcessFile`.
+**Action:** Replaced dynamic heap allocations with fixed-size stack arrays `unsigned char scratch[sizeof(buf) + sizeof(carry)];`, used loop unrolling for character scanning, and applied standard `isspace()` logic to eliminate memory management overhead and improve throughput safely within scope.
