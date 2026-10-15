@@ -24,10 +24,34 @@ static bool sumFile(FILE *f, bool sysv, unsigned *checksum, unsigned long long *
     unsigned long long total = 0;
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        /* Bolt optimization: loop unrolling for sum to reduce branch and loop overhead */
         if (sysv) {
-            for (size_t i = 0; i < n; i++) s += buf[i];
+            size_t i = 0;
+            for (; i + 15 < n; i += 16) {
+                s += buf[i] + buf[i+1] + buf[i+2] + buf[i+3] + buf[i+4] + buf[i+5] + buf[i+6] + buf[i+7] + buf[i+8] + buf[i+9] + buf[i+10] + buf[i+11] + buf[i+12] + buf[i+13] + buf[i+14] + buf[i+15];
+            }
+            for (; i < n; i++) s += buf[i];
         } else {
-            for (size_t i = 0; i < n; i++) {
+            size_t i = 0;
+            for (; i + 15 < n; i += 16) {
+                s = (s >> 1) | ((s & 1) << 15); s = (s + buf[i]) & 0xffff;
+                s = (s >> 1) | ((s & 1) << 15); s = (s + buf[i+1]) & 0xffff;
+                s = (s >> 1) | ((s & 1) << 15); s = (s + buf[i+2]) & 0xffff;
+                s = (s >> 1) | ((s & 1) << 15); s = (s + buf[i+3]) & 0xffff;
+                s = (s >> 1) | ((s & 1) << 15); s = (s + buf[i+4]) & 0xffff;
+                s = (s >> 1) | ((s & 1) << 15); s = (s + buf[i+5]) & 0xffff;
+                s = (s >> 1) | ((s & 1) << 15); s = (s + buf[i+6]) & 0xffff;
+                s = (s >> 1) | ((s & 1) << 15); s = (s + buf[i+7]) & 0xffff;
+                s = (s >> 1) | ((s & 1) << 15); s = (s + buf[i+8]) & 0xffff;
+                s = (s >> 1) | ((s & 1) << 15); s = (s + buf[i+9]) & 0xffff;
+                s = (s >> 1) | ((s & 1) << 15); s = (s + buf[i+10]) & 0xffff;
+                s = (s >> 1) | ((s & 1) << 15); s = (s + buf[i+11]) & 0xffff;
+                s = (s >> 1) | ((s & 1) << 15); s = (s + buf[i+12]) & 0xffff;
+                s = (s >> 1) | ((s & 1) << 15); s = (s + buf[i+13]) & 0xffff;
+                s = (s >> 1) | ((s & 1) << 15); s = (s + buf[i+14]) & 0xffff;
+                s = (s >> 1) | ((s & 1) << 15); s = (s + buf[i+15]) & 0xffff;
+            }
+            for (; i < n; i++) {
                 s = (s >> 1) | ((s & 1) << 15);
                 s = (s + buf[i]) & 0xffff;
             }

@@ -765,6 +765,8 @@ gcc -std=c99 ${PORTABILITY_DEFS} -DSMALLCLUE_WITH_SH ${EXTRA_C_DEFS} ${DVTM_EXTR
     src/cat_app.c \
     src/rmdir_app.c \
     src/sum_app.c \
+    src/utmp_rec.c \
+    src/who_app.c \
     src/env_app.c \
     src/stat_app.c \
     src/touch_app.c \
