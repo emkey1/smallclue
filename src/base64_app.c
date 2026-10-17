@@ -27,26 +27,106 @@ static int smallclueBase64DecodeChar(char c) {
 }
 
 static int smallclueBase64Encode(FILE *in, FILE *out, int wrapCol) {
-    unsigned char buf[3];
+    unsigned char in_buf[16384];
+    unsigned char out_buf[32768];
+    size_t out_len = 0;
     size_t n;
     int col = 0;
-    while ((n = fread(buf, 1, 3, in)) > 0) {
-        unsigned char b0 = buf[0];
-        unsigned char b1 = (n > 1) ? buf[1] : 0;
-        unsigned char b2 = (n > 2) ? buf[2] : 0;
+    unsigned char carry[2];
+    size_t carry_len = 0;
+
+    while ((n = fread(in_buf, 1, sizeof(in_buf), in)) > 0) {
+        size_t i = 0;
+
+        // Process carry from last block if any
+        if (carry_len > 0) {
+            unsigned char b0, b1, b2;
+            size_t total_avail = carry_len + n;
+
+            b0 = carry[0];
+            b1 = (carry_len == 2) ? carry[1] : in_buf[i++];
+            b2 = (total_avail > 2) ? in_buf[i++] : 0;
+
+            if (total_avail >= 3) {
+                char out4[4];
+                out4[0] = kBase64Chars[b0 >> 2];
+                out4[1] = kBase64Chars[((b0 & 0x3) << 4) | (b1 >> 4)];
+                out4[2] = kBase64Chars[((b1 & 0xF) << 2) | (b2 >> 6)];
+                out4[3] = kBase64Chars[b2 & 0x3F];
+
+                for (int j = 0; j < 4; j++) {
+                    out_buf[out_len++] = out4[j];
+                    col++;
+                    if (wrapCol > 0 && col == wrapCol) {
+                        out_buf[out_len++] = '\n';
+                        col = 0;
+                    }
+                }
+                carry_len = 0;
+            } else {
+                // Still not enough (very rare, e.g. read only 1 byte and had 1 carry)
+                if (i < n) carry[carry_len++] = in_buf[i++];
+                continue; // Wait for more
+            }
+        }
+
+        // Process main block
+        while (i + 2 < n) {
+            unsigned char b0 = in_buf[i];
+            unsigned char b1 = in_buf[i+1];
+            unsigned char b2 = in_buf[i+2];
+            i += 3;
+
+            char out4[4];
+            out4[0] = kBase64Chars[b0 >> 2];
+            out4[1] = kBase64Chars[((b0 & 0x3) << 4) | (b1 >> 4)];
+            out4[2] = kBase64Chars[((b1 & 0xF) << 2) | (b2 >> 6)];
+            out4[3] = kBase64Chars[b2 & 0x3F];
+
+            for (int j = 0; j < 4; j++) {
+                out_buf[out_len++] = out4[j];
+                col++;
+                if (wrapCol > 0 && col == wrapCol) {
+                    out_buf[out_len++] = '\n';
+                    col = 0;
+                }
+            }
+
+            if (out_len >= sizeof(out_buf) - 5) {
+                fwrite(out_buf, 1, out_len, out);
+                out_len = 0;
+            }
+        }
+
+        // Save remaining bytes to carry
+        while (i < n) {
+            carry[carry_len++] = in_buf[i++];
+        }
+    }
+
+    // Process final carry
+    if (carry_len > 0) {
+        unsigned char b0 = carry[0];
+        unsigned char b1 = (carry_len > 1) ? carry[1] : 0;
+
         char out4[4];
         out4[0] = kBase64Chars[b0 >> 2];
         out4[1] = kBase64Chars[((b0 & 0x3) << 4) | (b1 >> 4)];
-        out4[2] = (n > 1) ? kBase64Chars[((b1 & 0xF) << 2) | (b2 >> 6)] : '=';
-        out4[3] = (n > 2) ? kBase64Chars[b2 & 0x3F] : '=';
-        for (int i = 0; i < 4; ++i) {
-            fputc(out4[i], out);
+        out4[2] = (carry_len > 1) ? kBase64Chars[((b1 & 0xF) << 2)] : '=';
+        out4[3] = '=';
+
+        for (int j = 0; j < 4; j++) {
+            out_buf[out_len++] = out4[j];
             col++;
             if (wrapCol > 0 && col == wrapCol) {
-                fputc('\n', out);
+                out_buf[out_len++] = '\n';
                 col = 0;
             }
         }
+    }
+
+    if (out_len > 0) {
+        fwrite(out_buf, 1, out_len, out);
     }
     if (wrapCol > 0 && col != 0) {
         fputc('\n', out);
@@ -55,34 +135,69 @@ static int smallclueBase64Encode(FILE *in, FILE *out, int wrapCol) {
 }
 
 static int smallclueBase64Decode(FILE *in, FILE *out, bool ignoreGarbage) {
-    int c = EOF;
+    unsigned char in_buf[16384];
+    unsigned char out_buf[16384];
+    size_t out_len = 0;
     int vals[4];
     int count = 0;
-    while ((c = fgetc(in)) != EOF) {
-        if (c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
-        if (c == '=') break;
-        int v = smallclueBase64DecodeChar((char)c);
-        if (v < 0) {
-            if (ignoreGarbage) continue;
-            fprintf(stderr, "base64: invalid input\n");
-            return 1;
+    size_t n;
+    bool pad_found = false;
+
+    while ((n = fread(in_buf, 1, sizeof(in_buf), in)) > 0) {
+        size_t i;
+        for (i = 0; i < n; i++) {
+            char c = in_buf[i];
+            if (c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+            if (c == '=') {
+                pad_found = true;
+                break;
+            }
+            int v = smallclueBase64DecodeChar(c);
+            if (v < 0) {
+                if (ignoreGarbage) continue;
+                if (out_len > 0) fwrite(out_buf, 1, out_len, out);
+                fprintf(stderr, "base64: invalid input\n");
+                return 1;
+            }
+            vals[count++] = v;
+            if (count == 4) {
+                out_buf[out_len++] = (vals[0] << 2) | (vals[1] >> 4);
+                out_buf[out_len++] = ((vals[1] & 0xF) << 4) | (vals[2] >> 2);
+                out_buf[out_len++] = ((vals[2] & 0x3) << 6) | vals[3];
+                count = 0;
+                if (out_len >= sizeof(out_buf) - 3) {
+                    fwrite(out_buf, 1, out_len, out);
+                    out_len = 0;
+                }
+            }
         }
-        vals[count++] = v;
-        if (count == 4) {
-            fputc((vals[0] << 2) | (vals[1] >> 4), out);
-            fputc(((vals[1] & 0xF) << 4) | (vals[2] >> 2), out);
-            fputc(((vals[2] & 0x3) << 6) | vals[3], out);
-            count = 0;
+        if (pad_found) {
+            // Consume remaining padding/whitespace up to the next real character
+            i++; // skip the '=' we just found
+            for (; i < n; i++) {
+                char c = in_buf[i];
+                if (c == '=' || c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+                break; // found a real character, so break.
+            }
+            // if we exhausted this buffer, we'd need to consume stream.
+            // But realistically we just break out since we are done decoding.
+            break;
         }
     }
-    if (c == '=') {
-        /* Consume any remaining padding/whitespace up to the next real
-         * character (there shouldn't be one in well-formed input). */
+
+    // Original logic consumes stream until next non-whitespace/padding character
+    if (pad_found) {
+        int c;
         while ((c = fgetc(in)) != EOF) {
             if (c == '=' || c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
             break;
         }
     }
+
+    if (out_len > 0) {
+        fwrite(out_buf, 1, out_len, out);
+    }
+
     if (count == 2) {
         fputc((vals[0] << 2) | (vals[1] >> 4), out);
     } else if (count == 3) {
