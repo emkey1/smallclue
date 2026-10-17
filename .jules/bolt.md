@@ -33,3 +33,6 @@
 ## YYYY-MM-DD - Optimize cmp applet via block reads
 **Learning:** For utilities like `cmp` that compare inputs byte-by-byte, using `fgetc` introduces substantial function-call and buffering overhead. Profiling shows that reading data in 16KB blocks directly into stack arrays dramatically speeds up byte processing.
 **Action:** Replace `fgetc` with standard `fread` and stack buffers in high-throughput byte-comparison loops like `cmp` to minimize stdio execution overhead.
+## 2026-10-17 - Optimization of base64 via block read/write
+**Learning:** The `base64` applet processed bytes individually using `fread` for 3 bytes at a time and `fputc`/`fgetc`. This introduces significant overhead due to memory copying, lock acquisition, and function call overhead for every byte or small group of bytes. Using `fread` and `fwrite` with large 16KB-32KB stack buffers avoids these bottlenecks.
+**Action:** Replace byte-by-byte stdio reading/writing with block-based loop processing using `fread` and `fwrite` into large static stack buffers for stream-oriented utilities like `base64` to maximize throughput.
