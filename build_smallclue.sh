@@ -773,6 +773,8 @@ gcc -std=c99 ${PORTABILITY_DEFS} -DSMALLCLUE_WITH_SH ${EXTRA_C_DEFS} ${DVTM_EXTR
     src/ls_app.c \
     src/chmod_app.c \
     src/date_app.c \
+    src/utmp_rec.c \
+    src/who_app.c \
     src/cp_app.c \
     src/grep_app.c \
     src/find_app.c \

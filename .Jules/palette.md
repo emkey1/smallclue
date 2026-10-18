@@ -29,3 +29,7 @@
 ## YYYY-MM-DD - Dynamic Full-Width Inverse Video Headers
 **Learning:** Hardcoded inverse video headers in fullscreen applets do not stretch across the terminal, resulting in jagged resizing and poor visual hierarchy.
 **Action:** Always dynamically build header strings using `snprintf`, measure their length, calculate the remaining width via `pscalRuntimeDetectWindowCols()`, and append space padding so the inverse video highlight stretches cleanly across the terminal row.
+
+## YYYY-MM-DD - Dynamic padding in TUI elements
+**Learning:** Hard-coded lengths or padded format strings can cause off-by-one errors and line-wrapping issues or cut off ANSI reset strings when the terminal window resizes.
+**Action:** Use the width format specifier `*` in C `fprintf`/`printf` alongside dynamically fetching terminal columns (`pscalRuntimeDetectWindowCols`) to gracefully print space padding in inverse video UI menus.

@@ -6047,7 +6047,7 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         qsort(entries, count, sizeof(SmallclueTopEntry), smallclueTopCompareEntries);
 
-        if (!batch && isatty(STDOUT_FILENO)) {
+        if (!batch && pscalRuntimeStdoutIsInteractive()) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
         }
 
@@ -6066,10 +6066,9 @@ static int smallclueTopCommand(int argc, char **argv) {
         if (smallclueColourWanted()) {
             fputs("\n\033[7m", stdout);
             int raw_len = printf("  %5s %5s %-8s %s %7s %6s %s", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
-            int cols = pscalRuntimeDetectWindowCols();
-            if (cols <= 0) cols = 80;
-            int pad = cols - raw_len;
-            if (pad < 0) pad = 0;
+            int pad_cols = pscalRuntimeDetectWindowCols();
+            if (pad_cols <= 0) pad_cols = 80;
+            int pad = pad_cols - raw_len;
             if (pad > 0) printf("%*s", pad, "");
             fputs("\033[0m\n", stdout);
         } else {
@@ -6077,7 +6076,7 @@ static int smallclueTopCommand(int argc, char **argv) {
         }
 
         int rows = -1, cols = -1;
-        if (!batch && isatty(STDOUT_FILENO)) {
+        if (!batch && pscalRuntimeStdoutIsInteractive()) {
             smallclueGetTerminalSize(&rows, &cols);
         }
         size_t visible = count;
@@ -12176,12 +12175,16 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
         if (colour) {
             fputs("\x1b[7m", out);
         }
+        int raw_len = 0;
         if (cols > 0 && (int)strlen(header) > cols) {
-            if (cols <= 3) { fwrite(header, 1, (size_t)cols, out); }
-            else { fwrite(header, 1, (size_t)(cols - 3), out); fputs("...", out); }
+            if (cols <= 3) { raw_len = fwrite(header, 1, (size_t)cols, out); }
+            else { raw_len = fwrite(header, 1, (size_t)(cols - 3), out); fputs("...", out); raw_len += 3; }
         } else {
-            fprintf(out, "%s", header);
+            raw_len = fprintf(out, "%s", header);
         }
+        int pad_cols = cols > 0 ? cols : 80;
+        int pad = pad_cols - raw_len;
+        if (pad > 0) fprintf(out, "%*s", pad, "");
         if (colour) {
             fputs("\x1b[0m", out);
         }
@@ -12600,16 +12603,21 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
     if (colour) {
         fputs("\x1b[7m", out);
     }
+    int raw_len = 0;
     if (term_cols > 0 && (int)strlen(header) > term_cols) {
         if (term_cols <= 3) {
-            fwrite(header, 1, (size_t)term_cols, out);
+            raw_len = fwrite(header, 1, (size_t)term_cols, out);
         } else {
-            fwrite(header, 1, (size_t)(term_cols - 3), out);
+            raw_len = fwrite(header, 1, (size_t)(term_cols - 3), out);
             fputs("...", out);
+            raw_len += 3;
         }
     } else {
-        fprintf(out, "%s", header);
+        raw_len = fprintf(out, "%s", header);
     }
+    int pad_cols = term_cols > 0 ? term_cols : 80;
+    int pad = pad_cols - raw_len;
+    if (pad > 0) fprintf(out, "%*s", pad, "");
     if (colour) {
         fputs("\x1b[0m", out);
     }
@@ -14507,10 +14515,9 @@ static int smallclueWatchCommand(int argc, char **argv) {
         if (smallclueColourWanted()) {
             fputs("\033[7m", stdout);
             int raw_len = printf("Every %.2fs: %s", interval, cmdline ? cmdline : argv[idx]);
-            int cols = pscalRuntimeDetectWindowCols();
-            if (cols <= 0) cols = 80;
-            int pad = cols - raw_len;
-            if (pad < 0) pad = 0;
+            int pad_cols = pscalRuntimeDetectWindowCols();
+            if (pad_cols <= 0) pad_cols = 80;
+            int pad = pad_cols - raw_len;
             if (pad > 0) printf("%*s", pad, "");
             fputs("\033[0m\n\n", stdout);
         } else {
