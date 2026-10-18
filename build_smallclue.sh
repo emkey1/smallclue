@@ -720,6 +720,8 @@ gcc -std=c99 ${PORTABILITY_DEFS} -DSMALLCLUE_WITH_SH ${EXTRA_C_DEFS} ${DVTM_EXTR
     ${DVTM_OBJS} \
     src/openssh_app.c \
     src/vproc_test_app.c \
+    src/utmp_rec.c \
+    src/who_app.c \
     src/shell/lexer.c \
     src/shell/parser.c \
     src/shell/ast.c \
