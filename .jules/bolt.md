@@ -24,7 +24,7 @@
 **Learning:** The `head` applet (`smallclueHeadStream` in `src/core.c`) is optimized by replacing line-by-line dynamic allocations (`smallclueGetlineStream`) with 16KB block processing (`smallclueReadStream`) and a manually unrolled loop to scan for newlines, significantly reducing system call and heap allocation overhead.
 **Action:** For sequential parsing, use 16KB block reads with `smallclueReadStream` rather than byte-by-byte or line-by-line dynamic allocations (`smallclueGetlineStream`), and unroll inner loops to eliminate branching overhead.
 
-## $(date +%Y-%m-%d) - Optimize Cat throughput via syscall bypass
+## 2025-05-19 - Optimize Cat throughput via syscall bypass
 **Learning:** For file stream utilities like `cat`, wrapping the stream through stdio `fwrite()` imposes unneeded overhead due to buffering memory copies and lock acquisition compared to raw direct POSIX `write()` loops. By upgrading `cat_file`/`print_file` to use direct `write(STDOUT_FILENO)` with a large stack buffer (64K), we avoid stdio bottlenecking.
 **Action:** When implementing tools meant to shovel bytes quickly (cat, yes, dd), use unbuffered direct system calls like `read` and `write` wrapped in retry loops for `EINTR`, and manually ensure `fflush()` is called on stdio streams beforehand if intermixing could occur.
 ## 2025-05-19 - Optimization of tee applet block read
@@ -33,3 +33,6 @@
 ## YYYY-MM-DD - Optimize cmp applet via block reads
 **Learning:** For utilities like `cmp` that compare inputs byte-by-byte, using `fgetc` introduces substantial function-call and buffering overhead. Profiling shows that reading data in 16KB blocks directly into stack arrays dramatically speeds up byte processing.
 **Action:** Replace `fgetc` with standard `fread` and stack buffers in high-throughput byte-comparison loops like `cmp` to minimize stdio execution overhead.
+## 2025-05-19 - wc wide character processing optimization
+**Learning:** Hot file-processing loops in C (like the 16KB block processing in `smallclueWcProcessFileWide`) should avoid dynamic heap allocations (`malloc`/`free`) per iteration. Using fixed-size stack arrays for bounded multi-byte character processing buffers and loop unrolling can eliminate memory management and branching overhead, drastically improving throughput.
+**Action:** Always prefer fixed-size stack allocations over dynamic heap allocations inside hot loops for bounded data structures. Look for loop unrolling opportunities in critical paths.
