@@ -29,3 +29,7 @@
 ## YYYY-MM-DD - Dynamic Full-Width Inverse Video Headers
 **Learning:** Hardcoded inverse video headers in fullscreen applets do not stretch across the terminal, resulting in jagged resizing and poor visual hierarchy.
 **Action:** Always dynamically build header strings using `snprintf`, measure their length, calculate the remaining width via `pscalRuntimeDetectWindowCols()`, and append space padding so the inverse video highlight stretches cleanly across the terminal row.
+
+## YYYY-MM-DD - Batch Mode Output Separation for Continuous Applets
+**Learning:** Continuous output utilities (like `watch` and `top`) typically clear the screen between frames when running interactively. When their output is redirected (batch mode), omitting the clear sequence without providing a substitute results in successive frames running together without any visual boundaries, creating a confusing and unreadable log.
+**Action:** Always replace screen-clearing ANSI sequences with a simple newline separator between frames when continuous TUI applets are run in non-interactive batch mode, maintaining readable, visually separated iteration logs.

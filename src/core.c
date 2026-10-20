@@ -6049,6 +6049,8 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         if (!batch && isatty(STDOUT_FILENO)) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
+        } else if (iterations > 0) {
+            fputs("\n", stdout);
         }
 
         double load[3] = {0, 0, 0};
@@ -6119,8 +6121,8 @@ static int smallclueTopCommand(int argc, char **argv) {
         for (size_t i = 0; i < count; ++i) free(entries[i].command);
         free(entries);
 
+        iterations++;
         if (max_iterations > 0) {
-            iterations++;
             if (iterations >= max_iterations) break;
         }
 
@@ -14503,6 +14505,8 @@ static int smallclueWatchCommand(int argc, char **argv) {
         const bool cleared = isatty(STDOUT_FILENO) != 0;
         if (cleared) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
+        } else if (iterations > 0) {
+            fputs("\n", stdout);
         }
         if (smallclueColourWanted()) {
             fputs("\033[7m", stdout);
@@ -14544,8 +14548,8 @@ static int smallclueWatchCommand(int argc, char **argv) {
             status = abort_status;
             goto watch_done;
         }
+        iterations++;
         if (max_iterations > 0) {
-            iterations++;
             if (iterations >= max_iterations) {
                 break;
             }
