@@ -7662,6 +7662,23 @@ static ssize_t pagerReadByteWithTimeout(int fd,
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
         int wait_ms = required ? -1 : timeout_ms;
         int poll_rc = poll(&pfd, 1, wait_ms);
+        /* macOS's poll() does not support /dev/tty, which is the control fd
+         * pager_control_fd() opens first: it answers POLLNVAL at once, for a
+         * descriptor that is perfectly open. Reading that as "no key yet"
+         * spun the pager without ever reading a key, so it ignored every
+         * keypress until ^C. select() does support it, so wait there instead.
+         * A descriptor that really is closed fails F_GETFD and stays an
+         * error. */
+        if (poll_rc > 0 && (pfd.revents & POLLNVAL) &&
+            fcntl(fd, F_GETFD) != -1 && fd < FD_SETSIZE) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(fd, &rfds);
+            struct timeval tv = { .tv_sec = wait_ms / 1000,
+                                  .tv_usec = (wait_ms % 1000) * 1000 };
+            poll_rc = select(fd + 1, &rfds, NULL, NULL, wait_ms < 0 ? NULL : &tv);
+            pfd.revents = (poll_rc > 0) ? POLLIN : 0;
+        }
         if (poll_rc < 0) {
             if (errno == EINTR) {
                 if (g_pager_sigwinch_received) {
@@ -7675,6 +7692,12 @@ static ssize_t pagerReadByteWithTimeout(int fd,
             return 0;
         }
         if ((pfd.revents & (POLLIN | POLLHUP)) == 0) {
+            /* Not a timeout -- poll_rc said something happened -- so an error
+               here must end the read, not come back as "no key yet". */
+            if (pfd.revents & (POLLERR | POLLNVAL)) {
+                errno = (pfd.revents & POLLNVAL) ? EBADF : EIO;
+                return -1;
+            }
             return 0;
         }
         ssize_t n = read(fd, out, 1);
