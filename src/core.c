@@ -6892,24 +6892,60 @@ static size_t pagerMaxTop(const PagerBuffer *buffer, int page_rows) {
     return buffer->line_count - page;
 }
 
+/* How many bytes of s fit in width columns, and (in *used) the columns they
+ * take. A byte that does not decode counts as one column, as every byte does
+ * in the C locale: there a non-ASCII name leaves the bar short, never wrapped. */
+static size_t pagerFitColumns(const char *s, int width, int *used) {
+    mbstate_t st;
+    memset(&st, 0, sizeof(st));
+    size_t len = strlen(s), pos = 0;
+    int cols = 0;
+    while (pos < len) {
+        wchar_t wc;
+        size_t n = mbrtowc(&wc, s + pos, len - pos, &st);
+        int w = 1;
+        if (n == (size_t)-1 || n == (size_t)-2) {
+            memset(&st, 0, sizeof(st));
+            n = 1;
+        } else {
+            if (n == 0) n = 1;
+            w = wcwidth(wc);
+            if (w < 0) w = 1;
+        }
+        if (cols + w > width) break;
+        cols += w;
+        pos += n;
+    }
+    *used = cols;
+    return pos;
+}
+
 static int pagerPromptAndRead(const char *cmd_name, const char *detail) {
     const char *label = pager_command_name(cmd_name);
     bool md_mode = (label && strcmp(label, "md") == 0);
     bool color = smallclueColourWanted();
-    const char *inv = color ? "\033[7m" : "";
-    const char *rst = color ? "\033[0m" : "";
+    const char *keys = md_mode ? "Space=advance, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit"
+                     : (detail && *detail) ? "Space=advance, b=prev, arrows=scroll, q=next file, Q=exit"
+                     : "Space=advance, b=prev, arrows=scroll, q=quit";
+    char prompt[512];
     if (detail && *detail) {
-        if (md_mode) {
-            fprintf(stdout, "\r%s--%s %s-- (Space=advance, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)%s ",
-                    inv, label, detail, rst);
-        } else {
-            fprintf(stdout, "\r%s--%s %s-- (Space=advance, b=prev, arrows=scroll, q=next file, Q=exit)%s ",
-                    inv, label, detail, rst);
-        }
-    } else if (md_mode) {
-        fprintf(stdout, "\r%s--%s-- (Space=advance, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)%s ", inv, label, rst);
+        snprintf(prompt, sizeof(prompt), "--%s %s-- (%s)", label, detail, keys);
     } else {
-        fprintf(stdout, "\r%s--%s-- (Space=advance, b=prev, arrows=scroll, q=quit)%s ", inv, label, rst);
+        snprintf(prompt, sizeof(prompt), "--%s-- (%s)", label, keys);
+    }
+    /* One line, cut short of the last column. A prompt the terminal wraps
+     * scrolls the top of the page off the screen (md's is wider than a
+     * phone's three times over), and the \r\x1b[K below clears only its last
+     * line. With colour the reverse-video bar spans the window, as the
+     * headers of top and watch do. */
+    int cols = pscalRuntimeDetectWindowCols();
+    if (cols <= 1) cols = 80;
+    int used = 0;
+    size_t fit = pagerFitColumns(prompt, cols - 1, &used);
+    if (color) {
+        fprintf(stdout, "\r\033[7m%.*s%*s\033[0m", (int)fit, prompt, cols - used, "");
+    } else {
+        fprintf(stdout, "\r%.*s ", (int)fit, prompt);
     }
     fflush(stdout);
     int key = pager_read_key();
