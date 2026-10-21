@@ -35,5 +35,5 @@
 **Action:** Replace `fgetc` with standard `fread` and stack buffers in high-throughput byte-comparison loops like `cmp` to minimize stdio execution overhead.
 
 ## 2024-10-07 - Optimize smallclue wc applet space checking
-**Learning:** Checking for whitespace using manual range checks (`c == ' ' || (c >= '\t' && c <= '\r')`) inside hot loops (like in the `wc` applet) incurs branching overhead. Replacing it with a precomputed static lookup table (`is_space_lookup[256]`) can speed up inner loops by around ~20% in raw byte counting performance on large inputs.
-**Action:** When micro-optimizing character class checks inside hot fast paths, use static boolean lookup arrays if memory footprint and cache locality allow.
+**Learning:** The user rejected the PR. While adding a static `is_space_lookup` table sped up the micro-benchmark of the whitespace parsing loop by ~20%, it actually increased the overall execution time of the `wc` applet on large inputs. This happened because the primary bottleneck for `wc` is reading the file block-by-block (IO/`fread` overhead), not the raw character parsing loop itself.
+**Action:** Do not prematurely optimize character processing loops with static arrays or bitwise tricks if the surrounding code is bottlenecked by disk IO or file streaming functions. Measure full application execution time before proposing micro-optimizations.
