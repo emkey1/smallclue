@@ -19675,10 +19675,16 @@ static int smallclueWcProcessFileWide(const char *path, FILE *fp, SmallclueWcCou
         size_t pos = 0;
         while (pos < avail) {
             wchar_t wc;
+            mbstate_t before = mbs;
             size_t rc = mbrtowc(&wc, (const char *)scratch + pos, avail - pos, &mbs);
             if (rc == (size_t)-2) {
                 /* Incomplete sequence at the end of the buffer -- carry the
-                 * remaining bytes over to the next read. */
+                 * remaining bytes over to the next read. mbrtowc has taken
+                 * them into the state already, and they are fed again from
+                 * the carry, so the state goes back to before them: fed
+                 * twice, the lead byte is taken for an invalid continuation
+                 * and one character counts as three. */
+                mbs = before;
                 size_t remain = avail - pos;
                 if (remain > sizeof(carry)) remain = sizeof(carry);
                 memcpy(carry, scratch + pos, remain);
