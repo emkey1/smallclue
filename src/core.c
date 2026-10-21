@@ -6049,6 +6049,10 @@ static int smallclueTopCommand(int argc, char **argv) {
 
         if (!batch && isatty(STDOUT_FILENO)) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
+        } else if (iterations > 0) {
+            /* Frames one after another, a blank line apart, as procps
+             * top -b writes them. */
+            putchar('\n');
         }
 
         double load[3] = {0, 0, 0};
@@ -6119,10 +6123,8 @@ static int smallclueTopCommand(int argc, char **argv) {
         for (size_t i = 0; i < count; ++i) free(entries[i].command);
         free(entries);
 
-        if (max_iterations > 0) {
-            iterations++;
-            if (iterations >= max_iterations) break;
-        }
+        iterations++;
+        if (max_iterations > 0 && iterations >= max_iterations) break;
 
         /* Sleep in slices so a keypress is noticed promptly, instead of one
          * long nanosleep that only ends on a signal. This is what makes 'q'
