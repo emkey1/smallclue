@@ -50,11 +50,18 @@
 #endif
 
 /* Provided by an embedding host that can restore a process: true while the
- * running program is one the host re-launched after a restore. */
-bool smallclueHostWasRestored(void) __attribute__((weak));
+ * running program is one the host re-launched after a restore. A standalone
+ * smallclue has no such host. A bare weak *declaration* leaves an undefined
+ * symbol that Mach-O refuses to link, so carry a weak *definition* instead --
+ * the shape copyBuildVersion() in core.c uses. iSH-AOK's strong definition
+ * (kernel/smallclue_glue.c) wins at link time. */
+__attribute__((weak))
+bool smallclueHostWasRestored(void) {
+    return false;
+}
 
 static bool initWasRestored(void) {
-    return smallclueHostWasRestored != NULL && smallclueHostWasRestored();
+    return smallclueHostWasRestored();
 }
 
 static const char *initBaseName(const char *path) {
