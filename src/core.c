@@ -6848,25 +6848,19 @@ static int pagerPromptAndRead(const char *cmd_name, const char *detail) {
     bool color = smallclueColourWanted();
     const char *inv = color ? "\033[7m" : "";
     const char *rst = color ? "\033[0m" : "";
-    char raw_prompt[256];
     if (detail && *detail) {
         if (md_mode) {
-            snprintf(raw_prompt, sizeof(raw_prompt), "--%s %s-- (Space=advance, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)", label, detail);
+            fprintf(stdout, "\r%s--%s %s-- (Space=advance, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)%s ",
+                    inv, label, detail, rst);
         } else {
-            snprintf(raw_prompt, sizeof(raw_prompt), "--%s %s-- (Space=advance, b=prev, arrows=scroll, q=next file, Q=exit)", label, detail);
+            fprintf(stdout, "\r%s--%s %s-- (Space=advance, b=prev, arrows=scroll, q=next file, Q=exit)%s ",
+                    inv, label, detail, rst);
         }
     } else if (md_mode) {
-        snprintf(raw_prompt, sizeof(raw_prompt), "--%s-- (Space=advance, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)", label);
+        fprintf(stdout, "\r%s--%s-- (Space=advance, b=prev, arrows=scroll, [ ]=pick link, Enter=open, o=links, q=back, Q=quit)%s ", inv, label, rst);
     } else {
-        snprintf(raw_prompt, sizeof(raw_prompt), "--%s-- (Space=advance, b=prev, arrows=scroll, q=quit)", label);
+        fprintf(stdout, "\r%s--%s-- (Space=advance, b=prev, arrows=scroll, q=quit)%s ", inv, label, rst);
     }
-
-    int raw_len = (int)strlen(raw_prompt);
-    int cols = pscalRuntimeDetectWindowCols();
-    if (cols <= 0) cols = 80;
-    int pad = cols - raw_len - 1;
-    if (pad < 0) pad = 0;
-    fprintf(stdout, "\r%s%s%*s%s ", inv, raw_prompt, pad, "", rst);
     fflush(stdout);
     int key = pager_read_key();
     fputs("\r\x1b[K", stdout);
