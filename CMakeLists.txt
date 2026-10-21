@@ -1074,6 +1074,35 @@ endif()
 set(_smallclue_saved_lib_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
 set(CMAKE_FIND_LIBRARY_SUFFIXES .a ${CMAKE_FIND_LIBRARY_SUFFIXES})
 find_package(ZLIB REQUIRED)
+# The libssh2 stale-cache trap again, for OpenSSL: FindOpenSSL caches the
+# absolute paths it found, and Homebrew's openssl.pc names the version-stamped
+# Cellar prefix, so `brew upgrade openssl@3` leaves an existing build tree
+# pointing at a directory that is gone. find_package still reports success
+# from the cached variables, but declines to create OpenSSL::SSL/Crypto for
+# files that do not exist, and the first sign of it is target_link_libraries
+# saying "OpenSSL::SSL ... the target was not found". So drop the cached
+# answer once any path it names has gone away, along with the pkg-config
+# result FindOpenSSL takes its hints from (it queries under the _OPENSSL
+# prefix), and let find_package below search again.
+foreach(_smallclue_openssl_var IN ITEMS
+        OPENSSL_INCLUDE_DIR OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY)
+    if(${_smallclue_openssl_var} AND NOT EXISTS "${${_smallclue_openssl_var}}")
+        message(STATUS
+            "Cached ${_smallclue_openssl_var} ${${_smallclue_openssl_var}} no "
+            "longer exists (upgraded?) -- searching for OpenSSL again")
+        unset(OPENSSL_INCLUDE_DIR CACHE)
+        unset(OPENSSL_SSL_LIBRARY CACHE)
+        unset(OPENSSL_CRYPTO_LIBRARY CACHE)
+        unset(__pkg_config_checked__OPENSSL CACHE)
+        get_cmake_property(_smallclue_cache_vars CACHE_VARIABLES)
+        foreach(_smallclue_cache_var IN LISTS _smallclue_cache_vars)
+            if(_smallclue_cache_var MATCHES "^pkgcfg_lib__OPENSSL_")
+                unset(${_smallclue_cache_var} CACHE)
+            endif()
+        endforeach()
+        break()
+    endif()
+endforeach()
 find_package(OpenSSL REQUIRED)
 # This system's libcrypto.a was built with its optional zlib/zstd BIO
 # compression filters compiled in (c_zlib.o/c_zstd.o) -- those object files
