@@ -9605,6 +9605,21 @@ static char *markdownTrimInline(char *str) {
     return str;
 }
 
+/* GFM: `\|` is a pipe inside the cell, code spans included, and only an
+ * unescaped one separates cells. Splitting on every '|' cut `\|\|` into three
+ * cells and gave the whole table two extra columns. */
+static int markdownCountTablePipes(const char *line) {
+    int count = 0;
+    for (const char *p = line; p && *p; ++p) {
+        if (*p == '\\' && p[1] == '|') {
+            ++p;
+        } else if (*p == '|') {
+            count++;
+        }
+    }
+    return count;
+}
+
 static void markdownParseTableRow(char *line, MarkdownTableRow *row) {
     if (!row) return;
     row->col_count = 0;
@@ -9613,23 +9628,31 @@ static void markdownParseTableRow(char *line, MarkdownTableRow *row) {
     if (*start == '|') {
         start++;
     }
-    while (start) {
-        char *delim = strchr(start, '|');
-        if (delim) {
-            *delim = '\0';
-            if (row->col_count < MARKDOWN_MAX_TABLE_COLS) {
-                row->cells[row->col_count++] = markdownSimplifyInlinePlain(markdownTrimInline(start));
-            }
-            start = delim + 1;
-            if (*start == '\0') {
-                break;
-            }
+    /* Unescape in place: the write cursor never passes the read cursor. */
+    char *cell = start;
+    char *w = start;
+    for (char *p = start;; ++p) {
+        if (*p == '\\' && p[1] == '|') {
+            *w++ = '|';
+            ++p;
             continue;
         }
-        if (row->col_count < MARKDOWN_MAX_TABLE_COLS) {
-            row->cells[row->col_count++] = markdownSimplifyInlinePlain(markdownTrimInline(start));
+        if (*p != '|' && *p != '\0') {
+            *w++ = *p;
+            continue;
         }
-        break;
+        bool at_end = (*p == '\0');
+        *w = '\0';
+        char *text = markdownTrimInline(cell);
+        /* The text after a closing pipe is not a cell. */
+        if (!(at_end && *text == '\0' && cell != start) &&
+            row->col_count < MARKDOWN_MAX_TABLE_COLS) {
+            row->cells[row->col_count++] = markdownSimplifyInlinePlain(text);
+        }
+        if (at_end) {
+            break;
+        }
+        cell = w = p + 1;
     }
 }
 
@@ -9657,9 +9680,9 @@ static int markdownIsSeparatorRow(const MarkdownTableRow *row) {
 
 /* Inline markup resolved, but with no colour markers in the result.
  *
- * Table cells are sliced by byte offset and padded with "%-*.*s", so a marker
- * could be cut in half at a wrap boundary and would count against the column
- * width either way. Cells therefore get the text and not the colour -- which
+ * Table cells are wrapped and padded by display column, so a marker could be
+ * cut off from its reset at a wrap boundary and would count against the
+ * column width either way. Cells therefore get the text and not the colour -- which
  * still fixes the visible half of the problem, since cells used to print their
  * backticks while the same code span in a paragraph did not. */
 static char *markdownSimplifyInlinePlain(const char *text) {
@@ -9670,18 +9693,123 @@ static char *markdownSimplifyInlinePlain(const char *text) {
     return out;
 }
 
-static int markdownTableWrapLen(const char *text, int max_width, int offset) {
-    int len = (int)strlen(text);
-    int remaining = len - offset;
-    if (remaining <= max_width) return remaining;
-    for (int k = max_width; k > 0; --k) {
-        char prev = text[offset + k - 1];
-        if (prev == ' ') return k;
-        if (prev == '/' || prev == '-' || prev == '_' || prev == ',' || prev == '.') {
-            return k;
+/* Terminal columns one code point takes. Locale-free on purpose: md never
+ * calls setlocale(), and in the C locale it runs in, mbrtowc() and wcwidth()
+ * count each byte of an arrow or an em dash as a column of its own -- which
+ * is how table borders drifted on every row holding one. The ranges are the
+ * usual zero-width (combining marks, joiners, variation selectors) and
+ * double-width (East Asian wide, emoji) blocks; anything else is one. */
+static int markdownCodepointWidth(uint32_t cp) {
+    if ((cp >= 0x0300 && cp <= 0x036F) || (cp >= 0x1AB0 && cp <= 0x1AFF) ||
+        (cp >= 0x1DC0 && cp <= 0x1DFF) || (cp >= 0x200B && cp <= 0x200F) ||
+        (cp >= 0x2060 && cp <= 0x2064) || (cp >= 0x20D0 && cp <= 0x20FF) ||
+        (cp >= 0xFE00 && cp <= 0xFE0F) || (cp >= 0xFE20 && cp <= 0xFE2F) ||
+        cp == 0xFEFF) {
+        return 0;
+    }
+    if ((cp >= 0x1100 && cp <= 0x115F) || (cp >= 0x2E80 && cp <= 0x303E) ||
+        (cp >= 0x3041 && cp <= 0x33FF) || (cp >= 0x3400 && cp <= 0x4DBF) ||
+        (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0xA000 && cp <= 0xA4CF) ||
+        (cp >= 0xAC00 && cp <= 0xD7A3) || (cp >= 0xF900 && cp <= 0xFAFF) ||
+        (cp >= 0xFE30 && cp <= 0xFE4F) || (cp >= 0xFF00 && cp <= 0xFF60) ||
+        (cp >= 0xFFE0 && cp <= 0xFFE6) || (cp >= 0x1F300 && cp <= 0x1F64F) ||
+        (cp >= 0x1F900 && cp <= 0x1F9FF) || (cp >= 0x20000 && cp <= 0x3FFFD)) {
+        return 2;
+    }
+    return 1;
+}
+
+/* Byte length of the UTF-8 character at s (len bytes left, len > 0), and the
+ * columns it takes in *width. A byte that starts no valid sequence is one
+ * byte and one column, so malformed input still advances. */
+static size_t markdownUtf8Char(const unsigned char *s, size_t len, int *width) {
+    unsigned char c = s[0];
+    size_t n = (c < 0x80) ? 1
+             : (c >= 0xC2 && c <= 0xDF) ? 2
+             : (c >= 0xE0 && c <= 0xEF) ? 3
+             : (c >= 0xF0 && c <= 0xF4) ? 4 : 0;
+    if (n == 0 || n > len) {
+        *width = 1;
+        return 1;
+    }
+    uint32_t cp = (n == 1) ? c : (n == 2) ? (c & 0x1Fu) : (n == 3) ? (c & 0x0Fu) : (c & 0x07u);
+    for (size_t i = 1; i < n; ++i) {
+        if ((s[i] & 0xC0) != 0x80) {
+            *width = 1;
+            return 1;
+        }
+        cp = (cp << 6) | (s[i] & 0x3Fu);
+    }
+    *width = markdownCodepointWidth(cp);
+    return n;
+}
+
+static int markdownDisplayWidth(const char *text) {
+    const unsigned char *s = (const unsigned char *)text;
+    size_t len = strlen(text);
+    size_t pos = 0;
+    int cols = 0;
+    while (pos < len) {
+        int w;
+        pos += markdownUtf8Char(s + pos, len - pos, &w);
+        cols += w;
+    }
+    return cols;
+}
+
+/* How much of text, from byte offset on, goes on one line of a column
+ * max_width wide: returns the bytes to print, and the columns they take in
+ * *used. Breaks at the last space that fits. Only a single word longer than
+ * the column breaks elsewhere -- after its last '/', '-', '_', ',' or '.'
+ * that fits, failing that at the column edge -- and always between
+ * characters, never inside one. Preferring punctuation to spaces (as before)
+ * gave "inventing ." / "equals(...)". */
+static int markdownTableWrapLen(const char *text, int max_width, int offset, int *used) {
+    const unsigned char *s = (const unsigned char *)text;
+    size_t len = strlen(text);
+    size_t start = (size_t)offset;
+    size_t pos = start;
+    int cols = 0;
+    size_t space_end = 0, punct_end = 0;
+    int space_cols = 0, punct_cols = 0;
+    while (pos < len) {
+        int w;
+        size_t n = markdownUtf8Char(s + pos, len - pos, &w);
+        if (cols + w > max_width) {
+            break;
+        }
+        if (s[pos] == ' ' && pos > start) {
+            space_end = pos;
+            space_cols = cols;
+        }
+        pos += n;
+        cols += w;
+        if (n == 1 && strchr("/-_,.", s[pos - 1])) {
+            punct_end = pos;
+            punct_cols = cols;
         }
     }
-    return max_width;
+    if (pos >= len || (s[pos] == ' ' && pos > start)) {
+        *used = cols;
+        return (int)(pos - start);
+    }
+    if (space_end > start) {
+        *used = space_cols;
+        return (int)(space_end - start);
+    }
+    if (punct_end > start) {
+        *used = punct_cols;
+        return (int)(punct_end - start);
+    }
+    if (pos == start) {
+        /* One character wider than the whole column: print it anyway. */
+        int w;
+        size_t n = markdownUtf8Char(s + pos, len - pos, &w);
+        *used = w;
+        return (int)n;
+    }
+    *used = cols;
+    return (int)(pos - start);
 }
 
 static void markdownPrintSeparator(FILE *out, const int *col_widths, int cols) {
@@ -9711,23 +9839,63 @@ static void markdownRenderTable(FILE *out, MarkdownTableRow *rows, int row_count
         }
         if (!markdownIsSeparatorRow(&rows[i])) {
             for (int j = 0; j < rows[i].col_count; ++j) {
-                int len = (int)strlen(rows[i].cells[j]);
-                if (len > col_widths[j]) {
-                    col_widths[j] = len;
+                int width = markdownDisplayWidth(rows[i].cells[j]);
+                if (width > col_widths[j]) {
+                    col_widths[j] = width;
                 }
             }
         }
     }
 
-    int total_padding = (max_cols * 3) + 1;
-    int available = term_width - total_padding;
+    /* Each line is "  |" and then " cell |" per column: 3 + 3 per column
+       besides the text. The last terminal column stays free too, or a table
+       exactly as wide as the screen autowraps on every line. */
+    int available = term_width - 1 - (3 + max_cols * 3);
     int current_total = 0;
     for (int j = 0; j < max_cols; ++j) current_total += col_widths[j];
-    if (available > 0 && current_total > available && max_cols > 0) {
-        int avg = available / max_cols;
-        if (avg < MARKDOWN_MIN_COL_WIDTH) avg = MARKDOWN_MIN_COL_WIDTH;
-        for (int j = 0; j < max_cols; ++j) {
-            if (col_widths[j] > avg) col_widths[j] = avg;
+    if (current_total > available && max_cols > 0) {
+        /* Fair shares: a column narrower than its share keeps its width and
+           leaves the rest to the wider ones, until every column left is
+           wider than what it gets. Capping each column at the plain average
+           (as before) left the narrow columns' slack unused, and the wide
+           columns wrapped more than the screen required. */
+        bool settled[MARKDOWN_MAX_TABLE_COLS] = {false};
+        int remaining = available;
+        int open = max_cols;
+        bool changed = true;
+        while (changed && open > 0) {
+            changed = false;
+            int share = remaining / open;
+            for (int j = 0; j < max_cols; ++j) {
+                if (!settled[j] && col_widths[j] <= share) {
+                    settled[j] = true;
+                    remaining -= col_widths[j];
+                    open--;
+                    changed = true;
+                }
+            }
+        }
+        if (open > 0) {
+            int share = remaining / open;
+            int extra = remaining % open;
+            /* The usual floor, unless the screen cannot hold it: on a phone
+               a 4-column table at 10 columns each is wider than the screen,
+               and every line of it wraps. Narrower than 4 is unreadable
+               either way, so stop there. */
+            int floor_width = MARKDOWN_MIN_COL_WIDTH;
+            if (available / max_cols < floor_width) {
+                floor_width = available / max_cols;
+            }
+            if (floor_width < 4) {
+                floor_width = 4;
+            }
+            for (int j = 0; j < max_cols; ++j) {
+                if (settled[j]) continue;
+                int width = share + (extra > 0 ? 1 : 0);
+                if (extra > 0) extra--;
+                if (width < floor_width) width = floor_width;
+                if (width < col_widths[j]) col_widths[j] = width;
+            }
         }
     }
 
@@ -9759,8 +9927,15 @@ static void markdownRenderTable(FILE *out, MarkdownTableRow *rows, int row_count
                 int len = (int)strlen(text);
                 int off = offsets[j];
                 if (off < len) {
-                    int take = markdownTableWrapLen(text, width, off);
-                    fprintf(out, " %-*.*s", width, take, text + off);
+                    /* Padded by hand: printf's %-*s counts bytes, and a
+                       UTF-8 cell takes fewer columns than it has bytes. */
+                    int used = 0;
+                    int take = markdownTableWrapLen(text, width, off, &used);
+                    fputc(' ', out);
+                    fwrite(text + off, 1, (size_t)take, out);
+                    for (int k = used; k < width; ++k) {
+                        fputc(' ', out);
+                    }
                     offsets[j] += take;
                     if (offsets[j] < len && text[offsets[j]] == ' ') {
                         offsets[j]++;
@@ -11491,7 +11666,12 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             }
             continue;
         }
-        if (strchr(trimmed, ':') && strchr(trimmed, ';') &&
+        /* A colon and a semicolon is a CSS declaration only in a page that
+           was HTML. In markdown it is ordinary prose or code -- `let x: Int =
+           0;` -- and dropping it lost 63 lines of one guide, among them a
+           table row, which also split the table round it in two. */
+        if (gMarkdownFromHtml &&
+            strchr(trimmed, ':') && strchr(trimmed, ';') &&
             !strstr(trimmed, "http://") && !strstr(trimmed, "https://") &&
             !strstr(trimmed, "](")) {
             if (in_table) {
@@ -11732,12 +11912,7 @@ static int markdownRenderStream(const char *label, FILE *input, FILE *output) {
             continue;
         }
 
-        int pipe_count = 0;
-        for (const char *p = trimmed; *p; ++p) {
-            if (*p == '|') {
-                pipe_count++;
-            }
-        }
+        int pipe_count = markdownCountTablePipes(trimmed);
         if (pipe_count >= 2) {
             if (!in_table) {
                 bool had_paragraph = paragraph_len > 0;
