@@ -22857,6 +22857,10 @@ int smallclueMain(int argc, char **argv) {
             print_usage();
             return 1;
         }
+        if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+            print_usage();
+            return 0;
+        }
         if (markdownIsRemoteTarget(argv[1])) {
             direct_url_target = argv[1];
         }
@@ -22882,8 +22886,9 @@ int smallclueMain(int argc, char **argv) {
         if (suggestion) {
             fprintf(stderr, "Did you mean '%s'?\n", suggestion);
         }
-        fprintf(stderr, "\n");
-        print_usage();
+        /* Not the whole list: a hundred lines of it scroll the error and the
+         * suggestion off the screen. */
+        fprintf(stderr, "Run 'smallclue --help' to see the available applets.\n");
         return 127;
     }
 
