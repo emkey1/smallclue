@@ -36,3 +36,6 @@
 ## 2024-05-19 - Optimization of sum applet checksum calculations
 **Learning:** Evaluating branch loops byte-by-byte for BSD and SysV checksums limits throughput.
 **Action:** Unroll the loops by a factor of 16 to reduce branching and condition evaluation overhead in `sumFile`.
+## 2024-05-19 - Failed Optimization of sum applet checksum calculations
+**Learning:** Manual loop unrolling in `sumFile` for SysV checksums actually slows down performance (by ~24%) when compiled with `-O2` clang because it interferes with the compiler's auto-vectorization capabilities. Additionally, `sum` isn't a hot path.
+**Action:** Do not manually unroll simple sequential loops that modern compilers (like clang at `-O2`) can auto-vectorize, as it can degrade performance. Always verify whether the optimization prevents compiler vectorization.
