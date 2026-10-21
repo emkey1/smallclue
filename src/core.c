@@ -17920,7 +17920,9 @@ done:
     return status;
 }
 
-static int smallclueWgetCommand(int argc, char **argv) {
+/* userpwdBuf holds "user:password" for --user/--password. It belongs to the
+ * caller, which wipes it whichever way the download returns. */
+static int smallclueWgetRun(int argc, char **argv, char *userpwdBuf, size_t userpwdSize) {
     const char *method = NULL;
     char **headers = NULL;
     int headerCount = 0, headerCap = 0;
@@ -17940,8 +17942,6 @@ static int smallclueWgetCommand(int argc, char **argv) {
     long connectTimeout = 0, readTimeout = 0;
     int tries = 1;
     long waitRetry = 10;
-    char userpwdBuf[512];
-    userpwdBuf[0] = '\0';
 
     /* Real wget has no short forms for these, only --header=/--post-data=/
      * --method=/--user=/--password=/--no-check-certificate (repeated GNU
@@ -18064,7 +18064,7 @@ static int smallclueWgetCommand(int argc, char **argv) {
         args[nargs++] = argv[i];
     }
     if (wgetUser) {
-        snprintf(userpwdBuf, sizeof(userpwdBuf), "%s:%s", wgetUser, wgetPassword ? wgetPassword : "");
+        snprintf(userpwdBuf, userpwdSize, "%s:%s", wgetUser, wgetPassword ? wgetPassword : "");
     }
 
     smallclueResetGetopt();
@@ -18272,6 +18272,14 @@ static int smallclueWgetCommand(int argc, char **argv) {
     free(headers);
     free(postData);
     free(args);
+    return status;
+}
+
+static int smallclueWgetCommand(int argc, char **argv) {
+    char userpwdBuf[512];
+    userpwdBuf[0] = '\0';
+    int status = smallclueWgetRun(argc, argv, userpwdBuf, sizeof(userpwdBuf));
+    smallclueSecureMemzero(userpwdBuf, sizeof(userpwdBuf));
     return status;
 }
 

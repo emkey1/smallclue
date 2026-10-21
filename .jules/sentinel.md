@@ -45,3 +45,8 @@
 **Vulnerability:** The password wiping logic used `smallclueSecureMemzero(pass, strlen(pass))`, which zeros out the password characters but leaves the null terminator byte untouched on the heap before the buffer is freed.
 **Learning:** While zeroing the characters removes the secret, leaving the null terminator untouched can theoretically lead to a 1-byte heap disclosure or hint at string lengths, and it violates the best practice of clearing the entire allocated buffer for sensitive data.
 **Prevention:** Always zero out at least `strlen(pass) + 1` bytes for dynamically allocated strings to ensure no remnants, including terminators, remain on the heap.
+
+## 2026-10-21 - [wget credentials left on the stack]
+**Vulnerability:** `wget --user/--password` formatted `user:password` into a stack buffer that was never wiped, on any of the function's dozen return paths. Filed by Sentinel almost daily (#296 and 16 duplicates).
+**Learning:** Zeroing before each `return` is easy to get wrong as returns are added; the bot's own patches each missed a different subset.
+**Prevention:** `smallclueWgetCommand` now owns the buffer and wipes it after `smallclueWgetRun` returns, so every path is covered by construction. Hold a secret in the caller and wipe it once, rather than at each exit.
