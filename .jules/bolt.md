@@ -36,3 +36,6 @@
 ## 2025-05-19 - wc wide character processing optimization
 **Learning:** Hot file-processing loops in C (like the 16KB block processing in `smallclueWcProcessFileWide`) should avoid dynamic heap allocations (`malloc`/`free`) per iteration. Using fixed-size stack arrays for bounded multi-byte character processing buffers and loop unrolling can eliminate memory management and branching overhead, drastically improving throughput.
 **Action:** Always prefer fixed-size stack allocations over dynamic heap allocations inside hot loops for bounded data structures. Look for loop unrolling opportunities in critical paths.
+## 2025-05-19 - wc wide character processing unrolling rejection
+**Learning:** In the wide character processing path of `wc` (`smallclueWcProcessFileWide`), the time is predominantly spent in `mbrtowc`. Unrolling the initial byte scanning loop provides no measurable performance gain and adds unnecessary complexity.
+**Action:** Do not manually unroll loops when the primary bottleneck lies in a heavy function call (like character decoding) inside a subsequent loop. Focus optimization efforts on the actual bottleneck or accept that the current path is heavily constrained by system library performance.
