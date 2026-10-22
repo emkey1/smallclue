@@ -29,3 +29,7 @@
 ## YYYY-MM-DD - Dynamic Full-Width Inverse Video Headers
 **Learning:** Hardcoded inverse video headers in fullscreen applets do not stretch across the terminal, resulting in jagged resizing and poor visual hierarchy.
 **Action:** Always dynamically build header strings using `snprintf`, measure their length, calculate the remaining width via `pscalRuntimeDetectWindowCols()`, and append space padding so the inverse video highlight stretches cleanly across the terminal row.
+
+## YYYY-MM-DD - TUI Menu Inverse Video Highlights
+**Learning:** Terminal User Interfaces (TUIs) that use inverse video (`\x1b[7m`) to highlight selected rows or headers can look jagged and unfinished if the background highlight ends abruptly at the string boundary instead of extending fully to the edge of the terminal.
+**Action:** Always dynamically pad TUI highlighted strings to the terminal width using `pscalRuntimeDetectWindowCols()` and the formatting string `%*s` to append remaining spaces, ensuring consistent full-width highlight bars.

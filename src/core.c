@@ -12412,11 +12412,15 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
         if (colour) {
             fputs("\x1b[7m", out);
         }
-        if (cols > 0 && (int)strlen(header) > cols) {
+        int raw_len = (int)strlen(header);
+        if (cols > 0 && raw_len > cols) {
             if (cols <= 3) { fwrite(header, 1, (size_t)cols, out); }
             else { fwrite(header, 1, (size_t)(cols - 3), out); fputs("...", out); }
         } else {
             fprintf(out, "%s", header);
+            if (colour && cols > raw_len) {
+                fprintf(out, "%*s", cols - raw_len, "");
+            }
         }
         if (colour) {
             fputs("\x1b[0m", out);
@@ -12437,7 +12441,8 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
             const char *marker = colour ? "" : (active ? "> " : "  ");
             snprintf(line, sizeof(line), "%s%3zu. %s (%s)", marker, i + 1, text, target);
             if (active && colour) fputs("\x1b[7m", out);
-            if (cols > 0 && (int)strlen(line) > cols) {
+            int raw_line_len = (int)strlen(line);
+            if (cols > 0 && raw_line_len > cols) {
                 if (cols > 3) {
                     fwrite(line, 1, (size_t)(cols - 3), out);
                     fputs("...", out);
@@ -12446,7 +12451,11 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
                 }
                 fputc('\n', out);
             } else {
-                fprintf(out, "%s\n", line);
+                fprintf(out, "%s", line);
+                if (active && colour && cols > raw_line_len) {
+                    fprintf(out, "%*s", cols - raw_line_len, "");
+                }
+                fputc('\n', out);
             }
             if (active && colour) fputs("\x1b[0m", out);
         }
@@ -12836,7 +12845,8 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
     if (colour) {
         fputs("\x1b[7m", out);
     }
-    if (term_cols > 0 && (int)strlen(header) > term_cols) {
+    int raw_len = (int)strlen(header);
+    if (term_cols > 0 && raw_len > term_cols) {
         if (term_cols <= 3) {
             fwrite(header, 1, (size_t)term_cols, out);
         } else {
@@ -12845,6 +12855,9 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
         }
     } else {
         fprintf(out, "%s", header);
+        if (colour && term_cols > raw_len) {
+            fprintf(out, "%*s", term_cols - raw_len, "");
+        }
     }
     if (colour) {
         fputs("\x1b[0m", out);
@@ -12866,7 +12879,8 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
         if (highlight && colour) {
             fputs("\x1b[7m", out);
         }
-        if (term_cols > 0 && (int)strlen(line) > term_cols) {
+        int raw_line_len = (int)strlen(line);
+        if (term_cols > 0 && raw_line_len > term_cols) {
             if (term_cols <= 3) {
                 fwrite(line, 1, (size_t)term_cols, out);
             } else {
@@ -12875,7 +12889,11 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
             }
             fputc('\n', out);
         } else {
-            fprintf(out, "%s\n", line);
+            fprintf(out, "%s", line);
+            if (highlight && colour && term_cols > raw_line_len) {
+                fprintf(out, "%*s", term_cols - raw_line_len, "");
+            }
+            fputc('\n', out);
         }
         if (highlight && colour) {
             fputs("\x1b[0m", out);
