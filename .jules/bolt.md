@@ -33,3 +33,7 @@
 ## YYYY-MM-DD - Optimize cmp applet via block reads
 **Learning:** For utilities like `cmp` that compare inputs byte-by-byte, using `fgetc` introduces substantial function-call and buffering overhead. Profiling shows that reading data in 16KB blocks directly into stack arrays dramatically speeds up byte processing.
 **Action:** Replace `fgetc` with standard `fread` and stack buffers in high-throughput byte-comparison loops like `cmp` to minimize stdio execution overhead.
+
+## YYYY-MM-DD - Optimize sum applet checksum loops
+**Learning:** For file checksum algorithms like `sum`, processing bytes individually within a tight hot loop using single iterations imposes substantial branch evaluation overhead.
+**Action:** Unroll loops that iterate character by character when performing byte stream parsing or mathematical sequence operations. Used a 16-unroll factor for the `sysv` and `bsd` algorithms in `sumFile` within `src/sum_app.c`.

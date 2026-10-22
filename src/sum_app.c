@@ -25,9 +25,27 @@ static bool sumFile(FILE *f, bool sysv, unsigned *checksum, unsigned long long *
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
         if (sysv) {
-            for (size_t i = 0; i < n; i++) s += buf[i];
+            size_t i = 0;
+            while (i + 15 < n) {
+                s += buf[i+0] + buf[i+1] + buf[i+2] + buf[i+3] +
+                     buf[i+4] + buf[i+5] + buf[i+6] + buf[i+7] +
+                     buf[i+8] + buf[i+9] + buf[i+10] + buf[i+11] +
+                     buf[i+12] + buf[i+13] + buf[i+14] + buf[i+15];
+                i += 16;
+            }
+            for (; i < n; i++) s += buf[i];
         } else {
-            for (size_t i = 0; i < n; i++) {
+            size_t i = 0;
+            while (i + 15 < n) {
+                #define BSD_SUM(v) s = (s >> 1) | ((s & 1) << 15); s = (s + (v)) & 0xffff;
+                BSD_SUM(buf[i+0]); BSD_SUM(buf[i+1]); BSD_SUM(buf[i+2]); BSD_SUM(buf[i+3]);
+                BSD_SUM(buf[i+4]); BSD_SUM(buf[i+5]); BSD_SUM(buf[i+6]); BSD_SUM(buf[i+7]);
+                BSD_SUM(buf[i+8]); BSD_SUM(buf[i+9]); BSD_SUM(buf[i+10]); BSD_SUM(buf[i+11]);
+                BSD_SUM(buf[i+12]); BSD_SUM(buf[i+13]); BSD_SUM(buf[i+14]); BSD_SUM(buf[i+15]);
+                #undef BSD_SUM
+                i += 16;
+            }
+            for (; i < n; i++) {
                 s = (s >> 1) | ((s & 1) << 15);
                 s = (s + buf[i]) & 0xffff;
             }
