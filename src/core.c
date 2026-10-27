@@ -6945,7 +6945,7 @@ static int pagerPromptAndRead(const char *cmd_name, const char *detail) {
     int used = 0;
     size_t fit = pagerFitColumns(prompt, cols - 1, &used);
     if (color) {
-        fprintf(stdout, "\r\033[7m%.*s%*s\033[0m", (int)fit, prompt, cols - used, "");
+        fprintf(stdout, "\r\033[7m%.*s%*s\033[0m", (int)fit, prompt, cols - used - 1, "");
     } else {
         fprintf(stdout, "\r%.*s ", (int)fit, prompt);
     }
