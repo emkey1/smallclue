@@ -102,6 +102,7 @@
 #include <libgen.h>
 #include <locale.h>
 #include <wchar.h>
+#include <wctype.h>
 #include <pwd.h>
 #if defined(__linux__) || defined(linux) || defined(__linux)
 #include <shadow.h>
@@ -19799,6 +19800,10 @@ static int smallclueWcProcessFileFast(const char *path, FILE *fp, SmallclueWcCou
     char buf[16384];
     ssize_t n;
 
+    static const unsigned char is_space_lookup[256] = {
+        [' '] = 1, ['\t'] = 1, ['\n'] = 1, ['\v'] = 1, ['\f'] = 1, ['\r'] = 1
+    };
+
     while ((n = smallclueReadStream(fp, buf, sizeof(buf), &read_err)) > 0) {
         bytes += (uint64_t)n;
         ssize_t i = 0;
@@ -19806,7 +19811,7 @@ static int smallclueWcProcessFileFast(const char *path, FILE *fp, SmallclueWcCou
         #define PROCESS_CHAR(idx) do { \
             unsigned char c = (unsigned char)buf[idx]; \
             lines += (c == '\n'); \
-            if ((c == ' ') || (c >= '\t' && c <= '\r')) { \
+            if (is_space_lookup[c]) { \
                 in_word = 0; \
             } else if (!in_word) { \
                 words++; \
@@ -19835,13 +19840,9 @@ static int smallclueWcProcessFileFast(const char *path, FILE *fp, SmallclueWcCou
         #undef PROCESS_CHAR
         for (; i < n; ++i) {
             unsigned char c = (unsigned char)buf[i];
-            if (c == '\n') {
-                lines++;
-            }
+            lines += (c == '\n');
 
-            /* Bolt optimization: inline space check instead of isspace() to avoid function call overhead */
-            int is_sp = (c == ' ') || (c >= '\t' && c <= '\r');
-            if (is_sp) {
+            if (is_space_lookup[c]) {
                 in_word = 0;
             } else if (!in_word) {
                 words++;
@@ -19883,20 +19884,6 @@ static int smallclueWcProcessFileWide(const char *path, FILE *fp, SmallclueWcCou
     while ((n = smallclueReadStream(fp, buf, sizeof(buf), &read_err)) > 0) {
         bytes += (uint64_t)n;
 
-        for (int i = 0; i < n; ++i) {
-            unsigned char c = (unsigned char)buf[i];
-            if (c == '\n') {
-                lines++;
-            }
-            int is_sp = (c == ' ') || (c >= '\t' && c <= '\r');
-            if (is_sp) {
-                in_word = 0;
-            } else if (!in_word) {
-                words++;
-                in_word = 1;
-            }
-        }
-
         /* Character decode: work off a carry buffer so a multibyte
          * sequence split across two reads still decodes correctly. */
         size_t avail = carryLen + (size_t)n;
@@ -19937,12 +19924,20 @@ static int smallclueWcProcessFileWide(const char *path, FILE *fp, SmallclueWcCou
             if (rc == 0) rc = 1; /* embedded NUL still counts as a character */
             chars++;
             if (wc == L'\n') {
+                lines++;
                 if (cur_line_length > max_line_length) max_line_length = cur_line_length;
                 cur_line_length = 0;
             } else if (wc == L'\t') {
                 cur_line_length = (cur_line_length / 8 + 1) * 8;
             } else {
                 cur_line_length++;
+            }
+
+            if (iswspace(wc)) {
+                in_word = 0;
+            } else if (!in_word) {
+                words++;
+                in_word = 1;
             }
             pos += rc;
             carryLen = 0;
