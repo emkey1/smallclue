@@ -1,0 +1,3 @@
+## YYYY-MM-DD - Branchless word counting and space lookup in wc
+**Learning:** In C applications, manual compound boolean checks for character classes (like whitespace) in hot processing loops are significantly slower due to branching overhead. Replacing them with a static 256-element boolean lookup array (e.g., `is_space_lookup[256]`) eliminates branching. Furthermore, state machine transitions like counting words based on an `in_word` flag can be converted to branchless arithmetic: `words += (!in_word && !is_sp); in_word = !is_sp;`.
+**Action:** In hot C processing loops, replace compound boolean checks with static boolean lookup arrays, cast the index to `unsigned char`, and replace state machine branches with boolean arithmetic where possible to maximize throughput.
