@@ -19799,19 +19799,21 @@ static int smallclueWcProcessFileFast(const char *path, FILE *fp, SmallclueWcCou
     char buf[16384];
     ssize_t n;
 
+    static const unsigned char is_space_lookup[256] = {
+        [' '] = 1, ['\t'] = 1, ['\n'] = 1,
+        ['\v'] = 1, ['\f'] = 1, ['\r'] = 1
+    };
+
     while ((n = smallclueReadStream(fp, buf, sizeof(buf), &read_err)) > 0) {
         bytes += (uint64_t)n;
         ssize_t i = 0;
-        /* Bolt optimization: loop unrolling for wc */
+        /* Bolt optimization: loop unrolling and branchless lookups for wc */
         #define PROCESS_CHAR(idx) do { \
             unsigned char c = (unsigned char)buf[idx]; \
             lines += (c == '\n'); \
-            if ((c == ' ') || (c >= '\t' && c <= '\r')) { \
-                in_word = 0; \
-            } else if (!in_word) { \
-                words++; \
-                in_word = 1; \
-            } \
+            unsigned char is_sp = is_space_lookup[c]; \
+            words += (!in_word && !is_sp); \
+            in_word = !is_sp; \
         } while (0)
 
         for (; i + 15 < n; i += 16) {
@@ -19835,18 +19837,10 @@ static int smallclueWcProcessFileFast(const char *path, FILE *fp, SmallclueWcCou
         #undef PROCESS_CHAR
         for (; i < n; ++i) {
             unsigned char c = (unsigned char)buf[i];
-            if (c == '\n') {
-                lines++;
-            }
-
-            /* Bolt optimization: inline space check instead of isspace() to avoid function call overhead */
-            int is_sp = (c == ' ') || (c >= '\t' && c <= '\r');
-            if (is_sp) {
-                in_word = 0;
-            } else if (!in_word) {
-                words++;
-                in_word = 1;
-            }
+            lines += (c == '\n');
+            unsigned char is_sp = is_space_lookup[c];
+            words += (!in_word && !is_sp);
+            in_word = !is_sp;
         }
     }
 
