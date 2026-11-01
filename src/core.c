@@ -18831,6 +18831,55 @@ bool smallclueAppResolveExec(const char *name, char *resolved, size_t size) {
     return smallclueResolveCommandPathForExec(name, resolved, size);
 }
 
+#if defined(PSCAL_TARGET_IOS)
+/* One stream per thread, so pipeline stages do not share read-ahead. */
+static pthread_key_t gAppStdinKey;
+static pthread_once_t gAppStdinKeyOnce = PTHREAD_ONCE_INIT;
+
+static void smallclueAppStdinRelease(void *stream) {
+    fclose((FILE *)stream);
+}
+
+static void smallclueAppStdinKeyInit(void) {
+    pthread_key_create(&gAppStdinKey, smallclueAppStdinRelease);
+}
+
+static int smallclueAppStdinRead(void *cookie, char *buf, int size) {
+    (void)cookie;
+    return (int)read(STDIN_FILENO, buf, (size_t)size);
+}
+
+FILE *smallclueAppStdin(void) {
+    pthread_once(&gAppStdinKeyOnce, smallclueAppStdinKeyInit);
+    FILE *stream = (FILE *)pthread_getspecific(gAppStdinKey);
+    if (!stream) {
+        stream = funopen(NULL, smallclueAppStdinRead, NULL, NULL, NULL);
+        if (!stream) {
+            return __stdinp;
+        }
+        pthread_setspecific(gAppStdinKey, stream);
+    }
+    return stream;
+}
+
+int smallclueAppFileno(FILE *stream) {
+    if (stream == smallclueAppStdin()) {
+        return STDIN_FILENO;
+    }
+    return vprocFilenoShim(stream);
+}
+
+/* An applet on this thread starts clean: no end-of-file left by the last one,
+ * and, unless it was called by another applet, none of that one's read-ahead. */
+static void smallclueAppStdinReset(bool nested) {
+    FILE *stream = smallclueAppStdin();
+    clearerr(stream);
+    if (!nested) {
+        fpurge(stream);
+    }
+}
+#endif
+
 void smallclueAppClearEnv(void) {
     smallclueEnvClearAll();
 }
@@ -22957,7 +23006,16 @@ int smallclueDispatchApplet(const SmallclueApplet *applet, int argc, char **argv
         return 127;
     }
     optind = 1;
+#if defined(PSCAL_TARGET_IOS)
+    static _Thread_local int dispatchDepth = 0;
+    smallclueAppStdinReset(dispatchDepth > 0);
+    dispatchDepth++;
+    int appletStatus = applet->entry(argc, argv);
+    dispatchDepth--;
+    return appletStatus;
+#else
     return applet->entry(argc, argv);
+#endif
 }
 
 static void smallclueRedirectFromEnv(void) {
