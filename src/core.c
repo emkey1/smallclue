@@ -820,6 +820,8 @@ static int smallclueRunShebangTool(const char *path, char *const *argv) {
  #else
         status = entry((int)total_args, tool_argv);
  #endif
+        /* No process exit follows to flush the frontend's buffered output. */
+        fflush(NULL);
     } else {
         fprintf(stderr, "%s: out of memory launching tool runner\n", tool_name);
     }
@@ -6538,12 +6540,13 @@ static FILE *smallclueOpenTempFile(const char *tag) {
     }
     int tracked_fd = vprocHostDup(fd);
     if (tracked_fd >= 0) {
-        close(fd);
+        /* close() is the slot shim, and this is a host descriptor. */
+        vprocHostClose(fd);
         fd = tracked_fd;
     }
     FILE *fp = fdopen(fd, "w+b");
     if (!fp) {
-        close(fd);
+        vprocHostClose(fd);
         unlink(tmpl);
         return NULL;
     }
@@ -6620,13 +6623,17 @@ static int pagerBufferOpen(const char *cmd_name, const char *path, FILE *stream,
      */
     int tracked_fd = vprocHostDup(fd);
     if (tracked_fd >= 0) {
-        close(fd);
+        vprocHostClose(fd);
         fd = tracked_fd;
     }
 #endif
     FILE *fp = fdopen(fd, "w+b");
     if (!fp) {
+#if defined(PSCAL_TARGET_IOS)
+        vprocHostClose(fd);
+#else
         close(fd);
+#endif
         unlink(tmpl);
         fprintf(stderr, "%s: failed to open pager storage: %s\n",
                 pager_command_name(cmd_name), strerror(errno));
