@@ -266,15 +266,16 @@ static int vprocTestDupFd(int fd) {
     if (fd < 0) {
         return -1;
     }
-    int duped = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    /* A host descriptor, from the session or vprocHostPipe. */
+    int duped = (fcntl)(fd, F_DUPFD_CLOEXEC, 0);
     if (duped < 0 && errno == EINVAL) {
-        duped = fcntl(fd, F_DUPFD, 0);
+        duped = (fcntl)(fd, F_DUPFD, 0);
     }
     if (duped < 0) {
         duped = vprocHostDup(fd);
     }
     if (duped >= 0) {
-        fcntl(duped, F_SETFD, FD_CLOEXEC);
+        (fcntl)(duped, F_SETFD, FD_CLOEXEC);
     }
     return duped;
 }

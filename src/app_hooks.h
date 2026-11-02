@@ -36,9 +36,13 @@ void smallclueAppClearEnv(void);
  * host's, sees nothing: applets read through smallclueAppStdin. read, fstat, lseek
  * and dup are vproc shims that take table slots, while a stream from
  * smallclueAppOpenRead or fopen holds a host descriptor: fileno marks it as one.
- * ftruncate, futimens and fchdir have no shim of their own elsewhere: a raw call
- * would reach whichever host descriptor has the slot's number. */
+ * ftruncate, futimens, fchdir, fcntl, pread and pwrite have no shim of their own
+ * elsewhere: a raw call would reach whichever host descriptor has the slot's number.
+ * A number from vprocHostPipe or vprocHostOpen is a host descriptor, not a slot, so
+ * it goes to the host's: (fcntl)(fd, ...). */
 #if defined(PSCAL_TARGET_IOS) && !defined(VPROC_SHIM_DISABLED)
+#include <fcntl.h>
+#include <unistd.h>
 #include "common/path_virtualization.h"
 FILE *smallclueAppStdin(void);
 int smallclueAppFileno(FILE *stream);
@@ -52,6 +56,12 @@ int smallclueAppFileno(FILE *stream);
 #define futimens(fd, times) vprocFutimensShim((fd), (times))
 #undef fchdir
 #define fchdir(fd) vprocFchdirShim((fd))
+#undef fcntl
+#define fcntl(fd, ...) vprocFcntlShim((fd), __VA_ARGS__)
+#undef pread
+#define pread(fd, buf, count, offset) vprocPreadShim((fd), (buf), (count), (offset))
+#undef pwrite
+#define pwrite(fd, buf, count, offset) vprocPwriteShim((fd), (buf), (count), (offset))
 #endif
 
 #endif /* SMALLCLUE_APP_HOOKS_H */

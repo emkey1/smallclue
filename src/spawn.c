@@ -1,5 +1,7 @@
 #include "spawn.h"
 
+#include "app_hooks.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>

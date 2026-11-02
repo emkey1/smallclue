@@ -1227,10 +1227,11 @@ static bool microHostStdioBridgeSetup(MicroHostStdioBridge *bridge,
         bridge->stdin_pipe_write = in_pipe[1];
         bridge->output_pipe_read = out_pipe[0];
         bridge->output_pipe_write = out_pipe[1];
-        fcntl(bridge->stdin_pipe_read, F_SETFD, FD_CLOEXEC);
-        fcntl(bridge->stdin_pipe_write, F_SETFD, FD_CLOEXEC);
-        fcntl(bridge->output_pipe_read, F_SETFD, FD_CLOEXEC);
-        fcntl(bridge->output_pipe_write, F_SETFD, FD_CLOEXEC);
+        /* vprocHostPipe gives host descriptors, not slots. */
+        (fcntl)(bridge->stdin_pipe_read, F_SETFD, FD_CLOEXEC);
+        (fcntl)(bridge->stdin_pipe_write, F_SETFD, FD_CLOEXEC);
+        (fcntl)(bridge->output_pipe_read, F_SETFD, FD_CLOEXEC);
+        (fcntl)(bridge->output_pipe_write, F_SETFD, FD_CLOEXEC);
     }
 
     if (bridge->pty_use_shim) {
