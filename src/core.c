@@ -18864,6 +18864,7 @@ FILE *smallclueAppStdin(void) {
         if (!stream) {
             return __stdinp;
         }
+        vprocStreamSkipFlushAll(stream);
         pthread_setspecific(gAppStdinKey, stream);
     }
     return stream;
