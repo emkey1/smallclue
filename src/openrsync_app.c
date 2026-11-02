@@ -8,6 +8,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+#if defined(PSCAL_TARGET_IOS)
+#include <poll.h>
+#include "ios/vproc.h"
+#endif
 
 int pscal_openrsync_main(int argc, char **argv);
 
@@ -74,7 +80,8 @@ _Noreturn void pscal_openrsync_request_exit(int code) {
         g_openrsync_exit_ctx->exit_code = code;
         siglongjmp(g_openrsync_exit_ctx->env, 1);
     }
-    _Exit(code);
+    /* In the app this ends the thread; _Exit would end every terminal session. */
+    exit(code);
 }
 
 _Noreturn void pscal_openrsync_err(int eval, const char *fmt, ...) {
@@ -124,6 +131,41 @@ void pscal_openrsync_warnx(const char *fmt, ...) {
     va_end(ap);
 }
 
+#if defined(PSCAL_TARGET_IOS)
+/*
+ * With pscal_ios_shim.h a file openrsync opens is a host descriptor, while its
+ * socket to the other end is a vproc slot, and vprocPollShim calls the former
+ * invalid. A file never blocks, so it is ready and the slots get no wait.
+ */
+int pscal_openrsync_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
+    VProc *vp = vprocCurrent();
+    int saved[8];
+    if (nfds > sizeof(saved) / sizeof(saved[0])) {
+        errno = EINVAL;
+        return -1;
+    }
+    int files = 0;
+    for (nfds_t i = 0; i < nfds; ++i) {
+        saved[i] = fds[i].fd;
+        if (fds[i].fd >= 0 && vprocTranslateFd(vp, fds[i].fd) < 0) {
+            fds[i].fd = -1;
+            files++;
+        }
+    }
+    int ready = poll(fds, nfds, files > 0 ? 0 : timeout);
+    for (nfds_t i = 0; i < nfds; ++i) {
+        if (saved[i] != fds[i].fd) {
+            fds[i].fd = saved[i];
+            if (ready >= 0) {
+                fds[i].revents = fds[i].events;
+                ready++;
+            }
+        }
+    }
+    return ready;
+}
+#endif
+
 int smallclueRunRsync(int argc, char **argv) {
     OpenrsyncExitContext ctx;
     const char *prior_progname = g_openrsync_progname;
@@ -140,6 +182,9 @@ int smallclueRunRsync(int argc, char **argv) {
 
     int status = 1;
     if (sigsetjmp(ctx.env, 1) == 0) {
+        /* A local transfer's server gets here past the applet dispatcher. Zero is
+         * what every libc's getopt takes as "start over". */
+        optind = 0;
         status = pscal_openrsync_main(argc, argv);
     } else {
         status = ctx.exit_code;

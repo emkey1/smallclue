@@ -125,8 +125,18 @@
 #ifdef pthread_create
 #undef pthread_create
 #endif
+#ifdef lseek
+#undef lseek
+#endif
+#ifdef poll
+#undef poll
+#endif
 
 #include "pscal_ios_shim.h"
+
+#include <poll.h>
+int pscal_openrsync_poll(struct pollfd *fds, nfds_t nfds, int timeout);
+#define poll(fds, nfds, timeout) pscal_openrsync_poll((fds), (nfds), (timeout))
 #endif /* PSCAL_TARGET_IOS */
 
 #endif /* SMALLCLUE_OPENRSYNC_IOS_SHIM_H */
