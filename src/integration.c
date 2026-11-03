@@ -64,6 +64,17 @@ extern void shellRuntimeSetLastStatus(int status) __attribute__((weak));
 void shellRuntimeSetLastStatus(int status);
 #endif
 
+#if defined(PSCAL_TARGET_IOS)
+/* An applet is a program: it reads what the shell would have passed to one. */
+#if defined(__APPLE__)
+extern void *shellRuntimeProgramEnvEnter(void) __attribute__((weak_import));
+extern void shellRuntimeProgramEnvLeave(void *scope) __attribute__((weak_import));
+#else
+extern void *shellRuntimeProgramEnvEnter(void) __attribute__((weak));
+extern void shellRuntimeProgramEnvLeave(void *scope) __attribute__((weak));
+#endif
+#endif
+
 static char *smallclueDuplicateArg(const Value *value) {
     if (!value) {
         return strdup("");
@@ -223,6 +234,7 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
             cooperative_stop_guard = true;
         }
 
+        void *program_env = shellRuntimeProgramEnvEnter ? shellRuntimeProgramEnvEnter() : NULL;
         jmp_buf exit_env;
         volatile int exit_status_sink = 0;
         bool override_active = false;
@@ -246,6 +258,9 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
         status = smallclueDispatchApplet(applet, argc, argv);
 #if defined(PSCAL_TARGET_IOS)
 smallclue_dispatch_done:
+        if (shellRuntimeProgramEnvLeave) {
+            shellRuntimeProgramEnvLeave(program_env);
+        }
         if (vproc_scope_active) {
             vprocCommandScopeEnd(&vproc_scope, status);
             vproc_scope_active = false;

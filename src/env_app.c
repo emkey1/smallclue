@@ -493,6 +493,12 @@ int smallclueEnvCommand(int argc, char **argv) {
             for (int i = 0; cmd[i]; i++) envDev(&e, "   arg[%d]= %s\n", i, envQuote(cmd[i], q, sizeof(q)));
         }
         fflush(stdout);
+        /* Where an applet cannot be spawned it is a call, under what was set above. */
+        {
+            int cmd_argc = 0;
+            while (cmd[cmd_argc]) cmd_argc++;
+            if (smallclueAppRunInProcess(cmd_argc, cmd, &status)) goto done;
+        }
         char resolved[PATH_MAX];
         if (smallclueAppResolveExec(cmd[0], resolved, sizeof(resolved))) execv(resolved, cmd);
         execvp(cmd[0], cmd);
