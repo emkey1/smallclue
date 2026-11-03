@@ -7,6 +7,9 @@
 #include <stddef.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(PSCAL_TARGET_IOS)
+#include "ios/vproc.h"
+#endif
 
 /* A platform without fork() supplies its own implementation and defines
  * SMALLCLUE_PLATFORM_SPAWN. iSH-AOK does this: a child there is a real guest
@@ -23,6 +26,19 @@ pid_t smallclueSpawn(const SmallclueSpawnRequest *request) {
 
 #ifdef SMALLCLUE_PLATFORM_SPAWN
     return smallcluePlatformSpawn(request);
+#elif defined(PSCAL_TARGET_IOS) && !defined(VPROC_SHIM_DISABLED)
+    /* The app is one process, and a real fork would leave the shim's waitpid with no
+     * child it knows. A child is a thread with a vproc of its own instead, which the
+     * shim's waitpid and kill treat as any other. There is no exec to fail in the child,
+     * so a name that cannot run is reported here. */
+    errno = ENOENT;
+    for (size_t i = 0; i < request->attempt_count; i++) {
+        const SmallclueSpawnAttempt *a = &request->attempts[i];
+        if (a->file == NULL || a->argv == NULL || !smallclueAppCanRun(a->file))
+            continue;
+        return vprocSpawnEntry(a->file, !request->setpgid_self, smallclueAppChildMain, a->argv);
+    }
+    return -1;
 #else
     /* Close-on-exec pipe: the child writes its errno into it only if every
      * exec fails, so a successful exec closes it empty and the parent can tell

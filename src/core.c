@@ -6403,6 +6403,20 @@ static bool smallclueTimeoutParseDuration(const char *s, double *out) {
  * waitpid(WNOHANG) rather than relying on SIGALRM/itimers, matching the
  * simple portable style used elsewhere in this file (e.g. init's reap
  * loop) instead of adding signal-handler state. */
+static int smallclueTimeoutSignal(pid_t child, int sig) {
+#if defined(PSCAL_TARGET_IOS)
+    return vprocKillTree(child, sig);
+#else
+    return kill(-child, sig);
+#endif
+}
+
+#if defined(PSCAL_TARGET_IOS)
+static void smallclueTimeoutCancelled(void *child) {
+    smallclueTimeoutSignal(*(pid_t *)child, SIGKILL);
+}
+#endif
+
 static int smallclueTimeoutCommand(int argc, char **argv) {
     int signalToSend = SIGTERM;
     double killAfter = 0.0;
@@ -6473,13 +6487,29 @@ static int smallclueTimeoutCommand(int argc, char **argv) {
     char **cmdArgv = &argv[argi];
 
     SmallclueSpawnAttempt timeoutAttempt = { cmdArgv[0], cmdArgv, 1 };
+#if defined(PSCAL_TARGET_IOS)
+    /* The command stays in timeout's process group: there it can read the terminal and
+     * Ctrl-C reaches it. A group of its own would not reach any further here, because what
+     * a shell runs has groups of its own anyway, so the signal goes down the task tree. */
+    SmallclueSpawnRequest timeoutRequest = { &timeoutAttempt, 1, 0 };
+#else
     SmallclueSpawnRequest timeoutRequest = { &timeoutAttempt, 1, 1 };
+#endif
     pid_t pid = smallclueSpawn(&timeoutRequest);
     if (pid < 0) {
-        fprintf(stderr, "timeout: %s: %s\n", cmdArgv[0], strerror(errno));
+        int spawnError = errno;
+        fprintf(stderr, "timeout: %s: %s\n", cmdArgv[0], strerror(spawnError));
+        /* A fork that fails is timeout's own failure. In the app the spawn also looks the
+         * command up, which a host's child reports with these statuses from its exec. */
+#if defined(PSCAL_TARGET_IOS)
+        return spawnError == ENOENT ? 127 : 126;
+#else
         return 125;
+#endif
     }
+#if !defined(PSCAL_TARGET_IOS)
     setpgid(pid, pid);
+#endif
 
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -6487,31 +6517,44 @@ static int smallclueTimeoutCommand(int argc, char **argv) {
     bool killSent = false;
     struct timespec signalSentAt = {0, 0};
     int status = 0;
+    int waitError = 0;
+#if defined(PSCAL_TARGET_IOS)
+    /* A kill cancels this thread, and the command must not outlive it. */
+    pthread_cleanup_push(smallclueTimeoutCancelled, &pid);
+#endif
     for (;;) {
         pid_t r = waitpid(pid, &status, WNOHANG);
         if (r == pid) break;
         if (r < 0 && errno != EINTR) {
-            fprintf(stderr, "timeout: waitpid: %s\n", strerror(errno));
-            return 125;
+            waitError = errno;
+            break;
         }
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         double elapsed = (double)(now.tv_sec - start.tv_sec) +
                           (double)(now.tv_nsec - start.tv_nsec) / 1e9;
-        if (!timedOut && elapsed >= duration) {
-            kill(-pid, signalToSend);
+        /* A duration of 0 means no limit. */
+        if (!timedOut && duration > 0.0 && elapsed >= duration) {
+            smallclueTimeoutSignal(pid, signalToSend);
             timedOut = true;
             signalSentAt = now;
         } else if (timedOut && killAfter > 0.0 && !killSent) {
             double sinceSignal = (double)(now.tv_sec - signalSentAt.tv_sec) +
                                    (double)(now.tv_nsec - signalSentAt.tv_nsec) / 1e9;
             if (sinceSignal >= killAfter) {
-                kill(-pid, SIGKILL);
+                smallclueTimeoutSignal(pid, SIGKILL);
                 killSent = true;
             }
         }
         struct timespec pollInterval = {0, 20 * 1000 * 1000};
         nanosleep(&pollInterval, NULL);
+    }
+#if defined(PSCAL_TARGET_IOS)
+    pthread_cleanup_pop(0);
+#endif
+    if (waitError != 0) {
+        fprintf(stderr, "timeout: waitpid: %s\n", strerror(waitError));
+        return 125;
     }
 
     if (timedOut) {
