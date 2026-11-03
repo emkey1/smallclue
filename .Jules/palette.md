@@ -29,3 +29,6 @@
 ## YYYY-MM-DD - Dynamic Full-Width Inverse Video Headers
 **Learning:** Hardcoded inverse video headers in fullscreen applets do not stretch across the terminal, resulting in jagged resizing and poor visual hierarchy.
 **Action:** Always dynamically build header strings using `snprintf`, measure their length, calculate the remaining width via `pscalRuntimeDetectWindowCols()`, and append space padding so the inverse video highlight stretches cleanly across the terminal row.
+## YYYY-MM-DD - Full-Width Highlight for Pager Active Items
+**Learning:** Terminal pager list items (like selected Markdown links or documents) highlighted with inverse video look inconsistent and jagged if the highlight doesn't span the full terminal width, especially when resizing the terminal.
+**Action:** Always dynamically pad highlighted pager list items with spaces (`%*s`) to stretch the inverse video cleanly across the terminal row, using the detected window columns (`pscalRuntimeDetectWindowCols()` or `term_cols`).

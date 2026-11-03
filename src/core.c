@@ -12423,7 +12423,14 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
             if (cols <= 3) { fwrite(header, 1, (size_t)cols, out); }
             else { fwrite(header, 1, (size_t)(cols - 3), out); fputs("...", out); }
         } else {
-            fprintf(out, "%s", header);
+            int raw_len = (int)strlen(header);
+            int pad = cols - raw_len;
+            if (pad < 0) pad = 0;
+            if (colour && pad > 0) {
+                fprintf(out, "%s%*s", header, pad, "");
+            } else {
+                fprintf(out, "%s", header);
+            }
         }
         if (colour) {
             fputs("\x1b[0m", out);
@@ -12453,7 +12460,14 @@ static int markdownInteractiveSelectLink(const MarkdownLinkList *links, const ch
                 }
                 fputc('\n', out);
             } else {
-                fprintf(out, "%s\n", line);
+                int raw_len = (int)strlen(line);
+                int pad = cols - raw_len;
+                if (pad < 0) pad = 0;
+                if (active && colour && pad > 0) {
+                    fprintf(out, "%s%*s\n", line, pad, "");
+                } else {
+                    fprintf(out, "%s\n", line);
+                }
             }
             if (active && colour) fputs("\x1b[0m", out);
         }
@@ -12851,7 +12865,14 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
             fputs("...", out);
         }
     } else {
-        fprintf(out, "%s", header);
+        int raw_len = (int)strlen(header);
+        int pad = term_cols - raw_len;
+        if (pad < 0) pad = 0;
+        if (colour && pad > 0) {
+            fprintf(out, "%s%*s", header, pad, "");
+        } else {
+            fprintf(out, "%s", header);
+        }
     }
     if (colour) {
         fputs("\x1b[0m", out);
@@ -12882,7 +12903,14 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
             }
             fputc('\n', out);
         } else {
-            fprintf(out, "%s\n", line);
+            int raw_len = (int)strlen(line);
+            int pad = term_cols - raw_len;
+            if (pad < 0) pad = 0;
+            if (highlight && colour && pad > 0) {
+                fprintf(out, "%s%*s\n", line, pad, "");
+            } else {
+                fprintf(out, "%s\n", line);
+            }
         }
         if (highlight && colour) {
             fputs("\x1b[0m", out);
