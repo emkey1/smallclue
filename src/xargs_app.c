@@ -367,7 +367,8 @@ static bool xargsReadLine(Xargs *x, XargsKids *kids) {
         }
         switch (state) {
         case SPACE:
-            if (isspace(c)) continue;
+            /* Bolt optimization: inline space check instead of isspace() to avoid function call overhead */
+            if (c == ' ' || (c >= '\t' && c <= '\r')) continue;
             state = NORM;
             /* fall through */
         case NORM:
