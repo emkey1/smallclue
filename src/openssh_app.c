@@ -16,6 +16,7 @@
 #include <ctype.h>
 #include <sys/stat.h>
 #include <termios.h>
+#include <time.h>
 #include "common/path_truncate.h"
 #include "pscal_openssh_hooks.h"
 #if defined(PSCAL_TARGET_IOS)
@@ -808,6 +809,83 @@ static bool smallclueApplyVirtualHome(char **saved_home, char **saved_pscali_hom
     return true;
 }
 
+#if defined(PSCAL_TARGET_IOS)
+int pscal_ios_isatty(int fd);
+#endif
+
+static bool smallclueSshFdIsTerminal(int fd) {
+#if defined(PSCAL_TARGET_IOS)
+    return pscal_ios_isatty(fd) != 0;
+#else
+    return isatty(fd) != 0;
+#endif
+}
+
+typedef struct {
+    bool has_host;
+    bool has_command;
+    bool force_tty;
+    bool no_tty;
+    bool no_session;
+} smallclueSshArgs;
+
+/* What ssh.c's own option parsing will find. The value options are its getopt
+ * string's, and options may follow the host. */
+static void smallclueSshScanArgs(int argc, char **argv, smallclueSshArgs *out) {
+    memset(out, 0, sizeof(*out));
+    for (int i = 1; argv && i < argc && !out->has_command; ++i) {
+        const char *arg = argv[i];
+        if (!arg) {
+            continue;
+        }
+        if (strcmp(arg, "--") == 0) {
+            int left = argc - i - 1;
+            out->has_command = left > (out->has_host ? 0 : 1);
+            out->has_host = out->has_host || left > 0;
+            break;
+        }
+        if (arg[0] != '-' || arg[1] == '\0') {
+            out->has_command = out->has_host;
+            out->has_host = true;
+            continue;
+        }
+        for (const char *opt = arg + 1; *opt != '\0'; ++opt) {
+            if (*opt == 't') {
+                out->force_tty = true;
+            } else if (*opt == 'T') {
+                out->no_tty = true;
+            } else if (*opt == 'V' || *opt == 'G' || *opt == 'Q' ||
+                       *opt == 'O' || *opt == 'W') {
+                /* These print something, or talk to a master, or forward stdio. */
+                out->no_session = true;
+            }
+            if (strchr("bceilmopBDEFIJLOPQRSwW", *opt) != NULL) {
+                if (opt[1] == '\0') {
+                    ++i;
+                }
+                break;
+            }
+        }
+    }
+}
+
+/*
+ * A login gets a tab of its own: a terminal on this end and nothing to run but
+ * the remote side's. Anything else is a command like any other and runs here,
+ * for its data and its status to reach whoever started it. A tab would report 0
+ * at once and take the remote command's output with it.
+ */
+static bool smallclueSshIsLogin(int argc, char **argv) {
+    smallclueSshArgs args;
+    smallclueSshScanArgs(argc, argv, &args);
+    if (!args.has_host || args.no_session || args.no_tty ||
+        (args.has_command && !args.force_tty)) {
+        return false;
+    }
+    return smallclueSshFdIsTerminal(STDIN_FILENO) &&
+           smallclueSshFdIsTerminal(STDOUT_FILENO);
+}
+
 typedef struct {
     char *askpass;
     char *askpass_require;
@@ -870,12 +948,20 @@ static void smallclueRestoreSshPromptEnv(smallclueSshAskpassEnv *env) {
 #endif
 }
 
-static bool smallcluePushDisableSoftSignalingScope(const char *label, smallclueSoftSignalScope *scope) {
+static bool smallcluePushDisableSoftSignalingScope(const char *label, int argc, char **argv,
+                                                   smallclueSoftSignalScope *scope) {
     if (!scope) {
         return false;
     }
     memset(scope, 0, sizeof(*scope));
     if (!label || strcmp(label, "ssh") != 0) {
+        return false;
+    }
+    /* ^C is the remote terminal's only when there is one. Without it ^C has to
+     * stop this command, as it does any other. */
+    smallclueSshArgs args;
+    smallclueSshScanArgs(argc, argv, &args);
+    if (!args.force_tty && (args.has_command || args.no_tty)) {
         return false;
     }
 #if defined(PSCAL_TARGET_IOS)
@@ -966,6 +1052,37 @@ static void smallclueRestoreState(const smallclue_saved_state *state) {
     }
 }
 
+/* What one run of the client puts back, when it returns or when a signal cancels
+ * its thread and nothing after the entry point runs. */
+typedef struct {
+    smallclue_saved_state saved_state;
+    smallclueSoftSignalScope soft_signal_scope;
+    bool restore_soft_signal_scope;
+    char **augmented_argv;
+    bool exit_override_active;
+} smallclueOpensshRun;
+
+static SMALLCLUE_THREAD_LOCAL smallclueOpensshRun *g_smallclue_openssh_run = NULL;
+
+static void smallclueOpensshRunEnd(smallclueOpensshRun *run) {
+    g_smallclue_openssh_run = NULL;
+#if defined(PSCAL_TARGET_IOS)
+    if (run->exit_override_active) {
+        if (PSCALRuntimePopExitOverrideWithStatus) {
+            PSCALRuntimePopExitOverrideWithStatus();
+        } else if (PSCALRuntimePopExitOverride) {
+            PSCALRuntimePopExitOverride();
+        }
+    }
+    pscal_openssh_set_global_exit_handler(NULL, NULL);
+#endif
+    if (run->restore_soft_signal_scope) {
+        smallcluePopDisableSoftSignalingScope(&run->soft_signal_scope);
+    }
+    free(run->augmented_argv);
+    smallclueRestoreState(&run->saved_state);
+}
+
 static int smallclueInvokeOpensshEntry(const char *label, int (*entry)(int, char **),
                                        int argc, char **argv) {
     g_smallclue_openssh_exit_requested = 0;
@@ -1011,8 +1128,9 @@ static int smallclueRunOpensshEntryOnce(const char *label, int (*entry)(int, cha
         fprintf(stderr, "%s: command unavailable\n", label ? label : "ssh");
         return 127;
     }
-    smallclue_saved_state saved_state;
-    smallclueSaveState(&saved_state);
+    smallclueOpensshRun run;
+    memset(&run, 0, sizeof(run));
+    smallclueSaveState(&run.saved_state);
 
     struct sigaction ignore_action;
     memset(&ignore_action, 0, sizeof(ignore_action));
@@ -1028,15 +1146,6 @@ static int smallclueRunOpensshEntryOnce(const char *label, int (*entry)(int, cha
     char connection_attempts_option[48] = {0};
     bool inject_connect_timeout = false;
     bool inject_connection_attempts = false;
-    if (argc > 0 && argv) {
-        /*
-         * OpenSSH's closefrom() is process-wide and unsafe in our multitab
-         * runtime (it can close unrelated tab/session descriptors). Force the
-         * iOS guard for all OpenSSH entrypoints (ssh/scp/sftp), including
-         * nested ssh invocations launched by sftp/scp transport setup.
-         */
-        setenv("PSCALI_SSH_SKIP_CLOSEFROM", "1", 1);
-    }
 
     if (label && strcmp(label, "ssh") == 0 && argc > 0 && argv) {
         if (!smallclueSshArgvHasOptionKey(argc, argv, "ConnectTimeout")) {
@@ -1082,23 +1191,23 @@ static int smallclueRunOpensshEntryOnce(const char *label, int (*entry)(int, cha
             invoke_argv = augmented_argv;
         }
     }
-    smallclueSoftSignalScope soft_signal_scope = {0};
-    bool restore_soft_signal_scope = smallcluePushDisableSoftSignalingScope(label,
-                                                                             &soft_signal_scope);
+    run.augmented_argv = augmented_argv;
+    run.restore_soft_signal_scope = smallcluePushDisableSoftSignalingScope(label, argc, argv,
+                                                                           &run.soft_signal_scope);
+    g_smallclue_openssh_run = &run;
 #if defined(PSCAL_TARGET_IOS)
     jmp_buf exit_env;
     volatile int exit_status_sink = 0;
-    bool override_active = false;
     if (PSCALRuntimePushExitOverrideWithStatus &&
         PSCALRuntimePushExitOverrideWithStatus(&exit_env, &exit_status_sink) == 0) {
-        override_active = true;
+        run.exit_override_active = true;
         int jump_code = setjmp(exit_env);
         if (jump_code != 0) {
             status = (jump_code == 1) ? exit_status_sink : jump_code;
             goto smallclue_openssh_done;
         }
     } else if (PSCALRuntimePushExitOverride && PSCALRuntimePushExitOverride(&exit_env) == 0) {
-        override_active = true;
+        run.exit_override_active = true;
         int jump_code = setjmp(exit_env);
         if (jump_code != 0) {
             status = (jump_code == 1) ? 0 : jump_code;
@@ -1116,24 +1225,10 @@ static int smallclueRunOpensshEntryOnce(const char *label, int (*entry)(int, cha
     status = smallclueInvokeOpensshEntry(label, entry, invoke_argc, invoke_argv);
 smallclue_openssh_done:
     g_smallclue_openssh_fallback_active = 0;
-    if (override_active) {
-        if (PSCALRuntimePopExitOverrideWithStatus) {
-            PSCALRuntimePopExitOverrideWithStatus();
-        } else if (PSCALRuntimePopExitOverride) {
-            PSCALRuntimePopExitOverride();
-        }
-    }
-#if defined(PSCAL_TARGET_IOS)
-    pscal_openssh_set_global_exit_handler(NULL, NULL);
-#endif
 #else
     status = smallclueInvokeOpensshEntry(label, entry, invoke_argc, invoke_argv);
 #endif
-    if (restore_soft_signal_scope) {
-        smallcluePopDisableSoftSignalingScope(&soft_signal_scope);
-    }
-    free(augmented_argv);
-    smallclueRestoreState(&saved_state);
+    smallclueOpensshRunEnd(&run);
     return status;
 }
 
@@ -1147,6 +1242,12 @@ typedef struct {
     VProcSessionStdio *session_stdio;
     uint64_t session_id;
     pthread_t caller_tid;
+    bool caller_leaves_task;
+    pthread_mutex_t done_mu;
+    pthread_cond_t done_cv;
+    bool done;
+    bool returned;
+    int status;
 } smallclueOpensshThreadContext;
 
 typedef struct {
@@ -1183,6 +1284,21 @@ static bool smallclueMapVprocFd(VProc *vp,
     return false;
 }
 
+/* A pipe, a file or a socket here is where the command's stdio was sent. Only
+ * a closed slot or the terminal may be pointed at the session's. */
+static bool smallclueVprocFdIsRedirected(VProc *vp, int fd) {
+    struct pscal_fd *pscal_fd = vprocGetPscalFd(vp, fd);
+    if (pscal_fd) {
+        bool is_tty = pscal_fd->tty != NULL;
+        pscal_fd_close(pscal_fd);
+        return !is_tty;
+    }
+    if (vprocTranslateFd(vp, fd) < 0) {
+        return false;
+    }
+    return !smallclueSshFdIsTerminal(fd);
+}
+
 static bool smallcluePushVprocStdioScope(VProc *vp,
                                          VProcSessionStdio *session_stdio,
                                          smallclueVprocStdioScope *scope) {
@@ -1213,19 +1329,22 @@ static bool smallcluePushVprocStdioScope(VProc *vp,
                                                             ? session_stdio->pty_slave
                                                             : session_stdio->stdout_pscal_fd));
 
-    bool mapped_stdin = smallclueMapVprocFd(vp,
+    bool mapped_stdin = smallclueVprocFdIsRedirected(vp, STDIN_FILENO) ||
+                        smallclueMapVprocFd(vp,
                                             STDIN_FILENO,
                                             in_pscal,
                                             session_stdio->stdin_host_fd,
                                             NULL,
                                             -1);
-    bool mapped_stdout = smallclueMapVprocFd(vp,
+    bool mapped_stdout = smallclueVprocFdIsRedirected(vp, STDOUT_FILENO) ||
+                         smallclueMapVprocFd(vp,
                                              STDOUT_FILENO,
                                              out_pscal,
                                              session_stdio->stdout_host_fd,
                                              err_pscal,
                                              session_stdio->stderr_host_fd);
-    bool mapped_stderr = smallclueMapVprocFd(vp,
+    bool mapped_stderr = smallclueVprocFdIsRedirected(vp, STDERR_FILENO) ||
+                         smallclueMapVprocFd(vp,
                                              STDERR_FILENO,
                                              err_pscal,
                                              session_stdio->stderr_host_fd,
@@ -1297,23 +1416,55 @@ static void smallcluePopVprocStdioScope(smallclueVprocStdioScope *scope) {
     memset(scope, 0, sizeof(*scope));
 }
 
+typedef struct {
+    smallclueOpensshThreadContext *ctx;
+    VProc *vp;
+    bool activated;
+    VProcSessionStdio *prev_stdio;
+    bool stdio_swapped;
+    smallclueVprocStdioScope stdio_scope;
+} smallclueOpensshThreadState;
+
+static void smallclueOpensshThreadEnd(void *arg) {
+    smallclueOpensshThreadState *state = (smallclueOpensshThreadState *)arg;
+    if (g_smallclue_openssh_run) {
+        smallclueOpensshRunEnd(g_smallclue_openssh_run);
+    }
+    smallcluePopVprocStdioScope(&state->stdio_scope);
+    if (state->stdio_swapped) {
+        vprocSessionStdioActivate(state->prev_stdio);
+    }
+    if (state->activated) {
+        vprocUnregisterThread(state->vp, pthread_self());
+        vprocDeactivate();
+    }
+    pthread_mutex_lock(&state->ctx->done_mu);
+    state->ctx->done = true;
+    pthread_cond_signal(&state->ctx->done_cv);
+    pthread_mutex_unlock(&state->ctx->done_mu);
+}
+
 static void *smallclueRunOpensshEntryThread(void *arg) {
     smallclueOpensshThreadContext *ctx = (smallclueOpensshThreadContext *)arg;
-    bool activated = false;
-    VProcSessionStdio *prev_stdio = NULL;
-    bool stdio_swapped = false;
-    smallclueVprocStdioScope stdio_scope = {0};
+    smallclueOpensshThreadState state = {0};
+    state.ctx = ctx;
     if (ctx && ctx->vp) {
         vprocActivate(ctx->vp);
         vprocRegisterThread(ctx->vp, pthread_self());
-        activated = true;
+        state.vp = ctx->vp;
+        state.activated = true;
+        /* A signal that stops this command cancels all of its threads, and the
+         * one waiting for this one can be the shell's. */
+        if (ctx->caller_leaves_task) {
+            vprocUnregisterThread(ctx->vp, ctx->caller_tid);
+        }
     }
     if (ctx && ctx->session_stdio) {
-        prev_stdio = vprocSessionStdioCurrent();
+        state.prev_stdio = vprocSessionStdioCurrent();
         vprocSessionStdioActivate(ctx->session_stdio);
-        stdio_swapped = true;
+        state.stdio_swapped = true;
         if (ctx->vp) {
-            (void)smallcluePushVprocStdioScope(ctx->vp, ctx->session_stdio, &stdio_scope);
+            (void)smallcluePushVprocStdioScope(ctx->vp, ctx->session_stdio, &state.stdio_scope);
         }
     }
     if (ctx && ctx->session_id != 0 && pscalRuntimeRegisterShellThread) {
@@ -1323,16 +1474,57 @@ static void *smallclueRunOpensshEntryThread(void *arg) {
     sigemptyset(&unblock);
     sigaddset(&unblock, SIGWINCH);
     (void)pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
-    int status = smallclueRunOpensshEntryOnce(ctx->label, ctx->entry, ctx->argc, ctx->argv);
-    smallcluePopVprocStdioScope(&stdio_scope);
-    if (stdio_swapped) {
-        vprocSessionStdioActivate(prev_stdio);
+    int status = 255;
+    /* Out here, past the setjmps in the run: exit() in the client jumps back to those. */
+    pthread_cleanup_push(smallclueOpensshThreadEnd, &state);
+    status = smallclueRunOpensshEntryOnce(ctx->label, ctx->entry, ctx->argc, ctx->argv);
+    /* Here, not in the thread's return value: PTHREAD_CANCELED is (void *)1, the
+     * same as a client's exit status of 1. */
+    ctx->status = status;
+    ctx->returned = true;
+    pthread_cleanup_pop(1);
+    return NULL;
+}
+
+extern bool pscalRuntimeConsumeSigint(void);
+
+static bool smallclueOpensshInterruptRequested(VProc *vp) {
+    if (pscalRuntimeConsumeSigint()) {
+        return true;
     }
-    if (activated) {
-        vprocUnregisterThread(ctx->vp, pthread_self());
-        vprocDeactivate();
+    int pid = vprocPid(vp);
+    sigset_t pending;
+    if (vprocSigpending(pid, &pending) != 0 || !sigismember(&pending, SIGINT)) {
+        return false;
     }
-    return (void *)(intptr_t)status;
+    sigset_t interrupt;
+    sigemptyset(&interrupt);
+    sigaddset(&interrupt, SIGINT);
+    int signo = 0;
+    return vprocSigwait(pid, &interrupt, &signo) == 0;
+}
+
+/* The other applets look for ^C as they work. The client sits in connect() and
+ * poll() and never looks, so the thread waiting for it does. */
+static bool smallclueOpensshWaitForInterrupt(smallclueOpensshThreadContext *ctx) {
+    bool interrupted = false;
+    pthread_mutex_lock(&ctx->done_mu);
+    while (!ctx->done && !interrupted) {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_nsec += 100L * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec += 1;
+            deadline.tv_nsec -= 1000000000L;
+        }
+        if (pthread_cond_timedwait(&ctx->done_cv, &ctx->done_mu, &deadline) == ETIMEDOUT) {
+            pthread_mutex_unlock(&ctx->done_mu);
+            interrupted = smallclueOpensshInterruptRequested(ctx->vp);
+            pthread_mutex_lock(&ctx->done_mu);
+        }
+    }
+    pthread_mutex_unlock(&ctx->done_mu);
+    return interrupted;
 }
 
 static int smallclueRunOpensshEntry(const char *label, int (*entry)(int, char **),
@@ -1342,16 +1534,31 @@ static int smallclueRunOpensshEntry(const char *label, int (*entry)(int, char **
     if (session_stdio && session_stdio->session_id != 0) {
         session_id = session_stdio->session_id;
     }
+    VProc *vp = vprocCurrent();
     smallclueOpensshThreadContext ctx = {
         .label = label,
         .entry = entry,
         .argc = argc,
         .argv = argv,
-        .vp = vprocCurrent(),
+        .vp = vp,
         .session_stdio = session_stdio,
         .session_id = session_id,
-        .caller_tid = pthread_self()
+        .caller_tid = pthread_self(),
+        .caller_leaves_task = vp && vprocPid(vp) != vprocGetShellSelfPid(),
+        .done_mu = PTHREAD_MUTEX_INITIALIZER,
+        .done_cv = PTHREAD_COND_INITIALIZER
     };
+    /* A task starts with the shell's handler for SIGINT. Blocked, the signal stays
+     * queued for the wait below, or the client's next poll() would run that handler
+     * and lose it. */
+    bool watch_interrupt = ctx.caller_leaves_task && label && strcmp(label, "ssh") == 0;
+    sigset_t saved_mask;
+    if (watch_interrupt) {
+        sigset_t interrupt;
+        sigemptyset(&interrupt);
+        sigaddset(&interrupt, SIGINT);
+        watch_interrupt = vprocSigprocmask(vprocPid(vp), SIG_BLOCK, &interrupt, &saved_mask) == 0;
+    }
     pthread_t thread;
     pthread_attr_t attr;
     pthread_attr_t *attrp = NULL;
@@ -1368,14 +1575,35 @@ static int smallclueRunOpensshEntry(const char *label, int (*entry)(int, char **
         pthread_attr_destroy(&attr);
     }
     if (err != 0) {
+        if (watch_interrupt) {
+            (void)vprocSigprocmask(vprocPid(vp), SIG_SETMASK, &saved_mask, NULL);
+        }
         return smallclueRunOpensshEntryOnce(label, entry, argc, argv);
     }
-    void *thread_ret = NULL;
-    pthread_join(thread, &thread_ret);
+    bool interrupted = watch_interrupt && smallclueOpensshWaitForInterrupt(&ctx);
+    if (interrupted) {
+        pthread_cancel(thread);
+    }
+    pthread_join(thread, NULL);
+    pthread_cond_destroy(&ctx.done_cv);
+    pthread_mutex_destroy(&ctx.done_mu);
     if (ctx.session_id != 0 && pscalRuntimeRegisterShellThread) {
         pscalRuntimeRegisterShellThread(ctx.session_id, ctx.caller_tid);
     }
-    return (int)(intptr_t)thread_ret;
+    if (!ctx.returned && !interrupted) {
+        /* A signal ended the task, so the caller doesn't go back to it. */
+        return 128 + SIGINT;
+    }
+    if (watch_interrupt) {
+        (void)vprocSigprocmask(vprocPid(vp), SIG_SETMASK, &saved_mask, NULL);
+    }
+    if (ctx.caller_leaves_task) {
+        vprocRegisterThread(ctx.vp, ctx.caller_tid);
+    }
+    if (!ctx.returned) {
+        return 128 + SIGINT;
+    }
+    return ctx.status;
 }
 
 extern void pscalRuntimeSshSessionExited(uint64_t session_id, int status) __attribute__((weak));
@@ -1742,31 +1970,17 @@ static int smallclueRunOpensshEntry(const char *label, int (*entry)(int, char **
 
 int smallclueRunSsh(int argc, char **argv) {
     smallclueEnsureWritableHomeSsh();
-#if defined(PSCAL_TARGET_IOS)
-    /*
-     * In the tabbed iOS runtime, closefrom() is unsafe because it closes
-     * descriptors process-wide. Keep OpenSSH in skip-closefrom mode.
-     */
-    setenv("PSCALI_SSH_SKIP_CLOSEFROM", "1", 1);
-#endif
     if (argc < 2) {
         fprintf(stderr, "usage: ssh [options] host [command]\n");
         return 255;
     }
     /* Preserve user args; only ensure -tt for interactive sessions. */
-    bool has_tty_flag = false;
-    for (int i = 1; i < argc; ++i) {
-        const char *arg = argv[i];
-        if (!arg) {
-            continue;
-        }
-        if (strcmp(arg, "-t") == 0 || strcmp(arg, "-tt") == 0) {
-            has_tty_flag = true;
-            break;
-        }
-    }
+    bool login = smallclueSshIsLogin(argc, argv);
+    smallclueSshArgs scanned;
+    smallclueSshScanArgs(argc, argv, &scanned);
+    bool has_tty_flag = scanned.force_tty;
 
-    int extra = has_tty_flag ? 0 : 1;
+    int extra = (login && !has_tty_flag) ? 1 : 0;
     int new_argc = argc + extra;
     char **augmented = (char **)calloc((size_t)new_argc, sizeof(char *));
     int status = 255;
@@ -1787,7 +2001,7 @@ int smallclueRunSsh(int argc, char **argv) {
     } else {
         augmented[count++] = strdup("ssh");
     }
-    if (!has_tty_flag) {
+    if (login && !has_tty_flag) {
         augmented[count++] = strdup("-tt");
     }
     for (int i = 1; i < argc; ++i) {
@@ -1798,7 +2012,7 @@ int smallclueRunSsh(int argc, char **argv) {
     char **expanded = smallclueExpandSshArgs(count, augmented, &expanded_count);
     bool opened_runtime_session = false;
 #if defined(PSCAL_TARGET_IOS)
-    if (pscalRuntimeOpenSshSession) {
+    if (login && pscalRuntimeOpenSshSession) {
         int open_status = pscalRuntimeOpenSshSession(expanded ? expanded_count : count,
                                                      expanded ? expanded : augmented);
         if (open_status == 0) {
