@@ -233,6 +233,12 @@ static bool rmIsRoot(const char *path) {
 
 static bool rmOne(const RmOptions *o, const char *path) {
     char q[PATH_MAX + 8];
+    /* A child joined onto an empty name is "/child", so the walk must never see one. */
+    if (!path[0]) {
+        if (o->force) return true;
+        rmFail(path, ENOENT);
+        return false;
+    }
     if (o->recursive && rmIsDotOrDotDot(path)) {
         fprintf(stderr, "rm: refusing to remove '.' or '..' directory: skipping %s\n", gnuQuote(path, q, sizeof(q)));
         return false;
