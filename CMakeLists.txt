@@ -955,14 +955,18 @@ int main(void) { return chachapoly_crypt() + chachapoly_get_length(); }
             -DBUILD_EXAMPLES=OFF
             -DBUILD_FUZZERS=OFF
             -DUSE_SSH=$<IF:$<BOOL:${SMALLCLUE_LIBGIT2_USE_SSH}>,ON,OFF>
-            -DUSE_HTTPS=ON
+            # Named rather than ON: libgit2 only adds OpenSSL's headers and
+            # libraries when OpenSSL is its HTTPS backend, and left to choose,
+            # macOS picks SecureTransport, which would leave the hash backend
+            # below without them.
+            -DUSE_HTTPS=OpenSSL
             # builtin (libgit2's vendored RFC6234 SHA implementation) declares
             # SHA1/SHA224/SHA256/SHA384/SHA512 as an enum; OpenSSL's own
             # <openssl/sha.h> (pulled in transitively via the openssl streams
-            # backend USE_HTTPS=ON selects) declares the same identifiers as
-            # functions. Both land in the same TU (libgit2.c) and collide.
-            # Since USE_HTTPS is already OpenSSL, use OpenSSL for the hash
-            # backend too so there's only one declaration of each symbol.
+            # backend above) declares the same identifiers as functions. Both
+            # land in the same TU (libgit2.c) and collide. Since USE_HTTPS is
+            # already OpenSSL, use OpenSSL for the hash backend too so there's
+            # only one declaration of each symbol.
             -DUSE_SHA1=OpenSSL
             -DUSE_SHA256=OpenSSL
             -DUSE_HTTP_PARSER=builtin

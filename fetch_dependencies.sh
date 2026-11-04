@@ -115,8 +115,8 @@ if [ ! -d "$THIRD_PARTY_DIR/dvtm" ]; then
 fi
 
 # --- libgit2 ---
-# Tracked as a git submodule (see .gitmodules) pinned to emkey1/libgit2, the
-# same fork PSCAL's third-party tree uses. `git submodule update --init` is
+# Tracked as a git submodule (see .gitmodules) pinned to upstream libgit2,
+# unmodified, as PSCAL's third-party tree is. `git submodule update --init` is
 # the normal way to populate it; fall back to a plain clone for tarball
 # checkouts (no .git) or PSCAL's own nested tree.
 if [ -f .gitmodules ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -133,7 +133,8 @@ if [ ! -d "$THIRD_PARTY_DIR/libgit2" ]; then
         cp -a "../third-party/libgit2" "$THIRD_PARTY_DIR/libgit2"
     else
         echo "Cloning libgit2 (submodule unavailable)..."
-        git clone https://github.com/emkey1/libgit2 "$THIRD_PARTY_DIR/libgit2"
+        git clone https://github.com/libgit2/libgit2 "$THIRD_PARTY_DIR/libgit2"
+        git -C "$THIRD_PARTY_DIR/libgit2" checkout -q 86c7738ca
     fi
 fi
 

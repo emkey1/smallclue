@@ -9,4 +9,5 @@ This product includes third-party software under its own license:
 - compat/sys/queue.h, Copyright (c) 1991, 1993 The Regents of the University of
   California, under the BSD 3-Clause License (see the file itself).
 - The submodules in third-party/ (dvtm, libgit2, nextvi, openrsync, openssh),
-  each under the license in its own directory.
+  each under the license in its own directory. libgit2 is licensed under GPLv2
+  with a linking exception, and is linked unmodified.
