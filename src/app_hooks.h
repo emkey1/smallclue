@@ -25,6 +25,10 @@ bool smallclueAppRunInProcess(int argc, char **argv, int *status);
 /* The executable `name` runs as, through the host's command lookup (PSCAL's
  * virtual paths on iOS); false to leave it to execvp. */
 bool smallclueAppResolveExec(const char *name, char *resolved, size_t size);
+/* execvp for an applet that runs a program in its own place. Nothing can exec in PSCAL on iOS, so
+ * there the program is a call, and this returns its exit status. Elsewhere it is execvp. Either
+ * way, -1 with errno as execvp sets it if the program cannot run. */
+int smallclueAppExecvp(char **argv);
 /* Empty the environment, as env -i does. */
 void smallclueAppClearEnv(void);
 

@@ -6,6 +6,8 @@
 
 #include "chroot_app.h"
 
+#include "app_hooks.h"
+
 #include <errno.h>
 #include <grp.h>
 #include <pwd.h>
@@ -148,7 +150,10 @@ int smallclueChrootCommand(int argc, char **argv) {
         execArgv = fallbackArgs;
     }
 
-    execvp(execArgv[0], execArgv);
+    int status = smallclueAppExecvp(execArgv);
+    if (status >= 0) {
+        return status;
+    }
     fprintf(stderr, "chroot: cannot execute '%s': %s\n", execArgv[0], strerror(errno));
     return 127;
 }

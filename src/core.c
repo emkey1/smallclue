@@ -18943,6 +18943,22 @@ int smallclueAppChildMain(int argc, char **argv) {
 }
 #endif
 
+int smallclueAppExecvp(char **argv) {
+#if defined(PSCAL_TARGET_IOS)
+    int argc = 0;
+    while (argv[argc]) {
+        argc++;
+    }
+    if (smallclueAppCanRun(argv[0])) {
+        return smallclueAppChildMain(argc, argv) & 0xff;
+    }
+    errno = strchr(argv[0], '/') && access(argv[0], F_OK) == 0 ? EACCES : ENOENT;
+    return -1;
+#else
+    return execvp(argv[0], argv);
+#endif
+}
+
 
 
 

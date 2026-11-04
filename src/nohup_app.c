@@ -6,6 +6,8 @@
 
 #include "nohup_app.h"
 
+#include "app_hooks.h"
+
 #include <errno.h>
 #include <limits.h>
 #include <signal.h>
@@ -64,7 +66,10 @@ int smallclueNohupCommand(int argc, char **argv) {
         dup2(STDOUT_FILENO, STDERR_FILENO);
     }
 
-    execvp(argv[1], &argv[1]);
+    int status = smallclueAppExecvp(&argv[1]);
+    if (status >= 0) {
+        return status;
+    }
     int err = errno;
     fprintf(stderr, "nohup: %s: %s\n", argv[1], strerror(err));
     return (err == ENOENT) ? 127 : 126;
