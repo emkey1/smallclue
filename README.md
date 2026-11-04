@@ -131,6 +131,7 @@ These applets are only registered on `PSCAL_TARGET_IOS` builds.
 
 * **addt**: Open an additional shell tab.
 * **tabadd** / **tadd**: Aliases for `addt`.
+* **ws**: Open a Workspace applet (`ws open TOOL [PATH]`), list those open (`ws applets`), or say whether this session is under Workspace (`ws status`).
 * **smallclue-help**: List available smallclue applets and command help.
 * **dmesg**: Prints the PSCAL runtime session log.
 * **licenses**: View open source licenses included in the distribution.

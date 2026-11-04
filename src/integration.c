@@ -413,6 +413,7 @@ DEFINE_SMALLCLUE_WRAPPER("host", host)
 DEFINE_SMALLCLUE_WRAPPER("addt", addt)
 DEFINE_SMALLCLUE_WRAPPER("tabadd", tabadd)
 DEFINE_SMALLCLUE_WRAPPER("tadd", tadd)
+DEFINE_SMALLCLUE_WRAPPER("ws", ws)
 DEFINE_SMALLCLUE_WRAPPER("dmesg", dmesg)
 DEFINE_SMALLCLUE_WRAPPER("licenses", licenses)
 DEFINE_SMALLCLUE_WRAPPER("top", top)
@@ -580,6 +581,7 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("addt", vmBuiltinSmallclue_addt, "addt");
     registerSmallclueBuiltin("tabadd", vmBuiltinSmallclue_tabadd, "tabadd");
     registerSmallclueBuiltin("tadd", vmBuiltinSmallclue_tadd, "tadd");
+    registerSmallclueBuiltin("ws", vmBuiltinSmallclue_ws, "ws");
     registerSmallclueBuiltin("dmesg", vmBuiltinSmallclue_dmesg, "dmesg");
     registerSmallclueBuiltin("licenses", vmBuiltinSmallclue_licenses, "licenses");
     registerSmallclueBuiltin("top", vmBuiltinSmallclue_top, "top");

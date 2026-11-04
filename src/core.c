@@ -164,6 +164,9 @@ void PSCALRuntimeBeginScriptCapture(const char *path, int append) __attribute__(
 void PSCALRuntimeEndScriptCapture(void) __attribute__((weak));
 int PSCALRuntimeScriptCaptureActive(void) __attribute__((weak));
 int pscalRuntimeOpenShellTab(void) __attribute__((weak));
+int pscalRuntimeWorkspaceOpen(const char *tool, const char *path) __attribute__((weak));
+char *pscalRuntimeWorkspaceStatus(void) __attribute__((weak));
+char *pscalRuntimeWorkspaceApplets(void) __attribute__((weak));
 char *pscalRuntimePickMountSourceDirectory(void) __attribute__((weak));
 extern int PSCALRuntimePingHost(const char *host,
     int count,
@@ -184,6 +187,9 @@ __attribute__((weak)) void PSCALRuntimeBeginScriptCapture(const char *path, int 
 __attribute__((weak)) void PSCALRuntimeEndScriptCapture(void) {}
 __attribute__((weak)) int PSCALRuntimeScriptCaptureActive(void) { return 0; }
 __attribute__((weak)) int pscalRuntimeOpenShellTab(void) { errno = ENOSYS; return -1; }
+__attribute__((weak)) int pscalRuntimeWorkspaceOpen(const char *tool, const char *path) { (void)tool; (void)path; return -ENOSYS; }
+__attribute__((weak)) char *pscalRuntimeWorkspaceStatus(void) { errno = ENOSYS; return NULL; }
+__attribute__((weak)) char *pscalRuntimeWorkspaceApplets(void) { errno = ENOSYS; return NULL; }
 __attribute__((weak)) char *pscalRuntimePickMountSourceDirectory(void) { errno = ENOSYS; return NULL; }
 __attribute__((weak)) void *PSCALRuntimeGetCurrentRuntimeContext(void) { return NULL; }
 __attribute__((weak)) void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) { (void)ctx; }
@@ -1600,6 +1606,7 @@ static int smallclueTopCommand(int argc, char **argv);
 #if defined(PSCAL_TARGET_IOS)
 static int smallclueHelpCommand(int argc, char **argv);
 static int smallclueAddTabCommand(int argc, char **argv);
+static int smallclueWorkspaceCommand(int argc, char **argv);
 #endif
 static int smallclueDmesgCommand(int argc, char **argv);
 
@@ -3853,6 +3860,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"addt", smallclueAddTabCommand, "Open an additional shell tab"},
     {"tabadd", smallclueAddTabCommand, "Alias for addt: open an additional shell tab"},
     {"tadd", smallclueAddTabCommand, "Alias for addt: open an additional shell tab"},
+    {"ws", smallclueWorkspaceCommand, "Open a Workspace applet, or list the ones open"},
     {"smallclue-help", smallclueHelpCommand, "List available smallclue applets"},
     {"licenses", smallclueLicensesCommand, "View third-party licenses"},
     {"top", smallclueTopCommand, "Show PSCAL virtual processes"},
@@ -4436,6 +4444,15 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                "  Alias for addt"},
     {"tadd", "tadd\n"
              "  Alias for addt"},
+    {"ws", "ws [status]\n"
+           "ws applets\n"
+           "ws open TOOL [PATH]\n"
+           "  Talk to Workspace, the app's desktop of windows.\n"
+           "  status lists whether this session is under Workspace and which\n"
+           "  tools it can open. applets lists the applet windows open, one per\n"
+           "  line: id, tool, Desktop (* for all), front, shown or hidden, age\n"
+           "  in seconds, title. open opens TOOL, passing it PATH if given.\n"
+           "  Success means the request was accepted, not that a window is up."},
     {"smallclue-help", "smallclue-help [command]\n"
                        "  Without arguments: list all applets\n"
                        "  With a command: show usage if available"},
@@ -15251,6 +15268,67 @@ static int smallclueAddTabCommand(int argc, char **argv) {
         return 1;
     }
     return 0;
+}
+
+static int smallcluePrintWorkspaceText(char *text) {
+    if (!text) {
+        fprintf(stderr, "ws: command unavailable\n");
+        return 1;
+    }
+    fputs(text, stdout);
+    free(text);
+    return 0;
+}
+
+/*
+ * Returns as soon as the app has accepted a request and never waits on the
+ * interface for one: this runs on the shell's own thread, and a shell whose
+ * terminal is on screen would deadlock waiting for the main thread. That's why
+ * success means accepted, not on screen.
+ */
+static int smallclueWorkspaceCommand(int argc, char **argv) {
+    const char *verb = argc > 1 ? argv[1] : "status";
+    if (strcmp(verb, "status") == 0 && argc <= 2) {
+        return smallcluePrintWorkspaceText(pscalRuntimeWorkspaceStatus ? pscalRuntimeWorkspaceStatus() : NULL);
+    }
+    if (strcmp(verb, "applets") == 0 && argc == 2) {
+        return smallcluePrintWorkspaceText(pscalRuntimeWorkspaceApplets ? pscalRuntimeWorkspaceApplets() : NULL);
+    }
+    if (strcmp(verb, "open") != 0 || argc < 3 || argc > 4) {
+        fputs("usage: ws [status]\n"
+              "       ws applets\n"
+              "       ws open TOOL [PATH]\n", stderr);
+        return 2;
+    }
+    if (!pscalRuntimeWorkspaceOpen) {
+        fprintf(stderr, "ws: command unavailable\n");
+        return 1;
+    }
+    const char *path = argc == 4 ? argv[3] : NULL;
+    char absolute[PATH_MAX];
+    /* The app can't resolve this later: the shell's directory isn't the app's,
+     * and it may have changed by then. An address isn't a path. */
+    if (path && path[0] != '/' && strncmp(path, "http://", 7) != 0 && strncmp(path, "https://", 8) != 0) {
+        char cwd[PATH_MAX];
+        if (!getcwd(cwd, sizeof(cwd)) ||
+            snprintf(absolute, sizeof(absolute), "%s/%s", cwd, path) >= (int)sizeof(absolute)) {
+            fprintf(stderr, "ws: %s: can't resolve path\n", path);
+            return 1;
+        }
+        path = absolute;
+    }
+    int rc = pscalRuntimeWorkspaceOpen(argv[2], path);
+    if (rc == 0) {
+        return 0;
+    }
+    if (rc == -EINVAL) {
+        fprintf(stderr, "ws: no such tool: %s (ws status lists them)\n", argv[2]);
+    } else if (rc == -EOPNOTSUPP) {
+        fprintf(stderr, "ws: this session is not under Workspace\n");
+    } else {
+        fprintf(stderr, "ws: unable to open %s: %s\n", argv[2], strerror(rc < 0 ? -rc : EIO));
+    }
+    return 1;
 }
 #endif
 #if SMALLCLUE_HAS_IFADDRS
