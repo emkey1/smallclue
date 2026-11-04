@@ -135,6 +135,18 @@ void pscal_openrsync_warnx(const char *fmt, ...) {
 }
 
 #if defined(PSCAL_TARGET_IOS)
+static SMALLCLUE_THREAD_LOCAL volatile sig_atomic_t g_openrsync_interrupted = 0;
+
+bool pscal_openrsync_interrupted(void) {
+    return g_openrsync_interrupted != 0;
+}
+
+/* Runs on rsync's own thread, as a blocked poll returns with EINTR. */
+static void smallclueOpenrsyncOnInterrupt(int signo) {
+    (void)signo;
+    g_openrsync_interrupted = 1;
+}
+
 /*
  * With pscal_ios_shim.h a file openrsync opens is a host descriptor, while its
  * socket to the other end is a vproc slot, and vprocPollShim calls the former
@@ -155,7 +167,17 @@ int pscal_openrsync_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
             files++;
         }
     }
-    int ready = poll(fds, nfds, files > 0 ? 0 : timeout);
+    int ready;
+    do {
+        ready = poll(fds, nfds, files > 0 ? 0 : timeout);
+    } while (ready == -1 && errno == EINTR && !g_openrsync_interrupted);
+    int saved_errno = errno;
+    /* Even with something ready: ^C ends the ssh as well, and rsync then has an interrupt to
+     * report, not a lost connection. */
+    if (g_openrsync_interrupted) {
+        ready = -1;
+        saved_errno = EINTR;
+    }
     for (nfds_t i = 0; i < nfds; ++i) {
         if (saved[i] != fds[i].fd) {
             fds[i].fd = saved[i];
@@ -165,6 +187,7 @@ int pscal_openrsync_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
             }
         }
     }
+    errno = saved_errno;
     return ready;
 }
 #endif
@@ -187,6 +210,17 @@ int smallclueRunRsync(int argc, char **argv) {
      * command in a job or a pipeline stage runs on that task, which goes on after this. */
     mode_t prior_mask = umask(0);
     umask(prior_mask);
+#if defined(PSCAL_TARGET_IOS)
+    /* A command can share the shell's thread, so the signal's default action can't end this
+     * one. Caught, it fails the transfer's next wait, and the command ends the way it would. */
+    g_openrsync_interrupted = 0;
+    struct sigaction on_interrupt;
+    struct sigaction saved_interrupt;
+    memset(&on_interrupt, 0, sizeof(on_interrupt));
+    sigemptyset(&on_interrupt.sa_mask);
+    on_interrupt.sa_handler = smallclueOpenrsyncOnInterrupt;
+    bool caught = sigaction(SIGINT, &on_interrupt, &saved_interrupt) == 0;
+#endif
 
     int status = 1;
     if (sigsetjmp(ctx.env, 1) == 0) {
@@ -199,6 +233,12 @@ int smallclueRunRsync(int argc, char **argv) {
     }
 
     umask(prior_mask);
+#if defined(PSCAL_TARGET_IOS)
+    if (caught) {
+        (void)sigaction(SIGINT, &saved_interrupt, NULL);
+    }
+#endif
+
     g_openrsync_exit_ctx = ctx.prev;
     g_openrsync_progname = prior_progname;
     return status;

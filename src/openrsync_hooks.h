@@ -19,6 +19,12 @@ void pscal_openrsync_warn(const char *fmt, ...);
 void pscal_openrsync_warnc(int code, const char *fmt, ...);
 void pscal_openrsync_warnx(const char *fmt, ...);
 
+#ifdef PSCAL_TARGET_IOS
+#include <stdbool.h>
+/* A ^C or a kill -INT has been seen, so what fails from here on is only its result. */
+bool pscal_openrsync_interrupted(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
