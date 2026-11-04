@@ -23106,6 +23106,10 @@ const SmallclueApplet *smallclueFindApplet(const char *name) {
     return NULL;
 }
 
+/* The shell keeps what the process's ids told it, and su, sudo, login and chroot come back with
+ * new ones when their exec fails. */
+__attribute__((weak)) void shellRuntimeIdsMayHaveChanged(void) { }
+
 int smallclueDispatchApplet(const SmallclueApplet *applet, int argc, char **argv) {
     if (!applet || !applet->entry) {
         return 127;
@@ -23117,10 +23121,11 @@ int smallclueDispatchApplet(const SmallclueApplet *applet, int argc, char **argv
     dispatchDepth++;
     int appletStatus = applet->entry(argc, argv);
     dispatchDepth--;
-    return appletStatus;
 #else
-    return applet->entry(argc, argv);
+    int appletStatus = applet->entry(argc, argv);
 #endif
+    shellRuntimeIdsMayHaveChanged();
+    return appletStatus;
 }
 
 static void smallclueRedirectFromEnv(void) {
