@@ -46,6 +46,13 @@ void smallclueAppClearEnv(void);
 #include "common/path_virtualization.h"
 FILE *smallclueAppStdin(void);
 int smallclueAppFileno(FILE *stream);
+/* What a program started from an applet runs as, on this thread, and whether a name is one
+ * it can run: an applet, a frontend, or a file the shell's lookup finds. */
+bool smallclueAppCanRun(const char *name);
+int smallclueAppChildMain(int argc, char **argv);
+/* The shell says how it runs a command that is not an applet: this library is also linked
+ * into tools that have no shell. */
+void smallclueAppSetCommandRunner(int (*runner)(int argc, char **argv));
 #undef stdin
 #define stdin smallclueAppStdin()
 #undef fileno

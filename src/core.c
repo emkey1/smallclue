@@ -18907,6 +18907,40 @@ bool smallclueAppRunInProcess(int argc, char **argv, int *status) {
     return false;
 }
 
+#if defined(PSCAL_TARGET_IOS)
+/* Set by the shell: this library is also linked into tools that have no shell. */
+static int (*gAppCommandRunner)(int argc, char **argv);
+
+void smallclueAppSetCommandRunner(int (*runner)(int argc, char **argv)) {
+    gAppCommandRunner = runner;
+}
+
+bool smallclueAppCanRun(const char *name) {
+    static const char *const frontends[] = {
+        "aether", "clike", "dascal", "exsh", "pascal", "pscalasm", "pscald", "pscaljson2bc", "pscalvm", "rea", "sh",
+    };
+    if (smallclueFindApplet(name)) {
+        return true;
+    }
+    for (size_t i = 0; i < sizeof(frontends) / sizeof(frontends[0]); i++) {
+        if (strcmp(name, frontends[i]) == 0) {
+            return true;
+        }
+    }
+    char resolved[PATH_MAX];
+    return smallclueResolveCommandPathForExec(name, resolved, sizeof(resolved));
+}
+
+int smallclueAppChildMain(int argc, char **argv) {
+    int status = 127;
+    if (smallclueAppRunInProcess(argc, argv, &status)) {
+        return status;
+    }
+    /* A frontend or a script: the shell is what knows how to run those. */
+    return gAppCommandRunner ? gAppCommandRunner(argc, argv) : status;
+}
+#endif
+
 
 
 

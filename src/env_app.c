@@ -498,10 +498,19 @@ int smallclueEnvCommand(int argc, char **argv) {
             int cmd_argc = 0;
             while (cmd[cmd_argc]) cmd_argc++;
             if (smallclueAppRunInProcess(cmd_argc, cmd, &status)) goto done;
+#if defined(PSCAL_TARGET_IOS) && !defined(VPROC_SHIM_DISABLED)
+            /* Nothing can exec there, so a frontend or a script is a call as well. */
+            if (smallclueAppCanRun(cmd[0])) {
+                status = smallclueAppChildMain(cmd_argc, cmd);
+                goto done;
+            }
+            errno = strchr(cmd[0], '/') && access(cmd[0], F_OK) == 0 ? EACCES : ENOENT;
+#else
+            char resolved[PATH_MAX];
+            if (smallclueAppResolveExec(cmd[0], resolved, sizeof(resolved))) execv(resolved, cmd);
+            execvp(cmd[0], cmd);
+#endif
         }
-        char resolved[PATH_MAX];
-        if (smallclueAppResolveExec(cmd[0], resolved, sizeof(resolved))) execv(resolved, cmd);
-        execvp(cmd[0], cmd);
         int err = errno;
         status = err == ENOENT ? ENV_ENOENT : ENV_CANNOT_INVOKE;
         fprintf(stderr, "env: %s: %s\n", envQuote(cmd[0], q, sizeof(q)), strerror(err));
