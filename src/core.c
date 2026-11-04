@@ -1085,6 +1085,8 @@ static bool smallclueResolveExecutableFromBaseCwd(const char *base_cwd,
 extern int optreset;
 #endif
 
+#include "thread_getopt.h"
+
 #if defined(__APPLE__)
 extern bool shellRuntimeConsumeExitRequested(void) __attribute__((weak_import));
 #elif defined(__GNUC__)

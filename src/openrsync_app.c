@@ -15,6 +15,8 @@
 #include "ios/vproc.h"
 #endif
 
+#include "thread_getopt.h"
+
 int pscal_openrsync_main(int argc, char **argv);
 
 #ifndef SMALLCLUE_THREAD_LOCAL

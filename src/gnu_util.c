@@ -609,3 +609,47 @@ const char *gnuBackupSuffix(const char *given) {
     const char *env = getenv("SIMPLE_BACKUP_SUFFIX");
     return env && *env && !strchr(env, '/') ? env : "~";
 }
+
+#if defined(PSCAL_TARGET_IOS)
+/* Last in the file, as these names are macros from here on. */
+#include "thread_getopt.h"
+
+int BSDgetopt(int argc, char * const *argv, const char *opts);
+int BSDgetopt_long(int argc, char * const *argv, const char *opts,
+                   const struct option *longs, int *index);
+
+/* The parser's own messages go to ssh's log, so an applet's come from here, in glibc's words. */
+static void threadGetoptComplain(char * const *argv, const char *opts) {
+    const char *prog = argv[0] ? argv[0] : "";
+    const char *spec = optopt ? strchr(opts, optopt) : NULL;
+    if (spec && spec[1] == ':') {
+        fprintf(stderr, "%s: option requires an argument -- '%c'\n", prog, optopt);
+    } else {
+        fprintf(stderr, "%s: invalid option -- '%c'\n", prog, optopt);
+    }
+}
+
+int smallclueThreadGetopt(int argc, char * const *argv, const char *opts) {
+    opterr = 0;
+    int c = BSDgetopt(argc, argv, opts);
+    if (c == '?' && opts[0] != ':') {
+        threadGetoptComplain(argv, opts);
+    }
+    return c;
+}
+
+int smallclueThreadGetoptLong(int argc, char * const *argv, const char *opts,
+                              const struct option *longs, int *index) {
+    opterr = 0;
+    int c = BSDgetopt_long(argc, argv, opts, longs, index);
+    if (c == '?' && opts[0] != ':') {
+        const char *arg = optind > 0 && optind <= argc ? argv[optind - 1] : NULL;
+        if (arg && arg[0] == '-' && arg[1] == '-') {
+            fprintf(stderr, "%s: bad option '%s'\n", argv[0] ? argv[0] : "", arg);
+        } else {
+            threadGetoptComplain(argv, opts);
+        }
+    }
+    return c;
+}
+#endif /* PSCAL_TARGET_IOS */

@@ -1,6 +1,8 @@
 #ifndef SMALLCLUE_OPENRSYNC_HOOKS_H
 #define SMALLCLUE_OPENRSYNC_HOOKS_H
 
+#include "thread_getopt.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
