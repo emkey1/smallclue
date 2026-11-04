@@ -9,6 +9,7 @@
  * These stubs provide sensible defaults so the standalone build works.
  */
 bool pscalRuntimeStdoutIsInteractive(void);
+bool pscalRuntimeStderrIsInteractive(void);
 bool pscalRuntimeStdinIsInteractive(void);
 bool pscalRuntimeFdIsInteractive(int fd);
 bool pscalRuntimeStdinHasRealTTY(void);

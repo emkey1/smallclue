@@ -31,6 +31,10 @@ __attribute__((weak)) bool pscalRuntimeStdoutIsInteractive(void) {
     return isatty(STDOUT_FILENO);
 }
 
+__attribute__((weak)) bool pscalRuntimeStderrIsInteractive(void) {
+    return isatty(STDERR_FILENO);
+}
+
 __attribute__((weak)) bool pscalRuntimeStdinIsInteractive(void) {
     return isatty(STDIN_FILENO);
 }
