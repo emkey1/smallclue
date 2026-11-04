@@ -103,7 +103,8 @@ static bool envSignalAction(Env *e, const char *arg, bool toDefault) {
         return true;
     }
     char *copy = strdup(arg);
-    for (char *tok = strtok(copy, ","); tok; tok = strtok(NULL, ",")) {
+    char *save = NULL;
+    for (char *tok = strtok_r(copy, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
         int i = envSignal(tok);
         if (i < 0) {
             free(copy);
@@ -122,7 +123,8 @@ static bool envBlock(Env *e, const char *arg) {
         return true;
     }
     char *copy = strdup(arg);
-    for (char *tok = strtok(copy, ","); tok; tok = strtok(NULL, ",")) {
+    char *save = NULL;
+    for (char *tok = strtok_r(copy, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
         int i = envSignal(tok);
         if (i < 0) {
             free(copy);

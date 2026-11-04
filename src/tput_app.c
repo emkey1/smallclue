@@ -863,7 +863,8 @@ int smallclueTputCommand(int argc, char **argv) {
         while (fgets(line, sizeof(line), stdin)) {
             char *words[16];
             int n = 0;
-            for (char *tok = strtok(line, " \t\r\n"); tok && n < 16; tok = strtok(NULL, " \t\r\n")) {
+            char *save = NULL;
+            for (char *tok = strtok_r(line, " \t\r\n", &save); tok && n < 16; tok = strtok_r(NULL, " \t\r\n", &save)) {
                 words[n++] = tok;
             }
             if (n > 0) {

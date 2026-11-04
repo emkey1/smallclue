@@ -21188,7 +21188,8 @@ static int smallclueMountCommand(int argc, char **argv) {
     if (options) {
         char *opts = strdup(options);
         if (opts) {
-            char *token = strtok(opts, ",");
+            char *saveptr = NULL;
+            char *token = strtok_r(opts, ",", &saveptr);
             while (token) {
                 if (strcmp(token, "ro") == 0) flags |= SMALLCLUE_MOUNT_RDONLY;
                 else if (strcmp(token, "rw") == 0) flags &= ~SMALLCLUE_MOUNT_RDONLY;
@@ -21200,7 +21201,7 @@ static int smallclueMountCommand(int argc, char **argv) {
                 else if (strcmp(token, "exec") == 0) flags &= ~SMALLCLUE_MOUNT_NOEXEC;
                 else if (strcmp(token, "remount") == 0) flags |= SMALLCLUE_MOUNT_REMOUNT;
                 else if (strcmp(token, "bind") == 0) flags |= SMALLCLUE_MOUNT_BIND;
-                token = strtok(NULL, ",");
+                token = strtok_r(NULL, ",", &saveptr);
             }
             free(opts);
         }
@@ -21580,7 +21581,8 @@ static int smallclueWhichCommand(int argc, char **argv) {
         if (env && *env) {
             char *path_copy = strdup(env);
             if (path_copy) {
-                char *token = strtok(path_copy, ":");
+                char *saveptr = NULL;
+                char *token = strtok_r(path_copy, ":", &saveptr);
                 while (token) {
                     char candidate[PATH_MAX];
                     int w = snprintf(candidate, sizeof(candidate), "%s/%s", token, name);
@@ -21605,7 +21607,7 @@ static int smallclueWhichCommand(int argc, char **argv) {
                             break;
                         }
                     }
-                    token = strtok(NULL, ":");
+                    token = strtok_r(NULL, ":", &saveptr);
                 }
                 free(path_copy);
             }
