@@ -1403,7 +1403,7 @@ static bool smallclueColourWantedOn(int fd) {
     if (!term || !*term || strcmp(term, "dumb") == 0) {
         return false;
     }
-    return isatty(fd) != 0;
+    return pscalRuntimeFdIsInteractive(fd);
 }
 
 static bool smallclueColourWanted(void) {
@@ -14743,7 +14743,7 @@ static int smallclueWatchCommand(int argc, char **argv) {
          * -- and the leading newline belongs to that question, standing in for
          * the clear when there was none. The banner's reverse video is the only
          * decoration here, and it is the only thing gated on colour. */
-        const bool cleared = isatty(STDOUT_FILENO) != 0;
+        const bool cleared = pscalRuntimeStdoutIsInteractive();
         if (cleared) {
             fputs("\x1b[3J\x1b[H\x1b[2J", stdout);
         }
