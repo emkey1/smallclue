@@ -550,7 +550,7 @@ static char **smallclueExpandScpArgs(int argc, char **argv, int *out_count) {
             }
             continue;
         }
-        if ((arg[1] == 'i' || arg[1] == 'F' || arg[1] == 'S') && arg[2] != '\0') {
+        if (arg[0] == '-' && (arg[1] == 'i' || arg[1] == 'F' || arg[1] == 'S') && arg[2] != '\0') {
             char prefix[3] = { arg[0], arg[1], '\0' };
             char *value = smallclueExpandAbsolutePath(arg + 2);
             expanded[count++] = smallclueConcatOptionValue(prefix, value);
