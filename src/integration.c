@@ -255,10 +255,22 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
                 goto smallclue_dispatch_done;
             }
         }
+        /* A kill this program sends itself, if its thread has to go on without it. */
+        VProcProgramFrame program_frame;
+        program_frame.pushed = false;
+        {
+            int killed_status = setjmp(program_frame.env);
+            if (killed_status != 0) {
+                status = killed_status;
+                goto smallclue_dispatch_done;
+            }
+        }
+        vprocProgramFramePush(&program_frame);
 #endif
         status = smallclueDispatchApplet(applet, argc, argv);
 #if defined(PSCAL_TARGET_IOS)
 smallclue_dispatch_done:
+        vprocProgramFramePop(&program_frame);
         vprocLocaleRestore(program_locale);
         if (shellRuntimeProgramEnvLeave) {
             shellRuntimeProgramEnvLeave(program_env);
