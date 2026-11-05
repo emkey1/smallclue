@@ -23288,14 +23288,25 @@ static bool smallclueIsInteger(const char *s, long long *out) {
     return true;
 }
 
+static bool smallclueTestIsBinaryOp(const char *op) {
+    static const char *const kOps[] = {"=", "==", "!=", "-nt", "-ot", "-ef", "-eq", "-ne", "-gt", "-ge", "-lt", "-le"};
+    for (size_t i = 0; i < sizeof(kOps) / sizeof(kOps[0]); ++i) {
+        if (strcmp(op, kOps[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Evaluates a single atomic expression: no -a/-o splitting (that's handled
  * one level up, by smallclueTestEvaluateOr/And below), just !expr, a bare
- * string, a unary op + operand, or a binary op between two operands. */
+ * string, a unary op + operand, or a binary op between two operands. With three
+ * words a binary op comes first, so a value that happens to be ! is a value. */
 static bool smallclueTestEvaluate(int argc, char **argv) {
     if (argc <= 0) {
         return false;
     }
-    if (strcmp(argv[0], "!") == 0) {
+    if (strcmp(argv[0], "!") == 0 && !(argc == 3 && smallclueTestIsBinaryOp(argv[1]))) {
         return !smallclueTestEvaluate(argc - 1, argv + 1);
     }
     if (argc == 1) {
@@ -23343,7 +23354,7 @@ static bool smallclueTestEvaluate(int argc, char **argv) {
         const char *left = argv[0];
         const char *op = argv[1];
         const char *right = argv[2];
-        if (strcmp(op, "=") == 0) {
+        if (strcmp(op, "=") == 0 || strcmp(op, "==") == 0) {
             return strcmp(left, right) == 0;
         }
         if (strcmp(op, "!=") == 0) {
