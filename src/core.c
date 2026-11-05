@@ -17,6 +17,7 @@
 #include "ln_app.h"
 #include "du_app.h"
 #include "cat_app.h"
+#include "gnu_mode.h"
 #include "rmdir_app.h"
 #include "sum_app.h"
 #include "env_app.h"
@@ -1503,6 +1504,7 @@ static int smallcluePsCommand(int argc, char **argv);
 static int smallclueKillCommand(int argc, char **argv);
 static int smallclueTimeoutCommand(int argc, char **argv);
 static int smallclueMkdirCommand(int argc, char **argv);
+static int smallclueMkfifoCommand(int argc, char **argv);
 static int smallclueMknodCommand(int argc, char **argv);
 static int smallclueMountCommand(int argc, char **argv);
 static int smallclueUmountCommand(int argc, char **argv);
@@ -3743,6 +3745,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"md", smallclueMarkdownCommand, "Read Markdown documents"},
     {"mdev", smallclueMdevCommand, "Device manager"},
     {"mkdir", smallclueMkdirCommand, "Create directories"},
+    {"mkfifo", smallclueMkfifoCommand, "Create named pipes"},
     {"mknod", smallclueMknodCommand, "Create special files"},
     {"mount", smallclueMountCommand, "Mount filesystems"},
     {"umount", smallclueUmountCommand, "Unmount filesystems"},
@@ -4066,6 +4069,9 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
               "  -m set the mode of each named directory (octal)\n"
               "  -p create parents as needed\n"
               "  -v verbose"},
+    {"mkfifo", "mkfifo [-m MODE] NAME...\n"
+               "  Create named pipes. -m sets the mode outright, whatever the file mask;\n"
+               "  otherwise it is 0666 less the mask"},
     {"mknod", "mknod [-m mode] NAME TYPE [MAJOR MINOR]\n"
               "  Create special files (b=block, c/u=char, p=fifo)"},
     {"mount", "mount [-p] [-t type] [-o options] [source] dir\n"
@@ -20731,6 +20737,46 @@ static int smallclueMkdirCommand(int argc, char **argv) {
         if (haveMode && chmod(target, mode) != 0) {
             fprintf(stderr, "mkdir: cannot set permissions on '%s': %s\n",
                     target, strerror(errno));
+            status = 1;
+        }
+    }
+    return status;
+}
+
+static int smallclueMkfifoCommand(int argc, char **argv) {
+    const char *modeText = NULL;
+    smallclueResetGetopt();
+    int opt;
+    while ((opt = getopt(argc, argv, "m:")) != -1) {
+        if (opt != 'm') {
+            fprintf(stderr, "usage: mkfifo [-m MODE] NAME...\n");
+            return 1;
+        }
+        modeText = optarg;
+    }
+    if (optind >= argc) {
+        fprintf(stderr, "mkfifo: missing operand\n");
+        return 1;
+    }
+    mode_t mode = 0666;
+    if (modeText) {
+        GnuMode change = {0};
+        if (!gnuModeCompile(modeText, &change)) {
+            fprintf(stderr, "mkfifo: invalid mode '%s'\n", modeText);
+            return 1;
+        }
+        mode_t mask = umask(0);
+        umask(mask);
+        mode = gnuModeAdjust(0666, false, mask, &change, NULL);
+        gnuModeFree(&change);
+    }
+    int status = 0;
+    for (int i = optind; i < argc; ++i) {
+        if (mkfifo(argv[i], 0666) != 0) {
+            fprintf(stderr, "mkfifo: cannot create fifo '%s': %s\n", argv[i], strerror(errno));
+            status = 1;
+        } else if (modeText && chmod(argv[i], mode) != 0) {
+            fprintf(stderr, "mkfifo: cannot set permissions of '%s': %s\n", argv[i], strerror(errno));
             status = 1;
         }
     }
