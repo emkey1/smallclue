@@ -3474,11 +3474,15 @@ static int smallcluePasswdCommand(int argc, char **argv) {
         fclose(f);
         if (n != sizeof(random_bytes)) {
             fprintf(stderr, "passwd: failed to read random source\n");
+            smallclueSecureMemzero(new_pass_copy, strlen(new_pass_copy) + 1);
+            free(new_pass_copy);
             ulckpwdf();
             return 1;
         }
     } else {
         fprintf(stderr, "passwd: cannot open /dev/urandom\n");
+        smallclueSecureMemzero(new_pass_copy, strlen(new_pass_copy) + 1);
+        free(new_pass_copy);
         ulckpwdf();
         return 1;
     }
