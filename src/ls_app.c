@@ -1504,7 +1504,10 @@ int smallclueLsCommand(int argc, char **argv) {
 
 done:
     fflush(stdout);
-    if (ferror(stdout) && status == 0) status = 2;
+    if (ferror(stdout)) {
+        gnuWriteError("ls", errno);
+        if (status == 0) status = 2;
+    }
     free(ls->ignore);
     free(ls->hide);
     free(ls->colorBuf);

@@ -1171,6 +1171,9 @@ int smallclueDateCommand(int argc, char **argv) {
 
 done:
     free(operands);
-    if (fflush(stdout) != 0 && status == 0) status = 1;
+    if (fflush(stdout) != 0 && status == 0) {
+        gnuWriteError("date", errno);
+        status = 1;
+    }
     return status;
 }

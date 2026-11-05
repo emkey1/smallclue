@@ -1527,7 +1527,11 @@ int smallclueGrepCommand(int argc, char **argv) {
     else status = g->anyMatch ? 0 : 1;
 
 done:
-    fflush(stdout);
+    /* 1 would mean no match. */
+    if (fflush(stdout) != 0 || ferror(stdout)) {
+        gnuWriteError("grep", errno);
+        status = 2;
+    }
     for (size_t k = 0; k < g->npats; k++)
         if (!g->pats[k].empty) regfree(&g->pats[k].re);
     free(g->pats);

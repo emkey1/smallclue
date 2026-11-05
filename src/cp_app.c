@@ -1012,7 +1012,10 @@ done:
     for (size_t k = 0; k < c.nlinks; k++) free(c.links[k].dst);
     free(c.links);
     free(ops);
-    if (fflush(stdout) != 0) status = 1;
+    if (fflush(stdout) != 0) {
+        gnuWriteError("cp", errno);
+        status = 1;
+    }
     return status;
 }
 

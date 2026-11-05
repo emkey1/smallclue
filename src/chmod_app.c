@@ -304,6 +304,9 @@ int smallclueChmodCommand(int argc, char **argv) {
 done:
     gnuModeFree(&c.mode);
     free(files);
-    if (fflush(stdout) != 0) status = 1;
+    if (fflush(stdout) != 0) {
+        gnuWriteError("chmod", errno);
+        status = 1;
+    }
     return status;
 }

@@ -1543,7 +1543,10 @@ int smallclueDiffCommand(int argc, char **argv) {
 
 done:
     fflush(stdout);
-    if (ferror(stdout)) status = 2;
+    if (ferror(stdout)) {
+        gnuWriteError("diff", errno);
+        status = 2;
+    }
     for (size_t k = 0; k < d->nIgnoreRe; k++) regfree(&d->ignoreRe[k]);
     free(d->ignoreRe);
     if (d->haveFuncRe) regfree(&d->funcRe);

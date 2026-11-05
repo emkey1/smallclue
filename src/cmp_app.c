@@ -10,6 +10,7 @@
 
 #include "app_hooks.h"
 #include "gnu_getopt.h"
+#include "gnu_util.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -327,6 +328,9 @@ done:
         free(f);
     }
     gnuGetoptFree(&g);
-    if (fflush(stdout) != 0 && status < 2) status = 2;
+    if (fflush(stdout) != 0 && status < 2) {
+        gnuWriteError("cmp", errno);
+        status = 2;
+    }
     return status;
 }

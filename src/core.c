@@ -23122,11 +23122,26 @@ const SmallclueApplet *smallclueFindApplet(const char *name) {
  * new ones when their exec fails. */
 __attribute__((weak)) void shellRuntimeIdsMayHaveChanged(void) { }
 
+/* As GNU's close_stdout: an applet that never looked still fails if its output was lost. */
+static int smallclueFinishOutput(const SmallclueApplet *applet, int status) {
+    if (fflush(stdout) == 0 && !ferror(stdout)) {
+        return status;
+    }
+    int err = errno;
+    clearerr(stdout);
+    if (status != 0) {
+        return status;
+    }
+    gnuWriteError(applet->name, err);
+    return 1;
+}
+
 int smallclueDispatchApplet(const SmallclueApplet *applet, int argc, char **argv) {
     if (!applet || !applet->entry) {
         return 127;
     }
     optind = 1;
+    clearerr(stdout);
 #if defined(PSCAL_TARGET_IOS)
     static _Thread_local int dispatchDepth = 0;
     smallclueAppStdinReset(dispatchDepth > 0);
@@ -23137,7 +23152,7 @@ int smallclueDispatchApplet(const SmallclueApplet *applet, int argc, char **argv
     int appletStatus = applet->entry(argc, argv);
 #endif
     shellRuntimeIdsMayHaveChanged();
-    return appletStatus;
+    return smallclueFinishOutput(applet, appletStatus);
 }
 
 static void smallclueRedirectFromEnv(void) {

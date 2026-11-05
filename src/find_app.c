@@ -1816,7 +1816,10 @@ done:
     free(f->anc);
     free(f->mounts);
     free(paths);
-    if (ferror(stdout)) status = 1;
+    if (ferror(stdout)) {
+        gnuWriteError("find", errno);
+        status = 1;
+    }
     free(f);
     return status;
 }
