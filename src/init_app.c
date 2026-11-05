@@ -44,6 +44,9 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(PSCAL_TARGET_IOS)
+#include "ios/vproc.h"
+#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -367,9 +370,17 @@ int smallclueHaltCommand(int argc, char **argv) {
     }
 
 #if defined(PSCAL_TARGET_IOS)
-    /* The PSCAL app has no init to ask: ending the shell runtime is the halt. */
-    printf("System %s requested...\n", cmd);
-    exit(0);
+    /* iOS can't be halted from an app, and the app has no init to ask, so the
+     * system a command can see is its tab. Its session's leader is the tab's
+     * shell, which ends where `exit` would, and the tab closes with it. exit()
+     * is no way down: in the app it is pthread_exit, and a shell's thread ended
+     * that way never tells its tab. */
+    (void)poweroff;
+    if (vprocHaltSession() != 0) {
+        fprintf(stderr, "%s: cannot end this session: %s\n", cmd, strerror(errno));
+        return 1;
+    }
+    return 0;
 #else
     int sig = SIGUSR1;
     if (strcmp(cmd, "reboot") == 0) {

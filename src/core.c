@@ -4012,7 +4012,11 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  blame,\n"
             "  describe"},
     {"halt", "halt|poweroff|reboot [-dfhHinpw]\n"
+#if defined(PSCAL_TARGET_IOS)
+             "  End this tab, as exit does: the app can't halt its device\n"
+#else
              "  Ask init to halt, power off or reboot (SIGUSR1, SIGUSR2, SIGTERM)\n"
+#endif
              "  -w only writes the record, which here is nothing, and halts nothing"},
     {"head", "head [-c [-]NUM | -n [-]NUM] [-q|-v] [-z] [FILE...]\n"
            "  Print the first 10 lines (or NUM lines/bytes) of each FILE\n"
@@ -4184,7 +4188,11 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  -t TTL    time to live (over 255: a reply timeout in ms)\n"
              "  -q        only the summary;  -D  a timestamp on each line"},
     {"poweroff", "poweroff [-f]\n"
+#if defined(PSCAL_TARGET_IOS)
+             "  End this tab, as exit does: the app can't power off its device"},
+#else
              "  Power off the system"},
+#endif
     {"ps", "ps [-e|-A|-a] [-f] [-p PID[,PID...]] [-u USER[,USER...]]\n"
            "  Show process list (all processes are always shown; -e/-A/-a\n"
            "  are accepted for compatibility). Also accepts bundled BSD-style\n"
@@ -4195,7 +4203,11 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
     {"pwd", "pwd\n"
             "  Print working directory"},
     {"reboot", "reboot [-f]\n"
+#if defined(PSCAL_TARGET_IOS)
+             "  End this tab, as exit does: the app can't reboot its device"},
+#else
              "  Reboot the system"},
+#endif
     {"reset", "reset\n"
               "  stty sane, then the terminal's reset strings and a visible cursor"},
     {"resize", "resize [COLUMNS ROWS]\n"
