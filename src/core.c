@@ -1190,6 +1190,14 @@ static bool smallclueShouldAbort(int *out_status) {
     }
 
 #if defined(PSCAL_TARGET_IOS)
+    /* Killed, on a thread that cannot be cancelled: the shell's own. */
+    int dying_signal = vprocCurrentDyingSignal();
+    if (dying_signal > 0) {
+        if (out_status) {
+            *out_status = 128 + dying_signal;
+        }
+        return true;
+    }
     /* Fallback: drain pending vproc signals so Ctrl-C/Z delivered via vprocKillShim
      * interrupt in-process applets even when the runtime bridge is absent. */
     if (cur_pid <= 0) {
