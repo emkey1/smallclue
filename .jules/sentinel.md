@@ -50,3 +50,7 @@
 **Vulnerability:** `wget --user/--password` formatted `user:password` into a stack buffer that was never wiped, on any of the function's dozen return paths. Filed by Sentinel almost daily (#296 and 16 duplicates).
 **Learning:** Zeroing before each `return` is easy to get wrong as returns are added; the bot's own patches each missed a different subset.
 **Prevention:** `smallclueWgetCommand` now owns the buffer and wipes it after `smallclueWgetRun` returns, so every path is covered by construction. Hold a secret in the caller and wipe it once, rather than at each exit.
+## 2024-05-24 - Zeroing Stack-Allocated Secrets in C
+**Vulnerability:** In C applets, sensitive data (e.g., passwords in buffers) must be explicitly zeroed out before the function returns across all execution paths (including early returns and error conditions) to prevent memory disclosure vulnerabilities, as heap/stack memory isn't automatically cleared.
+**Learning:** Returning without explicitly calling the zeroing function leaves sensitive data on the heap or stack. In `passwd`, `new_pass_copy` leaked when `/dev/urandom` failed.
+**Prevention:** Make sure `smallclueSecureMemzero` is called on sensitive buffers before returning, and double check error paths.
