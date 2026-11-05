@@ -553,6 +553,18 @@ int smallclueOdCommand(int argc, char **argv) {
         for (;;) {
             intmax_t len = 0;
             while (len < od.perLine && (od.limit < 0 || total < od.limit)) {
+                if (od.in) {
+                    size_t to_read = od.perLine - len;
+                    if (od.limit >= 0 && to_read > (size_t)(od.limit - total)) {
+                        to_read = od.limit - total;
+                    }
+                    size_t r = fread(block + len, 1, to_read, od.in);
+                    if (r > 0) {
+                        len += r;
+                        total += r;
+                        continue;
+                    }
+                }
                 int ch = odGetc(&od);
                 if (ch < 0) break;
                 block[len++] = (unsigned char)ch;

@@ -33,3 +33,6 @@
 ## YYYY-MM-DD - Optimize cmp applet via block reads
 **Learning:** For utilities like `cmp` that compare inputs byte-by-byte, using `fgetc` introduces substantial function-call and buffering overhead. Profiling shows that reading data in 16KB blocks directly into stack arrays dramatically speeds up byte processing.
 **Action:** Replace `fgetc` with standard `fread` and stack buffers in high-throughput byte-comparison loops like `cmp` to minimize stdio execution overhead.
+## YYYY-MM-DD - Optimize od applet via block reads
+**Learning:** For utilities like `od` that read data byte-by-byte for processing formats, using `fgetc` inside a loop iterating `od.perLine` (usually 16 or 32 bytes) introduces substantial function-call and buffering overhead.
+**Action:** Replace `fgetc` with standard `fread` directly into the byte formatting stack buffer array to minimize `stdio` overhead and significantly speed up rendering.
