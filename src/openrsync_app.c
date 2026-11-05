@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #if defined(PSCAL_TARGET_IOS)
@@ -182,6 +183,11 @@ int smallclueRunRsync(int argc, char **argv) {
     ctx.prev = g_openrsync_exit_ctx;
     g_openrsync_exit_ctx = &ctx;
 
+    /* The receiver zeroes the file mask and leaves it so, as a process about to exit may. A
+     * command in a job or a pipeline stage runs on that task, which goes on after this. */
+    mode_t prior_mask = umask(0);
+    umask(prior_mask);
+
     int status = 1;
     if (sigsetjmp(ctx.env, 1) == 0) {
         /* A local transfer's server gets here past the applet dispatcher. Zero is
@@ -192,6 +198,7 @@ int smallclueRunRsync(int argc, char **argv) {
         status = ctx.exit_code;
     }
 
+    umask(prior_mask);
     g_openrsync_exit_ctx = ctx.prev;
     g_openrsync_progname = prior_progname;
     return status;
