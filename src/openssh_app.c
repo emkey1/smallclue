@@ -1709,6 +1709,10 @@ static void *smallclueRunSshSessionThread(void *arg) {
                  (unsigned long long)ctx->session_id);
         smallclueSshDebugLog(logbuf);
     }
+    /* A tab of its own, with no shell to give it an environment. What it sets, a virtual HOME
+     * among them, stays out of what the next tab starts with. */
+    VProcEnv *own_env = vprocEnvCapture();
+    vprocEnvActivate(own_env);
     int status = 255;
     int kernel_pid = vprocEnsureKernelPid();
     VProcSessionStdio *session_stdio = vprocSessionStdioCreate();
@@ -1833,6 +1837,10 @@ static void *smallclueRunSshSessionThread(void *arg) {
     smallclueSshSessionNotifyExit(ctx->session_id, status);
     smallclueFreeArgv(ctx->argv, ctx->argc);
     free(ctx);
+    if (own_env) {
+        vprocEnvActivate(NULL);
+        vprocEnvRelease(own_env);
+    }
     if (runtime_ctx_swapped && PSCALRuntimeSetCurrentRuntimeContext) {
         PSCALRuntimeSetCurrentRuntimeContext(prev_runtime_ctx);
     }
