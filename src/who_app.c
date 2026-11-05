@@ -26,12 +26,13 @@ static void whoTime(int64_t sec, char *buf, size_t size) {
 }
 
 /* Idle time as coreutils prints it: "." under a minute, "old" over a day,
- * else HH:MM -- from the terminal's last access. */
+ * else HH:MM -- from the terminal's last access. A terminal with no access time,
+ * as the iOS app's are, gets the same "?" as coreutils gives one. */
 static void whoIdle(const char *line, char *buf, size_t size) {
     char path[64];
     snprintf(path, sizeof(path), "/dev/%s", line);
     struct stat st;
-    if (stat(path, &st) != 0) {
+    if (stat(path, &st) != 0 || st.st_atime == 0) {
         snprintf(buf, size, "  ?  ");
         return;
     }

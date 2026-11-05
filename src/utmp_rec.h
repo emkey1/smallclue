@@ -96,4 +96,15 @@ void smallclueUtmpBoot(int64_t bootTime, char runlevel);
  * wtmp record). */
 void smallclueUtmpShutdown(bool utmpToo);
 
+#if defined(PSCAL_TARGET_IOS)
+/* A terminal of the iOS app is a login with no login program. Opened, on the
+ * terminal's own thread: a login for the terminal on standard input, in the name
+ * whoami prints, with PID as its process and SESSION as the app's name for it.
+ * The first one in a run of the app is that run's boot. Closed ends it, and says
+ * nothing for a SESSION with no login, so a session's thread and the removal of
+ * its tab can both call it, in either order. */
+void smallclueUtmpTerminalOpened(uint64_t session, pid_t pid);
+void smallclueUtmpTerminalClosed(uint64_t session);
+#endif
+
 #endif /* SMALLCLUE_UTMP_REC_H */

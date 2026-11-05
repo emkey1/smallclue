@@ -13,6 +13,12 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#if defined(PSCAL_TARGET_IOS)
+#include <pthread.h>
+#include <pwd.h>
+#include <time.h>
+#endif
+
 /* Offsets common to both layouts. */
 #define OFF_TYPE    0
 #define OFF_PID     4
@@ -122,9 +128,35 @@ void smallclueUtmpStamp(SmallclueUtmp *rec) {
     rec->usec = tv.tv_usec;
 }
 
+#if defined(PSCAL_TARGET_IOS)
+/* Every tab and command of the app is one process, and a record lock is the
+ * process's, so it keeps nobody out there: two tabs opening together would find
+ * the same free slot and one login would be lost. This keeps them apart. A
+ * command's thread can be cancelled, and must not end holding it. */
+static pthread_mutex_t gWriterLock = PTHREAD_MUTEX_INITIALIZER;
+static int gWriterCancelState;
+
+static void writerEnter(void) {
+    int cancelState;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancelState);
+    pthread_mutex_lock(&gWriterLock);
+    gWriterCancelState = cancelState;
+}
+
+static void writerLeave(void) {
+    int cancelState = gWriterCancelState;
+    pthread_mutex_unlock(&gWriterLock);
+    pthread_setcancelstate(cancelState, NULL);
+}
+#else
+static void writerEnter(void) {}
+static void writerLeave(void) {}
+#endif
+
 /* The whole-file write lock glibc's utmp functions take, so the guest's own
  * glibc writers (login, sshd, utempter) and these do not interleave. */
 static int lockFile(int fd, short type) {
+    writerEnter();
     struct flock fl;
     memset(&fl, 0, sizeof(fl));
     fl.l_type = type;
@@ -133,6 +165,8 @@ static int lockFile(int fd, short type) {
     do {
         rc = fcntl(fd, F_SETLKW, &fl);
     } while (rc < 0 && errno == EINTR);
+    if (rc < 0)
+        writerLeave();
     return rc;
 }
 
@@ -142,9 +176,17 @@ static void unlockFile(int fd) {
     fl.l_type = F_UNLCK;
     fl.l_whence = SEEK_SET;
     fcntl(fd, F_SETLK, &fl);
+    writerLeave();
 }
 
 static int openRecords(const char *path, int flags) {
+#if defined(SMALLCLUE_APP_HOOKS_H) && defined(PSCAL_TARGET_IOS)
+    /* open is the vproc's shim, which translates a path only for a thread with a
+     * task. A tab's logout can come after its shell's task has gone, or from the
+     * queue that removes the tab, and would look on the host's filesystem. */
+    char expanded[PATH_MAX];
+    path = pscalPathVirtualized_hostPath(path, expanded);
+#endif
     int fd = open(path, flags | O_CLOEXEC, 0664);
     return fd;
 }
@@ -422,3 +464,79 @@ void smallclueUtmpShutdown(bool utmpToo) {
     snprintf(rec.line, sizeof(rec.line), "~~");
     (void) smallclueWtmpAppend(SMALLCLUE_WTMP_PATH, &rec);
 }
+
+#if defined(PSCAL_TARGET_IOS)
+/* What wtmp may reach before a launch moves it aside: nothing else here rotates it. */
+#define WTMP_ROTATE_BYTES (1024 * 1024)
+
+typedef struct TerminalLogin {
+    uint64_t session;
+    pid_t pid;
+    struct TerminalLogin *next;
+} TerminalLogin;
+
+static TerminalLogin *gTerminalLogins = NULL;
+static pthread_mutex_t gTerminalLoginsLock = PTHREAD_MUTEX_INITIALIZER;
+
+/* A launch of the app is its boot. /run is a tmpfs on Linux, so utmp starts each
+ * boot empty, and it has to here: iOS ends the app without warning, and the last
+ * run's tabs would stay in the file as logins nobody has. In wtmp they stay with
+ * no logout, as after a crash on Linux. */
+static void terminalsBoot(void) {
+    (void) mkdir("/var", 0755);
+    (void) mkdir("/var/run", 0755);
+    (void) mkdir("/var/log", 0755);
+    (void) unlink(SMALLCLUE_UTMP_PATH);
+    struct stat st;
+    if (stat(SMALLCLUE_WTMP_PATH, &st) == 0 && st.st_size >= WTMP_ROTATE_BYTES)
+        (void) rename(SMALLCLUE_WTMP_PATH, SMALLCLUE_WTMP_PATH ".1");
+    smallclueUtmpBoot((int64_t) time(NULL), '2');
+}
+
+void smallclueUtmpTerminalOpened(uint64_t session, pid_t pid) {
+    static pthread_once_t boot = PTHREAD_ONCE_INIT;
+    pthread_once(&boot, terminalsBoot);
+
+    char line[33], id[5];
+    if (!smallclueUtmpLineForFd(STDIN_FILENO, line, id))
+        return;
+    TerminalLogin *login = malloc(sizeof(*login));
+    if (login == NULL)
+        return;
+
+    /* What whoami prints. getpwuid is the app's own, from its /etc/passwd, where
+     * getpwuid_r is the host's and knows only a number here. */
+    char name[33];
+    uid_t uid = geteuid();
+    struct passwd *found = getpwuid(uid);
+    if (found != NULL && found->pw_name != NULL && found->pw_name[0] != '\0')
+        snprintf(name, sizeof(name), "%s", found->pw_name);
+    else
+        snprintf(name, sizeof(name), "%u", (unsigned) uid);
+    smallclueUtmpLogin(pid, line, id, name, NULL);
+
+    login->session = session;
+    login->pid = pid;
+    pthread_mutex_lock(&gTerminalLoginsLock);
+    login->next = gTerminalLogins;
+    gTerminalLogins = login;
+    pthread_mutex_unlock(&gTerminalLoginsLock);
+}
+
+void smallclueUtmpTerminalClosed(uint64_t session) {
+    TerminalLogin *login = NULL;
+    pthread_mutex_lock(&gTerminalLoginsLock);
+    for (TerminalLogin **at = &gTerminalLogins; *at != NULL; at = &(*at)->next) {
+        if ((*at)->session == session) {
+            login = *at;
+            *at = login->next;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&gTerminalLoginsLock);
+    if (login == NULL)
+        return;
+    smallclueUtmpProcessEnded(login->pid);
+    free(login);
+}
+#endif

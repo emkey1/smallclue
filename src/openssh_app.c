@@ -19,6 +19,7 @@
 #include <time.h>
 #include "common/path_truncate.h"
 #include "pscal_openssh_hooks.h"
+#include "utmp_rec.h"
 #if defined(PSCAL_TARGET_IOS)
 #include "ios/vproc.h"
 #include "ios/tty/pscal_pty.h"
@@ -1674,6 +1675,10 @@ static void smallclueCloseSessionFds(smallclueSshSessionContext *ctx) {
     }
 }
 
+static void smallclueSshTerminalClosed(void *arg) {
+    smallclueUtmpTerminalClosed(((smallclueSshSessionContext *)arg)->session_id);
+}
+
 static void *smallclueRunSshSessionThread(void *arg) {
     smallclueSshSessionContext *ctx = (smallclueSshSessionContext *)arg;
     if (!ctx) {
@@ -1786,8 +1791,11 @@ static void *smallclueRunSshSessionThread(void *arg) {
     }
 
     if (vp) {
+        smallclueUtmpTerminalOpened(ctx->session_id, vprocPid(vp));
+        pthread_cleanup_push(smallclueSshTerminalClosed, ctx);
         smallclueSshDebugLog("[ssh-session] openssh entry start");
         status = smallclueRunOpensshEntryOnce("ssh", pscal_openssh_ssh_main, ctx->argc, ctx->argv);
+        pthread_cleanup_pop(1);
     }
 
     if (vp) {
