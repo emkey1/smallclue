@@ -235,6 +235,7 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
         }
 
         void *program_env = shellRuntimeProgramEnvEnter ? shellRuntimeProgramEnvEnter() : NULL;
+        void *program_locale = vprocLocaleSave();
         jmp_buf exit_env;
         volatile int exit_status_sink = 0;
         bool override_active = false;
@@ -258,6 +259,7 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
         status = smallclueDispatchApplet(applet, argc, argv);
 #if defined(PSCAL_TARGET_IOS)
 smallclue_dispatch_done:
+        vprocLocaleRestore(program_locale);
         if (shellRuntimeProgramEnvLeave) {
             shellRuntimeProgramEnvLeave(program_env);
         }
