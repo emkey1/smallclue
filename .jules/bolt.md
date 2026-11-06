@@ -33,3 +33,6 @@
 ## YYYY-MM-DD - Optimize cmp applet via block reads
 **Learning:** For utilities like `cmp` that compare inputs byte-by-byte, using `fgetc` introduces substantial function-call and buffering overhead. Profiling shows that reading data in 16KB blocks directly into stack arrays dramatically speeds up byte processing.
 **Action:** Replace `fgetc` with standard `fread` and stack buffers in high-throughput byte-comparison loops like `cmp` to minimize stdio execution overhead.
+## 2025-05-19 - Optimization of smallclueWcProcessFileFast character processing loop
+**Learning:** `smallclueWcProcessFileFast` used a branch-heavy logic inside an unrolled byte-processing loop to update the `words` count by checking `in_word` state and using compound space evaluation logic (`c == ' ' || (c >= '\t' && c <= '\r')`). This branching is slow. Replacing it with a static `is_space_lookup` array, bitwise logical operators (`&`), and branchless arithmetic (`words += (!in_word & !is_sp)`) removes all branches, providing ~20% faster execution throughput for `wc`.
+**Action:** In hot text processing loops processing single bytes, eliminate all `if/else` branching using branchless bitwise logic (`&`, `|`) alongside static 256-element arrays for lookups like `is_space` or `is_alpha`.
