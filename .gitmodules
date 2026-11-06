@@ -14,4 +14,4 @@
 [submodule "third-party/openssh"]
 	path = third-party/openssh
 	url = https://github.com/emkey1/openssh.git
-	branch = ish-aok-10.5
+	branch = ish-aok-10.6
