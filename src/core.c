@@ -12915,6 +12915,12 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
         }
     } else {
         fprintf(out, "%s", header);
+        if (colour && term_cols > 0) {
+            int pad = term_cols - (int)strlen(header);
+            if (pad > 0) {
+                fprintf(out, "%*s", pad, "");
+            }
+        }
     }
     if (colour) {
         fputs("\x1b[0m", out);
@@ -12943,13 +12949,19 @@ static void markdownInteractiveRenderList(MarkdownDocEntry *entries,
                 fwrite(line, 1, (size_t)(term_cols - 3), out);
                 fputs("...", out);
             }
-            fputc('\n', out);
         } else {
-            fprintf(out, "%s\n", line);
+            fprintf(out, "%s", line);
+            if (highlight && colour && term_cols > 0) {
+                int pad = term_cols - (int)strlen(line);
+                if (pad > 0) {
+                    fprintf(out, "%*s", pad, "");
+                }
+            }
         }
         if (highlight && colour) {
             fputs("\x1b[0m", out);
         }
+        fputc('\n', out);
     }
     if (show_docs_dir) {
         char docs_dir_display[PATH_MAX];

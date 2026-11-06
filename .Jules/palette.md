@@ -29,3 +29,7 @@
 ## YYYY-MM-DD - Dynamic Full-Width Inverse Video Headers
 **Learning:** Hardcoded inverse video headers in fullscreen applets do not stretch across the terminal, resulting in jagged resizing and poor visual hierarchy.
 **Action:** Always dynamically build header strings using `snprintf`, measure their length, calculate the remaining width via `pscalRuntimeDetectWindowCols()`, and append space padding so the inverse video highlight stretches cleanly across the terminal row.
+
+## YYYY-MM-DD - Inverse Video Bleeding Across Newlines
+**Learning:** When rendering full-width inverse video backgrounds in terminal UIs (like selection highlights), placing the ANSI color reset sequence (`\x1b[0m`) after a newline character (`\n`) can cause the background color to bleed onto the entire next line in some terminal emulators.
+**Action:** Always ensure that ANSI formatting reset sequences are emitted strictly *before* newline characters when closing out styled terminal lines.
