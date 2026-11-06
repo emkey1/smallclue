@@ -461,8 +461,8 @@ static void registerSmallclueBuiltin(const char *name,
      * and (wget) network side effects. Blanket-classify conservatively rather
      * than auditing each of the ~30 wrapped tools (Docs/pscal_vm2_plan.md
      * §6.3's default for ext_builtins categories). */
-    registerVmBuiltin(name, handler, BUILTIN_TYPE_PROCEDURE, display_name,
-                      FX_PROC | FX_IO | FX_NET);
+    registerShellVmBuiltin(name, handler, BUILTIN_TYPE_PROCEDURE, display_name,
+                           FX_PROC | FX_IO | FX_NET);
     smallclueRecordRegisteredName(name);
 }
 
