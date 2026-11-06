@@ -1099,8 +1099,16 @@ int smallclueSttyCommand(int argc, char **argv) {
 #if !defined(__linux__)
     kernelPath = sttyKernelGet(fd, &mode);
 #endif
-    if (!kernelPath && tcgetattr(fd, &host) != 0) {
-        int err = errno;
+    int err = 0;
+#if defined(PSCAL_TARGET_IOS)
+    /* Every terminal in the app answers the ioctl above, so this is no terminal. tcgetattr
+     * has no shim and would ask the host's descriptor of the slot's number: on iOS 17 that
+     * was a socket, and `stty -F /dev/null` said "Operation not supported on socket". */
+    if (!kernelPath) err = (errno == EBADF) ? EBADF : ENOTTY;
+#else
+    if (!kernelPath && tcgetattr(fd, &host) != 0) err = errno;
+#endif
+    if (err != 0) {
 #if defined(PSCAL_TARGET_IOS)
         /* PSCAL's virtual terminal has no termios: report its size, as before. */
         if (!deviceName && !pscalRuntimeStdinHasRealTTY()) {
