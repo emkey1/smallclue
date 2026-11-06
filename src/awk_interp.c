@@ -1882,12 +1882,24 @@ static bool awkNextMainRecord(char **outLine) {
             }
         }
         char *line = NULL;
+        errno = 0;
         if (awkReadRecordFromFile(gInterp.curFile, &line)) {
             *outLine = line;
             return true;
         }
+        /* An input that could not be read is no end of it: exit 2, no END, as for a
+         * file that could not be opened. `awk '{print}' <&-` gave 0. */
+        bool failed = ferror(gInterp.curFile);
+        int err = errno ? errno : EIO;
         if (gInterp.curFileIsOwned) fclose(gInterp.curFile);
         gInterp.curFile = NULL;
+        if (failed) {
+            const char *name = awkGetVarStr("FILENAME");
+            fprintf(stderr, "awk: cannot read \"%s\" (%s)\n", *name ? name : "-", strerror(err));
+            gInterp.fatal = gInterp.exiting = true;
+            gInterp.exitCode = 2;
+            return false;
+        }
     }
 }
 

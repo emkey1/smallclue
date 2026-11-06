@@ -61,6 +61,7 @@ typedef struct {
     char buf[65536];
     size_t pos, len;
     bool eof;
+    int readErr;            /* why the input ended early, or 0 */
     size_t lineno;          /* -L: complete lines in the pending command */
     bool nulWarned;
     /* the command being built */
@@ -84,6 +85,7 @@ static int xargsGetc(Xargs *x) {
             ssize_t n = read(x->fd, x->buf, sizeof(x->buf));
             if (n < 0 && errno == EINTR) continue;
             if (n <= 0) {
+                if (n < 0) x->readErr = errno ? errno : EIO;
                 x->eof = true;
                 return EOF;
             }
@@ -826,6 +828,12 @@ int smallclueXargsCommand(int argc, char **argv) {
     }
     xargsWaitFor(x, kids.v, &kids.n, 0);
     status = x->status;
+    /* An input that failed is no end of it. As GNU's, the command has run on what came,
+     * and then it fails: `xargs echo <&-` gave 0. */
+    if (x->readErr) {
+        fprintf(stderr, "xargs: read error: %s\n", strerror(x->readErr));
+        if (status == 0) status = 1;
+    }
 
 done:
     if (x->fd > 0) close(x->fd);

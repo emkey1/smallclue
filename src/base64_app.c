@@ -26,6 +26,15 @@ static int smallclueBase64DecodeChar(char c) {
     return -1;
 }
 
+/* GNU's: what is done so far goes out, then why it stopped. `base64 <&-` gave 1 and no word. */
+static int smallclueBase64ReadError(const unsigned char *done, size_t len, FILE *out) {
+    int err = errno ? errno : EIO;
+    if (len > 0) fwrite(done, 1, len, out);
+    fflush(out);
+    fprintf(stderr, "base64: read error: %s\n", strerror(err));
+    return 1;
+}
+
 static int smallclueBase64Encode(FILE *in, FILE *out, int wrapCol) {
     unsigned char in_buf[16384 + 2];
     unsigned char out_buf[32768];
@@ -46,6 +55,9 @@ static int smallclueBase64Encode(FILE *in, FILE *out, int wrapCol) {
         carry = avail - i;
         memmove(in_buf, in_buf + i, carry);
     }
+    if (ferror(in)) {
+        return smallclueBase64ReadError(out_buf, out_len, out);
+    }
     if (carry > 0) {
         if (out_len > sizeof(out_buf) - 8) { fwrite(out_buf, 1, out_len, out); out_len = 0; }
         unsigned char b0 = in_buf[0], b1 = carry > 1 ? in_buf[1] : 0;
@@ -58,7 +70,7 @@ static int smallclueBase64Encode(FILE *in, FILE *out, int wrapCol) {
     }
     if (out_len > 0) fwrite(out_buf, 1, out_len, out);
     if (wrapCol > 0 && col != 0) fputc('\n', out);
-    return ferror(in) ? 1 : 0;
+    return 0;
 }
 
 static int smallclueBase64Decode(FILE *in, FILE *out, bool ignoreGarbage) {
@@ -101,6 +113,9 @@ static int smallclueBase64Decode(FILE *in, FILE *out, bool ignoreGarbage) {
         if (pad_found) {
             break;
         }
+    }
+    if (!pad_found && ferror(in)) {
+        return smallclueBase64ReadError(out_buf, out_len, out);
     }
 
     /* Padding ends the data. Whatever follows it in this block or the

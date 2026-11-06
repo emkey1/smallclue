@@ -19336,23 +19336,22 @@ static int smallclueTtyCommand(int argc, char **argv) {
         }
     }
 
-    if (!pscalRuntimeStdinHasRealTTY()) {
+    /* stdin's own answer: the session having a terminal is not stdin being one, so
+     * `tty <&-` and `tty < /dev/null` named the session's. */
+    if (!pscalRuntimeStdinIsInteractive()) {
         if (!silent) {
             printf("not a tty\n");
         }
         return 1;
     }
 
-    const char *name = NULL;
+    const char *name = ttyname(STDIN_FILENO);
 #if defined(PSCAL_TARGET_IOS)
     char session_name[64];
-    if (smallclueSessionPtyName(session_name, sizeof(session_name))) {
+    if ((!name || !*name) && smallclueSessionPtyName(session_name, sizeof(session_name))) {
         name = session_name;
     }
 #endif
-    if (!name || !*name) {
-        name = ttyname(STDIN_FILENO);
-    }
     if (!name || !*name) {
         name = ttyname(STDOUT_FILENO);
     }
@@ -20275,6 +20274,11 @@ static int smallclueWcCommand(int argc, char **argv) {
     bool print_each = total_mode != 2;
     if (paths <= 0) {
         if (smallclueWcProcessFile(NULL, &counts, needWide) != 0) {
+            /* GNU's: the counts it has, then why. `wc -l <&-` said nothing. */
+            int err = errno;
+            smallclueWcPrint(&counts, show_lines, show_words, show_chars, show_bytes, show_maxline, NULL, width);
+            fflush(stdout);
+            fprintf(stderr, "wc: 'standard input': %s\n", strerror(err));
             return 1;
         }
         if (total_mode == 2) {

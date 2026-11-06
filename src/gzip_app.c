@@ -444,9 +444,15 @@ static void gzStdin(Gz *g) {
         g->status = 1;
         return;
     }
+    /* GNU asks first, so a closed stdin writes no header: `gzip -c <&-` used to. */
     struct stat st;
+    if (fstat(STDIN_FILENO, &st) != 0) {
+        fprintf(stderr, "gzip: standard input: %s\n", strerror(errno));
+        g->status = 1;
+        return;
+    }
     uint32_t mtime = 0;
-    if (g->saveName && fstat(STDIN_FILENO, &st) == 0 && S_ISREG(st.st_mode)) mtime = (uint32_t)st.st_mtime;
+    if (g->saveName && S_ISREG(st.st_mode)) mtime = (uint32_t)st.st_mtime;
     uintmax_t in = 0, out = 0;
     if (g->mode == GZ_COMPRESS) {
         if (!gzCompress(g, STDIN_FILENO, STDOUT_FILENO, "stdin", NULL, mtime, &in, &out)) g->status = 1;
