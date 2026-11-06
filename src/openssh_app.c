@@ -1489,8 +1489,17 @@ static void *smallclueRunOpensshEntryThread(void *arg) {
 
 extern bool pscalRuntimeConsumeSigint(void);
 
+/* The app's interrupt flag stands for the foreground. A background ssh that took it ended in
+ * place of the command ^C was meant for; its own comes as a signal to its task. */
+static bool smallclueOpensshInForeground(VProc *vp) {
+    int pid = vprocPid(vp);
+    int sid = vprocGetSid(pid);
+    int foreground = sid > 0 ? vprocGetForegroundPgid(sid) : -1;
+    return foreground > 0 && vprocGetPgid(pid) == foreground;
+}
+
 static bool smallclueOpensshInterruptRequested(VProc *vp) {
-    if (pscalRuntimeConsumeSigint()) {
+    if (smallclueOpensshInForeground(vp) && pscalRuntimeConsumeSigint()) {
         return true;
     }
     int pid = vprocPid(vp);
