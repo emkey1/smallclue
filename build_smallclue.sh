@@ -664,6 +664,13 @@ if [ "$SMALLCLUE_WITH_LIBGIT2" = "1" ]; then
     if command -v ninja >/dev/null 2>&1; then
         CMAKE_GENERATOR_ARGS="-G Ninja"
     fi
+    # libgit2 adds OpenSSL's headers only when OpenSSL is also its HTTPS
+    # backend. On macOS that backend is SecureTransport, so hash with
+    # CommonCrypto there, libgit2's own default for macOS.
+    LIBGIT2_SHA=OpenSSL
+    if [ "$(uname -s)" = "Darwin" ]; then
+        LIBGIT2_SHA=CommonCrypto
+    fi
     echo "Building libgit2 applet support..."
     cmake -S "$LIBGIT2_DIR" -B "$LIBGIT2_BUILD_DIR" $CMAKE_GENERATOR_ARGS \
         -DCMAKE_BUILD_TYPE=Release \
@@ -675,8 +682,8 @@ if [ "$SMALLCLUE_WITH_LIBGIT2" = "1" ]; then
         -DBUILD_FUZZERS=OFF \
         -DUSE_SSH=OFF \
         -DUSE_HTTPS=ON \
-        -DUSE_SHA1=OpenSSL \
-        -DUSE_SHA256=OpenSSL \
+        -DUSE_SHA1=$LIBGIT2_SHA \
+        -DUSE_SHA256=$LIBGIT2_SHA \
         -DUSE_HTTP_PARSER=builtin \
         -DUSE_AUTH_NTLM=OFF \
         -DUSE_AUTH_NEGOTIATE=OFF \
