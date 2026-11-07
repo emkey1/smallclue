@@ -56,6 +56,7 @@
 #include "who_app.h"
 #include "tput_app.h"
 #include "free_app.h"
+#include "ip_app.h"
 #include "mount_app.h"
 #include "dd_app.h"
 #include "od_app.h"
@@ -4175,6 +4176,7 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"tabadd", smallclueAddTabCommand, "Alias for addt: open an additional shell tab"},
     {"tadd", smallclueAddTabCommand, "Alias for addt: open an additional shell tab"},
     {"ws", smallclueWorkspaceCommand, "Open a Workspace applet, or list the ones open"},
+    {"ip", smallclueIpCommand, "Show network interfaces, addresses and routes"},
     {"smallclue-help", smallclueHelpCommand, "List available smallclue applets"},
     {"licenses", smallclueLicensesCommand, "View third-party licenses"},
     {"top", smallclueTopCommand, "Show PSCAL virtual processes"},
@@ -4364,6 +4366,16 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
              "  PID 1: run /etc/rc, reap orphans, and on SIGTERM (reboot), SIGUSR1\n"
              "  (halt) or SIGUSR2 (poweroff) run /etc/rc.shutdown and stop everything\n"
              "  --service-mode allows compatibility startup when PID != 1"},
+#if defined(PSCAL_TARGET_IOS)
+    {"ip", "ip [-4|-6|-0] [-br] [-j [-p]] [-o] OBJECT [COMMAND]\n"
+           "  Show network interfaces, addresses and routes, as iproute2's ip\n"
+           "  ip address [show [dev] IFNAME] [up]     (a, addr)\n"
+           "  ip link [show [dev] IFNAME] [up]\n"
+           "  ip route [show] [dev IFNAME] [default]  (r)\n"
+           "  ip route get ADDRESS\n"
+           "  Changes (link set, address add, route add) are refused: the app\n"
+           "  can't configure the device's network"},
+#endif
 #if SMALLCLUE_HAS_IFADDRS
     {"ipaddr", "ipaddr [-4|-6] [-a]\n"
                "  Show interface IP addresses\n"
