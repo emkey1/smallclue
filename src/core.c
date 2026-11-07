@@ -110,6 +110,12 @@
 #include <sys/klog.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#elif defined(PSCAL_TARGET_IOS)
+// The app: shadow lookups and a "$6$" crypt of its own, on the app's /etc/shadow.
+#ifndef SMALLCLUE_HAVE_SHADOW_AUTH
+#define SMALLCLUE_HAVE_SHADOW_AUTH 1
+#endif
+#include "ios_shadow.h"
 #elif defined(SMALLCLUE_HAVE_SHADOW_AUTH)
 // A native build wants the shadow lookups out of this group and nothing else:
 // klog and netlink are Linux kernel interfaces with no stand-in, while
@@ -2410,6 +2416,46 @@ static int smallclueHostCommand(int argc, char **argv) {
 }
 
 static int smallclueHostnameCommand(int argc, char **argv) {
+#if defined(PSCAL_TARGET_IOS)
+    /* The kernel's name, as on Linux: gethostname, and sethostname for root. */
+    bool short_name = false;
+    const char *new_name = NULL;
+    for (int i = 1; i < argc; ++i) {
+        const char *a = argv[i];
+        if (strcmp(a, "-s") == 0 || strcmp(a, "--short") == 0) {
+            short_name = true;
+        } else if (strcmp(a, "-f") == 0 || strcmp(a, "--fqdn") == 0 || strcmp(a, "--long") == 0 ||
+                   strcmp(a, "-a") == 0 || strcmp(a, "-A") == 0) {
+            short_name = false;
+        } else if (a[0] == '-' && a[1] != '\0') {
+            fprintf(stderr, "hostname: invalid option -- '%s'\n", a + 1);
+            fprintf(stderr, "usage: hostname [-s|-f] [NAME]\n");
+            return 1;
+        } else if (!new_name) {
+            new_name = a;
+        } else {
+            fprintf(stderr, "usage: hostname [-s|-f] [NAME]\n");
+            return 1;
+        }
+    }
+    if (new_name) {
+        if (sethostname(new_name, strlen(new_name)) != 0) {
+            fprintf(stderr, "hostname: you must be root to change the host name\n");
+            return 1;
+        }
+        return 0;
+    }
+    char name[256];
+    if (gethostname(name, sizeof(name)) != 0) {
+        perror("hostname");
+        return 1;
+    }
+    if (short_name) {
+        name[strcspn(name, ".")] = '\0';
+    }
+    puts(name);
+    return 0;
+#endif
     if (argc > 1) {
         if (sethostname(argv[1], strlen(argv[1])) != 0) {
             fprintf(stderr, "hostname: %s: %s\n", argv[1], strerror(errno));
@@ -2450,6 +2496,10 @@ typedef struct SmallclueAppletHelp {
 // authentication path of its own.
 static void smallclueSecureMemzero(void *ptr, size_t len);
 static char *smallclueGetPass(const char *prompt);
+#if defined(PSCAL_TARGET_IOS)
+/* Where smallclueGetPass reads when standard input isn't the terminal: sudo's /dev/tty. */
+static _Thread_local bool gSmallcluePassFromTty = false;
+#endif
 
 static int smallclueSuCommand(int argc, char **argv) {
     const char *usage = "usage: su [-] [username] [-c command]\n";
@@ -2524,15 +2574,27 @@ static int smallclueSuCommand(int argc, char **argv) {
             fprintf(stderr, "su: account %s is locked or has no password\n", user);
             return 1;
         }
-        char *pass = smallclueGetPass("Password: ");
-        if (!pass)
-            return 1;
-        char *encrypted = crypt(pass, sp->sp_pwdp);
-        smallclueSecureMemzero(pass, strlen(pass) + 1);
-        free(pass);
-        if (!encrypted || strcmp(encrypted, sp->sp_pwdp) != 0) {
-            fprintf(stderr, "su: authentication failure\n");
-            return 1;
+#if defined(PSCAL_TARGET_IOS)
+        // NOT a missing check. In the app an empty field means the account has
+        // no password, as pam_unix's nullok does on Linux: the app ships root
+        // and mobile that way, and `sudo passwd` is how the owner sets one.
+        // Anyone at this prompt could already do what root can while there is
+        // none, so asking for nothing gives nothing away.
+        bool no_password = sp->sp_pwdp[0] == '\0';
+#else
+        bool no_password = false;
+#endif
+        if (!no_password) {
+            char *pass = smallclueGetPass("Password: ");
+            if (!pass)
+                return 1;
+            char *encrypted = crypt(pass, sp->sp_pwdp);
+            smallclueSecureMemzero(pass, strlen(pass) + 1);
+            free(pass);
+            if (!encrypted || strcmp(encrypted, sp->sp_pwdp) != 0) {
+                fprintf(stderr, "su: authentication failure\n");
+                return 1;
+            }
         }
 #else
         fprintf(stderr, "su: authentication not supported on this platform\n");
@@ -2553,6 +2615,11 @@ static int smallclueSuCommand(int argc, char **argv) {
         return 1;
     }
 
+#if defined(PSCAL_TARGET_IOS)
+    /* The app's shell has no $SHELL of its own to keep. */
+    if (pw->pw_shell && *pw->pw_shell)
+        setenv("SHELL", pw->pw_shell, 1);
+#endif
     if (login) {
         setenv("HOME", pw->pw_dir, 1);
         setenv("SHELL", pw->pw_shell, 1);
@@ -2986,6 +3053,72 @@ static bool sudoersCmndAllows(const char *spec, const char *cmd_path) {
 static bool sudoersScan(const char *path, const struct passwd *pw, const char *target,
                         const char *cmd_path, bool *allowed, bool *nopasswd, int depth);
 
+#if defined(PSCAL_TARGET_IOS)
+/* The one Defaults the app reads, rootpw, which its /etc/sudoers ships: sudo asks for root's
+ * password rather than the caller's, so the app has one password to know. Plain `Defaults` lines
+ * only; a per-user or per-host Defaults is skipped like every other unknown. */
+static _Thread_local bool gSudoersRootpw = false;
+
+static void sudoersReadDefaults(const char *rest) {
+    if (*rest != ' ' && *rest != '\t')
+        return;
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "%s", rest);
+    for (char *save = NULL, *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        char *t = sudoersTrim(tok);
+        if (strcmp(t, "rootpw") == 0)
+            gSudoersRootpw = true;
+        else if (strcmp(t, "!rootpw") == 0)
+            gSudoersRootpw = false;
+    }
+}
+
+/* sudo's memory of a password: five minutes, for this tab, in a file only root can reach. A file
+ * from an earlier launch of the app has another boot id, so it counts for nothing. */
+#define SUDO_TS_DIR "/var/run/sudo/ts"
+#define SUDO_TS_SECONDS 300
+
+static bool sudoTimestampPath(const char *user, char *out, size_t size) {
+    pid_t sid = getsid(0);
+    return snprintf(out, size, SUDO_TS_DIR "/%s.%ld", user, (long) sid) < (int) size;
+}
+
+static bool sudoTimestampValid(const char *user) {
+    char path[PATH_MAX];
+    if (!sudoTimestampPath(user, path, sizeof(path)))
+        return false;
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+        return false;
+    unsigned long long boot = 0;
+    long long when = 0;
+    bool ok = fscanf(fp, "%llu %lld", &boot, &when) == 2;
+    fclose(fp);
+    long long now = (long long) time(NULL);
+    return ok && boot == (unsigned long long) vprocBootId() && now >= when && now - when < SUDO_TS_SECONDS;
+}
+
+static void sudoTimestampWrite(const char *user) {
+    (void) mkdir("/var/run", 0755);
+    (void) mkdir("/var/run/sudo", 0700);
+    (void) mkdir(SUDO_TS_DIR, 0700);
+    char path[PATH_MAX];
+    if (!sudoTimestampPath(user, path, sizeof(path)))
+        return;
+    FILE *fp = fopen(path, "w");
+    if (!fp)
+        return;
+    fprintf(fp, "%llu %lld\n", (unsigned long long) vprocBootId(), (long long) time(NULL));
+    fclose(fp);
+}
+
+static void sudoTimestampRemove(const char *user) {
+    char path[PATH_MAX];
+    if (sudoTimestampPath(user, path, sizeof(path)))
+        (void) unlink(path);
+}
+#endif
+
 static void sudoersScanDir(const char *dir, const struct passwd *pw, const char *target,
                            const char *cmd_path, bool *allowed, bool *nopasswd, int depth) {
     DIR *d = opendir(dir);
@@ -3051,8 +3184,12 @@ static bool sudoersScan(const char *path, const struct passwd *pw, const char *t
         }
         if (*p == '#' || *p == '\0')
             continue;
-        if (strncmp(p, "Defaults", 8) == 0)
+        if (strncmp(p, "Defaults", 8) == 0) {
+#if defined(PSCAL_TARGET_IOS)
+            sudoersReadDefaults(p + 8);
+#endif
             continue;
+        }
         if (strstr(p, "_Alias") != NULL)
             continue;             /* aliases are not implemented; do not guess */
         if (strchr(p, '!') != NULL)
@@ -3125,6 +3262,8 @@ static int smallclueSudoCommand(int argc, char **argv) {
     const char *target = "root";
     bool non_interactive = false;
     bool list_only = false;
+    bool invalidate = false;
+    bool read_stdin = false;
 
     /* Sentinel: Sanitize environment to prevent privilege escalation via LD_PRELOAD/PATH injection */
     unsetenv("LD_PRELOAD");
@@ -3149,6 +3288,15 @@ static int smallclueSudoCommand(int argc, char **argv) {
             non_interactive = true;
         } else if (strcmp(a, "-l") == 0 || strcmp(a, "--list") == 0) {
             list_only = true;
+#if defined(PSCAL_TARGET_IOS)
+        } else if (strcmp(a, "-S") == 0) {
+            read_stdin = true;
+#endif
+#if defined(PSCAL_TARGET_IOS)
+        } else if (strcmp(a, "-k") == 0 || strcmp(a, "-K") == 0) {
+            /* Forget the password, here and now: the record is root's, and sudo is. */
+            invalidate = true;
+#endif
         } else if (strcmp(a, "-k") == 0 || strcmp(a, "-K") == 0 ||
                    strcmp(a, "-H") == 0 || strcmp(a, "-E") == 0 || strcmp(a, "-S") == 0) {
             /* Accepted and without effect: there is no credential cache to
@@ -3179,6 +3327,18 @@ static int smallclueSudoCommand(int argc, char **argv) {
         i++;
     }
     int envEnd = i;
+#if defined(PSCAL_TARGET_IOS)
+    if (invalidate) {
+        struct passwd *self = getpwuid(getuid());
+        if (self) {
+            char self_name[256];
+            snprintf(self_name, sizeof(self_name), "%s", self->pw_name);
+            sudoTimestampRemove(self_name);
+        }
+        if (!list_only && i >= argc)
+            return 0;
+    }
+#endif
     if (!list_only && i >= argc) {
         fputs(usage, stderr);
         return 1;
@@ -3237,6 +3397,9 @@ static int smallclueSudoCommand(int argc, char **argv) {
 
         bool allowed = false;
         bool nopasswd = false;
+#if defined(PSCAL_TARGET_IOS)
+        gSudoersRootpw = false;
+#endif
         bool have_policy = sudoersScan(SUDOERS_PATH, &invoker_pw, target_name,
                                        exec_path, &allowed, &nopasswd, 0);
         if (!have_policy) {
@@ -3268,32 +3431,64 @@ static int smallclueSudoCommand(int argc, char **argv) {
 
         if (!nopasswd) {
 #if defined(__linux__) || defined(linux) || defined(__linux) || defined(SMALLCLUE_HAVE_SHADOW_AUTH)
+#if !defined(PSCAL_TARGET_IOS)
             if (non_interactive) {
                 fprintf(stderr, "sudo: a password is required\n");
                 return 1;
             }
+#endif
             /* THE invoking user's password, not the target's. sudo asks you to
              * prove you are you; su asks you to prove you are them. This asked
              * for root's, which is su's question wearing sudo's name -- and it
              * meant anyone who knew the root password was effectively in the
              * sudoers file whether or not they were in it. */
-            struct spwd *sp = getspnam(invoker);
-            if (!sp || !sp->sp_pwdp || sp->sp_pwdp[0] == '\0' ||
-                strcmp(sp->sp_pwdp, "*") == 0 || strcmp(sp->sp_pwdp, "!") == 0) {
-                fprintf(stderr, "sudo: account %s has no password set, so it cannot authenticate\n", invoker);
-                return 1;
-            }
-            char prompt[160];
-            snprintf(prompt, sizeof(prompt), "[sudo] password for %s: ", invoker);
-            char *pass = smallclueGetPass(prompt);
-            if (!pass)
-                return 1;
-            char *encrypted = crypt(pass, sp->sp_pwdp);
-            smallclueSecureMemzero(pass, strlen(pass) + 1);
-            free(pass);
-            if (!encrypted || strcmp(encrypted, sp->sp_pwdp) != 0) {
-                fprintf(stderr, "sudo: authentication failure\n");
-                return 1;
+#if defined(PSCAL_TARGET_IOS)
+            /* Defaults rootpw: root's password is the question, and the app's root has none until
+             * one is set with `sudo passwd`. An empty field is no password, as su takes it; this
+             * is NOT a missing check (see su). A remembered answer counts for five minutes. */
+            const char *auth_user = gSudoersRootpw ? "root" : invoker;
+            bool remembered = sudoTimestampValid(invoker);
+#else
+            const char *auth_user = invoker;
+            bool remembered = false;
+#endif
+            struct spwd *sp = remembered ? NULL : getspnam(auth_user);
+#if defined(PSCAL_TARGET_IOS)
+            bool no_password = !remembered && sp && sp->sp_pwdp && sp->sp_pwdp[0] == '\0';
+#else
+            bool no_password = false;
+#endif
+            if (!remembered && !no_password) {
+                if (!sp || !sp->sp_pwdp || sp->sp_pwdp[0] == '\0' ||
+                    strcmp(sp->sp_pwdp, "*") == 0 || strcmp(sp->sp_pwdp, "!") == 0) {
+                    fprintf(stderr, "sudo: account %s has no password set, so it cannot authenticate\n", auth_user);
+                    return 1;
+                }
+                if (non_interactive) {
+                    fprintf(stderr, "sudo: a password is required\n");
+                    return 1;
+                }
+                char prompt[160];
+                snprintf(prompt, sizeof(prompt), "[sudo] password for %s: ", auth_user);
+#if defined(PSCAL_TARGET_IOS)
+                gSmallcluePassFromTty = !read_stdin;
+                char *pass = smallclueGetPass(prompt);
+                gSmallcluePassFromTty = false;
+#else
+                char *pass = smallclueGetPass(prompt);
+#endif
+                if (!pass)
+                    return 1;
+                char *encrypted = crypt(pass, sp->sp_pwdp);
+                smallclueSecureMemzero(pass, strlen(pass) + 1);
+                free(pass);
+                if (!encrypted || strcmp(encrypted, sp->sp_pwdp) != 0) {
+                    fprintf(stderr, "sudo: authentication failure\n");
+                    return 1;
+                }
+#if defined(PSCAL_TARGET_IOS)
+                sudoTimestampWrite(invoker);
+#endif
             }
 #else
             fprintf(stderr, "sudo: authentication not supported on this platform\n");
@@ -3349,6 +3544,76 @@ static int smallclueSudoCommand(int argc, char **argv) {
 // Plain POSIX termios -- tcgetattr, ~ECHO, tcsetattr -- which Darwin has
 // and the shim routes at the guest's terminal. It was gated on the OS
 // rather than on anything it actually uses.
+#if defined(PSCAL_TARGET_IOS)
+/* getpass(3) as Linux's does it: the terminal, with echo off, read a byte at a time so nothing
+ * after the line is taken. Standard input when it is the terminal; otherwise sudo goes to
+ * /dev/tty, as real sudo does, unless `sudo -S` says to read standard input. su and passwd read a
+ * piped standard input. Nothing is turned off on a pipe. The applet's stdio isn't the task's
+ * descriptors here, so this reads and writes them directly. */
+static char *smallclueGetPass(const char *prompt) {
+    char buf[256];
+    int in_fd = STDIN_FILENO;
+    int out_fd = STDERR_FILENO;
+    int tty_fd = -1;
+    if (!isatty(STDIN_FILENO) && gSmallcluePassFromTty) {
+        tty_fd = open("/dev/tty", O_RDWR | O_NOCTTY);
+        if (tty_fd >= 0 && isatty(tty_fd)) {
+            in_fd = out_fd = tty_fd;
+        } else if (tty_fd >= 0) {
+            close(tty_fd);
+            tty_fd = -1;
+        }
+    }
+    struct termios old;
+    bool restore = false;
+    if (isatty(in_fd) && tcgetattr(in_fd, &old) == 0) {
+        struct termios quiet = old;
+        quiet.c_lflag &= ~(tcflag_t)(ECHO | ECHOE | ECHOK | ECHONL);
+        quiet.c_lflag |= ICANON;
+        restore = tcsetattr(in_fd, TCSAFLUSH, &quiet) == 0;
+    }
+    /* The prompt goes where stderr goes, as stdio has it: a redirection of a builtin's stderr
+     * moves the stream. */
+    if (tty_fd >= 0) {
+        (void) write(out_fd, prompt, strlen(prompt));
+    } else {
+        fputs(prompt, stderr);
+        fflush(stderr);
+    }
+    size_t len = 0;
+    bool got_line = false;
+    bool eof = true;
+    while (true) {
+        char c;
+        ssize_t n = read(in_fd, &c, 1);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        eof = false;
+        if (c == '\n' || c == '\r') {
+            got_line = true;
+            break;
+        }
+        if (len + 1 < sizeof(buf))
+            buf[len++] = c;
+    }
+    buf[len] = '\0';
+    if (restore)
+        (void) tcsetattr(in_fd, TCSAFLUSH, &old);
+    if (tty_fd >= 0) {
+        (void) write(out_fd, "\n", 1);
+    } else if (restore) {
+        fputc('\n', stderr);
+        fflush(stderr);
+    }
+    if (tty_fd >= 0)
+        close(tty_fd);
+    char *result = (eof && !got_line) ? NULL : strdup(buf);
+    smallclueSecureMemzero(buf, sizeof(buf));
+    return result;
+}
+#else
 static char *smallclueGetPass(const char *prompt) {
     static char buf[128];
     struct termios old, new;
@@ -3390,11 +3655,21 @@ static char *smallclueGetPass(const char *prompt) {
     smallclueSecureMemzero(buf, sizeof(buf));
     return result;
 }
+#endif /* PSCAL_TARGET_IOS */
 #endif
 
 static int smallcluePasswdCommand(int argc, char **argv) {
 #if defined(__linux__) || defined(linux) || defined(__linux) || defined(SMALLCLUE_HAVE_SHADOW_AUTH)
     const char *username = NULL;
+    bool delete_password = false;
+#if defined(PSCAL_TARGET_IOS)
+    /* passwd -d [USER]: the account then has no password, which root's has by default here. */
+    if (argc > 1 && strcmp(argv[1], "-d") == 0) {
+        delete_password = true;
+        argv++;
+        argc--;
+    }
+#endif
     if (argc > 1) {
         username = argv[1];
     } else {
@@ -3448,6 +3723,16 @@ static int smallcluePasswdCommand(int argc, char **argv) {
         }
     }
 
+    char *hashed = NULL;
+    if (delete_password) {
+        if (uid != 0) {
+            fprintf(stderr, "passwd: only root can remove a password\n");
+            ulckpwdf();
+            return 1;
+        }
+        hashed = (char *)"";
+        goto passwd_write;
+    }
     char *new_pass = smallclueGetPass("New password: ");
     if (!new_pass || !*new_pass) {
         if (new_pass) free(new_pass);
@@ -3501,14 +3786,22 @@ static int smallcluePasswdCommand(int argc, char **argv) {
     }
 
     // SHA-512 salt format: $6$salt$
+#if defined(PSCAL_TARGET_IOS)
+    snprintf(salt, sizeof(salt), "$6$rounds=%d$", SMALLCLUE_SHADOW_ROUNDS);
+    int salt_idx = (int) strlen(salt);
+    for (int i = 0; i < 16 && salt_idx < (int) sizeof(salt) - 1; ++i) {
+        salt[salt_idx++] = salt_chars[random_bytes[i] % 64];
+    }
+#else
     strcpy(salt, "$6$");
     int salt_idx = 3;
     for (int i = 0; i < 16 && salt_idx < 19; ++i) {
         salt[salt_idx++] = salt_chars[random_bytes[i] % 64];
     }
+#endif
     salt[salt_idx] = '\0';
 
-    char *hashed = crypt(new_pass_copy, salt);
+    hashed = crypt(new_pass_copy, salt);
     smallclueSecureMemzero(new_pass_copy, strlen(new_pass_copy) + 1);
     free(new_pass_copy);
 
@@ -3518,6 +3811,7 @@ static int smallcluePasswdCommand(int argc, char **argv) {
         return 1;
     }
 
+passwd_write:;
     // Update shadow file
     FILE *fp = fopen("/etc/shadow", "r");
     if (!fp) {
@@ -3528,6 +3822,20 @@ static int smallcluePasswdCommand(int argc, char **argv) {
 
     /* Sentinel: Fix TOCTOU race condition by using O_EXCL and 0600 at creation. */
     unlink("/etc/shadow.tmp");
+#if defined(PSCAL_TARGET_IOS)
+    /* A descriptor from open is the task's, and fdopen wants the host's: the stream is opened by
+     * name. Only root may make a file in /etc here, so no one else can have made this one. */
+    mode_t old_mask = umask(077);
+    FILE *out_fp = fopen("/etc/shadow.tmp", "w");
+    umask(old_mask);
+    if (!out_fp) {
+        perror("passwd: /etc/shadow.tmp");
+        fclose(fp);
+        ulckpwdf();
+        return 1;
+    }
+    (void) chmod("/etc/shadow.tmp", 0640);
+#else
     int fd = open("/etc/shadow.tmp", O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd < 0) {
         perror("passwd: /etc/shadow.tmp");
@@ -3554,6 +3862,7 @@ static int smallcluePasswdCommand(int argc, char **argv) {
         (void) fchmod(fd, shadow_st.st_mode & 07777);
         (void) fchown(fd, shadow_st.st_uid, shadow_st.st_gid);
     }
+#endif
 
     /* Line by line, and only this account's second and third fields change:
      * every other line, and this one's ageing fields, go through as they are.
@@ -3618,6 +3927,11 @@ static int smallcluePasswdCommand(int argc, char **argv) {
 
     ulckpwdf();
     printf("passwd: password updated successfully\n");
+#if defined(PSCAL_TARGET_IOS)
+    if (!delete_password)
+        printf("passwd: if it is forgotten, delete etc/shadow from the Files app (On My iPad, PSCAL);\n"
+               "passwd: the next launch puts it back with no passwords set\n");
+#endif
     return 0;
 #else
     (void)argc;
@@ -19060,21 +19374,85 @@ bool smallclueAppRunInProcess(int argc, char **argv, int *status) {
 /* Set by the shell: this library is also linked into tools that have no shell. */
 static int (*gAppCommandRunner)(int argc, char **argv);
 
-void smallclueAppSetCommandRunner(int (*runner)(int argc, char **argv)) {
-    gAppCommandRunner = runner;
+static bool smallclueAppIsFrontend(const char *name);
+
+/* What exec is asked to run, as the app names it. /usr/bin/id is the id applet, as it is one
+ * program on Linux: the applets are in every system bin directory, files or not. */
+static const char *smallclueExecProgramName(const char *path) {
+    static const char *const kBinDirs[] = { "/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/", "/usr/local/bin/" };
+    const char *base = strrchr(path, '/');
+    if (!base || base[1] == '\0') {
+        return path;
+    }
+    base++;
+    if (!smallclueFindApplet(base) && !smallclueAppIsFrontend(base)) {
+        return path;
+    }
+    for (size_t i = 0; i < sizeof(kBinDirs) / sizeof(kBinDirs[0]); ++i) {
+        size_t len = strlen(kBinDirs[i]);
+        if ((size_t)(base - path) == len && strncmp(path, kBinDirs[i], len) == 0) {
+            return base;
+        }
+    }
+    /* The same directories as PATH lookup gives them: host paths under the app's root. */
+    char stripped[PATH_MAX];
+    if (pathTruncateStrip(path, stripped, sizeof(stripped)) && strcmp(stripped, path) != 0) {
+        const char *sbase = strrchr(stripped, '/');
+        for (size_t i = 0; sbase && i < sizeof(kBinDirs) / sizeof(kBinDirs[0]); ++i) {
+            size_t len = strlen(kBinDirs[i]);
+            if ((size_t)(sbase + 1 - stripped) == len && strncmp(stripped, kBinDirs[i], len) == 0) {
+                return base;
+            }
+        }
+    }
+    /* A host's own /usr/bin/id, which PATH can find on an iOS-flavoured host build. */
+    static const char *const kHostBinDirs[] = { "/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/" };
+    for (size_t i = 0; i < sizeof(kHostBinDirs) / sizeof(kHostBinDirs[0]); ++i) {
+        size_t len = strlen(kHostBinDirs[i]);
+        if ((size_t)(base - path) == len && strncmp(path, kHostBinDirs[i], len) == 0) {
+            return base;
+        }
+    }
+    return path;
 }
 
-bool smallclueAppCanRun(const char *name) {
+static bool smallclueExecCanRun(const char *path) {
+    return smallclueAppCanRun(smallclueExecProgramName(path));
+}
+
+static int smallclueExecRun(int argc, char **argv) {
+    const char *name = smallclueExecProgramName(argv[0]);
+    if (name != argv[0]) {
+        char *original = argv[0];
+        argv[0] = (char *)name;
+        int status = smallclueAppChildMain(argc, argv);
+        argv[0] = original;
+        return status;
+    }
+    return smallclueAppChildMain(argc, argv);
+}
+
+void smallclueAppSetCommandRunner(int (*runner)(int argc, char **argv)) {
+    gAppCommandRunner = runner;
+    /* exec is the kernel's, and this is how it starts a program: as a call. */
+    vprocSetExecHooks(smallclueExecCanRun, smallclueExecRun);
+}
+
+static bool smallclueAppIsFrontend(const char *name) {
     static const char *const frontends[] = {
         "aether", "clike", "dascal", "exsh", "pascal", "pscalasm", "pscald", "pscaljson2bc", "pscalvm", "rea", "sh",
     };
-    if (smallclueFindApplet(name)) {
-        return true;
-    }
     for (size_t i = 0; i < sizeof(frontends) / sizeof(frontends[0]); i++) {
         if (strcmp(name, frontends[i]) == 0) {
             return true;
         }
+    }
+    return false;
+}
+
+bool smallclueAppCanRun(const char *name) {
+    if (smallclueFindApplet(name) || smallclueAppIsFrontend(name)) {
+        return true;
     }
     char resolved[PATH_MAX];
     return smallclueResolveCommandPathForExec(name, resolved, sizeof(resolved));

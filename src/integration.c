@@ -120,6 +120,15 @@ static void smallclueFormatLabel(int argc, char **argv, char *out, size_t out_sz
     out[used] = '\0';
 }
 
+#if defined(PSCAL_TARGET_IOS)
+/* The programs a Linux system installs set-user-id root. The kernel gives them root as they
+ * start (vprocExecApplyCredentials), since applets have no files to carry the bit. */
+static bool smallclueAppletIsSetuid(const char *name) {
+    return name && (strcmp(name, "su") == 0 || strcmp(name, "sudo") == 0 ||
+                    strcmp(name, "passwd") == 0 || strcmp(name, "login") == 0);
+}
+#endif
+
 static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const char *name) {
     const SmallclueApplet *applet = smallclueFindApplet(name);
     if (!applet) {
@@ -187,11 +196,21 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
              * stable synthetic job even when invoked from a stage vproc. */
             force_new_vproc = true;
         }
+        /* A set-user-id program is a process of its own, as on Linux: the root it gets ends with
+         * it, even when it runs inside a subshell's or a stage's task. */
+        bool is_setuid_applet = smallclueAppletIsSetuid(applet->name);
+        if (is_setuid_applet) {
+            force_new_vproc = true;
+        }
         smallclueFormatLabel(argc, argv, label, sizeof(label));
         if (label[0]) {
             vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, label, force_new_vproc, false);
         } else {
             vproc_scope_active = vprocCommandScopeBegin(&vproc_scope, applet->name, force_new_vproc, false);
+        }
+        if (is_setuid_applet && vproc_scope_active) {
+            (void)vprocCommandScopeTakeDescriptors(&vproc_scope);
+            vprocExecApplyCredentials(applet->name);
         }
         if (vproc_scope_active) {
             execution_pid = vproc_scope.pid;
@@ -261,7 +280,8 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
         {
             int killed_status = setjmp(program_frame.env);
             if (killed_status != 0) {
-                status = killed_status;
+                /* A signal it sent itself, or a program it exec'd that has ended. */
+                status = vprocProgramFrameStatus(&program_frame, killed_status);
                 goto smallclue_dispatch_done;
             }
         }
@@ -390,6 +410,8 @@ DEFINE_SMALLCLUE_WRAPPER("type", type)
 DEFINE_SMALLCLUE_WRAPPER("file", file)
 DEFINE_SMALLCLUE_WRAPPER("su", su)
 DEFINE_SMALLCLUE_WRAPPER("sudo", sudo)
+DEFINE_SMALLCLUE_WRAPPER("passwd", passwd)
+DEFINE_SMALLCLUE_WRAPPER("login", login)
 DEFINE_SMALLCLUE_WRAPPER("scp", scp)
 DEFINE_SMALLCLUE_WRAPPER("sftp", sftp)
 DEFINE_SMALLCLUE_WRAPPER("rsync", rsync)
@@ -557,6 +579,8 @@ static void smallclueRegisterBuiltinsOnce(void) {
     registerSmallclueBuiltin("rsync", vmBuiltinSmallclue_rsync, "rsync");
     registerSmallclueBuiltin("su", vmBuiltinSmallclue_su, "su");
     registerSmallclueBuiltin("sudo", vmBuiltinSmallclue_sudo, "sudo");
+    registerSmallclueBuiltin("passwd", vmBuiltinSmallclue_passwd, "passwd");
+    registerSmallclueBuiltin("login", vmBuiltinSmallclue_login, "login");
     registerSmallclueBuiltin("ssh", vmBuiltinSmallclue_ssh, "ssh");
     registerSmallclueBuiltin("ssh-keygen", vmBuiltinSmallclue_sshkeygen, "ssh-keygen");
     registerSmallclueBuiltin("ssh-copy-id", vmBuiltinSmallclue_sshcopyid, "ssh-copy-id");
