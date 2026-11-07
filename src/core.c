@@ -178,6 +178,7 @@ int pscalRuntimeWorkspaceOpen(const char *tool, const char *path) __attribute__(
 char *pscalRuntimeWorkspaceStatus(void) __attribute__((weak));
 char *pscalRuntimeWorkspaceApplets(void) __attribute__((weak));
 char *pscalRuntimePickMountSourceDirectory(void) __attribute__((weak));
+char *pscalRuntimeMountSourceLabel(const char *path) __attribute__((weak));
 extern int PSCALRuntimePingHost(const char *host,
     int count,
     int timeout_ms,
@@ -201,6 +202,7 @@ __attribute__((weak)) int pscalRuntimeWorkspaceOpen(const char *tool, const char
 __attribute__((weak)) char *pscalRuntimeWorkspaceStatus(void) { errno = ENOSYS; return NULL; }
 __attribute__((weak)) char *pscalRuntimeWorkspaceApplets(void) { errno = ENOSYS; return NULL; }
 __attribute__((weak)) char *pscalRuntimePickMountSourceDirectory(void) { errno = ENOSYS; return NULL; }
+__attribute__((weak)) char *pscalRuntimeMountSourceLabel(const char *path) { (void)path; errno = ENOSYS; return NULL; }
 __attribute__((weak)) void *PSCALRuntimeGetCurrentRuntimeContext(void) { return NULL; }
 __attribute__((weak)) void PSCALRuntimeSetCurrentRuntimeContext(void *ctx) { (void)ctx; }
 #endif
@@ -21572,7 +21574,7 @@ static bool smallclueMountPersistFstabEntry(const char *source,
                                             const char *target,
                                             const char *type,
                                             const char *options) {
-    if (!source || source[0] != '/' ||
+    if (!source || (source[0] != '/' && strncmp(source, "UUID=", 5) != 0) ||
         !target || target[0] != '/' ||
         !type || type[0] == '\0' ||
         !options || options[0] == '\0') {
@@ -21974,12 +21976,29 @@ static int smallclueMountCommand(int argc, char **argv) {
         return 1;
     }
 
+    /* /etc/fstab is the app's: a source in its storage by its path there, one outside it by
+     * the label the runtime keeps for it, as Linux names a disk UUID=. Never the host's path,
+     * unless no runtime gives labels (a host build), where that is all there is. Named before
+     * the mount, which would otherwise name the source by its own new mount point. */
+    char source_virtual[PATH_MAX];
+    char *source_label = NULL;
+    const char *entry_source = source_real;
+    if (persist_to_fstab) {
+        if (pathTruncateStrip(source_real, source_virtual, sizeof(source_virtual)) &&
+            strcmp(source_virtual, source_real) != 0) {
+            entry_source = source_virtual;
+        } else if ((source_label = pscalRuntimeMountSourceLabel(source_real)) != NULL) {
+            entry_source = source_label;
+        }
+    }
+
     if (!pathTruncateMountAdd(source_real,
                               target_virtual,
                               type ? type : "bind",
                               options,
                               flags)) {
         perror("mount");
+        free(source_label);
         free(options);
         free(picked_source);
         return 1;
@@ -21988,7 +22007,11 @@ static int smallclueMountCommand(int argc, char **argv) {
     if (persist_to_fstab) {
         const char *entry_type = (type && type[0] != '\0') ? type : "bind";
         const char *entry_options = (options && options[0] != '\0') ? options : "rw";
-        if (!smallclueMountPersistFstabEntry(source_real, target_virtual, entry_type, entry_options)) {
+        bool persisted = smallclueMountPersistFstabEntry(entry_source, target_virtual, entry_type, entry_options);
+        int persist_errno = errno;
+        free(source_label);
+        errno = persist_errno;
+        if (!persisted) {
             int saved_errno = errno;
             fprintf(stderr,
                     "mount: mounted but failed to persist in /etc/fstab: %s\n",
