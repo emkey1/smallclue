@@ -13,3 +13,5 @@ enter_chroot.sh
 src/openssh_globals.c
 build-codex-check/
 docker-build*
+test_ls_sort
+smallclue_top
