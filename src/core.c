@@ -16248,14 +16248,9 @@ static bool smallclueDfQuery(const char *path, SmallclueDfStats *out) {
         return false;
     }
     memset(out, 0, sizeof(*out));
+    /* In the app statfs and realpath take the virtual path, and the mount
+     * table below is the app's: a host path here would name host mounts. */
     const char *query_path = path;
-#if defined(PSCAL_TARGET_IOS)
-    char resolved_path[PATH_MAX];
-    const char *resolved = smallclueResolvePath(path, resolved_path, sizeof(resolved_path));
-    if (resolved && resolved[0] != '\0') {
-        query_path = resolved;
-    }
-#endif
 #if defined(SMALLCLUE_HAVE_STATVFS)
     struct statvfs st;
     if (statvfs(query_path, &st) != 0) {
@@ -16325,7 +16320,9 @@ static bool smallclueDfQuery(const char *path, SmallclueDfStats *out) {
  * lists all mounts like the real tool, instead of only reporting the
  * current directory's filesystem. Returns a malloc'd array of malloc'd
  * mount-point strings; caller frees each element and the array. */
-#if defined(__linux__) || defined(linux) || defined(__linux)
+#if defined(__linux__) || defined(linux) || defined(__linux) || defined(PSCAL_TARGET_IOS)
+/* The app keeps a Linux /proc/mounts of its own, so it reads that too:
+ * getmntinfo there would list the device's volumes. */
 static char **smallclueDfEnumerateMounts(size_t *outCount) {
     FILE *fp = fopen("/proc/mounts", "r");
     if (!fp) fp = fopen("/etc/mtab", "r");
@@ -21795,38 +21792,29 @@ static int smallclueMountCommand(int argc, char **argv) {
     }
 
     if (optind >= argc) {
-        const char *root_source = "rootfs";
-        const char *root_type = "ext4";
-        struct statfs sfs;
-        if (statfs("/", &sfs) == 0) {
-            if (sfs.f_mntfromname[0]) {
-                root_source = sfs.f_mntfromname;
-            }
-            if (sfs.f_fstypename[0]) {
-                root_type = sfs.f_fstypename;
-            }
+        /* The app's mount table, the one /proc/mounts lists, in util-linux's form. */
+        size_t mount_count = pathTruncateMountTable(NULL, 0);
+        PathTruncateMountEntry *entries =
+            (PathTruncateMountEntry *)calloc(mount_count ? mount_count : 1, sizeof(PathTruncateMountEntry));
+        if (!entries) {
+            free(options);
+            fprintf(stderr, "mount: out of memory\n");
+            return 1;
         }
-        printf("%s / %s rw 0 0\n", root_source, root_type);
-
-        size_t mount_count = pathTruncateMountSnapshot(NULL, 0);
-        PathTruncateMountEntry *entries = NULL;
-        if (mount_count > 0) {
-            entries = (PathTruncateMountEntry *)calloc(mount_count, sizeof(PathTruncateMountEntry));
-            if (!entries) {
-                free(options);
-                fprintf(stderr, "mount: out of memory\n");
-                return 1;
+        size_t capacity = mount_count;
+        mount_count = pathTruncateMountTable(entries, capacity);
+        if (mount_count > capacity) {
+            mount_count = capacity; /* a mount made in between */
+        }
+        for (size_t i = 0; i < mount_count; ++i) {
+            if (type && strcmp(entries[i].type, type) != 0) {
+                continue;
             }
-            mount_count = pathTruncateMountSnapshot(entries, mount_count);
-            for (size_t i = 0; i < mount_count; ++i) {
-                const char *entry_type = entries[i].type[0] ? entries[i].type : "auto";
-                const char *entry_opts = entries[i].options[0] ? entries[i].options : "rw";
-                printf("%s %s %s %s 0 0\n",
-                       entries[i].source,
-                       entries[i].target,
-                       entry_type,
-                       entry_opts);
-            }
+            printf("%s on %s type %s (%s)\n",
+                   entries[i].source,
+                   entries[i].target,
+                   entries[i].type,
+                   entries[i].options);
         }
         free(entries);
         free(options);
