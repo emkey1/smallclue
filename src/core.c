@@ -57,6 +57,9 @@
 #include "tput_app.h"
 #include "free_app.h"
 #include "ip_app.h"
+#if defined(PSCAL_TARGET_IOS)
+#include "common/net_snapshot.h"
+#endif
 #include "mount_app.h"
 #include "dd_app.h"
 #include "od_app.h"
@@ -16022,6 +16025,7 @@ static int smallclueIpRouteModify(const char *destSpec, const char *gateway, con
 }
 #endif
 
+#if !defined(PSCAL_TARGET_IOS)
 static bool smallclueShouldSkipInterface(const struct ifaddrs *ifa, int family, bool show_all) {
     if (show_all || !ifa) {
         return false;
@@ -16039,6 +16043,7 @@ static bool smallclueShouldSkipInterface(const struct ifaddrs *ifa, int family, 
 #endif
     return false;
 }
+#endif
 
 static int smallclueIpAddrCommand(int argc, char **argv) {
     if (argc >= 2 && (strcmp(argv[1], "add") == 0 || strcmp(argv[1], "del") == 0)) {
@@ -16141,6 +16146,43 @@ static int smallclueIpAddrCommand(int argc, char **argv) {
     bool show_v4 = request_v4 || (!request_v4 && !request_v6);
     bool show_v6 = request_v6 || (!request_v4 && !request_v6);
 
+#if defined(PSCAL_TARGET_IOS)
+    /* The app's one reading of the interfaces, the one ip and /proc/net use:
+     * lo for lo0, and link-local addresses without Darwin's scope. */
+    PscalNetSnapshot snap;
+    if (!pscalNetSnapshotTake(&snap)) {
+        pscalNetSnapshotFree(&snap);
+        fprintf(stderr, "ipaddr: getifaddrs failed: %s\n", strerror(errno));
+        return 1;
+    }
+    bool printed = false;
+    for (size_t i = 0; i < snap.link_count; ++i) {
+        const PscalNetLink *link = &snap.links[i];
+        for (size_t j = 0; j < link->addr_count; ++j) {
+            const PscalNetAddress *a = &link->addrs[j];
+            if ((a->family == AF_INET && !show_v4) || (a->family == AF_INET6 && !show_v6)) {
+                continue;
+            }
+            if (!show_all && ((link->flags & IFF_LOOPBACK) ||
+                              (a->family == AF_INET6 && (strcmp(pscalNetAddressScope(a->family, a->addr), "link") == 0 ||
+                                                         a->addr[0] == 0xff)))) {
+                continue;
+            }
+            char host[INET6_ADDRSTRLEN];
+            if (!inet_ntop(a->family, a->addr, host, sizeof(host))) {
+                continue;
+            }
+            printf("%-12s %-4s %s\n", link->name, (a->family == AF_INET) ? "IPv4" : "IPv6", host);
+            printed = true;
+        }
+    }
+    pscalNetSnapshotFree(&snap);
+    if (!printed) {
+        fprintf(stderr, "ipaddr: no matching interfaces\n");
+        return 1;
+    }
+    return 0;
+#else
     struct ifaddrs *ifaddr = NULL;
     if (getifaddrs(&ifaddr) != 0) {
         fprintf(stderr, "ipaddr: getifaddrs failed: %s\n", strerror(errno));
@@ -16186,6 +16228,7 @@ static int smallclueIpAddrCommand(int argc, char **argv) {
         return 1;
     }
     return 0;
+#endif
 }
 #endif
 
