@@ -14067,7 +14067,10 @@ static int smallclueYesNoLoop(const char *text, int initial_status) {
         return initial_status;
     }
     size_t len = strlen(text);
-    size_t buf_size = 64 * 1024;
+    /* Bolt optimization: sizing standard I/O write buffers to match common
+     * pipe buffer sizes (8KB / 8192 bytes) is optimal for high-throughput
+     * continuous stream utilities to prevent cache misses and pipe write blocking. */
+    size_t buf_size = 8192;
     char *buffer = (char *)malloc(buf_size);
     if (!buffer) {
         return 1;
