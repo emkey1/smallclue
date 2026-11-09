@@ -14067,7 +14067,8 @@ static int smallclueYesNoLoop(const char *text, int initial_status) {
         return initial_status;
     }
     size_t len = strlen(text);
-    size_t buf_size = 64 * 1024;
+    // Align write buffer with typical pipe buffer sizes (8KB) for max throughput.
+    size_t buf_size = 8 * 1024;
     char *buffer = (char *)malloc(buf_size);
     if (!buffer) {
         return 1;
