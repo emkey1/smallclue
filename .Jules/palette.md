@@ -29,3 +29,7 @@
 ## YYYY-MM-DD - Dynamic Full-Width Inverse Video Headers
 **Learning:** Hardcoded inverse video headers in fullscreen applets do not stretch across the terminal, resulting in jagged resizing and poor visual hierarchy.
 **Action:** Always dynamically build header strings using `snprintf`, measure their length, calculate the remaining width via `pscalRuntimeDetectWindowCols()`, and append space padding so the inverse video highlight stretches cleanly across the terminal row.
+
+## 2025-05-24 - Dynamic Full-Width Inverse Video Headers
+**Learning:** When dynamically padding UI elements (like pager prompts) with spaces to achieve full terminal width, strictly account for any hardcoded trailing spaces or ANSI reset characters in the fprintf format string in the padding calculation to prevent off-by-one TUI rendering regressions that cause unwanted line wrapping. Also, instead of dynamically allocating string buffers (via malloc) just to construct variable-width padded terminal lines, use the width specifier * in fprintf/printf to directly stream the padding.
+**Action:** Always use pad = cols - raw_len - 1 when there's an ANSI reset character at the end of the line, and use fprintf(stdout, "%*s", pad, ""); instead of allocating a large string buffer.
