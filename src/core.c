@@ -5936,7 +5936,7 @@ static int smallclueTopCommand(int argc, char **argv) {
             int raw_len = snprintf(raw_header, sizeof(raw_header), "%6s %6s %6s %6s %-3s %-8s %-10s %6s %6s %s", "PID", "PPID", "PGID", "SID", "FG", "PTY", "STATE", "UTIME", "STIME", "CMD");
             int cols = pscalRuntimeDetectWindowCols();
             if (cols <= 0) cols = 80;
-            int pad = cols - raw_len;
+            int pad = cols - raw_len - 1;
             if (pad < 0) pad = 0;
             /* Use a dynamically allocated buffer to safely fit terminal padding */
             char *dyn_header = malloc((size_t)cols + 256);
@@ -6450,7 +6450,7 @@ static int smallclueTopCommand(int argc, char **argv) {
             int raw_len = printf("  %5s %5s %-8s %s %7s %6s %s", "PID", "PPID", "USER", "S", "%CPU", "%MEM", "COMMAND");
             int cols = pscalRuntimeDetectWindowCols();
             if (cols <= 0) cols = 80;
-            int pad = cols - raw_len;
+            int pad = cols - raw_len - 1;
             if (pad < 0) pad = 0;
             if (pad > 0) printf("%*s", pad, "");
             fputs("\033[0m\n", stdout);
@@ -15171,7 +15171,7 @@ static int smallclueWatchCommand(int argc, char **argv) {
             int raw_len = printf("Every %.2fs: %s", interval, cmdline ? cmdline : argv[idx]);
             int cols = pscalRuntimeDetectWindowCols();
             if (cols <= 0) cols = 80;
-            int pad = cols - raw_len;
+            int pad = cols - raw_len - 1;
             if (pad < 0) pad = 0;
             if (pad > 0) printf("%*s", pad, "");
             fputs("\033[0m\n\n", stdout);
