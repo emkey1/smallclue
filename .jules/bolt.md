@@ -33,3 +33,6 @@
 ## YYYY-MM-DD - Optimize cmp applet via block reads
 **Learning:** For utilities like `cmp` that compare inputs byte-by-byte, using `fgetc` introduces substantial function-call and buffering overhead. Profiling shows that reading data in 16KB blocks directly into stack arrays dramatically speeds up byte processing.
 **Action:** Replace `fgetc` with standard `fread` and stack buffers in high-throughput byte-comparison loops like `cmp` to minimize stdio execution overhead.
+## 2025-05-19 - Optimization of yes applet buffer size
+**Learning:** For high-throughput continuous stream utilities (like the `yes` applet) in C, sizing the standard I/O write buffer to match common pipe buffer sizes (8KB / 8192 bytes) is critical. Using larger buffers (e.g., 64KB) causes cache misses and pipe write blocking behavior that significantly decreases raw throughput.
+**Action:** When implementing or optimizing continuous stream tools that pipe data, size internal standard I/O write buffers to 8KB to maximize throughput and minimize pipe blocking.
