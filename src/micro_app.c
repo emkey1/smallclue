@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -32,6 +33,7 @@
 #endif
 #endif
 #include "ios/vproc.h"
+#include "common/path_truncate.h"
 #include "ios/tty/pscal_tty.h"
 typedef struct PSCALRuntimeContext PSCALRuntimeContext;
 extern uint64_t PSCALRuntimeCurrentSessionId(void) __attribute__((weak_import));
@@ -116,6 +118,84 @@ static int microGoFileMaskSet(int mask) {
     return __atomic_exchange_n(&gMicroGoFileMask, mask, __ATOMIC_RELAXED);
 }
 
+/* The Go runtime's libc calls take the whole app's working directory, which no tab's cd moves,
+ * so `micro notes.txt` opened and saved notes.txt in the app's directory, not the shell's, and
+ * micro's own cd moved every tab's. Its path calls come here too (go_archive_redirect_libc.py),
+ * and resolve as the task's own would: a relative name against the cwd of the task that started
+ * micro, which micro's cd moves for it alone, and an app path such as /home/x to the host's. Like
+ * the mask, the cwd is the latest launch's, and its end puts back the one before. */
+static pthread_mutex_t gMicroGoCwdMu = PTHREAD_MUTEX_INITIALIZER;
+static char gMicroGoCwd[PATH_MAX];
+
+static void microGoCwdGet(char out[PATH_MAX]) {
+    pthread_mutex_lock(&gMicroGoCwdMu);
+    memcpy(out, gMicroGoCwd, PATH_MAX);
+    pthread_mutex_unlock(&gMicroGoCwdMu);
+}
+
+static void microGoCwdSet(const char *cwd) {
+    pthread_mutex_lock(&gMicroGoCwdMu);
+    snprintf(gMicroGoCwd, sizeof(gMicroGoCwd), "%s", cwd ? cwd : "");
+    pthread_mutex_unlock(&gMicroGoCwdMu);
+}
+
+/* The host path for a path micro names, or NULL with errno set. A name relative to another
+ * directory's descriptor is that directory's already, so it stays. */
+static const char *microGoHostPath(int dirfd, const char *path, char out[PATH_MAX]) {
+    if (!path || !path[0] || (path[0] != '/' && dirfd != AT_FDCWD)) {
+        return path;
+    }
+    char joined[PATH_MAX];
+    const char *name = path;
+    if (path[0] != '/') {
+        char cwd[PATH_MAX];
+        microGoCwdGet(cwd);
+        if (!cwd[0]) {
+            return path;
+        }
+        size_t len = strlen(cwd);
+        int written = snprintf(joined, sizeof(joined), "%s%s%s", cwd,
+                               (len > 0 && cwd[len - 1] == '/') ? "" : "/", path);
+        if (written < 0 || (size_t)written >= sizeof(joined)) {
+            errno = ENAMETOOLONG;
+            return NULL;
+        }
+        name = joined;
+    }
+    if (!pathTruncateExpand(name, out, PATH_MAX)) {
+        if (name == path) {
+            return path;
+        }
+        return NULL;
+    }
+    return out;
+}
+
+#define MICRO_GO_HOST_PATH(var, dirfd, path)                    \
+    char var##Buf[PATH_MAX];                                    \
+    const char *var = microGoHostPath((dirfd), (path), var##Buf); \
+    if (!var) {                                                 \
+        return -1;                                              \
+    }
+
+/* micro's cd: the directory is micro's alone, kept in its app form, as pwd would name it. */
+static int microGoChdirHost(const char *host) {
+    struct stat st;
+    if ((stat)(host, &st) != 0) {
+        return -1;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    char virt[PATH_MAX];
+    if (!pathTruncateStrip(host, virt, sizeof(virt))) {
+        snprintf(virt, sizeof(virt), "%s", host);
+    }
+    microGoCwdSet(virt);
+    return 0;
+}
+
 int pscal_go_open(const char *path, int flags, ...) {
     mode_t mode = 0;
     if (flags & O_CREAT) {
@@ -124,7 +204,8 @@ int pscal_go_open(const char *path, int flags, ...) {
         mode = (mode_t)va_arg(ap, int);
         va_end(ap);
     }
-    return vprocHostOpenatWithMask(microGoFileMask(), AT_FDCWD, path, flags, mode);
+    MICRO_GO_HOST_PATH(host, AT_FDCWD, path);
+    return vprocHostOpenatWithMask(microGoFileMask(), AT_FDCWD, host, flags, mode);
 }
 
 int pscal_go_openat(int dirfd, const char *path, int flags, ...) {
@@ -135,15 +216,153 @@ int pscal_go_openat(int dirfd, const char *path, int flags, ...) {
         mode = (mode_t)va_arg(ap, int);
         va_end(ap);
     }
-    return vprocHostOpenatWithMask(microGoFileMask(), dirfd, path, flags, mode);
+    MICRO_GO_HOST_PATH(host, dirfd, path);
+    return vprocHostOpenatWithMask(microGoFileMask(), dirfd, host, flags, mode);
 }
 
 int pscal_go_mkdir(const char *path, mode_t mode) {
-    return vprocHostMkdiratWithMask(microGoFileMask(), AT_FDCWD, path, mode);
+    MICRO_GO_HOST_PATH(host, AT_FDCWD, path);
+    return vprocHostMkdiratWithMask(microGoFileMask(), AT_FDCWD, host, mode);
 }
 
 int pscal_go_mkdirat(int dirfd, const char *path, mode_t mode) {
-    return vprocHostMkdiratWithMask(microGoFileMask(), dirfd, path, mode);
+    MICRO_GO_HOST_PATH(host, dirfd, path);
+    return vprocHostMkdiratWithMask(microGoFileMask(), dirfd, host, mode);
+}
+
+int pscal_go_stat(const char *path, struct stat *st) {
+    MICRO_GO_HOST_PATH(host, AT_FDCWD, path);
+    return (stat)(host, st);
+}
+
+int pscal_go_lstat(const char *path, struct stat *st) {
+    MICRO_GO_HOST_PATH(host, AT_FDCWD, path);
+    return (lstat)(host, st);
+}
+
+int pscal_go_fstatat(int dirfd, const char *path, struct stat *st, int flag) {
+    MICRO_GO_HOST_PATH(host, dirfd, path);
+    return (fstatat)(dirfd, host, st, flag);
+}
+
+int pscal_go_faccessat(int dirfd, const char *path, int amode, int flag) {
+    MICRO_GO_HOST_PATH(host, dirfd, path);
+    return (faccessat)(dirfd, host, amode, flag);
+}
+
+int pscal_go_chmod(const char *path, mode_t mode) {
+    MICRO_GO_HOST_PATH(host, AT_FDCWD, path);
+    return (chmod)(host, mode);
+}
+
+int pscal_go_chown(const char *path, uid_t uid, gid_t gid) {
+    MICRO_GO_HOST_PATH(host, AT_FDCWD, path);
+    return (chown)(host, uid, gid);
+}
+
+int pscal_go_lchown(const char *path, uid_t uid, gid_t gid) {
+    MICRO_GO_HOST_PATH(host, AT_FDCWD, path);
+    return (lchown)(host, uid, gid);
+}
+
+int pscal_go_link(const char *from, const char *to) {
+    MICRO_GO_HOST_PATH(hostFrom, AT_FDCWD, from);
+    MICRO_GO_HOST_PATH(hostTo, AT_FDCWD, to);
+    return (link)(hostFrom, hostTo);
+}
+
+/* The link's text is stored as given; only where the link goes is a path. */
+int pscal_go_symlink(const char *target, const char *linkpath) {
+    MICRO_GO_HOST_PATH(host, AT_FDCWD, linkpath);
+    return (symlink)(target, host);
+}
+
+ssize_t pscal_go_readlink(const char *path, char *buf, size_t size) {
+    MICRO_GO_HOST_PATH(host, AT_FDCWD, path);
+    return (readlink)(host, buf, size);
+}
+
+ssize_t pscal_go_readlinkat(int dirfd, const char *path, char *buf, size_t size) {
+    MICRO_GO_HOST_PATH(host, dirfd, path);
+    return (readlinkat)(dirfd, host, buf, size);
+}
+
+int pscal_go_rename(const char *from, const char *to) {
+    MICRO_GO_HOST_PATH(hostFrom, AT_FDCWD, from);
+    MICRO_GO_HOST_PATH(hostTo, AT_FDCWD, to);
+    return (rename)(hostFrom, hostTo);
+}
+
+int pscal_go_rmdir(const char *path) {
+    MICRO_GO_HOST_PATH(host, AT_FDCWD, path);
+    return (rmdir)(host);
+}
+
+int pscal_go_truncate(const char *path, off_t length) {
+    MICRO_GO_HOST_PATH(host, AT_FDCWD, path);
+    return (truncate)(host, length);
+}
+
+int pscal_go_unlink(const char *path) {
+    MICRO_GO_HOST_PATH(host, AT_FDCWD, path);
+    return (unlink)(host);
+}
+
+int pscal_go_unlinkat(int dirfd, const char *path, int flag) {
+    MICRO_GO_HOST_PATH(host, dirfd, path);
+    return (unlinkat)(dirfd, host, flag);
+}
+
+int pscal_go_utimensat(int dirfd, const char *path, const struct timespec times[2], int flag) {
+    MICRO_GO_HOST_PATH(host, dirfd, path);
+    return (utimensat)(dirfd, host, times, flag);
+}
+
+int pscal_go_utimes(const char *path, const struct timeval times[2]) {
+    MICRO_GO_HOST_PATH(host, AT_FDCWD, path);
+    return (utimes)(host, times);
+}
+
+int pscal_go_chdir(const char *path) {
+    char cwd[PATH_MAX];
+    microGoCwdGet(cwd);
+    if (!cwd[0]) {
+        return (chdir)(path);
+    }
+    MICRO_GO_HOST_PATH(host, AT_FDCWD, path);
+    return microGoChdirHost(host);
+}
+
+int pscal_go_fchdir(int fd) {
+    char cwd[PATH_MAX];
+    microGoCwdGet(cwd);
+    if (!cwd[0]) {
+        return (fchdir)(fd);
+    }
+    char host[PATH_MAX];
+    if ((fcntl)(fd, F_GETPATH, host) != 0) {
+        return -1;
+    }
+    return microGoChdirHost(host);
+}
+
+char *pscal_go_getcwd(char *buf, size_t size) {
+    char cwd[PATH_MAX];
+    microGoCwdGet(cwd);
+    if (!cwd[0]) {
+        return (getcwd)(buf, size);
+    }
+    size_t len = strlen(cwd);
+    if (!buf || size == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    if (len + 1 > size) {
+        errno = ERANGE;
+        return NULL;
+    }
+    memcpy(buf, cwd, len + 1);
+    return buf;
 }
 
 uint64_t pscal_micro_current_session_id(void) {
@@ -2106,8 +2325,16 @@ int smallclueRunMicro(int argc, char **argv) {
     mode_t taskMask = vprocUmaskShim(0);
     (void)vprocUmaskShim(taskMask);
     int outerGoMask = microGoFileMaskSet((int)taskMask);
+    char outerGoCwd[PATH_MAX];
+    microGoCwdGet(outerGoCwd);
+    char taskCwd[PATH_MAX];
+    if (!vprocGetcwdShim(taskCwd, sizeof(taskCwd))) {
+        taskCwd[0] = '\0';
+    }
+    microGoCwdSet(taskCwd);
     extern int pscal_micro_main_entry(int argc, char **argv);
     status = pscal_micro_main_entry(launchArgc, launchArgv);
+    microGoCwdSet(outerGoCwd);
     (void)microGoFileMaskSet(outerGoMask);
     vprocProtectKqueueCloseExit();
 #else
