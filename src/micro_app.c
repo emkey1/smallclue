@@ -101,6 +101,51 @@ static void microGoLaunchContextClear(void) {
     ctx->tcell_stdout_fd = -1;
 }
 
+/* The Go runtime calls libc's open, openat, mkdir and mkdirat itself, on threads of its own that
+ * no task runs on, so the task's file mask never reached what micro made: the host's did, which
+ * follows the first tab's shell. ios/Tools/go_archive_redirect_libc.py points the Go object's
+ * calls here, and these make files with the mask of the task that started micro. The Go runtime
+ * is one for the app, so the mask is the latest launch's, and its end puts back the one before. */
+static int gMicroGoFileMask = -1;
+
+static int microGoFileMask(void) {
+    return __atomic_load_n(&gMicroGoFileMask, __ATOMIC_RELAXED);
+}
+
+static int microGoFileMaskSet(int mask) {
+    return __atomic_exchange_n(&gMicroGoFileMask, mask, __ATOMIC_RELAXED);
+}
+
+int pscal_go_open(const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    return vprocHostOpenatWithMask(microGoFileMask(), AT_FDCWD, path, flags, mode);
+}
+
+int pscal_go_openat(int dirfd, const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    return vprocHostOpenatWithMask(microGoFileMask(), dirfd, path, flags, mode);
+}
+
+int pscal_go_mkdir(const char *path, mode_t mode) {
+    return vprocHostMkdiratWithMask(microGoFileMask(), AT_FDCWD, path, mode);
+}
+
+int pscal_go_mkdirat(int dirfd, const char *path, mode_t mode) {
+    return vprocHostMkdiratWithMask(microGoFileMask(), dirfd, path, mode);
+}
+
 uint64_t pscal_micro_current_session_id(void) {
     MicroGoLaunchContext *ctx = microGoLaunchContextGet();
     if (!ctx) {
@@ -2061,8 +2106,12 @@ int smallclueRunMicro(int argc, char **argv) {
     int status = 1;
 #if defined(PSCAL_TARGET_IOS)
     vprocProtectKqueueCloseEnter();
+    mode_t taskMask = vprocUmaskShim(0);
+    (void)vprocUmaskShim(taskMask);
+    int outerGoMask = microGoFileMaskSet((int)taskMask);
     extern int pscal_micro_main_entry(int argc, char **argv);
     status = pscal_micro_main_entry(launchArgc, launchArgv);
+    (void)microGoFileMaskSet(outerGoMask);
     vprocProtectKqueueCloseExit();
 #else
     status = pscal_micro_main_entry(launchArgc, launchArgv);
