@@ -727,11 +727,11 @@ EOF
 
     echo "Building dvtm applet support for i686 (${DVTM_LIBS})..."
     "${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 \
-        -D_XOPEN_SOURCE_EXTENDED -D_GNU_SOURCE -DVERSION=\\\"0.16-pscal\\\" -Dexit=pscalDvtmRequestExit \
+        -D_XOPEN_SOURCE_EXTENDED -D_GNU_SOURCE -DVERSION='"0.16-pscal"' -Dexit=pscalDvtmRequestExit \
         $DVTM_INCLUDE_FLAGS -include "$DVTM_RUNTIME_HOOKS_HEADER" -Isrc -Dmain=dvtm_main_entry \
         -c "$DVTM_DIR/dvtm.c" -o "$DVTM_BUILD_DIR/dvtm.o"
     "${CC_CMD[@]}" "${TARGET_CFLAGS[@]}" -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 \
-        -D_XOPEN_SOURCE_EXTENDED -D_GNU_SOURCE -DVERSION=\\\"0.16-pscal\\\" -Dexit=pscalDvtmRequestExit \
+        -D_XOPEN_SOURCE_EXTENDED -D_GNU_SOURCE -DVERSION='"0.16-pscal"' -Dexit=pscalDvtmRequestExit \
         $DVTM_INCLUDE_FLAGS -include "$DVTM_RUNTIME_HOOKS_HEADER" -Isrc -c "$DVTM_DIR/vt.c" -o "$DVTM_BUILD_DIR/vt.o"
 
     DVTM_OBJS="$DVTM_BUILD_DIR/dvtm.o $DVTM_BUILD_DIR/vt.o"
@@ -834,6 +834,8 @@ if [ "$SMALLCLUE_WITH_LIBGIT2" = "1" ]; then
 fi
 
 # 4. Compile smallclue
+# The list is build_smallclue.sh's: an applet moved into its own file must be
+# added in both, or this link fails on its undefined smallclue*Command.
 NEXTVI_DEFS=""
 if [ "$NEXTVI_DIRECT_MODE" = "1" ]; then
     NEXTVI_DEFS="-DSMALLCLUE_NEXTVI_DIRECT=1"
@@ -912,6 +914,31 @@ echo "Compiling smallclue (iSH/32-bit static)..."
     src/split_app.c \
     src/tac_app.c \
     src/tar_app.c \
+    src/cat_app.c \
+    src/chmod_app.c \
+    src/cp_app.c \
+    src/date_app.c \
+    src/du_app.c \
+    src/env_app.c \
+    src/find_app.c \
+    src/grep_app.c \
+    src/head_app.c \
+    src/ln_app.c \
+    src/ls_app.c \
+    src/rm_app.c \
+    src/rmdir_app.c \
+    src/sed_app.c \
+    src/sort_app.c \
+    src/stat_app.c \
+    src/stty_app.c \
+    src/sum_app.c \
+    src/tail_app.c \
+    src/touch_app.c \
+    src/tr_app.c \
+    src/uniq_app.c \
+    src/who_app.c \
+    src/xargs_app.c \
+    src/utmp_rec.c \
     ${OPENSSH_LIBS} \
     ${DVTM_LIBS} \
     ${LIBGIT2_LIBS} \
@@ -1000,6 +1027,10 @@ else
 fi
 
 # iSH default launch command is /bin/login -f root; provide a simple wrapper.
+# smallclue has a login applet of its own, so the loop above left bin/login a
+# link to smallclue, and writing through it replaced the binary with this
+# script: the image held no smallclue at all. Write a file, not through the link.
+rm -f "$ROOTFS/bin/login"
 cat > "$ROOTFS/bin/login" <<EOF
 #!/bin/sh
 if [ "\$1" = "-f" ] && [ -n "\$2" ]; then
@@ -1072,6 +1103,12 @@ echo "Starting shell..."
 # exec /bin/sh
 EOF
 chmod +x "$ROOTFS/etc/rc"
+
+# Nothing above may have written through an applet link into the binary.
+if ! cmp -s smallclue "$ROOTFS/bin/smallclue"; then
+    echo "Error: $ROOTFS/bin/smallclue is not the binary just built."
+    exit 1
+fi
 
 # Package
 echo "Packaging to ish-rootfs.tar.gz..."
