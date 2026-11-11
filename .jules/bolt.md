@@ -33,3 +33,6 @@
 ## YYYY-MM-DD - Optimize cmp applet via block reads
 **Learning:** For utilities like `cmp` that compare inputs byte-by-byte, using `fgetc` introduces substantial function-call and buffering overhead. Profiling shows that reading data in 16KB blocks directly into stack arrays dramatically speeds up byte processing.
 **Action:** Replace `fgetc` with standard `fread` and stack buffers in high-throughput byte-comparison loops like `cmp` to minimize stdio execution overhead.
+## 2025-05-19 - Optimization of smallclueWcProcessFileFast character class checking
+**Learning:** Compound boolean checks for character classes in hot unrolled loops like wc create branching overhead. Replacing these with static 256-element boolean lookup arrays and using branchless arithmetic for state tracking (in_word flag) increases throughput noticeably.
+**Action:** In hot C processing loops processing byte-by-byte (like wc), substitute inline multiple conditional space checking with a static `is_space_lookup` boolean lookup array. Replace conditionally updated flags and word counters with branchless bitwise operations (`!in_word & !is_sp`).
