@@ -14062,6 +14062,17 @@ static char *smallclueYesNoPayload(int argc, char **argv, const char *fallback) 
     return buf;
 }
 
+/* GNU's: a failed write ends it with 1 and says so, except a reader that left while SIGPIPE has its
+ * default action, where it is already dying of the signal. */
+static int smallclueYesNoWriteFailed(int initial_status) {
+    int err = errno;
+    struct sigaction sa;
+    if (!(err == EPIPE && sigaction(SIGPIPE, NULL, &sa) == 0 && sa.sa_handler == SIG_DFL)) {
+        fprintf(stderr, "%s: standard output: %s\n", initial_status ? "no" : "yes", strerror(err));
+    }
+    return 1;
+}
+
 static int smallclueYesNoLoop(const char *text, int initial_status) {
     if (!text) {
         return initial_status;
@@ -14093,7 +14104,7 @@ static int smallclueYesNoLoop(const char *text, int initial_status) {
         while (true) {
             if (smallclueShouldAbort(&status)) break;
             if (fwrite(line, 1, line_len, stdout) != line_len) {
-                status = errno ? errno : status;
+                status = smallclueYesNoWriteFailed(initial_status);
                 break;
             }
         }
@@ -14114,7 +14125,7 @@ static int smallclueYesNoLoop(const char *text, int initial_status) {
             ssize_t n = write(STDOUT_FILENO, buffer + total_written, filled - total_written);
             if (n < 0) {
                 if (errno == EINTR) continue;
-                status = errno ? errno : status;
+                status = smallclueYesNoWriteFailed(initial_status);
                 free(buffer);
                 return status;
             }
@@ -23728,6 +23739,13 @@ int smallclueDispatchApplet(const SmallclueApplet *applet, int argc, char **argv
     dispatchDepth++;
     int appletStatus = applet->entry(argc, argv);
     dispatchDepth--;
+    shellRuntimeIdsMayHaveChanged();
+    int finishedStatus = smallclueFinishOutput(applet, appletStatus);
+    /* Its task was killed on a thread that can't be cancelled, by its own write to a pipe whose
+     * reader had gone too (SIGPIPE), the last flush's included: on Linux it would have died
+     * there, so the status is the signal's. */
+    int dyingSignal = vprocCurrentDyingSignal();
+    return dyingSignal > 0 ? 128 + dyingSignal : finishedStatus;
 #else
     int appletStatus = applet->entry(argc, argv);
 #endif

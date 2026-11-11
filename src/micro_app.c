@@ -830,7 +830,8 @@ static ssize_t microIoBridgeWrite(const MicroIoBridgeThreadCtx *ctx,
         return vprocHostWrite(ctx->write_fd, buf, count);
     }
     if (ctx->write_vproc_shim) {
-        return vprocWriteShim(ctx->write_fd, buf, count);
+        /* A relay, not micro's own write: its reader leaving is no SIGPIPE for micro. */
+        return vprocWriteShimNoSignal(ctx->write_fd, buf, count);
     }
     if (ctx->write_session_output) {
         ssize_t out = vprocSessionEmitOutput(ctx->session_id, buf, count);
