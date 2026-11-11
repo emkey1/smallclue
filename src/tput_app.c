@@ -884,6 +884,11 @@ int smallclueTputCommand(int argc, char **argv) {
 
 /* ------------------------------------------------------------------- reset */
 
+#if defined(PSCAL_TARGET_IOS)
+/* The app's; a build without it, a host test say, has this one that does nothing. */
+__attribute__((weak)) void PSCALRuntimeRefreshWindowSize(void) {}
+#endif
+
 int smallclueResetCommand(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -906,5 +911,10 @@ int smallclueResetCommand(int argc, char **argv) {
         fputs("\033c", stdout);
     }
     fflush(stdout);
+#if defined(PSCAL_TARGET_IOS)
+    /* The terminal's size is whatever its view measures. A program may have set another, so
+     * the view says it again: a reset terminal is the size it is. */
+    PSCALRuntimeRefreshWindowSize();
+#endif
     return 0;
 }
