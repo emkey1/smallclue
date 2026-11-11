@@ -2086,12 +2086,9 @@ int smallclueRunMicro(int argc, char **argv) {
         haveTty = true;
         savedIosValid = true;
     }
-#if defined(PSCAL_TARGET_IOS)
-    bool shouldApplyRawMode = !hostBridgeActive;
-#else
-    bool shouldApplyRawMode = true;
-#endif
-    if (haveTty && shouldApplyRawMode) {
+    /* Raw on the task's terminal with the bridge too: the bridge relays the session's
+     * input, and a terminal in line mode keeps every key, Ctrl-Q included, until Enter. */
+    if (haveTty) {
         struct termios raw = savedIos;
         raw.c_lflag &= ~(ICANON | ECHO | IEXTEN | ISIG);
         raw.c_iflag &= ~(ICRNL | IXON);
