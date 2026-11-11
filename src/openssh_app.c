@@ -18,6 +18,7 @@
 #include <termios.h>
 #include <time.h>
 #include "common/path_truncate.h"
+#include "common/path_virtualization.h"
 #include "pscal_openssh_hooks.h"
 #include "utmp_rec.h"
 #if defined(PSCAL_TARGET_IOS)
@@ -638,7 +639,10 @@ static void smallclueEnsureWritableHomeSsh(void) {
     if (existing_runner && *existing_runner) {
         const char *home_existing = getenv("HOME");
         if (home_existing && *home_existing) {
-            setenv("PSCALI_REAL_HOME", home_existing, 1);
+            /* The host's name: $HOME is the app's (/home) in a tab. */
+            char home_host[PATH_MAX];
+            const char *expanded = pscalPathVirtualized_hostPath(home_existing, home_host);
+            setenv("PSCALI_REAL_HOME", expanded ? expanded : home_existing, 1);
         }
     } else {
         const char *workspace = getenv("PSCALI_WORKSPACE_ROOT");
@@ -736,10 +740,27 @@ static void smallclueEnsureWritableHomeSsh(void) {
             setenv("PSCALI_TOOL_RUNNER_PATH", resolved_runner, 1);
         }
         if (home_for_runner && *home_for_runner) {
-            setenv("PSCALI_REAL_HOME", home_for_runner, 1);
+            char home_host[PATH_MAX];
+            const char *expanded = pscalPathVirtualized_hostPath(home_for_runner, home_host);
+            setenv("PSCALI_REAL_HOME", expanded ? expanded : home_for_runner, 1);
         }
     }
 #endif
+
+    /* A home already named, the app's /home in a tab, stays: the clients take app paths.
+     * Its .ssh is made in place. */
+    const char *named_home = getenv("HOME");
+    if (named_home && named_home[0] == '/') {
+        char named_ssh_dir[PATH_MAX];
+        int named_written = snprintf(named_ssh_dir, sizeof(named_ssh_dir), "%s/.ssh", named_home);
+        if (named_written > 0 && named_written < (int)sizeof(named_ssh_dir)) {
+            struct stat named_st;
+            if (stat(named_ssh_dir, &named_st) != 0) {
+                mkdir(named_ssh_dir, 0700);
+            }
+        }
+        return;
+    }
 
     const char *home = getenv("PSCALI_WORKDIR");
     if (!home || !*home) {

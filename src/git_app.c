@@ -1,5 +1,6 @@
 #include "smallclue.h"
 #include "common/path_truncate.h"
+#include "common/path_virtualization.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -62,6 +63,13 @@ static bool smallclueGitTryDefaultKeyFile(git_credential **out, const char *user
     }
     if (!home || !*home) {
         return false;
+    }
+    /* libgit2 opens the key files itself, past the app's path shims: give it the host's
+     * name for an app path such as $HOME's /home. */
+    char homeHost[PATH_MAX];
+    const char *homeExpanded = pscalPathVirtualized_hostPath(home, homeHost);
+    if (homeExpanded) {
+        home = homeExpanded;
     }
 
     static const char *kKeyNames[] = {"id_ed25519", "id_ecdsa", "id_rsa"};
