@@ -8000,9 +8000,7 @@ static bool pagerUseSessionInputQueue(void) {
     bool has_pscal_stdin = session->stdin_pscal_fd &&
                            session->stdin_pscal_fd->ops &&
                            session->stdin_pscal_fd->ops->read;
-    bool has_session_stdin = (session->stdin_host_fd >= 0) ||
-                             has_pscal_stdin ||
-                             (session->input != NULL);
+    bool has_session_stdin = (session->stdin_host_fd >= 0) || has_pscal_stdin;
     if (!has_session_stdin) {
         return false;
     }

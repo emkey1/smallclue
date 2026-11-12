@@ -60,28 +60,11 @@ static void vprocTestNote(VprocTestState *state,
 }
 
 static VprocTestResult vprocTestSessionReady(const char **detail) {
-    VProcSessionInput *input = vprocSessionInputEnsureShim();
-    if (!input) {
+    if (!vprocSessionStdioCurrent()) {
         if (detail) {
-            *detail = "no session input";
+            *detail = "no session";
         }
         return VPROC_TEST_FAIL;
-    }
-    pthread_mutex_lock(&input->mu);
-    bool busy = (input->len != 0);
-    bool eof = input->eof;
-    pthread_mutex_unlock(&input->mu);
-    if (eof) {
-        if (detail) {
-            *detail = "session eof";
-        }
-        return VPROC_TEST_FAIL;
-    }
-    if (busy) {
-        if (detail) {
-            *detail = "pending input";
-        }
-        return VPROC_TEST_SKIP;
     }
     return VPROC_TEST_OK;
 }
@@ -244,7 +227,6 @@ typedef struct {
     bool valid;
 } VprocTestSessionBackup;
 
-static void vprocTestSessionClearInput(VProcSessionStdio *session);
 
 typedef struct {
     int fd;
@@ -326,41 +308,10 @@ static bool vprocTestSessionBackup(VProcSessionStdio *session,
     return backup->valid;
 }
 
-static void vprocTestSessionStopReader(VProcSessionStdio *session) {
-    if (!session || !session->input) {
-        return;
-    }
-    VProcSessionInput *input = session->input;
-    pthread_mutex_lock(&input->mu);
-    bool active = input->reader_active;
-    input->stop_requested = true;
-    pthread_cond_broadcast(&input->cv);
-    pthread_mutex_unlock(&input->mu);
-
-    if (active && session->stdin_host_fd >= 0) {
-        vprocHostClose(session->stdin_host_fd);
-        session->stdin_host_fd = -1;
-    }
-
-    pthread_mutex_lock(&input->mu);
-    while (input->reader_active) {
-        pthread_cond_wait(&input->cv, &input->mu);
-    }
-    input->stop_requested = false;
-    input->eof = false;
-    input->len = 0;
-    input->interrupt_pending = false;
-    input->reader_fd = -1;
-    pthread_mutex_unlock(&input->mu);
-}
-
 static void vprocTestSessionRestore(VProcSessionStdio *session,
                                     VprocTestSessionBackup *backup) {
     if (!session || !backup || !backup->valid) {
         return;
-    }
-    if (session->input) {
-        vprocTestSessionStopReader(session);
     }
     if (session->stdin_host_fd >= 0) {
         vprocHostClose(session->stdin_host_fd);
@@ -379,33 +330,16 @@ static void vprocTestSessionRestore(VProcSessionStdio *session,
     backup->stderr_fd = -1;
     backup->valid = false;
 
-    vprocTestSessionClearInput(session);
-    (void)vprocSessionInputEnsureShim();
 }
 
 static void vprocTestSessionReplaceStdin(VProcSessionStdio *session, int stdin_fd) {
     if (!session) {
         return;
     }
-    if (session->input) {
-        vprocTestSessionStopReader(session);
-    }
     if (session->stdin_host_fd >= 0) {
         vprocHostClose(session->stdin_host_fd);
     }
     session->stdin_host_fd = stdin_fd;
-}
-
-static void vprocTestSessionClearInput(VProcSessionStdio *session) {
-    if (!session || !session->input) {
-        return;
-    }
-    pthread_mutex_lock(&session->input->mu);
-    session->input->len = 0;
-    session->input->eof = false;
-    session->input->interrupt_pending = false;
-    pthread_cond_broadcast(&session->input->cv);
-    pthread_mutex_unlock(&session->input->mu);
 }
 
 static void *vprocTestWritePipe(void *arg) {
@@ -728,8 +662,6 @@ static VprocTestResult vprocTestReadPassPipe(const char *payload, const char **d
     }
 
     vprocTestSessionReplaceStdin(session, session_stdin);
-    vprocTestSessionClearInput(session);
-    (void)vprocSessionInputEnsureShim();
 
     VProcOptions opts = vprocDefaultOptions();
     opts.stdin_fd = pipefd[0];
@@ -815,23 +747,6 @@ static VprocTestResult vprocTestReadPassInject(const char *payload, const char *
         return VPROC_TEST_FAIL;
     }
 
-    VProcSessionInput *input = vprocSessionInputEnsureShim();
-    if (!input) {
-        if (detail) {
-            *detail = "no session input";
-        }
-        return VPROC_TEST_FAIL;
-    }
-    if (vprocTestDebugEnabled()) {
-        pthread_mutex_lock(&input->mu);
-        fprintf(stderr,
-                "[vproc-test] inject input len=%zu eof=%d reader=%d fd=%d\n",
-                input->len,
-                (int)input->eof,
-                (int)input->reader_active,
-                input->reader_fd);
-        pthread_mutex_unlock(&input->mu);
-    }
 
     VprocTestInjectCtx *ctx = (VprocTestInjectCtx *)calloc(1, sizeof(VprocTestInjectCtx));
     pthread_t writer = 0;
@@ -863,7 +778,6 @@ static VprocTestResult vprocTestReadPassInject(const char *payload, const char *
         free(ctx);
     }
 
-    vprocTestSessionClearInput(vprocSessionStdioCurrent());
     return result;
 }
 
@@ -978,8 +892,6 @@ static VprocTestResult vprocTestReadPassSpawn(const char *payload, const char **
         }
         return VPROC_TEST_FAIL;
     }
-    vprocTestSessionClearInput(session);
-    (void)vprocSessionInputEnsureShim();
 
     VProc *vp = vprocCurrent();
     if (!vp) {
@@ -1045,7 +957,6 @@ static VprocTestResult vprocTestReadPassSpawn(const char *payload, const char **
     if (thread_started) {
         pthread_join(thread, NULL);
     }
-    vprocTestSessionClearInput(session);
 
     if (!ctx.ok) {
         if (detail) {
@@ -1087,11 +998,10 @@ static VprocTestResult vprocTestReadPassVproc(const char *payload, const char **
     }
     if (vprocTestDebugEnabled()) {
         fprintf(stderr,
-                "[vproc-test] readpass_vproc session stdin=%d stdout=%d stderr=%d input=%p\n",
+                "[vproc-test] readpass_vproc session stdin=%d stdout=%d stderr=%d\n",
                 session->stdin_host_fd,
                 session->stdout_host_fd,
-                session->stderr_host_fd,
-                (void *)session->input);
+                session->stderr_host_fd);
     }
     if (vprocTestDebugEnabled()) {
         fprintf(stderr,
@@ -1100,8 +1010,6 @@ static VprocTestResult vprocTestReadPassVproc(const char *payload, const char **
                 session->stdout_host_fd,
                 session->stderr_host_fd);
     }
-    vprocTestSessionClearInput(session);
-    (void)vprocSessionInputEnsureShim();
 
     VProcOptions opts = vprocDefaultOptions();
     if (session->stdin_host_fd >= 0) {
@@ -1224,7 +1132,6 @@ static VprocTestResult vprocTestReadPassVproc(const char *payload, const char **
         }
     }
     vprocDestroy(vp);
-    vprocTestSessionClearInput(session);
 
     if (!ctx.ok) {
         if (vprocTestDebugEnabled()) {
