@@ -183,6 +183,7 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
         bool vproc_scope_active = false;
         char label[96];
         int saved_fg_pgid = -1;
+        bool took_foreground = false;
         int session_sid = -1;
         int execution_pid = -1;
         bool cooperative_stop_guard = false;
@@ -227,13 +228,21 @@ static Value smallclueInvokeBuiltin(VM *vm, int arg_count, Value *args, const ch
             if (session_sid <= 0) {
                 session_sid = vprocGetSid(vproc_scope.pid);
             }
+            /* Only a program its terminal is running takes the terminal, as on Linux, where a
+             * background job never does. Taking it, and on the way out giving it to the tab's
+             * shell, in a background job gave the terminal away while a script still ran in the
+             * foreground: Ctrl-C then reached the tab's shell and the script went on. */
+            const int owner_pgid = (owner_pid > 0) ? vprocGetPgid(owner_pid) : -1;
             if (session_sid > 0) {
                 saved_fg_pgid = vprocGetForegroundPgid(session_sid);
+                const bool owner_in_foreground = saved_fg_pgid <= 0 || owner_pgid <= 0 ||
+                                                 saved_fg_pgid == owner_pgid;
                 if (saved_fg_pgid <= 0 && shell_pid > 0) {
                     saved_fg_pgid = vprocGetPgid(shell_pid);
                 }
-                if (scope_pgid > 0) {
+                if (scope_pgid > 0 && owner_in_foreground) {
                     (void)vprocSetForegroundPgid(session_sid, scope_pgid);
+                    took_foreground = true;
                 }
             }
         } else if (active_vp && vprocPid(active_vp) > 0) {
@@ -301,16 +310,10 @@ smallclue_dispatch_done:
         } else if (cooperative_stop_guard && execution_pid > 0) {
             vprocSetStopUnsupported(execution_pid, false);
         }
-        int restore_sid = session_sid;
-        if (restore_sid <= 0 && shell_pid > 0) {
-            restore_sid = vprocGetSid(shell_pid);
-        }
-        int restore_fg_pgid = saved_fg_pgid;
-        if (restore_fg_pgid <= 0 && shell_pid > 0) {
-            restore_fg_pgid = vprocGetPgid(shell_pid);
-        }
-        if (restore_sid > 0 && restore_fg_pgid > 0) {
-            vprocSetForegroundPgid(restore_sid, restore_fg_pgid);
+        /* Gives back only what it took: a program run in a stage or a background job never had
+         * the terminal, and giving it to the tab's shell took it from whoever had it. */
+        if (took_foreground && session_sid > 0 && saved_fg_pgid > 0) {
+            vprocSetForegroundPgid(session_sid, saved_fg_pgid);
         }
         if (override_active) {
             if (PSCALRuntimePopExitOverrideWithStatus) {
