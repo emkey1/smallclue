@@ -610,11 +610,54 @@ const char *gnuBackupSuffix(const char *given) {
     return env && *env && !strchr(env, '/') ? env : "~";
 }
 
+/* Which code points a UTF-8 locale still escapes. GNU asks iswprint(), and
+ * glibc answers no for the C1 controls, for the line and paragraph
+ * separators, and for the noncharacters. Those three classes are fixed by
+ * Unicode rather than by one libc's tables, so they are safe to name here. A
+ * code point that only a particular libc version calls unprintable is not,
+ * and goes through as itself: matching glibc's tables exactly would mean
+ * carrying them, and would then disagree with musl instead. */
+static bool gnuUtf8Printable(unsigned long cp) {
+    if (cp >= 0x80 && cp <= 0x9f) return false;
+    if (cp == 0x2028 || cp == 0x2029) return false;
+    if (cp >= 0xfdd0 && cp <= 0xfdef) return false;
+    if ((cp & 0xffff) >= 0xfffe) return false;
+    return true;
+}
+
+static unsigned long gnuUtf8Decode(const unsigned char *s, size_t k) {
+    static const unsigned char leadMask[5] = {0, 0x7f, 0x1f, 0x0f, 0x07};
+    unsigned long cp = s[0] & leadMask[k];
+    for (size_t i = 1; i < k; i++) cp = (cp << 6) | (s[i] & 0x3f);
+    return cp;
+}
+
 size_t gnuUtf8SeqLen(const unsigned char *s, size_t n) {
     if (s[0] < 0x80) return 1;
-    size_t k = (s[0] & 0xe0) == 0xc0 ? 2 : (s[0] & 0xf0) == 0xe0 ? 3 : (s[0] & 0xf8) == 0xf0 ? 4 : 0;
-    if (k == 0 || k > n) return 0;
-    for (size_t i = 1; i < k; i++)
+    /* The ranges, not just the bit patterns: RFC 3629 bars overlong forms,
+     * the UTF-16 surrogates and anything above U+10FFFF, and checking lead
+     * and continuation bits alone let an overlong `\301\201' and a surrogate
+     * `\355\240\200' through as characters where GNU escapes them. The first
+     * continuation byte carries the range for the two lead bytes that can be
+     * either; the rest only have to be continuations. */
+    size_t k;
+    unsigned char lo = 0x80, hi = 0xbf;
+    if (s[0] >= 0xc2 && s[0] <= 0xdf) {
+        k = 2;                              /* 0xc0 and 0xc1 are overlong */
+    } else if (s[0] >= 0xe0 && s[0] <= 0xef) {
+        k = 3;
+        if (s[0] == 0xe0) lo = 0xa0;        /* below that is overlong */
+        else if (s[0] == 0xed) hi = 0x9f;   /* above that is a surrogate */
+    } else if (s[0] >= 0xf0 && s[0] <= 0xf4) {
+        k = 4;
+        if (s[0] == 0xf0) lo = 0x90;        /* below that is overlong */
+        else if (s[0] == 0xf4) hi = 0x8f;   /* above that is past U+10FFFF */
+    } else {
+        return 0;                           /* 0x80-0xc1 and 0xf5-0xff */
+    }
+    if (k > n) return 0;
+    if (s[1] < lo || s[1] > hi) return 0;
+    for (size_t i = 2; i < k; i++)
         if ((s[i] & 0xc0) != 0x80) return 0;
     return k;
 }
@@ -627,7 +670,17 @@ bool gnuQuoteCStyleTo(GnuBuf *out, const char *name, bool cStyle, bool escapeSpa
     for (size_t i = 0; i < len;) {
         size_t k = utf8 ? gnuUtf8SeqLen(s + i, len - i) : 1;
         if (k > 1) {
-            gnuBufPut(out, name + i, k);
+            if (gnuUtf8Printable(gnuUtf8Decode(s + i, k))) {
+                gnuBufPut(out, name + i, k);
+            } else {
+                /* Well-formed but not printable: every byte of it escapes,
+                 * which is what GNU prints for U+2028 or U+10FFFF. */
+                for (size_t j = 0; j < k; j++) {
+                    char o[8];
+                    snprintf(o, sizeof(o), "\\%03o", s[i + j]);
+                    gnuBufPut(out, o, 4);
+                }
+            }
             i += k;
             continue;
         }
@@ -650,7 +703,16 @@ bool gnuQuoteCStyleTo(GnuBuf *out, const char *name, bool cStyle, bool escapeSpa
             gnuBufPut(out, esc, strlen(esc));
             continue;
         }
-        if (!isprint(ch)) {
+        /* ASCII-only on purpose, where GNU asks isprint(). These applets run
+         * natively, so isprint() answers from the HOST process's locale: the
+         * app calls setlocale(), the ish CLI does not. The same name in the
+         * same guest was therefore quoted two ways -- a stray 0xff came back
+         * raw on a device and escaped as \377 under the CLI -- and because
+         * every suite leg on a Mac goes through the CLI, none of them could
+         * see it. A byte the guest's locale did not just accept as part of a
+         * UTF-8 character is not printable here, which is what GNU does in
+         * the C and C.UTF-8 locales the roots actually set. */
+        if (ch < 0x20 || ch >= 0x7f) {
             char o[8];
             snprintf(o, sizeof(o), "\\%03o", ch);
             gnuBufPut(out, o, 4);
