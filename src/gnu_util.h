@@ -54,6 +54,24 @@ typedef struct {
 bool gnuBufPut(GnuBuf *b, const char *s, size_t n);
 static inline bool gnuBufPutc(GnuBuf *b, char c) { return gnuBufPut(b, &c, 1); }
 
+/* The length of the UTF-8 sequence beginning at S, or 0 when the bytes there
+ * are not one; N is how much of the string is left. */
+size_t gnuUtf8SeqLen(const unsigned char *s, size_t n);
+
+/* gnulib's escape_quoting_style and c_quoting_style: what ls writes for -b
+ * and -Q, and what tar writes for every member name it lists, that being
+ * tar's default --quoting-style. A backslash is doubled; \a \b \f \n \r \t
+ * and \v are spelled that way; any other byte that is not printable becomes
+ * \ooo -- in a UTF-8 locale a valid multibyte sequence passes through
+ * untouched, and outside one every byte above 0x7f is escaped. C style wraps
+ * the result in double quotes and escapes a double quote inside it.
+ *
+ * ESCAPESPACE is the one place the two callers part: ls lays names out in
+ * space-separated columns and so escapes a space, while tar gives each name
+ * a line of its own and leaves it alone. Returns whether outer quotes were
+ * written, which is what ls needs to line its columns up. */
+bool gnuQuoteCStyleTo(GnuBuf *out, const char *name, bool cStyle, bool escapeSpace);
+
 /* DIR/NAME, with no second slash when DIR ends in one; malloc'd. */
 char *gnuPathJoin(const char *dir, const char *name);
 

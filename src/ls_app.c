@@ -120,13 +120,8 @@ static const char *const lsColorNames[] = {"lc", "rc", "ec", "rs", "no", "fi", "
 
 /* --- Quoting (gnulib quotearg, as ls uses it). --- */
 
-static size_t lsUtf8Len(const unsigned char *s, size_t n) {
-    if (s[0] < 0x80) return 1;
-    size_t k = (s[0] & 0xe0) == 0xc0 ? 2 : (s[0] & 0xf0) == 0xe0 ? 3 : (s[0] & 0xf8) == 0xf0 ? 4 : 0;
-    if (k == 0 || k > n) return 0;
-    for (size_t i = 1; i < k; i++)
-        if ((s[i] & 0xc0) != 0x80) return 0;
-    return k;
+static inline size_t lsUtf8Len(const unsigned char *s, size_t n) {
+    return gnuUtf8SeqLen(s, n);
 }
 
 static bool lsShellSpecial(unsigned char c, size_t i) {
@@ -162,37 +157,11 @@ static bool lsQuote(const Ls *ls, const char *name, GnuBuf *out) {
         style = Q_C;
     }
     if (style == Q_C || style == Q_ESCAPE) {
+        /* -Q and -b. The escape style puts a backslash before a space here
+         * because ls separates columns with one; tar, sharing this code,
+         * does not. */
         bool c = style == Q_C;
-        if (c) gnuBufPutc(out, '"');
-        for (size_t i = 0; i < len;) {
-            size_t k = utf8 ? lsUtf8Len(s + i, len - i) : 1;
-            if (k > 1) { gnuBufPut(out, name + i, k); i += k; continue; }
-            unsigned char ch = s[i++];
-            const char *esc = NULL;
-            switch (ch) {
-            case '\a': esc = "\\a"; break;
-            case '\b': esc = "\\b"; break;
-            case '\f': esc = "\\f"; break;
-            case '\n': esc = "\\n"; break;
-            case '\r': esc = "\\r"; break;
-            case '\t': esc = "\\t"; break;
-            case '\v': esc = "\\v"; break;
-            case '\\': esc = "\\\\"; break;
-            case '"': if (c) esc = "\\\""; break;
-            case ' ': if (!c) esc = "\\ "; break;
-            default: break;
-            }
-            if (esc) { gnuBufPut(out, esc, strlen(esc)); continue; }
-            if (!isprint(ch)) {
-                char o[8];
-                snprintf(o, sizeof(o), "\\%03o", ch);
-                gnuBufPut(out, o, 4);
-                continue;
-            }
-            gnuBufPutc(out, (char)ch);
-        }
-        if (c) gnuBufPutc(out, '"');
-        return c;
+        return gnuQuoteCStyleTo(out, name, c, !c);
     }
     if (style == Q_LOCALE || style == Q_CLOCALE) {
         gnuBufPut(out, utf8 ? "\xe2\x80\x98" : "'", utf8 ? 3 : 1);

@@ -482,6 +482,24 @@ static void tarModeString(const TarEntry *e, char out[11]) {
     gnuModeString(e->mode, out + 1);
 }
 
+/* A member name the way tar lists it. GNU tar's default --quoting-style is
+ * escape, so a backslash is doubled and a control character, a DEL or (in a
+ * single-byte locale) a byte above 0x7f is spelled \ooo instead of being
+ * written through to the terminal. Without this a crafted archive could move
+ * the cursor or set colours on the screen of whoever ran `tar t`.
+ *
+ * BUF is the caller's and holds the result until its next use here, which is
+ * why a long listing, printing a name and a link target on one line, passes
+ * two of them. */
+static __thread GnuBuf tarNameq;
+
+static const char *tarQuoted(GnuBuf *buf, const char *name) {
+    buf->n = 0;
+    if (buf->s) buf->s[0] = '\0';
+    gnuQuoteCStyleTo(buf, name, false, false);
+    return buf->s ? buf->s : name;
+}
+
 static void tarListLong(Tar *t, const TarEntry *e, FILE *f) {
     static __thread int ugswidth = 19;
     char modes[11], user[80], size[64], when[64];
@@ -500,9 +518,11 @@ static void tarListLong(Tar *t, const TarEntry *e, FILE *f) {
     else snprintf(when, sizeof(when), "%jd", (intmax_t)tt);
     int pad = (int)(strlen(user) + 1 + strlen(size));
     if (pad > ugswidth) ugswidth = pad;
-    fprintf(f, "%s %s %*s %-16s %s", modes, user, ugswidth - pad + (int)strlen(size), size, when, e->name);
-    if (e->type == '1') fprintf(f, " link to %s", e->link);
-    else if (e->type == '2') fprintf(f, " -> %s", e->link);
+    static __thread GnuBuf nameq, linkq;
+    fprintf(f, "%s %s %*s %-16s %s", modes, user, ugswidth - pad + (int)strlen(size), size, when,
+            tarQuoted(&nameq, e->name));
+    if (e->type == '1') fprintf(f, " link to %s", tarQuoted(&linkq, e->link));
+    else if (e->type == '2') fprintf(f, " -> %s", tarQuoted(&linkq, e->link));
     fputc('\n', f);
 }
 
@@ -664,7 +684,7 @@ static void tarAdd(Tar *t, const char *fsPath, const char *archName, bool top) {
                         le.type = '1';
                         tarListLong(t, &le, t->listOut);
                     } else {
-                        fprintf(t->listOut, "%s\n", name);
+                        fprintf(t->listOut, "%s\n", tarQuoted(&tarNameq, name));
                     }
                 }
                 return;
@@ -737,7 +757,7 @@ static void tarAdd(Tar *t, const char *fsPath, const char *archName, bool top) {
         le.link = target;
         le.name = (char *)name;
         if (t->verbose > 1) tarListLong(t, &le, t->listOut);
-        else if (t->verbose) fprintf(t->listOut, "%s\n", name);
+        else if (t->verbose) fprintf(t->listOut, "%s\n", tarQuoted(&tarNameq, name));
         goto removed;
     } else if (S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode) || S_ISFIFO(st.st_mode)) {
         char type = S_ISCHR(st.st_mode) ? '3' : S_ISBLK(st.st_mode) ? '4' : '6';
@@ -756,7 +776,7 @@ static void tarAdd(Tar *t, const char *fsPath, const char *archName, bool top) {
     }
     le.name = verboseName ? verboseName : (char *)name;
     if (t->verbose > 1) tarListLong(t, &le, t->listOut);
-    else if (t->verbose) fprintf(t->listOut, "%s\n", le.name);
+    else if (t->verbose) fprintf(t->listOut, "%s\n", tarQuoted(&tarNameq, le.name));
     if (S_ISDIR(st.st_mode) && !t->noRecursion) tarAddDirEntries(t, fsPath, archName);
     free(verboseName);
 removed:
@@ -1191,7 +1211,7 @@ static int tarReadArchive(Tar *t, TarName *names, size_t nnames, const char *bas
         e.name = path;
         if (t->op == 't' || t->verbose) {
             if (t->op == 't' ? t->verbose : t->verbose > 1) tarListLong(t, &e, t->listOut);
-            else fprintf(t->listOut, "%s\n", path);
+            else fprintf(t->listOut, "%s\n", tarQuoted(&tarNameq, path));
         }
         if (t->op == 't') {
             if (!tarSkipData(t, tarHasData(e.type) ? e.size : 0)) {
