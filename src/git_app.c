@@ -3474,11 +3474,223 @@ static int smallclueGitCommandCatFile(git_repository *repo, int argc, char **arg
     return smallclueGitCatFileUsage();
 }
 
+/* The current directory as a repo-relative prefix: "" at the top of the
+ * working tree, "sub/dir/" below it. libgit2 matches pathspecs against
+ * repo-relative paths, so anything the user typed has to be joined to this
+ * first -- otherwise `git add x` inside a subdirectory would look for a
+ * top-level `x`. */
+static void smallclueGitCwdPrefix(git_repository *repo, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    const char *wd = git_repository_workdir(repo);
+    if (!wd || !*wd) {
+        return;
+    }
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof(cwd))) {
+        return;
+    }
+    /* In the app getcwd() answers with the virtualized path while libgit2
+     * holds the host one, so the two never share a prefix until one of them
+     * is translated. Both spellings are tried, and a directory that matches
+     * neither leaves the prefix empty -- the old repo-relative behaviour. */
+    char candidates[2][PATH_MAX];
+    size_t candidate_count = 0;
+    snprintf(candidates[candidate_count++], PATH_MAX, "%s", cwd);
+#if defined(PSCAL_TARGET_IOS)
+    char expanded[PATH_MAX];
+    if (pathTruncateExpand(cwd, expanded, sizeof(expanded)) && strcmp(expanded, cwd) != 0) {
+        snprintf(candidates[candidate_count++], PATH_MAX, "%s", expanded);
+    }
+#endif
+    size_t wlen = strlen(wd);
+    for (size_t i = 0; i < candidate_count; ++i) {
+        char *cand = candidates[i];
+        size_t clen = strlen(cand);
+        if (clen + 2 >= PATH_MAX) {
+            continue;
+        }
+        if (clen == 0 || cand[clen - 1] != '/') {
+            cand[clen++] = '/';
+            cand[clen] = '\0';
+        }
+        if (wlen > 0 && strncmp(cand, wd, wlen) == 0) {
+            snprintf(out, out_sz, "%s", cand + wlen);
+            return;
+        }
+    }
+}
+
+/* Resolves "." and ".." in a pathspec lexically, because libgit2 matches it
+ * against recorded paths as text: an unresolved `../docs/d.md` matches
+ * nothing and stages nothing, with no error to show for it. A ".." that
+ * climbs out of the working tree is refused instead. */
+static int smallclueGitAddNormalize(const char *in, char *out, size_t out_sz) {
+    const char *seg_start[256];
+    size_t seg_len[256];
+    size_t n = 0;
+    const char *p = in;
+    while (*p) {
+        while (*p == '/') {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+        const char *seg = p;
+        while (*p && *p != '/') {
+            p++;
+        }
+        size_t len = (size_t)(p - seg);
+        if (len == 1 && seg[0] == '.') {
+            continue;
+        }
+        if (len == 2 && seg[0] == '.' && seg[1] == '.') {
+            if (n == 0) {
+                return -1;
+            }
+            n--;
+            continue;
+        }
+        if (n >= sizeof(seg_start) / sizeof(seg_start[0])) {
+            return -1;
+        }
+        seg_start[n] = seg;
+        seg_len[n] = len;
+        n++;
+    }
+    size_t off = 0;
+    for (size_t i = 0; i < n; ++i) {
+        size_t need = seg_len[i] + (i ? 1u : 0u);
+        if (off + need + 1 > out_sz) {
+            return -1;
+        }
+        if (i) {
+            out[off++] = '/';
+        }
+        memcpy(out + off, seg_start[i], seg_len[i]);
+        off += seg_len[i];
+    }
+    out[off] = '\0';
+    return 0;
+}
+
+/* Turns one command-line path into the repo-relative pathspec libgit2 wants.
+ * `*whole_repo` comes back true for the pathspec that means "everything from
+ * here down" with nothing left to match -- `.` at the top of the tree. */
+static int smallclueGitAddBuildSpec(git_repository *repo,
+                                    const char *prefix,
+                                    const char *arg,
+                                    char *out,
+                                    size_t out_sz,
+                                    bool *whole_repo) {
+    *whole_repo = false;
+    const char *src = arg;
+    while (src[0] == '.' && src[1] == '/') {
+        src += 2;
+    }
+    if (strcmp(src, ".") == 0) {
+        src = "";
+    }
+    char joined[PATH_MAX];
+    if (src[0] == '/') {
+        const char *wd = git_repository_workdir(repo);
+        size_t wlen = wd ? strlen(wd) : 0;
+        if (!wd || !*wd || strncmp(src, wd, wlen) != 0) {
+            return -1;
+        }
+        if (snprintf(joined, sizeof(joined), "%s", src + wlen) >= (int)sizeof(joined)) {
+            return -1;
+        }
+    } else if (snprintf(joined, sizeof(joined), "%s%s", prefix, src) >= (int)sizeof(joined)) {
+        return -1;
+    }
+    char norm[PATH_MAX];
+    if (smallclueGitAddNormalize(joined, norm, sizeof(norm)) != 0) {
+        return -1;
+    }
+    if (!norm[0]) {
+        *whole_repo = true;
+        out[0] = '\0';
+        return 0;
+    }
+    size_t len = strlen(norm);
+    if (len >= out_sz) {
+        return -1;
+    }
+    memcpy(out, norm, len + 1);
+    return 0;
+}
+
+typedef struct {
+    char **specs;
+    bool *matched;
+    size_t count;
+} SmallclueGitAddMatchState;
+
+static int smallclueGitAddMatchedCb(const char *path, const char *matched_pathspec, void *payload) {
+    (void)path;
+    SmallclueGitAddMatchState *st = (SmallclueGitAddMatchState *)payload;
+    if (!st || !matched_pathspec) {
+        return 0;
+    }
+    for (size_t i = 0; i < st->count; ++i) {
+        if (strcmp(st->specs[i], matched_pathspec) == 0) {
+            st->matched[i] = true;
+            break;
+        }
+    }
+    return 0;
+}
+
+/* A pathspec that named something already recorded -- a tracked file with no
+ * change to stage, or a tracked directory -- still matched, even though the
+ * index-to-worktree diff had nothing to say about it. */
+static bool smallclueGitIndexHasPathUnder(git_index *index, const char *spec) {
+    size_t count = git_index_entrycount(index);
+    size_t slen = strlen(spec);
+    for (size_t i = 0; i < count; ++i) {
+        const git_index_entry *entry = git_index_get_byindex(index, i);
+        if (!entry || !entry->path) {
+            continue;
+        }
+        if (strcmp(entry->path, spec) == 0) {
+            return true;
+        }
+        if (strncmp(entry->path, spec, slen) == 0 && entry->path[slen] == '/') {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool smallclueGitAddSpecExists(git_repository *repo, const char *spec) {
+    char full[PATH_MAX];
+    if (smallclueGitBuildWorkdirPath(repo, spec, full, sizeof(full)) != 0) {
+        return false;
+    }
+    struct stat st;
+    return lstat(full, &st) == 0;
+}
+
+/* `git add` takes pathspecs, not file names: `.`, a directory, a glob, and a
+ * path whose file has been deleted all have to work, which is what everything
+ * that drives git from a script expects. This used to hand each argument
+ * straight to git_index_add_bypath(), so anything but an existing plain file
+ * failed -- `git add .` with "invalid path: '.'". */
 static int smallclueGitCommandAdd(git_repository *repo, int argc, char **argv) {
     bool add_all = false;
     bool force = false;
-    bool saw_paths = false;
     bool after_double_dash = false;
+
+    char *specs[256];
+    char *origs[256];
+    bool matched[256];
+    size_t spec_count = 0;
+    bool whole_repo = false;
+    int rc = 0;
 
     git_index *index = NULL;
     if (git_repository_index(&index, repo) != 0 || !index) {
@@ -3486,8 +3698,11 @@ static int smallclueGitCommandAdd(git_repository *repo, int argc, char **argv) {
         return 1;
     }
 
+    char prefix[PATH_MAX];
+    smallclueGitCwdPrefix(repo, prefix, sizeof(prefix));
+
     for (int i = 0; i < argc; ++i) {
-        const char *arg = argv[i];
+        char *arg = argv[i];
         if (!arg) {
             continue;
         }
@@ -3495,51 +3710,98 @@ static int smallclueGitCommandAdd(git_repository *repo, int argc, char **argv) {
             after_double_dash = true;
             continue;
         }
-        if (!after_double_dash && (strcmp(arg, "-A") == 0 || strcmp(arg, "--all") == 0)) {
+        if (!after_double_dash && (strcmp(arg, "-A") == 0 || strcmp(arg, "--all") == 0 ||
+                                   strcmp(arg, "--no-ignore-removal") == 0)) {
             add_all = true;
             continue;
         }
-        if (!after_double_dash && strcmp(arg, "-f") == 0) {
+        if (!after_double_dash && (strcmp(arg, "-f") == 0 || strcmp(arg, "--force") == 0)) {
             force = true;
             continue;
         }
+        if (!after_double_dash && (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0)) {
+            continue;
+        }
         if (!after_double_dash && arg[0] == '-') {
-            git_index_free(index);
             smallclueGitPrintError("unsupported add option");
-            return 2;
+            rc = 2;
+            goto done;
         }
-        if (git_index_add_bypath(index, arg) != 0) {
-            git_index_free(index);
-            smallclueGitPrintLibgitError("add failed");
-            return 128;
+        if (spec_count >= sizeof(specs) / sizeof(specs[0])) {
+            smallclueGitPrintError("too many add paths");
+            rc = 2;
+            goto done;
         }
-        saw_paths = true;
+        char spec[PATH_MAX];
+        bool spec_whole = false;
+        if (smallclueGitAddBuildSpec(repo, prefix, arg, spec, sizeof(spec), &spec_whole) != 0) {
+            fprintf(stderr, "git: add: '%s' is outside the working tree\n", arg);
+            rc = 128;
+            goto done;
+        }
+        if (spec_whole) {
+            whole_repo = true;
+            continue;
+        }
+        specs[spec_count] = strdup(spec);
+        origs[spec_count] = arg;
+        matched[spec_count] = false;
+        if (!specs[spec_count]) {
+            smallclueGitPrintError("out of memory");
+            rc = 1;
+            goto done;
+        }
+        spec_count++;
     }
 
-    if (!saw_paths && add_all) {
-        uint32_t flags = GIT_INDEX_ADD_DEFAULT;
-        if (force) {
-            flags |= GIT_INDEX_ADD_FORCE;
-        }
+    uint32_t flags = force ? GIT_INDEX_ADD_FORCE : GIT_INDEX_ADD_DEFAULT;
+
+    if (whole_repo || (spec_count == 0 && add_all)) {
+        /* Everything, with no pathspec to match against. */
         if (git_index_add_all(index, NULL, flags, NULL, NULL) != 0) {
-            git_index_free(index);
-            smallclueGitPrintLibgitError("add --all failed");
-            return 128;
+            smallclueGitPrintLibgitError("add failed");
+            rc = 128;
+            goto done;
         }
-    } else if (!saw_paths) {
-        git_index_free(index);
+    } else if (spec_count == 0) {
         smallclueGitPrintError("add requires at least one path");
-        return 2;
+        rc = 2;
+        goto done;
+    } else {
+        SmallclueGitAddMatchState state = { specs, matched, spec_count };
+        git_strarray pathspec;
+        pathspec.strings = specs;
+        pathspec.count = spec_count;
+        if (git_index_add_all(index, &pathspec, flags, smallclueGitAddMatchedCb, &state) != 0) {
+            smallclueGitPrintLibgitError("add failed");
+            rc = 128;
+            goto done;
+        }
+        /* Nothing is written if any pathspec named nothing at all, which is
+         * what real git does: it refuses the whole command. */
+        for (size_t i = 0; i < spec_count; ++i) {
+            if (matched[i] || smallclueGitAddSpecExists(repo, specs[i]) ||
+                smallclueGitIndexHasPathUnder(index, specs[i])) {
+                continue;
+            }
+            fprintf(stderr, "git: add: pathspec '%s' did not match any files\n", origs[i]);
+            rc = 128;
+            goto done;
+        }
     }
 
     if (git_index_write(index) != 0) {
-        git_index_free(index);
         smallclueGitPrintLibgitError("add: index write failed");
-        return 1;
+        rc = 1;
+        goto done;
     }
 
+done:
+    for (size_t i = 0; i < spec_count; ++i) {
+        free(specs[i]);
+    }
     git_index_free(index);
-    return 0;
+    return rc;
 }
 
 static int smallclueGitCommandRm(git_repository *repo, int argc, char **argv) {
@@ -4905,6 +5167,10 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
             message_mode = SMALLCLUE_GIT_COMMIT_MESSAGE_EXPLICIT;
             continue;
         }
+        if (strcmp(arg, "-m") == 0 || strcmp(arg, "--message") == 0) {
+            smallclueGitPrintError("commit --message requires a message");
+            return 2;
+        }
         if (strncmp(arg, "--message=", 10) == 0) {
             message = arg + 10;
             message_mode = SMALLCLUE_GIT_COMMIT_MESSAGE_EXPLICIT;
@@ -4966,7 +5232,18 @@ static int smallclueGitCommandCommit(git_repository *repo, int argc, char **argv
             reset_author = true;
             continue;
         }
-        smallclueGitPrintError("unsupported commit option");
+        /* Naming the argument matters here: the message of an unquoted
+         * `git commit -m some words` is one option and several stray paths,
+         * and "unsupported commit option" on its own reads as though -m
+         * itself were the thing not supported. */
+        if (arg[0] == '-') {
+            fprintf(stderr, "git: unsupported commit option '%s'\n", arg);
+        } else {
+            fprintf(stderr,
+                    "git: commit takes no paths ('%s'); stage what you want with git add, "
+                    "and quote a message of more than one word\n",
+                    arg);
+        }
         return 2;
     }
 

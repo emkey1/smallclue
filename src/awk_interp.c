@@ -199,6 +199,8 @@ typedef struct {
    leftovers. */
 static __thread AwkInterp gInterp;
 
+static void awkRuntimeError(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
 /* ---------------- Global variable access ---------------- */
 
 static AwkVar *awkFindGlobal(const char *name) {
@@ -255,17 +257,51 @@ static AwkArray *awkGetArrayFor(const char *name) {
     return v->arr;
 }
 
+/* Reading or writing an array name as if it were a scalar. Every awk
+ * diagnoses this -- mawk and bwk awk refuse the program, gawk calls it
+ * "array in a scalar context" -- and the one thing none of them does is
+ * answer silently, which is what this used to do: `if (counts)` came back
+ * false whatever the array held, so a whole report could print nothing and
+ * look like it had simply found no data. `length(arr)` is the test that
+ * works, here and everywhere else. */
+static void awkArrayInScalarContext(const char *name) {
+    awkRuntimeError("illegal reference to array %s", name);
+}
+
 static AwkValue awkGetScalar(const char *name) {
     AwkFrame *fr = awkCurFrame();
     int pi = awkFrameParamIndex(fr, name);
-    if (pi >= 0) return awkValCopy(&fr->scalars[pi]);
+    if (pi >= 0) {
+        if (fr->isArray && fr->isArray[pi]) {
+            awkArrayInScalarContext(name);
+            return awkValUninit();
+        }
+        return awkValCopy(&fr->scalars[pi]);
+    }
     AwkVar *v = awkGetOrCreateGlobal(name);
+    if (v->isArray) {
+        awkArrayInScalarContext(name);
+        return awkValUninit();
+    }
     return awkValCopy(&v->scalar);
 }
 
 static void awkSetScalar(const char *name, AwkValue val) {
     AwkFrame *fr = awkCurFrame();
     int pi = awkFrameParamIndex(fr, name);
+    if (pi >= 0 ? (fr->isArray && fr->isArray[pi]) : false) {
+        awkArrayInScalarContext(name);
+        awkValFree(&val);
+        return;
+    }
+    if (pi < 0) {
+        AwkVar *existing = awkFindGlobal(name);
+        if (existing && existing->isArray) {
+            awkArrayInScalarContext(name);
+            awkValFree(&val);
+            return;
+        }
+    }
     if (pi >= 0) {
         awkValFree(&fr->scalars[pi]);
         fr->scalars[pi] = val;
