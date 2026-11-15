@@ -338,6 +338,148 @@ static bool tputTryDir(const char *dir, const char *term, TputEntry *e) {
     return false;
 }
 
+/* ------------------------------------------------- the built-in description */
+
+/* A terminal description compiled in, for the terminals SmallCLUE itself
+ * draws when there is no terminfo database to read. The PSCAL app is the case
+ * that matters: it ships /etc/termcap and no terminfo at all, so every tput
+ * there failed with `unknown terminal "xterm-256color"` -- `tput cols`
+ * included -- while the same binary on a host worked only because the system
+ * database was behind it. The capabilities below are this terminal's own,
+ * taken from the sequences the app's terminal layer implements (etc/termcap
+ * describes the same terminal in the older format); they are not copied from
+ * anyone's terminfo source.
+ *
+ * It is the last resort: a real database entry, from $TERMINFO, ~/.terminfo or
+ * a system directory, is found first and wins, so a host is unaffected.
+ *
+ * setaf/setab use the direct 256-colour form, which addresses 0..255 uniformly
+ * and needs none of the conditional tparm operators the xterm entries use. */
+
+typedef struct {
+    const char *name;
+    int num;
+} TputBuiltinNum;
+
+typedef struct {
+    const char *name;
+    const char *str;
+} TputBuiltinStr;
+
+static const char *const tputBuiltinBools[] = {
+    "am",     /* wraps in the last column */
+    "xenl",   /* ... and does not move until the next character */
+    "mir",    /* safe to move while inserting */
+    "msgr",   /* safe to move while in standout */
+    "bce",    /* erase paints in the current background */
+    "km",     /* meta key sends the high bit */
+    NULL,
+};
+
+/* cols and lines are the fallback only: tputOne asks the terminal for its real
+ * size first and uses these when there is no tty to ask, as in a pipeline. */
+static const TputBuiltinNum tputBuiltinNums256[] = {
+    {"colors", 256}, {"pairs", 65536}, {"it", 8}, {"cols", 80}, {"lines", 24}, {NULL, 0},
+};
+
+static const TputBuiltinNum tputBuiltinNums8[] = {
+    {"colors", 8}, {"pairs", 64}, {"it", 8}, {"cols", 80}, {"lines", 24}, {NULL, 0},
+};
+
+static const TputBuiltinStr tputBuiltinStrs[] = {
+    /* clearing */
+    {"clear", "\033[H\033[2J"}, {"ed", "\033[J"}, {"el", "\033[K"},
+    {"el1", "\033[1K"}, {"ech", "\033[%p1%dX"},
+    /* cursor motion */
+    {"cup", "\033[%i%p1%d;%p2%dH"}, {"home", "\033[H"},
+    {"cuu1", "\033[A"}, {"cud1", "\033[B"}, {"cuf1", "\033[C"}, {"cub1", "\033[D"},
+    {"cuu", "\033[%p1%dA"}, {"cud", "\033[%p1%dB"},
+    {"cuf", "\033[%p1%dC"}, {"cub", "\033[%p1%dD"},
+    {"hpa", "\033[%i%p1%dG"}, {"vpa", "\033[%i%p1%dd"},
+    {"cr", "\r"}, {"nel", "\r\n"}, {"ind", "\n"}, {"ri", "\033M"},
+    {"indn", "\033[%p1%dS"}, {"rin", "\033[%p1%dT"},
+    {"sc", "\033" "7"}, {"rc", "\033" "8"}, {"csr", "\033[%i%p1%d;%p2%dr"},
+    /* insert and delete */
+    {"il1", "\033[L"}, {"dl1", "\033[M"},
+    {"il", "\033[%p1%dL"}, {"dl", "\033[%p1%dM"},
+    {"ich1", "\033[@"}, {"dch1", "\033[P"},
+    {"ich", "\033[%p1%d@"}, {"dch", "\033[%p1%dP"},
+    /* attributes */
+    {"bold", "\033[1m"}, {"dim", "\033[2m"}, {"sitm", "\033[3m"}, {"ritm", "\033[23m"},
+    {"smul", "\033[4m"}, {"rmul", "\033[24m"}, {"blink", "\033[5m"},
+    {"rev", "\033[7m"}, {"invis", "\033[8m"},
+    {"smso", "\033[7m"}, {"rmso", "\033[27m"},
+    {"sgr0", "\033[0m"}, {"op", "\033[39;49m"},
+    {"setaf", "\033[38;5;%p1%dm"}, {"setab", "\033[48;5;%p1%dm"},
+    /* cursor visibility and keypad */
+    {"civis", "\033[?25l"}, {"cnorm", "\033[?25h"},
+    {"smkx", ""}, {"rmkx", ""}, {"smcup", ""}, {"rmcup", ""},
+    /* the keys the line editor sends */
+    {"kcuu1", "\033[A"}, {"kcud1", "\033[B"},
+    {"kcuf1", "\033[C"}, {"kcub1", "\033[D"},
+    {"khome", "\033[H"}, {"kend", "\033[F"},
+    {"kbs", "\177"}, {"kdch1", "\033[3~"},
+    {"knp", "\033[6~"}, {"kpp", "\033[5~"},
+    {NULL, NULL},
+};
+
+/* The names this description answers to, and whether that name means 256
+ * colours. Anything else is still an unknown terminal, as it should be. */
+static const char *const tputBuiltinNames[] = {
+    "xterm-256color", "xterm-color", "xterm", "ansi", "pscali", "pscal", NULL,
+};
+
+static int tputBuiltinIndexOf(const char *const *names, int count, const char *name) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(names[i], name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool tputBuiltin(const char *term, TputEntry *e) {
+    int match = -1;
+    for (int i = 0; tputBuiltinNames[i]; i++) {
+        if (strcmp(tputBuiltinNames[i], term) == 0) {
+            match = i;
+            break;
+        }
+    }
+    if (match < 0) {
+        return false;
+    }
+    memset(e, 0, sizeof(*e));
+    e->names = strdup(term);
+    if (!e->names) {
+        return false;
+    }
+    for (int i = 0; i < TPUT_NUM_COUNT; i++) {
+        e->nums[i] = -1;
+    }
+    for (int i = 0; tputBuiltinBools[i]; i++) {
+        int at = tputBuiltinIndexOf(tputCapBoolNames, TPUT_BOOL_COUNT, tputBuiltinBools[i]);
+        if (at >= 0) {
+            e->bools[at] = 1;
+        }
+    }
+    const TputBuiltinNum *nums =
+        strstr(term, "256color") ? tputBuiltinNums256 : tputBuiltinNums8;
+    for (int i = 0; nums[i].name; i++) {
+        int at = tputBuiltinIndexOf(tputCapNumNames, TPUT_NUM_COUNT, nums[i].name);
+        if (at >= 0) {
+            e->nums[at] = nums[i].num;
+        }
+    }
+    for (int i = 0; tputBuiltinStrs[i].name; i++) {
+        int at = tputBuiltinIndexOf(tputCapStrNames, TPUT_STR_COUNT, tputBuiltinStrs[i].name);
+        if (at >= 0) {
+            e->strs[at] = tputBuiltinStrs[i].str;
+        }
+    }
+    return true;
+}
+
 static bool tputLoad(const char *term, TputEntry *e) {
     if (!term || !*term || strchr(term, '/') || strcmp(term, ".") == 0 || strcmp(term, "..") == 0) {
         return false;
@@ -383,7 +525,7 @@ static bool tputLoad(const char *term, TputEntry *e) {
             return true;
         }
     }
-    return false;
+    return tputBuiltin(term, e);
 }
 
 /* What a capability name is and where its value lives: 'b', 'n' or 's', or 0
