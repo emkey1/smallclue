@@ -4789,8 +4789,14 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                        "  With a command: show usage if available"},
     {"licenses", "licenses\n"
                  "  Browse PSCAL and third-party licenses; use arrows/enter to view"},
-    {"top", "top\n"
-            "  Show PSCAL virtual processes and CPU ticks"},
+    {"top", "top [-d SECONDS] [-n COUNT] [-b] [--tree|--flat] [--no-kernel]\n"
+            "  Show PSCAL virtual processes and CPU ticks, refreshing until you quit\n"
+            "  -d SECONDS refresh delay (default 3)\n"
+            "  -n COUNT   exit after COUNT frames\n"
+            "  -b         batch mode: never clear the screen, one frame unless -n\n"
+            "  --flat     show a flat list instead of the process tree\n"
+            "  --no-kernel hide the synthetic kernel row\n"
+            "  Keys: q quit, space refresh now, t tree/flat, k kernel row"},
 #else
     {"top", "top [-d SECONDS] [-n COUNT] [-b]\n"
             "  Show real system processes from /proc, sorted by %CPU\n"
@@ -5733,6 +5739,184 @@ static int smallcluePsCommand(int argc, char **argv) {
 #endif
 }
 
+/* Keyboard handling for the full-screen top.
+ *
+ * Keys do not come from STDIN_FILENO. In the app an applet's stdin belongs to
+ * the shell's session reader, so a raw read() there blocks forever and never
+ * sees the keystroke; on a host, stdin may be a pipe while the user is still
+ * at a terminal. The pager solved this already, so top reads through the same
+ * two helpers: `pager_control_fd()` (which finds /dev/tty, or the session pty
+ * on iOS) and `pagerReadByteWithTimeout()` (poll with a timeout, falling back
+ * to select for macOS's /dev/tty, or to the iOS session input queue). Both are
+ * defined further down this file with the pager.
+ *
+ * Keys are read from that terminal only while top is the foreground process
+ * group, because a background read would stop it with SIGTTIN; otherwise it
+ * refreshes without them (in the app, through the session input queue).
+ *
+ * ISIG is deliberately left enabled, so ^C and ^Z keep working; only
+ * line-buffering and echo are turned off, and they are put back when top
+ * returns.
+ */
+#define SMALLCLUE_TOP_POLL_SECONDS 0.1
+
+static int pager_control_fd(void);
+static ssize_t pagerReadByteWithTimeout(int fd,
+                                        bool use_session_queue,
+                                        unsigned char *out,
+                                        bool required,
+                                        int timeout_ms);
+#if defined(PSCAL_TARGET_IOS)
+static bool pagerUseSessionInputQueue(void);
+#endif
+
+typedef struct {
+    int fd;                   /* control fd for keys, -1 when there is none */
+    bool use_session_queue;   /* iOS: read through the session input queue */
+    bool have_termios;
+    struct termios saved;
+    bool have_flags;          /* O_NONBLOCK was added to fd and must come off */
+    int saved_flags;
+} SmallclueTopKeys;
+
+/* Reading, or changing the mode of, a controlling terminal from a process
+ * group that is not the foreground one raises SIGTTIN/SIGTTOU and stops the
+ * caller. top must not stop: it keeps refreshing instead, and takes keys only
+ * where they cannot cost it that. A terminal that cannot say who is in front
+ * does not count as ours. */
+static bool smallclueTopFdIsForeground(int fd) {
+    pid_t fg = tcgetpgrp(fd);
+    if (fg < 0) {
+        return false;
+    }
+    pid_t self = getpgrp();
+    return self >= 0 && fg == self;
+}
+
+static void smallclueTopSetupKeys(SmallclueTopKeys *keys) {
+    keys->fd = -1;
+    keys->use_session_queue = false;
+    keys->have_termios = false;
+    keys->have_flags = false;
+    keys->saved_flags = 0;
+
+    int fd = pager_control_fd();
+    bool fd_is_tty = (fd >= 0 && pscalRuntimeFdIsInteractive(fd));
+    bool direct = fd_is_tty && smallclueTopFdIsForeground(fd);
+#if defined(PSCAL_TARGET_IOS)
+    /* In the app an applet's keys normally arrive through the session input
+     * queue, which does not go through the tty driver at all. */
+    keys->use_session_queue = !direct && pagerUseSessionInputQueue();
+#endif
+    if (!direct && !keys->use_session_queue) {
+        return;               /* nowhere to read keys from: top just refreshes */
+    }
+    keys->fd = direct ? fd : -1;
+    if (keys->fd >= 0 && smallclueTcgetattr(keys->fd, &keys->saved) == 0) {
+        struct termios raw = keys->saved;
+        raw.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+        /* VMIN=0 matters: macOS reports /dev/tty readable when it is not, and
+         * the pager's VMIN=1 then blocks in read() for a key that never comes.
+         * A read that can return 0 keeps top refreshing. */
+        raw.c_cc[VMIN] = 0;
+        raw.c_cc[VTIME] = 0;
+        if (smallclueTcsetattr(keys->fd, TCSAFLUSH, &raw) == 0) {
+            keys->have_termios = true;
+        }
+    }
+    /* Belt and braces over VMIN: whatever mode the terminal is left in by the
+     * shell, O_NONBLOCK on the descriptor keeps an idle read from blocking,
+     * which is what lets top refresh while nobody is typing. */
+    if (keys->fd >= 0) {
+        int flags = fcntl(keys->fd, F_GETFL);
+        if (flags != -1 && fcntl(keys->fd, F_SETFL, flags | O_NONBLOCK) == 0) {
+            keys->saved_flags = flags;
+            keys->have_flags = true;
+        }
+    }
+}
+
+static void smallclueTopRestoreKeys(SmallclueTopKeys *keys) {
+    if (keys->have_flags) {
+        (void)fcntl(keys->fd, F_SETFL, keys->saved_flags);
+        keys->have_flags = false;
+    }
+    if (keys->have_termios) {
+        (void)smallclueTcsetattr(keys->fd, TCSAFLUSH, &keys->saved);
+        keys->have_termios = false;
+    }
+}
+
+static bool smallclueTopKeysActive(const SmallclueTopKeys *keys) {
+    return keys->fd >= 0 || keys->use_session_queue;
+}
+
+/* Wait up to timeout_ms for one key. Returns the key, or 0 when the wait ran
+ * out with nothing typed; with no key source it just sleeps, so the caller's
+ * refresh timing is the same either way.
+ *
+ * The control fd is read directly rather than through poll(): macOS answers
+ * POLLNVAL for /dev/tty, and the select() the pager falls back to there does
+ * not honour its timeout -- it returns only once a key arrives, which would
+ * stop top refreshing. With VMIN=0 a read costs nothing when the terminal is
+ * idle, so the waiting is done by sleeping instead. The iOS session queue has
+ * no such problem and keeps its timeout read. */
+static int smallclueTopWaitKey(SmallclueTopKeys *keys, int timeout_ms) {
+    if (keys->use_session_queue) {
+        unsigned char ch = 0;
+        if (pagerReadByteWithTimeout(-1, true, &ch, false, timeout_ms) == 1) {
+            return (int)ch;
+        }
+        return 0;
+    }
+
+    double left = (double)timeout_ms / 1000.0;
+    while (true) {
+        if (keys->fd >= 0) {
+            /* A zero timeout asks only "is a key waiting?", which is the one
+             * question select answers reliably for /dev/tty: with a timeout it
+             * does not come back until a key arrives, and a plain read obeys
+             * the terminal's own VMIN, which the shell may have left at 1. */
+            bool ready = true;
+            if (keys->fd < FD_SETSIZE) {
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(keys->fd, &rfds);
+                struct timeval now = {0, 0};
+                int rc = select(keys->fd + 1, &rfds, NULL, NULL, &now);
+                ready = (rc > 0 && FD_ISSET(keys->fd, &rfds));
+            }
+            if (ready) {
+                unsigned char ch = 0;
+                ssize_t n = read(keys->fd, &ch, 1);
+                if (n == 1) {
+                    return (int)ch;
+                }
+                if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                    keys->fd = -1;      /* the terminal went away: keep refreshing */
+                }
+            }
+        }
+        if (left <= 0.0) {
+            return 0;
+        }
+        double slice = left > 0.02 ? 0.02 : left;   /* 20ms: keys still feel instant */
+        struct timespec nap;
+        nap.tv_sec = (time_t)slice;
+        nap.tv_nsec = (long)((slice - (double)nap.tv_sec) * 1e9);
+        if (nap.tv_nsec < 1000000L && nap.tv_sec == 0) {
+            nap.tv_nsec = 1000000L;
+        }
+        (void)nanosleep(&nap, NULL);
+        left -= slice;
+    }
+}
+
+static bool smallclueTopQuitRequested(SmallclueTopKeys *keys) {
+    int key = smallclueTopWaitKey(keys, 0);
+    return key == 'q' || key == 'Q';
+}
+
 #if defined(PSCAL_TARGET_IOS)
 #include "ios/vproc_tree.h"
 static const char *smallclueTopState(const VProcSnapshot *snap) {
@@ -5835,12 +6019,43 @@ static bool smallclueReadCpuStats(double *usr, double *sys, double *nice, double
 static int smallclueTopCommand(int argc, char **argv) {
     bool tree = true;
     bool hide_kernel = false;
+    double delay = 3.0;
+    long max_frames = -1;
+    bool batch = false;
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
         if (!arg) {
             continue;
         }
-        if (strcmp(arg, "--flat") == 0) {
+        if (strcmp(arg, "-d") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "top: option requires an argument -- 'd'\n");
+                return 1;
+            }
+            char *end = NULL;
+            errno = 0;
+            double v = strtod(argv[++i], &end);
+            if (errno != 0 || !end || *end != '\0' || !(v >= 0.0)) {
+                fprintf(stderr, "top: invalid delay '%s'\n", argv[i]);
+                return 1;
+            }
+            delay = v;
+        } else if (strcmp(arg, "-n") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "top: option requires an argument -- 'n'\n");
+                return 1;
+            }
+            char *end = NULL;
+            errno = 0;
+            long v = strtol(argv[++i], &end, 10);
+            if (errno != 0 || !end || *end != '\0' || v < 1) {
+                fprintf(stderr, "top: invalid count '%s'\n", argv[i]);
+                return 1;
+            }
+            max_frames = v;
+        } else if (strcmp(arg, "-b") == 0) {
+            batch = true;
+        } else if (strcmp(arg, "--flat") == 0) {
             tree = false;
         } else if (strcmp(arg, "--tree") == 0) {
             tree = true;
@@ -5848,11 +6063,17 @@ static int smallclueTopCommand(int argc, char **argv) {
             hide_kernel = true;
         } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
             const char *help =
-                "top [--tree|--flat] [--no-kernel]\n"
-                "  Show PSCAL virtual processes.\n"
+                "top [-d SECONDS] [-n COUNT] [-b] [--tree|--flat] [--no-kernel]\n"
+                "  Show PSCAL virtual processes, refreshing until you quit.\n"
+                "  -d SECONDS refresh delay (default 3).\n"
+                "  -n COUNT   exit after COUNT frames.\n"
+                "  -b         batch mode: never clear the screen, one frame\n"
+                "             unless -n says otherwise.\n"
                 "  --tree (default) render parent/child tree.\n"
                 "  --flat show a flat list.\n"
-                "  --no-kernel hide the synthetic kernel row.\n";
+                "  --no-kernel hide the synthetic kernel row.\n"
+                "  Keys while running: q quit, space refresh now,\n"
+                "  t tree/flat, k show or hide the kernel row.\n";
             (void)gnuWriteAll(STDOUT_FILENO, help, strlen(help));
             return 0;
         } else {
@@ -5862,6 +6083,22 @@ static int smallclueTopCommand(int argc, char **argv) {
     }
     VProc *self_vp = vprocCurrent();
     int self_pid = self_vp ? vprocPid(self_vp) : (int)vprocGetPidShim();
+
+    /* Full-screen only on a terminal and only when -b was not asked for.
+     * Anywhere else (a pipe, a file, a test harness) top keeps its old
+     * single-frame behaviour unless -n asks for more. */
+    bool fullscreen = !batch && isatty(STDOUT_FILENO);
+    if (max_frames < 0) {
+        max_frames = fullscreen ? -1 : 1;
+    }
+
+    SmallclueTopKeys keys;
+    memset(&keys, 0, sizeof(keys));
+    keys.fd = -1;
+    if (fullscreen) {
+        smallclueTopSetupKeys(&keys);
+    }
+    smallclueClearPendingSignals();
 
     size_t snapshot_cap = 0;
     VProcSnapshot *snapshots = NULL;
@@ -5873,12 +6110,19 @@ static int smallclueTopCommand(int argc, char **argv) {
     nanosleep(&prime_sleep, &prime_sleep);
 #endif
 
-    while (1) {
+    int status = 0;
+    for (long frame = 0; max_frames < 0 || frame < max_frames; ++frame) {
+        int abort_status = 0;
+        if (smallclueShouldAbort(&abort_status)) {
+            status = abort_status;
+            break;
+        }
         size_t needed = vprocSnapshot(NULL, 0);
         if (needed > snapshot_cap) {
             VProcSnapshot *resized = (VProcSnapshot *)realloc(snapshots, needed * sizeof(VProcSnapshot));
             if (!resized) {
                 free(snapshots);
+                smallclueTopRestoreKeys(&keys);
                 fprintf(stderr, "top: out of memory\n");
                 return 1;
             }
@@ -5888,7 +6132,7 @@ static int smallclueTopCommand(int argc, char **argv) {
         size_t snapshot_count = snapshots ? vprocSnapshot(snapshots, snapshot_cap) : 0;
 
         /* Clear and render. */
-        if (isatty(STDOUT_FILENO)) {
+        if (fullscreen) {
             fputs("\x1b[2J\x1b[H", stdout);
         } else {
             fputc('\n', stdout);
@@ -6050,12 +6294,71 @@ static int smallclueTopCommand(int argc, char **argv) {
             }
         }
 
+        if (fullscreen && (max_frames < 0 || frame + 1 < max_frames)) {
+            const char *hint = "\n(q quit, space refresh, t tree/flat, k kernel)\n";
+            (void)gnuWriteAll(STDOUT_FILENO, hint, strlen(hint));
+        }
         fflush(stdout);
-        break;
+
+        if (max_frames >= 0 && frame + 1 >= max_frames) {
+            break;
+        }
+
+        /* Wait out the delay in short slices so a signal, or a key, is acted
+         * on promptly rather than at the end of the frame. */
+        bool quit = false;
+        bool redraw = false;
+        double elapsed = 0.0;
+        while (elapsed < delay && !redraw && !quit) {
+            double remaining = delay - elapsed;
+            double slice = remaining > SMALLCLUE_TOP_POLL_SECONDS
+                         ? SMALLCLUE_TOP_POLL_SECONDS : remaining;
+            int slice_ms = (int)(slice * 1000.0);
+            if (slice_ms < 1) {
+                slice_ms = 1;
+            }
+            switch (smallclueTopWaitKey(&keys, slice_ms)) {
+                case 'q':
+                case 'Q':
+                case 0x03:              /* ^C delivered as a byte, not a signal */
+                    quit = true;
+                    break;
+                case ' ':
+                case '\n':
+                case '\r':
+                    redraw = true;
+                    break;
+                case 't':
+                case 'T':
+                    tree = !tree;
+                    redraw = true;
+                    break;
+                case 'k':
+                case 'K':
+                    hide_kernel = !hide_kernel;
+                    redraw = true;
+                    break;
+                default:
+                    break;
+            }
+            if (!quit && smallclueShouldAbort(&abort_status)) {
+                status = abort_status;
+                quit = true;
+            }
+            elapsed += slice;
+        }
+        if (quit) {
+            break;
+        }
     }
 
+    if (fullscreen) {
+        fputc('\n', stdout);
+        fflush(stdout);
+    }
+    smallclueTopRestoreKeys(&keys);
     free(snapshots);
-    return 0;
+    return status;
 }
 #else
 /* Real /proc-based top for the Linux/aarch64 guest target (and any other
@@ -6237,68 +6540,6 @@ static unsigned long long smallclueTopPrevTicksFor(const SmallclueTopPrevTicks *
         if (prev[i].pid == pid) return prev[i].cpu_ticks;
     }
     return 0;
-}
-
-/* Interactive quit for top.
- *
- * The loop below used to end only at --iterations or on a signal, so `q` did
- * nothing -- there was no key handling in this build at all. (The
- * PSCAL_TARGET_IOS variant above has its own.)
- *
- * Reads are made non-blocking through termios rather than O_NONBLOCK or
- * select(): VMIN=0/VTIME=0 makes read() return 0 immediately when no key is
- * waiting, which needs nothing beyond tcsetattr and works on a host where
- * select is unavailable.
- *
- * ISIG is deliberately left enabled, so ^C and ^Z keep working as before; only
- * line-buffering and echo are turned off. If the process is killed rather than
- * quitting through 'q', the terminal is left in cbreak -- `stty sane` restores
- * it -- which is the usual trade for a full-screen tool.
- */
-#define SMALLCLUE_TOP_POLL_SECONDS 0.1
-
-typedef struct {
-    bool active;
-    struct termios saved;
-} SmallclueTopKeys;
-
-static void smallclueTopSetupKeys(SmallclueTopKeys *keys) {
-    keys->active = false;
-    if (!isatty(STDIN_FILENO)) {
-        return;   /* piped or redirected: nothing to read, leave it alone */
-    }
-    if (tcgetattr(STDIN_FILENO, &keys->saved) != 0) {
-        return;
-    }
-    struct termios raw = keys->saved;
-    raw.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
-    raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 0;
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) {
-        return;
-    }
-    keys->active = true;
-}
-
-static void smallclueTopRestoreKeys(SmallclueTopKeys *keys) {
-    if (keys->active) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &keys->saved);
-        keys->active = false;
-    }
-}
-
-static bool smallclueTopQuitRequested(SmallclueTopKeys *keys) {
-    if (!keys->active) {
-        return false;
-    }
-    char c;
-    ssize_t n;
-    while ((n = read(STDIN_FILENO, &c, 1)) > 0) {
-        if (c == 'q' || c == 'Q') {
-            return true;
-        }
-    }
-    return false;
 }
 
 static int smallclueTopCommand(int argc, char **argv) {
