@@ -251,7 +251,7 @@ endif()
 # src/openssh_globals.c is generated rather than committed. The openssh fork
 # declares these two `extern __thread` in scp.c, sftp.c and sftp-client.c: each
 # ssh/scp/sftp invocation gets its own, so a ^C'd transfer cannot leave a stale
-# flag for the next one in the same session (iSH-AOK defines them the same way,
+# flag for the next one in the same session (AOK-iSH defines them the same way,
 # in kernel/openssh_glue.c). The definition has to agree. ELF refuses the link
 # otherwise ("TLS reference ... mismatches non-TLS definition"), and Mach-O
 # quietly links a plain global that the TLS accessors then misread, so
@@ -603,7 +603,7 @@ set_source_files_properties(third-party/openssh/scp.c PROPERTIES COMPILE_DEFINIT
 # config.h (see "Configure third-party/openssh" below). That file leaves
 # HAVE_SYS_RANDOM_H undefined because the iOS SDK lacks the header, but on
 # macOS <sys/random.h> is the only header that declares getentropy(), which
-# bsd-getentropy.c calls under HAVE_GETENTROPY. iSH-AOK never notices because it
+# bsd-getentropy.c calls under HAVE_GETENTROPY. AOK-iSH never notices because it
 # force-includes kernel/native_libc.h, which declares getentropy itself; here
 # the build stops with "call to undeclared function 'getentropy'". The header
 # does exist on macOS, so say so, but only for the one file that asks.
@@ -1133,7 +1133,7 @@ set(CMAKE_FIND_LIBRARY_SUFFIXES ${_smallclue_saved_lib_suffixes})
 #
 # Everywhere else it is the wrong file. Its !__linux__ guards cover only the
 # BSD facts that are outright false on glibc; it was still generated on Darwin,
-# --without-openssl, for a build that force-includes iSH-AOK's
+# --without-openssl, for a build that force-includes AOK-iSH's
 # kernel/native_libc.h to declare what it leaves out. So run configure and let
 # it write one for this host. It also rewrites openbsd-compat/include: shims
 # for headers this host has, like <endian.h> on glibc, are removed and any it

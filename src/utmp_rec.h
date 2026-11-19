@@ -9,7 +9,7 @@
  * login, logout, boot and shutdown) -- in the guest's own Linux layout, read
  * and written by offset.
  *
- * Not <utmp.h>: SmallCLUE also runs as host code inside iSH-AOK, where the
+ * Not <utmp.h>: SmallCLUE also runs as host code inside AOK-iSH, where the
  * system's struct (Darwin's utmpx) has nothing to do with the guest's files.
  * And the Linux layout is not one layout. glibc's struct utmp is 384 bytes on
  * x86_64 and i386, which keep 32-bit time fields for compatibility, and 400 on

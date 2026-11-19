@@ -2,7 +2,7 @@
  * sed: a POSIX stream editor with the GNU extensions Linux scripts rely on.
  *
  * This replaces a substitution-only sed (s, y, d, p; g and i flags), which
- * quietly broke scripts as soon as it shadowed a distro's GNU sed -- iSH-AOK's
+ * quietly broke scripts as soon as it shadowed a distro's GNU sed -- AOK-iSH's
  * native-links.sh puts SmallCLUE's applets ahead of /usr/bin, maintainer
  * scripts included. `sed -n 's/x/y/p'` was rejected outright, and `sed -i`
  * rewrote files 0600.
@@ -20,7 +20,7 @@
  * file, a missing final newline is kept, and `sed -i` keeps the file's mode
  * and owner.
  *
- * Runs as a function call in hosts that embed SmallCLUE (iSH-AOK), so there is
+ * Runs as a function call in hosts that embed SmallCLUE (AOK-iSH), so there is
  * no global state and every path frees what it allocated and closes what it
  * opened.
  */

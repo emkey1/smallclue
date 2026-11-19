@@ -1295,7 +1295,7 @@ static void smallclueResetGetopt(void) {
 /* An applet does not own its argv, so the usual "strip a global long option
  * out of argv by shifting the rest down and decrementing argc" idiom is not
  * safe: a caller may well own argv as a NULL-terminated array it later frees
- * entry by entry. Under iSH-AOK it is the kernel's native-exec record, which
+ * entry by entry. Under AOK-iSH it is the kernel's native-exec record, which
  * allocates one slot more than the argument count and frees the array by
  * walking to the first NULL -- at the ORIGINAL length. Compacting in place
  * leaves the vacated tail slots holding stale copies of pointers that now
@@ -2671,7 +2671,7 @@ static int smallclueSuCommand(int argc, char **argv) {
  *
  * util-linux's and busybox's shape. -f is "already authenticated": only root
  * may say so, and it is how a terminal is opened for a user without asking --
- * iSH-AOK's terminals run `login -f root`, or `login -f <name>` for "Open
+ * AOK-iSH's terminals run `login -f root`, or `login -f <name>` for "Open
  * Everything as Default User". Without -f, login asks for the name (if not
  * given) and the password, checked against /etc/shadow.
  *
@@ -3990,7 +3990,7 @@ static int smallclueHistoryCommand(int argc, char **argv) {
 // Both of these are fronts for the PSCAL app runtime, and a build without it
 // links the no-op stubs near the top of this file rather than failing to
 // link -- so the failure is not a missing symbol, it is an applet that
-// appears to work and does nothing. iSH-AOK is such a build: `script`
+// appears to work and does nothing. AOK-iSH is such a build: `script`
 // reported success and captured no output, and `vproc-test` could only say
 // it was for iOS builds, while both sat in the applet list looking real.
 static bool smallclueScriptAvailable(void) {
@@ -8969,7 +8969,7 @@ static bool markdownInlineAppendLinkMarker(char **buffer,
 // `md native-programs`.
 //
 // SMALLCLUE_MARKDOWN_DOCS_DIR lets a build point that at documentation it
-// ships. iSH-AOK sets it to /AOK/docs, which is compiled into the app and so is
+// ships. AOK-iSH sets it to /AOK/docs, which is compiled into the app and so is
 // always present; without it the answer is $HOME/Docs exactly as before, and
 // that stays the fallback when the configured directory is not there. So a
 // build that defines nothing is unchanged, and one that defines a directory it
@@ -9113,7 +9113,7 @@ static bool markdownLooksLikeNewsMetaLine(const char *line);
  * merely unnecessary but actively wrong, because the file already has the
  * structure they are trying to reconstruct.
  *
- * That was not theoretical. Rendering /AOK/docs, "iSH-AOK" came out as
+ * That was not theoretical. Rendering /AOK/docs, "AOK-iSH" came out as
  * "i SH-AOK" and "macOS" as "mac OS" -- camelCase splitting meant for
  * run-together scraped text -- and any ordinary sentence with two commas and a
  * filename in it ("small, synthetic, read-only filesystem (`aokfs`, see
@@ -14434,7 +14434,7 @@ static bool smallclueFormatBuildTimestamp(const char *programVersion, char *out,
     return true;
 }
 
-/* iSH-AOK links its own copyBuildVersion(); a standalone smallclue has none.
+/* AOK-iSH links its own copyBuildVersion(); a standalone smallclue has none.
  * A bare weak *declaration* leaves an undefined symbol that Mach-O refuses to
  * link, so carry a weak *definition* instead -- the shape src/integration.c
  * already uses for the runtime bridge. A strong definition wins at link time,
@@ -14462,7 +14462,7 @@ static int smallclueVersionCommand(int argc, char **argv) {
     if (!version && fallback) {
         version = strdup(fallback);
     }
-    // iSH-AOK compiles this in and has no PROGRAM_VERSION, so `version` had
+    // AOK-iSH compiles this in and has no PROGRAM_VERSION, so `version` had
     // nothing to report and said "unknown". Its own build string is the right
     // answer -- the same one /AOK/VERSION and `uname -v` give, so the three
     // agree -- and it is already malloc'd, which is what the free() below
@@ -14823,7 +14823,7 @@ static int smallclueUnameCommand(int argc, char **argv) {
     const char *processor = info.machine;
     const char *platform = "unknown";
 #if defined(SMALLCLUE_UNAME_FROM_KERNEL)
-    /* Hosted in a system whose uname() already describes it (iSH-AOK: the
+    /* Hosted in a system whose uname() already describes it (AOK-iSH: the
      * guest kernel, through the native-program shim). Report that, as
      * coreutils does on Linux -- -m is the guest's architecture, which is
      * what a script asks it for, never the host device's model (#622). */
@@ -14859,7 +14859,7 @@ static int smallclueUnameCommand(int argc, char **argv) {
      * the userland is whoever's C library the root has: "GNU/Linux" where
      * glibc's loader is (Devuan, Arch -- what their own uname says), "Linux"
      * where musl's is (Alpine, as busybox says), and "AOK/Linux" where there
-     * is neither: iSH-AOK's native mode, whose userland is iSH-AOK's own
+     * is neither: AOK-iSH's native mode, whose userland is AOK-iSH's own
      * programs. It used to be GNU/Linux for everything without a musl
      * loader, which named a root with no GNU in it after GNU. */
     if (sysname && !strcmp(sysname, "Linux")) {
@@ -15151,7 +15151,7 @@ static int smallclueTimeRunCommand(int argc, char **argv) {
      * fork-and-exec idiom xargs and timeout use, and they were converted
      * for the reason spawn.h gives -- a platform that runs smallclue as
      * host code inside one process has no fork() to return twice. On
-     * iSH-AOK this path used to die with "time: fork: Function not
+     * AOK-iSH this path used to die with "time: fork: Function not
      * implemented", so `time echo hi` (an applet) worked and
      * `time /bin/true` (a real program) did not. */
     pid_t pid = smallclueSpawnSimple(argv[0], argv, 1);
@@ -16606,7 +16606,7 @@ static bool smallclueDfQuery(const char *path, SmallclueDfStats *out) {
         out->mount_point[sizeof(out->mount_point) - 1] = '\0';
     }
 #endif
-    /* Where there is a mount table it is the better authority: inside iSH-AOK
+    /* Where there is a mount table it is the better authority: inside AOK-iSH
      * this is the guest's, and it is what the real df reads. */
     smallclueDfLookupMount(query_path, out->source, sizeof(out->source),
                            out->fstype, sizeof(out->fstype),
@@ -17233,7 +17233,7 @@ static uint16_t smallclueInternetChecksum(const void *data, size_t len) {
      * go out swapped on a little-endian host: the packet is well-formed and
      * send() succeeds, the far end silently discards it as corrupt, and
      * every reply times out -- which is exactly how `ping` presented on
-     * iSH-AOK (100% loss to a host that answers a system ping fine). */
+     * AOK-iSH (100% loss to a host that answers a system ping fine). */
     return htons((uint16_t)~sum);
 }
 
@@ -18113,7 +18113,7 @@ static int smallclueTracerouteCommand(int argc, char **argv) {
             /* Whether the outer IP header comes with the datagram is a
              * property of the stack, not of the protocol: a BSD raw socket
              * delivers it, Linux's unprivileged ping socket strips it, and
-             * iSH-AOK strips it too (its kernel sets IP_STRIPHDR on every
+             * AOK-iSH strips it too (its kernel sets IP_STRIPHDR on every
              * AF_INET SOCK_DGRAM socket). This used to assume the BSD form
              * and require 48 bytes, so a stripped 36-byte ICMP
              * time-exceeded was discarded and EVERY hop printed `*`.
@@ -18374,7 +18374,7 @@ static int smallclueDmesgCommand(int argc, char **argv) {
     fprintf(stderr, "dmesg: session log unavailable\n");
     return 1;
 /* SMALLCLUE_HAVE_KLOGCTL: the host is not Linux but klogctl reaches a Linux
-   kernel anyway. iSH-AOK compiles SmallCLUE as host (Darwin) code that runs
+   kernel anyway. AOK-iSH compiles SmallCLUE as host (Darwin) code that runs
    against its own Linux guest, and routes klogctl to that guest's syslog(2) --
    so the question this branch asks is "can klogctl reach a ring buffer", not
    "was this compiled for Linux". Without it the #else below claimed dmesg was
@@ -18407,7 +18407,7 @@ static int smallclueDmesgCommand(int argc, char **argv) {
     }
     buf[n] = 0;
     if (human) {
-        /* -T: a line's "[Thu Oct  1 17:59:47 2026]" stamp is UTC (iSH-AOK's
+        /* -T: a line's "[Thu Oct  1 17:59:47 2026]" stamp is UTC (AOK-iSH's
          * ring buffer writes it so); give it in the reader's zone. */
         for (char *line = buf; *line;) {
             char *end = strchr(line, '\n');

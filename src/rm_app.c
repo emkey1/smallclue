@@ -15,7 +15,7 @@
  * statuses are GNU's.
  *
  * Kept from the old rm: a hosted shell that expands patterns itself
- * (SMALLCLUE_ARGS_EXPANDED, iSH-AOK) never has rm glob again, and elsewhere a
+ * (SMALLCLUE_ARGS_EXPANDED, AOK-iSH) never has rm glob again, and elsewhere a
  * name that does not exist but contains a pattern is expanded once.
  *
  * Runs as a function call inside embedding hosts: no global state.

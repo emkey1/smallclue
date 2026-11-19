@@ -7,7 +7,7 @@
  * TYPE (OPTS)" form; `umount [-l] [-f] [-R] DIR...`.
  *
  * Two kinds of host compile this. A Linux one calls mount(2) and umount2(2)
- * directly. An embedding whose host is NOT Linux but whose kernel is -- iSH-AOK
+ * directly. An embedding whose host is NOT Linux but whose kernel is -- AOK-iSH
  * runs SmallCLUE as host code inside an app that implements Linux -- defines
  * SMALLCLUE_HOST_LINUX_MOUNT and supplies smallclueHostMount and
  * smallclueHostUmount2, which take Linux's arguments and flag values. The flag
