@@ -2502,7 +2502,14 @@ typedef struct SmallclueAppletHelp {
 // authentication path of its own.
 static void smallclueSecureMemzero(void *ptr, size_t len);
 static char *smallclueGetPass(const char *prompt);
-#if defined(PSCAL_TARGET_IOS)
+/* The getpass that reads /dev/tty when standard input isn't the terminal, and standard input
+ * itself for `sudo -S`. It is plain POSIX, so AOK-iSH's native build (which has shadow auth but is
+ * not PSCAL_TARGET_IOS) takes it too: without it `echo pw | sudo -S cmd` failed with no message,
+ * since the other getpass gives up when standard input has no termios. */
+#if defined(PSCAL_TARGET_IOS) || defined(SMALLCLUE_HAVE_SHADOW_AUTH)
+#define SMALLCLUE_GETPASS_TTY_AWARE 1
+#endif
+#if defined(SMALLCLUE_GETPASS_TTY_AWARE)
 /* Where smallclueGetPass reads when standard input isn't the terminal: sudo's /dev/tty. */
 static _Thread_local bool gSmallcluePassFromTty = false;
 #endif
@@ -3294,7 +3301,7 @@ static int smallclueSudoCommand(int argc, char **argv) {
             non_interactive = true;
         } else if (strcmp(a, "-l") == 0 || strcmp(a, "--list") == 0) {
             list_only = true;
-#if defined(PSCAL_TARGET_IOS)
+#if defined(SMALLCLUE_GETPASS_TTY_AWARE)
         } else if (strcmp(a, "-S") == 0) {
             read_stdin = true;
 #endif
@@ -3303,10 +3310,13 @@ static int smallclueSudoCommand(int argc, char **argv) {
             /* Forget the password, here and now: the record is root's, and sudo is. */
             invalidate = true;
 #endif
-        } else if (strcmp(a, "-k") == 0 || strcmp(a, "-K") == 0 ||
-                   strcmp(a, "-H") == 0 || strcmp(a, "-E") == 0 || strcmp(a, "-S") == 0) {
-            /* Accepted and without effect: there is no credential cache to
-             * clear, and the environment is handled the same way regardless.
+        } else if (strcmp(a, "-k") == 0 || strcmp(a, "-K") == 0) {
+            /* No credential cache to clear here, so nothing to do -- but a bare
+             * `sudo -k` is a whole command, and printed the usage. */
+            invalidate = true;
+        } else if (strcmp(a, "-H") == 0 || strcmp(a, "-E") == 0 || strcmp(a, "-S") == 0) {
+            /* Accepted and without effect: the environment is handled the same
+             * way regardless, and -S where getpass cannot read standard input.
              * Taking them silently beats failing a command line that works
              * everywhere else. */
         } else {
@@ -3344,6 +3354,9 @@ static int smallclueSudoCommand(int argc, char **argv) {
         if (!list_only && i >= argc)
             return 0;
     }
+#else
+    if (invalidate && !list_only && i >= argc)
+        return 0;
 #endif
     if (!list_only && i >= argc) {
         fputs(usage, stderr);
@@ -3476,15 +3489,19 @@ static int smallclueSudoCommand(int argc, char **argv) {
                 }
                 char prompt[160];
                 snprintf(prompt, sizeof(prompt), "[sudo] password for %s: ", auth_user);
-#if defined(PSCAL_TARGET_IOS)
+#if defined(SMALLCLUE_GETPASS_TTY_AWARE)
                 gSmallcluePassFromTty = !read_stdin;
                 char *pass = smallclueGetPass(prompt);
                 gSmallcluePassFromTty = false;
 #else
                 char *pass = smallclueGetPass(prompt);
 #endif
-                if (!pass)
+                if (!pass) {
+                    /* End of input before a line: say so, as sudo(8) does, rather than
+                     * exiting 1 with nothing on the screen. */
+                    fputs("sudo: no password was provided\n", stderr);
                     return 1;
+                }
                 char *encrypted = crypt(pass, sp->sp_pwdp);
                 smallclueSecureMemzero(pass, strlen(pass) + 1);
                 free(pass);
@@ -3550,7 +3567,7 @@ static int smallclueSudoCommand(int argc, char **argv) {
 // Plain POSIX termios -- tcgetattr, ~ECHO, tcsetattr -- which Darwin has
 // and the shim routes at the guest's terminal. It was gated on the OS
 // rather than on anything it actually uses.
-#if defined(PSCAL_TARGET_IOS)
+#if defined(SMALLCLUE_GETPASS_TTY_AWARE)
 /* getpass(3) as Linux's does it: the terminal, with echo off, read a byte at a time so nothing
  * after the line is taken. Standard input when it is the terminal; otherwise sudo goes to
  * /dev/tty, as real sudo does, unless `sudo -S` says to read standard input. su and passwd read a
@@ -3661,7 +3678,7 @@ static char *smallclueGetPass(const char *prompt) {
     smallclueSecureMemzero(buf, sizeof(buf));
     return result;
 }
-#endif /* PSCAL_TARGET_IOS */
+#endif /* SMALLCLUE_GETPASS_TTY_AWARE */
 #endif
 
 static int smallcluePasswdCommand(int argc, char **argv) {
