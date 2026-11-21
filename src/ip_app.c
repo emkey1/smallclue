@@ -10,9 +10,9 @@
  * device's network, so every change is refused as Linux refuses an unprivileged
  * user, root included: "RTNETLINK answers: Operation not permitted", status 2.
  *
- * iOS only. On Linux the real ip is there, and macOS has its own tools. */
-
-#if defined(PSCAL_TARGET_IOS)
+ * Every platform: the PSCAL app reads pscal-core's snapshot; elsewhere
+ * (Linux, macOS, AOK-iSH's native programs) it is SmallCLUE's copy in
+ * net_snapshot.c, which reads Linux's interfaces and /proc/net routes. */
 
 #include "ip_app.h"
 
@@ -886,5 +886,3 @@ int smallclueIpCommand(int argc, char **argv) {
     pscalNetSnapshotFree(&snap);
     return rc;
 }
-
-#endif /* PSCAL_TARGET_IOS */

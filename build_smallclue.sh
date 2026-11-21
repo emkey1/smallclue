@@ -755,6 +755,8 @@ gcc -std=c99 ${PORTABILITY_DEFS} -DSMALLCLUE_WITH_SH ${EXTRA_C_DEFS} ${DVTM_EXTR
     src/tput_app.c \
     src/free_app.c \
     src/ip_app.c \
+    src/ifconfig_app.c \
+    src/net_snapshot.c \
     src/mount_app.c \
     src/comm_app.c \
     src/dd_app.c \

@@ -57,6 +57,7 @@
 #include "tput_app.h"
 #include "free_app.h"
 #include "ip_app.h"
+#include "ifconfig_app.h"
 #if defined(PSCAL_TARGET_IOS)
 #include "common/net_snapshot.h"
 #endif
@@ -1541,7 +1542,7 @@ static bool smallclueSessionPtyName(char *buf, size_t buf_len);
 #endif
 static int smallclueTypeCommand(int argc, char **argv);
 static int smallclueFileCommand(int argc, char **argv);
-static int __attribute__((unused)) smallclueLicensesCommand(int argc, char **argv);
+static int smallclueLicensesCommand(int argc, char **argv);
 static const char *smallclueLeafName(const char *path);
 static int smallclueBuildPath(char *buf, size_t buf_size, const char *dir, const char *leaf);
 static void smallclueTrimTrailingSlashes(char *path);
@@ -1615,8 +1616,8 @@ static int smallclueIpAddrCommand(int argc, char **argv);
 #endif
 static int smallclueDfCommand(int argc, char **argv);
 static int smallclueTopCommand(int argc, char **argv);
-#if defined(PSCAL_TARGET_IOS)
 static int smallclueHelpCommand(int argc, char **argv);
+#if defined(PSCAL_TARGET_IOS)
 static int smallclueAddTabCommand(int argc, char **argv);
 static int smallclueWorkspaceCommand(int argc, char **argv);
 #endif
@@ -4243,15 +4244,18 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"xargs", smallclueXargsCommand, "Build and run command lines from input"},
     {"df", smallclueDfCommand, "Report filesystem usage"},
     {"dmesg", smallclueDmesgCommand, "Print the kernel ring buffer"},
+    {"ip", smallclueIpCommand, "Show network interfaces, addresses and routes"},
+    {"ifconfig", smallclueIfconfigCommand, "Show network interfaces, as net-tools' ifconfig"},
+    {"smallclue-help", smallclueHelpCommand, "List available smallclue applets"},
+    {"licenses", smallclueLicensesCommand, "View third-party licenses"},
 
+    /* Only these are the app's alone: they drive the PSCAL app's own tabs and
+     * Workspace. Every other command is on every platform. */
 #if defined(PSCAL_TARGET_IOS)
     {"addt", smallclueAddTabCommand, "Open an additional shell tab"},
     {"tabadd", smallclueAddTabCommand, "Alias for addt: open an additional shell tab"},
     {"tadd", smallclueAddTabCommand, "Alias for addt: open an additional shell tab"},
     {"ws", smallclueWorkspaceCommand, "Open a Workspace applet, or list the ones open"},
-    {"ip", smallclueIpCommand, "Show network interfaces, addresses and routes"},
-    {"smallclue-help", smallclueHelpCommand, "List available smallclue applets"},
-    {"licenses", smallclueLicensesCommand, "View third-party licenses"},
     {"top", smallclueTopCommand, "Show PSCAL virtual processes"},
 #else
     {"top", smallclueTopCommand, "Show running processes (sorted by %CPU)"},
@@ -4435,20 +4439,29 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
                 "  Show command history"},
     {"id", "id\n"
            "  Show uid/gid info"},
+    {"smallclue-help", "smallclue-help [command]\n"
+                       "  Without arguments: list all applets\n"
+                       "  With a command: show usage if available"},
+    {"licenses", "licenses\n"
+                 "  Browse PSCAL and third-party licenses; use arrows/enter to view"},
     {"init", "init [--service-mode|-S|--allow-non-pid1]\n"
              "  PID 1: run /etc/rc, reap orphans, and on SIGTERM (reboot), SIGUSR1\n"
              "  (halt) or SIGUSR2 (poweroff) run /etc/rc.shutdown and stop everything\n"
              "  --service-mode allows compatibility startup when PID != 1"},
-#if defined(PSCAL_TARGET_IOS)
+    {"ifconfig", "ifconfig [-a] [-s] [IFACE]\n"
+                 "  Show network interfaces, as net-tools' ifconfig\n"
+                 "  -a  include interfaces that are down\n"
+                 "  -s  a short list, like netstat -i\n"
+                 "  Changes (up, down, addresses, mtu) are refused: the network\n"
+                 "  is not configured from here"},
     {"ip", "ip [-4|-6|-0] [-br] [-j [-p]] [-o] OBJECT [COMMAND]\n"
            "  Show network interfaces, addresses and routes, as iproute2's ip\n"
            "  ip address [show [dev] IFNAME] [up]     (a, addr)\n"
            "  ip link [show [dev] IFNAME] [up]\n"
            "  ip route [show] [dev IFNAME] [default]  (r)\n"
            "  ip route get ADDRESS\n"
-           "  Changes (link set, address add, route add) are refused: the app\n"
-           "  can't configure the device's network"},
-#endif
+           "  Changes (link set, address add, route add) are refused: the\n"
+           "  network is not configured from here"},
 #if SMALLCLUE_HAS_IFADDRS
     {"ipaddr", "ipaddr [-4|-6] [-a]\n"
                "  Show interface IP addresses\n"
@@ -4852,11 +4865,6 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
            "  line: id, tool, Desktop (* for all), front, shown or hidden, age\n"
            "  in seconds, title. open opens TOOL, passing it PATH if given.\n"
            "  Success means the request was accepted, not that a window is up."},
-    {"smallclue-help", "smallclue-help [command]\n"
-                       "  Without arguments: list all applets\n"
-                       "  With a command: show usage if available"},
-    {"licenses", "licenses\n"
-                 "  Browse PSCAL and third-party licenses; use arrows/enter to view"},
     {"top", "top [-d SECONDS] [-n COUNT] [-b] [--tree|--flat] [--no-kernel]\n"
             "  Show PSCAL virtual processes and CPU ticks, refreshing until you quit\n"
             "  -d SECONDS refresh delay (default 3)\n"
@@ -14560,8 +14568,6 @@ static int smallclueVersionCommand(int argc, char **argv) {
     return 0;
 }
 
-#if defined(PSCAL_TARGET_IOS)
-
 typedef struct {
     const char *name;
     const char *filename;
@@ -14612,17 +14618,37 @@ static bool smallclueLicensesResolvePath(const char *filename, char *out, size_t
         stat(out, &st) == 0 && S_ISREG(st.st_mode)) {
         return true;
     }
+    /* A Linux system's place for them, where the PSCAL rootfs installs them. */
+    if (smallclueBuildPath(out, out_size, "/usr/share/licenses/smallclue", filename) == 0 &&
+        stat(out, &st) == 0 && S_ISREG(st.st_mode)) {
+        return true;
+    }
     return false;
+}
+
+/* The entries whose file is installed here. The app ships every one; a Linux
+ * system has only what it was built with (no SDL2 or hterm in a rootfs), and a
+ * menu of entries that all say "not found" is not a list of licences. */
+static size_t gSmallclueLicensesShown[sizeof(kSmallclueLicenses) / sizeof(kSmallclueLicenses[0])];
+static size_t gSmallclueLicensesShownCount = 0;
+
+static void smallclueLicensesCollect(void) {
+    gSmallclueLicensesShownCount = 0;
+    char resolved[PATH_MAX];
+    for (size_t i = 0; i < smallclueLicensesCount(); ++i) {
+        if (smallclueLicensesResolvePath(kSmallclueLicenses[i].filename, resolved, sizeof(resolved))) {
+            gSmallclueLicensesShown[gSmallclueLicensesShownCount++] = i;
+        }
+    }
 }
 
 static void smallclueLicensesRenderMenu(size_t selected, bool *first_frame) {
     smallclueMenuStartFrameTo(stdout, first_frame);
     printf("PSCAL & Third-Party Licenses\n");
     printf("Use arrows to navigate, Enter to view, q to quit.\n\n");
-    size_t total = smallclueLicensesCount();
-    for (size_t i = 0; i < total; ++i) {
+    for (size_t i = 0; i < gSmallclueLicensesShownCount; ++i) {
         const char *marker = (i == selected) ? ">" : " ";
-        printf("%s %s\n", marker, kSmallclueLicenses[i].name);
+        printf("%s %s\n", marker, kSmallclueLicenses[gSmallclueLicensesShown[i]].name);
     }
     fflush(stdout);
 }
@@ -14631,9 +14657,10 @@ static int smallclueLicensesCommand(int argc, char **argv) {
     (void)argc;
     (void)argv;
     pager_control_fd_reset();
-    size_t total = smallclueLicensesCount();
+    smallclueLicensesCollect();
+    size_t total = gSmallclueLicensesShownCount;
     if (total == 0) {
-        fprintf(stderr, "licenses: no entries available\n");
+        fprintf(stderr, "licenses: no licence files are installed\n");
         return 1;
     }
     size_t selected = 0;
@@ -14655,7 +14682,7 @@ static int smallclueLicensesCommand(int argc, char **argv) {
                 break;
             case '\r':
             case '\n': {
-                const SmallclueLicense *entry = &kSmallclueLicenses[selected];
+                const SmallclueLicense *entry = &kSmallclueLicenses[gSmallclueLicensesShown[selected]];
                 char resolved[PATH_MAX];
                 if (!smallclueLicensesResolvePath(entry->filename, resolved, sizeof(resolved))) {
                     smallclueLicensesRenderMenu(selected, &first_frame);
@@ -14762,7 +14789,6 @@ static int smallclueHelpCommand(int argc, char **argv) {
     free(buffer);
     return status;
 }
-#endif
 
 #if defined(SMALLCLUE_WITH_EXSH)
 static int smallclueShCommand(int argc, char **argv) {
