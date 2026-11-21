@@ -3269,14 +3269,53 @@ static bool sudoersScan(const char *path, const struct passwd *pw, const char *t
     return true;
 }
 
+/* sudo(8)'s -p escapes: %p the user whose password is asked for, %u the
+ * invoking user, %U the target user, %h the short host name, %H the full one,
+ * %% a percent sign. Anything else after a % is kept as written. */
+static void sudoExpandPrompt(char *out, size_t size, const char *format, const char *pw_user,
+                             const char *invoker, const char *target) {
+    char host[256] = "localhost";
+    if (gethostname(host, sizeof(host)) != 0)
+        strcpy(host, "localhost");
+    host[sizeof(host) - 1] = '\0';
+    char short_host[256];
+    snprintf(short_host, sizeof(short_host), "%s", host);
+    char *dot = strchr(short_host, '.');
+    if (dot)
+        *dot = '\0';
+    size_t n = 0;
+    for (const char *f = format; *f && n + 1 < size; f++) {
+        const char *insert = NULL;
+        if (f[0] == '%' && f[1]) {
+            switch (f[1]) {
+            case 'p': insert = pw_user; break;
+            case 'u': insert = invoker; break;
+            case 'U': insert = target; break;
+            case 'h': insert = short_host; break;
+            case 'H': insert = host; break;
+            case '%': insert = "%"; break;
+            }
+        }
+        if (insert) {
+            f++;
+            for (; *insert && n + 1 < size; insert++)
+                out[n++] = *insert;
+        } else {
+            out[n++] = *f;
+        }
+    }
+    out[n] = '\0';
+}
+
 static int smallclueSudoCommand(int argc, char **argv) {
-    const char *usage = "usage: sudo [-u user] [-n] [--] command [args...]\n"
+    const char *usage = "usage: sudo [-u user] [-n] [-S] [-p prompt] [--] command [args...]\n"
                         "       sudo -l\n";
     const char *target = "root";
     bool non_interactive = false;
     bool list_only = false;
     bool invalidate = false;
     bool read_stdin = false;
+    const char *prompt_format = NULL;
 
     /* Sentinel: Sanitize environment to prevent privilege escalation via LD_PRELOAD/PATH injection */
     unsetenv("LD_PRELOAD");
@@ -3301,6 +3340,15 @@ static int smallclueSudoCommand(int argc, char **argv) {
             non_interactive = true;
         } else if (strcmp(a, "-l") == 0 || strcmp(a, "--list") == 0) {
             list_only = true;
+        } else if (strcmp(a, "-p") == 0 || strcmp(a, "--prompt") == 0) {
+            /* sudo -S -p '' is how scripts feed a password without a prompt
+             * in their output. An empty prompt is a real value, not "unset". */
+            if (i + 1 >= argc) { fputs(usage, stderr); return 1; }
+            prompt_format = argv[++i];
+        } else if (strncmp(a, "--prompt=", 9) == 0) {
+            prompt_format = a + 9;
+        } else if (strncmp(a, "-p", 2) == 0) {
+            prompt_format = a + 2;
 #if defined(SMALLCLUE_GETPASS_TTY_AWARE)
         } else if (strcmp(a, "-S") == 0) {
             read_stdin = true;
@@ -3487,8 +3535,11 @@ static int smallclueSudoCommand(int argc, char **argv) {
                     fprintf(stderr, "sudo: a password is required\n");
                     return 1;
                 }
-                char prompt[160];
-                snprintf(prompt, sizeof(prompt), "[sudo] password for %s: ", auth_user);
+                char prompt[256];
+                if (prompt_format)
+                    sudoExpandPrompt(prompt, sizeof(prompt), prompt_format, auth_user, invoker, target);
+                else
+                    snprintf(prompt, sizeof(prompt), "[sudo] password for %s: ", auth_user);
 #if defined(SMALLCLUE_GETPASS_TTY_AWARE)
                 gSmallcluePassFromTty = !read_stdin;
                 char *pass = smallclueGetPass(prompt);
