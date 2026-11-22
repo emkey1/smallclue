@@ -512,6 +512,7 @@ set(SOURCES
     src/init_app.c
     src/utmp_rec.c
     src/who_app.c
+    src/login_apps.c
     src/tput_app.c
     src/free_app.c
     src/ip_app.c

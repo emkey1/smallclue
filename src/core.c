@@ -54,6 +54,7 @@
 #include "init_app.h"
 #include "utmp_rec.h"
 #include "who_app.h"
+#include "login_apps.h"
 #include "tput_app.h"
 #include "free_app.h"
 #include "ip_app.h"
@@ -4127,6 +4128,9 @@ static const SmallclueApplet kSmallclueApplets[] = {
     {"free", smallclueFreeCommand, "Display amount of free and used memory"},
     {"who", smallclueWhoCommand, "Show who is logged in"},
     {"users", smallclueUsersCommand, "Print the names of users logged in"},
+    {"w", smallclueWCommand, "Show who is logged in and what they are doing"},
+    {"last", smallclueLastCommand, "Show the logins and reboots in /var/log/wtmp"},
+    {"finger", smallclueFingerCommand, "Show who a user is and whether they are on"},
     {"git", smallclueGitCommand, "Git plumbing and porcelain"},
     {"gzip", smallclueGzipCommand, "Compress files"},
     {"gunzip", smallclueGunzipCommand, "Decompress files"},
@@ -4377,6 +4381,18 @@ static const SmallclueAppletHelp kSmallclueAppletHelp[] = {
             "  -u idle time and pid, -m (or `who am i`) this terminal only"},
     {"users", "users [FILE]\n"
               "  The names of the users logged in, sorted, on one line"},
+    {"w", "w [-hsf] [USER]\n"
+          "  Uptime and load, then each login: terminal, host, login time, idle,\n"
+          "  CPU time on the terminal (JCPU) and of what it is running (PCPU,\n"
+          "  WHAT). -h no header, -s short, -f no FROM column. As procps-ng's w"},
+    {"last", "last [-axwFR] [-n NUM | -NUM] [-f FILE] [USER | TTY ...]\n"
+             "  Logins, logouts and reboots from /var/log/wtmp, newest first. -x\n"
+             "  runlevels and shutdowns, -F full times, -R no host, -a host last,\n"
+             "  -w full names, -n at most NUM lines. As util-linux's last"},
+    {"finger", "finger [-lmps] [LOGIN ...]\n"
+               "  With no LOGIN, who is on (-l in full). With one, the account: name,\n"
+               "  office, home, shell, logins and idle time, mail, ~/.project and\n"
+               "  ~/.plan (-p skips those). -s short. As Debian's bsd-finger"},
     {"free", "free [-b|-k|-m|-g|-h] [--si] [-w] [-l] [-t] [-s N] [-c N]\n"
              "  Memory and swap from /proc/meminfo, as procps-ng 4's free reports\n"
              "  them: used is total - available; buff/cache is buffers + cache"},

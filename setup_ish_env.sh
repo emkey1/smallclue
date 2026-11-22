@@ -939,6 +939,7 @@ echo "Compiling smallclue (iSH/32-bit static)..."
     src/tr_app.c \
     src/uniq_app.c \
     src/who_app.c \
+    src/login_apps.c \
     src/xargs_app.c \
     src/utmp_rec.c \
     ${OPENSSH_LIBS} \
