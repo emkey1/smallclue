@@ -512,6 +512,31 @@ static int applyRedirections(ShInterp *interp, const ShellRedirectionArray *redi
 static int runSimpleCommand(ShInterp *interp, const ShellCommand *command);
 static int runPipeline(ShInterp *interp, const ShellPipeline *pipeline, const ShellCommand *owner);
 static int runLogical(ShInterp *interp, const ShellLogicalList *logical);
+
+/* A compound command (loop, if, case, { }), alone or as the one command of a
+ * pipeline. set -e has already acted, or rightly not, on the commands inside
+ * it, and its status can come from one it ignores -- `for ...; do [ a = b ] &&
+ * x=1; done` ends with status 1 and must carry on -- so its own status is not
+ * checked again. A subshell is a command of its own, and is. */
+static bool errexitSkipsCompound(const ShellCommand *command) {
+    if (command && command->type == SHELL_COMMAND_PIPELINE && command->data.pipeline &&
+        command->data.pipeline->command_count == 1) {
+        command = command->data.pipeline->commands[0];
+    }
+    if (!command) {
+        return false;
+    }
+    switch (command->type) {
+        case SHELL_COMMAND_LOGICAL:
+        case SHELL_COMMAND_LOOP:
+        case SHELL_COMMAND_CONDITIONAL:
+        case SHELL_COMMAND_CASE:
+        case SHELL_COMMAND_BRACE_GROUP:
+            return true;
+        default:
+            return false;
+    }
+}
 static int runLoop(ShInterp *interp, const ShellCommand *command);
 static int runConditional(ShInterp *interp, const ShellCommand *command);
 static int runCase(ShInterp *interp, const ShellCommand *command);
@@ -742,8 +767,7 @@ int shRunCommand(ShInterp *interp, const ShellCommand *command) {
 
     /* set -e */
     if (interp->opt_errexit && status != 0 && interp->flow == SH_FLOW_NONE &&
-        command->type != SHELL_COMMAND_LOGICAL && command->type != SHELL_COMMAND_CONDITIONAL &&
-        command->type != SHELL_COMMAND_LOOP &&
+        !errexitSkipsCompound(command) &&
         !(command->type == SHELL_COMMAND_PIPELINE && command->data.pipeline &&
           command->data.pipeline->negated)) {
         interp->flow = SH_FLOW_EXIT;
@@ -760,6 +784,12 @@ static int runLogical(ShInterp *interp, const ShellLogicalList *logical) {
     }
     int status = 0;
     bool saved_errexit = interp->opt_errexit;
+    /* Whether the status below is the last element's own. POSIX: set -e acts
+     * on an AND-OR list only when its LAST command ran and failed, so
+     * `false && x=1` under set -e carries on -- the idiom `[ "$a" = "$b" ] &&
+     * skip=1` in a loop depends on it, and exiting there killed scripts such
+     * as AOK-iSH's native-links.sh without a word. */
+    bool ran_last = false;
     for (size_t i = 0; i < logical->count; ++i) {
         if (i > 0) {
             /* connectors[i] is the connector *preceding* pipelines[i];
@@ -780,12 +810,17 @@ static int runLogical(ShInterp *interp, const ShellLogicalList *logical) {
         wrapper.data.pipeline = logical->pipelines[i];
         status = runPipeline(interp, logical->pipelines[i], NULL);
         interp->last_status = status;
+        ran_last = (i == logical->count - 1);
         if (flowInterrupts(interp)) {
             break;
         }
     }
     interp->opt_errexit = saved_errexit;
-    if (interp->opt_errexit && status != 0 && interp->flow == SH_FLOW_NONE) {
+    /* Nor for a compound command: see errexitSkipsCompound. */
+    const ShellPipeline *last = logical->pipelines[logical->count - 1];
+    bool compound = last->command_count == 1 && errexitSkipsCompound(last->commands[0]);
+    if (interp->opt_errexit && ran_last && !compound && status != 0 &&
+        interp->flow == SH_FLOW_NONE && !last->negated) {
         interp->flow = SH_FLOW_EXIT;
         interp->exit_status = status;
     }
@@ -799,6 +834,12 @@ static int runPipeline(ShInterp *interp, const ShellPipeline *pipeline, const Sh
     }
 
     int status;
+    /* `! cmd`: set -e is ignored for the negated command (POSIX), so its
+     * failure is the pipeline's success, not an exit. */
+    bool saved_errexit = interp->opt_errexit;
+    if (pipeline->negated) {
+        interp->opt_errexit = false;
+    }
     if (pipeline->command_count == 1) {
         /* No pipe: run in-process to preserve variable assignments etc. */
         status = shRunCommand(interp, pipeline->commands[0]);
@@ -897,6 +938,9 @@ static int runPipeline(ShInterp *interp, const ShellPipeline *pipeline, const Sh
     }
 
     if (pipeline->negated) {
+        /* Only here: restoring after every pipeline would undo `set -e`
+         * itself the moment it ran. */
+        interp->opt_errexit = saved_errexit;
         status = (status == 0) ? 1 : 0;
     }
     interp->last_status = status;
