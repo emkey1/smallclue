@@ -593,7 +593,7 @@ int smallclueLastCommand(int argc, char **argv) {
     bool quit = false;
     for (int i = n - 1; i >= 0 && !quit; i--) {
         SmallclueUtmp u = recs[i];
-        bool down = false;
+        bool down = false, shutdown = false;
         int type = u.type;
         /* A runlevel record from "shutdown" is a shutdown, as util-linux
          * reads it. */
@@ -606,8 +606,7 @@ int smallclueLastCommand(int argc, char **argv) {
                 if (o.extended)
                     quit = lastPrint(&o, &u, "shutdown", "system down", lastBoot ? lastBoot : o.now, LAST_NORMAL);
                 lastDown = lastRunlevel = (time_t) u.sec;
-                down = true;
-                whyDown = LAST_DOWN;
+                down = shutdown = true;
                 break;
             case SMALLCLUE_UT_OLD_TIME:
             case SMALLCLUE_UT_NEW_TIME:
@@ -629,8 +628,7 @@ int smallclueLastCommand(int argc, char **argv) {
                 }
                 if (level == '0' || level == '6') {
                     lastDown = (time_t) u.sec;
-                    down = true;
-                    whyDown = LAST_DOWN;
+                    down = shutdown = true;
                 }
                 lastRunlevel = (time_t) u.sec;
                 break;
@@ -677,8 +675,12 @@ int smallclueLastCommand(int argc, char **argv) {
             default:
                 break;
         }
+        /* As util-linux: a login before this record and still open after it
+         * ended with it -- "down" when the record was a shutdown, "crash"
+         * when it was a boot with no shutdown before it. */
         if (down) {
             lastBoot = (time_t) u.sec;
+            whyDown = shutdown ? LAST_DOWN : LAST_CRASH;
             logoutCount = 0;
         }
     }

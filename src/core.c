@@ -2838,6 +2838,15 @@ static int smallclueLoginCommand(int argc, char **argv) {
         char utLine[33], utId[5];
         if (smallclueUtmpLineForFd(STDIN_FILENO, utLine, utId)) {
             smallclueUtmpLogin(getpid(), utLine, utId, name, remoteHost);
+            /* The terminal becomes the user's, as util-linux's login makes
+             * it: owner the user, group tty (0620, so `write` and `wall` can
+             * reach it) or, with no tty group, the user's own (0600). Left
+             * root's, `mesg` cannot change it, and `last` -- which tells a
+             * live session from a dead one by the terminal's owner where
+             * there is no /proc/<pid>/loginuid -- called every login "gone". */
+            struct group *ttyGroup = getgrnam("tty");
+            if (fchown(STDIN_FILENO, uid, ttyGroup ? ttyGroup->gr_gid : gid) == 0)
+                (void) fchmod(STDIN_FILENO, ttyGroup ? 0620 : 0600);
         }
     }
 
