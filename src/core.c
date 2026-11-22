@@ -17579,6 +17579,29 @@ static bool smallcluePingParseSeconds(const char *text, double min, double *out)
     return true;
 }
 
+static bool smallcluePingCandidate(const struct addrinfo *ai, int forceFamily) {
+    if (forceFamily != AF_UNSPEC && ai->ai_family != forceFamily) return false;
+    return (ai->ai_family == AF_INET && ai->ai_addrlen >= sizeof(struct sockaddr_in)) ||
+           (ai->ai_family == AF_INET6 && ai->ai_addrlen >= sizeof(struct sockaddr_in6));
+}
+
+/* Whether the host has a route to AI's address: connect() a UDP socket to it,
+ * which looks the route up and sends nothing. */
+static bool smallcluePingRoutable(const struct addrinfo *ai) {
+    int fd = socket(ai->ai_family, SOCK_DGRAM, 0);
+    if (fd < 0) return true;   /* cannot tell; let the ping itself find out */
+    struct sockaddr_storage to;
+    memcpy(&to, ai->ai_addr, ai->ai_addrlen);
+    if (ai->ai_family == AF_INET) ((struct sockaddr_in *)&to)->sin_port = htons(1025);
+    else ((struct sockaddr_in6 *)&to)->sin6_port = htons(1025);
+    int rc = connect(fd, (struct sockaddr *)&to, (socklen_t)ai->ai_addrlen);
+    int saved = errno;
+    close(fd);
+    if (rc == 0) return true;
+    return !(saved == ENETUNREACH || saved == EHOSTUNREACH || saved == EADDRNOTAVAIL ||
+             saved == EAFNOSUPPORT);
+}
+
 static int smallcluePingCommand(int argc, char **argv) {
     const char *usage =
         "usage: ping [-46nqD] [-c count] [-W timeout] [-w deadline] [-i interval]\n"
@@ -17741,14 +17764,23 @@ static int smallcluePingCommand(int argc, char **argv) {
         return 2;
     }
 
+    /* The first address this host can route to, as Linux's resolver orders
+     * them (RFC 6724 rule 1, "avoid unusable destinations"): a connected UDP
+     * socket sends nothing, and its connect() fails at once when there is no
+     * route. An AAAA answer on a network with no IPv6 route otherwise wins
+     * just by being first, and every packet is "No route to host". */
     struct addrinfo *selected = NULL;
+    struct addrinfo *firstUsable = NULL;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
-        if (forceFamily != AF_UNSPEC && ai->ai_family != forceFamily) continue;
-        if ((ai->ai_family == AF_INET && ai->ai_addrlen >= sizeof(struct sockaddr_in)) ||
-            (ai->ai_family == AF_INET6 && ai->ai_addrlen >= sizeof(struct sockaddr_in6))) {
+        if (!smallcluePingCandidate(ai, forceFamily)) continue;
+        if (!firstUsable) firstUsable = ai;
+        if (smallcluePingRoutable(ai)) {
             selected = ai;
             break;
         }
+    }
+    if (!selected) {
+        selected = firstUsable;
     }
     if (!selected) {
         fprintf(stderr, "ping: %s: no ICMP-capable address resolved\n", host);
@@ -17798,6 +17830,36 @@ static int smallcluePingCommand(int argc, char **argv) {
         int rc = smallcluePingAttempt(family, (struct sockaddr *)&target_addr, target_len,
             wait_ms, ident, (uint16_t)(i + 1), &extra, &elapsed_ms, &reply_len);
         int attemptErrno = errno;
+        /* A route the probe could not see (it said yes and the send said no):
+         * before anything has answered, move on to the next address, as
+         * iputils' ping does, rather than report every packet lost. */
+        if (rc != 0 && successes == 0 && i == 0 &&
+            (attemptErrno == ENETUNREACH || attemptErrno == EHOSTUNREACH ||
+             attemptErrno == EADDRNOTAVAIL)) {
+            struct addrinfo *next = NULL;
+            for (struct addrinfo *ai = selected->ai_next; ai; ai = ai->ai_next) {
+                if (smallcluePingCandidate(ai, forceFamily) && ai->ai_family != family) {
+                    next = ai;
+                    break;
+                }
+            }
+            if (next) {
+                selected = next;
+                target_len = (socklen_t)selected->ai_addrlen;
+                memcpy(&target_addr, selected->ai_addr, target_len);
+                family = selected->ai_family;
+                if (getnameinfo((struct sockaddr *)&target_addr, target_len,
+                        addrbuf, sizeof(addrbuf), NULL, 0, NI_NUMERICHOST) != 0) {
+                    strncpy(addrbuf, "unknown", sizeof(addrbuf));
+                    addrbuf[sizeof(addrbuf) - 1] = '\0';
+                }
+                printf("PING %s (%s): %zu data bytes\n", host, addrbuf, extra.payload);
+                fflush(stdout);
+                transmitted = 0;
+                i = -1;
+                continue;
+            }
+        }
         if (rc == 0) {
             successes++;
             if (successes == 1 || elapsed_ms < min_ms) {
