@@ -3,7 +3,7 @@
  *
  * The ln this replaces took -s and -f and nothing else, so `ln -sfn` -- the
  * usual way to repoint a symlink to a directory -- failed with "illegal option
- * -- n" wherever SmallCLUE's applets shadow the distro's (AOK-iSH's
+ * -- n" wherever SmallCLUE's applets shadow the distro's (AOK-Workstation's
  * native-links.sh), and a script that hid the error carried on without its
  * link.
  *

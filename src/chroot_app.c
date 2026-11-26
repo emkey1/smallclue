@@ -139,7 +139,7 @@ int smallclueChrootCommand(int argc, char **argv) {
         execArgv = &argv[argi];
     } else {
         /* $SHELL, as GNU chroot runs -- but it names a shell in the OLD
-         * root, which the new one may not have: AOK-iSH's native mode sets
+         * root, which the new one may not have: AOK-Workstation's native mode sets
          * SHELL=/AOK/native/zsh, and a distribution root has no /AOK/native
          * unless something bound it there. /bin/sh is what every root has. */
         const char *shell = getenv("SHELL");

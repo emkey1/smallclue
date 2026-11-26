@@ -11,7 +11,7 @@
  * user, root included: "RTNETLINK answers: Operation not permitted", status 2.
  *
  * Every platform: the PSCAL app reads pscal-core's snapshot; elsewhere
- * (Linux, macOS, AOK-iSH's native programs) it is SmallCLUE's copy in
+ * (Linux, macOS, AOK-Workstation's native programs) it is SmallCLUE's copy in
  * net_snapshot.c, which reads Linux's interfaces and /proc/net routes. */
 
 #include "ip_app.h"

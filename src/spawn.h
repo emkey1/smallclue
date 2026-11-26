@@ -9,7 +9,7 @@
  * The applets here all used the same idiom: fork(), and in the child exec()
  * (sometimes several candidates in turn), report failure, _exit(127). That is
  * fine wherever fork() is available, but it cannot be implemented at all on a
- * platform that gives the whole program a single process -- AOK-iSH compiles
+ * platform that gives the whole program a single process -- AOK-Workstation compiles
  * smallclue in as host code inside one app process, so a child has to become a
  * real guest task instead, and there is no way for fork() to return twice into
  * C code that is not being duplicated.

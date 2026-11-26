@@ -8,7 +8,7 @@
  *
  * which is also what halt, poweroff and reboot send it. Shutting down means
  * /etc/rc.shutdown, then SIGTERM to everything, a grace period, and SIGKILL.
- * On a system where pid 1 exiting ends everything (AOK-iSH: the app shows
+ * On a system where pid 1 exiting ends everything (AOK-Workstation: the app shows
  * "System Halted"), returning from init IS the halt.
  *
  * runit supervises /etc/service/<name>/run: it starts each, restarts one that
@@ -20,7 +20,7 @@
  * because on a platform running smallclue as host code inside one process
  * there is no fork() to return twice.
  *
- * Restore: a platform that checkpoints and restores processes (AOK-iSH) may
+ * Restore: a platform that checkpoints and restores processes (AOK-Workstation) may
  * re-launch init and runit from their argv after restoring the processes they
  * had started. smallclueHostWasRestored() says so, and both then carry on with
  * what is already running instead of starting it all a second time.
@@ -56,7 +56,7 @@
  * running program is one the host re-launched after a restore. A standalone
  * smallclue has no such host. A bare weak *declaration* leaves an undefined
  * symbol that Mach-O refuses to link, so carry a weak *definition* instead --
- * the shape copyBuildVersion() in core.c uses. AOK-iSH's strong definition
+ * the shape copyBuildVersion() in core.c uses. AOK-Workstation's strong definition
  * (kernel/smallclue_glue.c) wins at link time. */
 __attribute__((weak))
 bool smallclueHostWasRestored(void) {
@@ -308,7 +308,7 @@ int smallclueInitCommand(int argc, char **argv) {
  *
  * The request itself goes to init, as busybox's does: USR1 halt, USR2
  * poweroff, TERM reboot. -f would call reboot(2) directly on Linux; a system
- * that refuses that (AOK-iSH does) has init as its only way down, so -f asks
+ * that refuses that (AOK-Workstation does) has init as its only way down, so -f asks
  * init too. These used to print "System halt requested" and exit 0 having
  * halted nothing. */
 int smallclueHaltCommand(int argc, char **argv) {

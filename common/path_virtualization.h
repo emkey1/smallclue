@@ -16,7 +16,7 @@
  * assigns the result straight back over its own `path`. This fallback is the
  * thing the comment above has always promised and the header did not actually
  * provide, so a call outside a PSCAL_TARGET_IOS guard -- src/git_app.c has
- * one -- failed to compile in the standalone build and in AOK-iSH's. */
+ * one -- failed to compile in the standalone build and in AOK-Workstation's. */
 #if !defined(PSCAL_TARGET_IOS)
 static inline const char *pscalPathVirtualized_hostPath(const char *path, char *buffer) {
     (void)buffer;

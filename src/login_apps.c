@@ -2,13 +2,13 @@
  *
  * All three read the login records through utmp_rec.c (the guest's own Linux
  * utmp/wtmp layout, whatever the host), so they work the same as guest
- * programs and as AOK-iSH's native ones. The output is that of the programs
+ * programs and as AOK-Workstation's native ones. The output is that of the programs
  * Debian ships, measured against them byte for byte on the same utmp and wtmp
  * (Debian bookworm, arm64): procps-ng's w, util-linux's last and netkit's
- * bsd-finger. Where AOK-iSH differs from Linux it says so below.
+ * bsd-finger. Where AOK-Workstation differs from Linux it says so below.
  *
  * Terminals are matched to processes by name, not by stat: "pts/N" is device
- * 136:N and "ttyN" 4:N, which is what both Linux and AOK-iSH put in
+ * 136:N and "ttyN" 4:N, which is what both Linux and AOK-Workstation put in
  * /proc/<pid>/stat's tty_nr. A native program's stat() is Darwin-shaped, so
  * its st_rdev is not a number to compare that with. */
 
@@ -332,7 +332,7 @@ int smallclueWCommand(int argc, char **argv) {
         char what[4096];
         bestProcess(u, &jcpu, &pcpu, what, sizeof(what));
         /* procps: a terminal it cannot stat is idle 0. One with no access
-         * time (AOK-iSH's) is unknown, "?", not idle since 1970. */
+         * time (AOK-Workstation's) is unknown, "?", not idle since 1970. */
         long idle = 0;
         {
             char path[300];
@@ -779,7 +779,7 @@ static void fingerAddWhere(FingerPerson *p, const SmallclueUtmp *u, time_t now) 
         w->statFailed = true;
         return;
     }
-    /* AOK-iSH's terminals keep no access time: no idle time, rather than
+    /* AOK-Workstation's terminals keep no access time: no idle time, rather than
      * idle since 1970. */
     if (st.st_atime != 0 && now > st.st_atime)
         w->idle = (long) (now - st.st_atime);

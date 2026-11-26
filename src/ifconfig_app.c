@@ -32,7 +32,7 @@
 #endif
 
 /* Linux's IFF_* values, which ifconfig prints as a number. On Darwin (and so in
- * AOK-iSH's native programs) several differ -- IFF_MULTICAST is 0x8000 there --
+ * AOK-Workstation's native programs) several differ -- IFF_MULTICAST is 0x8000 there --
  * so each host flag is translated by name rather than printed raw. */
 typedef struct {
     unsigned host;
@@ -137,7 +137,7 @@ static IfcCounters ifcReadCounters(const PscalNetLink *link) {
 
 /* txqueuelen is a Linux queue setting with no counterpart elsewhere. Where the
  * kernel can't say, 1000 is Linux's default for every device type here, and the
- * answer AOK-iSH's own kernel gives net-tools in a guest. */
+ * answer AOK-Workstation's own kernel gives net-tools in a guest. */
 static int ifcTxQueueLen(const PscalNetLink *link) {
 #if defined(__linux__) && defined(SIOCGIFTXQLEN)
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -245,7 +245,7 @@ static void ifcPrintLong(FILE *out, const PscalNetLink *link) {
     } else if (strcmp(type, "ether") == 0
 #if !defined(__linux__)
                /* Darwin has no ARPHRD_NONE to say "no link layer": a tunnel just
-                * has no address, and AOK-iSH's kernel calls it Ethernet. */
+                * has no address, and AOK-Workstation's kernel calls it Ethernet. */
                || link->hwaddr_len == 0
 #endif
     ) {

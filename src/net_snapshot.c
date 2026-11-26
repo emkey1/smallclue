@@ -1,6 +1,6 @@
 /* SmallCLUE's copy of pscal-core's src/common/net_snapshot.c, for every build
  * that does not link pscal-core: the stand-alone Linux and macOS SmallCLUE, and
- * AOK-iSH's native programs. The PSCAL iOS app links pscal-core's own, so this
+ * AOK-Workstation's native programs. The PSCAL iOS app links pscal-core's own, so this
  * file is empty there.
  *
  * Added here: Linux. getifaddrs gives each interface's index, hardware address
@@ -122,7 +122,7 @@ static void netClearEmbeddedScope(unsigned char *addr16) {
 
 /* pscal-core renames lo0 to lo, because the PSCAL app has no Linux kernel to
  * name it. Every build of this copy has a kernel that names its own interfaces
- * -- Linux, macOS, or AOK-iSH's, which keeps the host's lo0 -- and /proc/net
+ * -- Linux, macOS, or AOK-Workstation's, which keeps the host's lo0 -- and /proc/net
  * and the distribution's own ip and ifconfig use that name, so this does too. */
 static void netLinuxName(const char *host, char *out, size_t len) {
     snprintf(out, len, "%s", host);
@@ -550,7 +550,7 @@ bool pscalNetSnapshotBuild(PscalNetSnapshot *out, const void *ifaddrs_list,
         link->flags = ifa->ifa_flags;
 #if defined(__APPLE__)
         /* Darwin sets IFF_NOTRAILERS on every interface; Linux never does, and
-         * AOK-iSH's kernel leaves it out of what a guest's ip and ifconfig see. */
+         * AOK-Workstation's kernel leaves it out of what a guest's ip and ifconfig see. */
         link->flags &= ~(unsigned)IFF_NOTRAILERS;
 #endif
         const struct sockaddr *sa = ifa->ifa_addr;

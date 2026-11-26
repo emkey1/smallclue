@@ -12,7 +12,7 @@
 #endif
 
 /* A platform without fork() supplies its own implementation and defines
- * SMALLCLUE_PLATFORM_SPAWN. AOK-iSH does this: a child there is a real guest
+ * SMALLCLUE_PLATFORM_SPAWN. AOK-Workstation does this: a child there is a real guest
  * task, created through the kernel's own task machinery, not a host process. */
 #ifdef SMALLCLUE_PLATFORM_SPAWN
 extern pid_t smallcluePlatformSpawn(const SmallclueSpawnRequest *request);

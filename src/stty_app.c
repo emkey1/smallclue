@@ -5,7 +5,7 @@
  * asm-generic/termbits.h, NCCS 32), whatever the host is, so that `stty -g`
  * produces and accepts exactly what GNU stty on Linux does: a script may save
  * a terminal with one stty and restore it with the other. On a Linux host the
- * conversion to and from struct termios is the identity; on Darwin (AOK-iSH,
+ * conversion to and from struct termios is the identity; on Darwin (AOK-Workstation,
  * where this runs as host code in front of a Linux guest's tty) each flag and
  * control character is carried across by name, and a Linux-only setting
  * (iuclc, olcuc, xcase, cmspar, swtch) is reported off and does not take.
@@ -444,7 +444,7 @@ static void sttyToHost(const SttyMode *m, struct termios *t) {
 /* The guest's termios itself, where the host fronts a Linux tty             */
 
 #if !defined(__linux__)
-/* AOK-iSH runs SmallCLUE as Darwin code in front of a Linux guest's tty, and
+/* AOK-Workstation runs SmallCLUE as Darwin code in front of a Linux guest's tty, and
  * its libc shim passes Linux's own TCGETS/TCSETSW through with the kernel's
  * struct termios. That carries every bit, including the ones Darwin's struct
  * has no field for (iuclc, olcuc, xcase, cmspar, swtch), so it is tried

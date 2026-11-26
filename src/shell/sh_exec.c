@@ -788,7 +788,7 @@ static int runLogical(ShInterp *interp, const ShellLogicalList *logical) {
      * on an AND-OR list only when its LAST command ran and failed, so
      * `false && x=1` under set -e carries on -- the idiom `[ "$a" = "$b" ] &&
      * skip=1` in a loop depends on it, and exiting there killed scripts such
-     * as AOK-iSH's native-links.sh without a word. */
+     * as AOK-Workstation's native-links.sh without a word. */
     bool ran_last = false;
     for (size_t i = 0; i < logical->count; ++i) {
         if (i > 0) {
